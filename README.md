@@ -2,10 +2,11 @@
 
 Gradial is a Windows 11 radial launcher built around a hold, flick, and release
 gesture. The current development build includes the first complete interaction
-spine and the first bounded Milestone 1 slice: a prewarmed, non-activating GPU
+spine and several bounded Milestone 1 slices: a prewarmed, non-activating GPU
 overlay for every connected display; dedicated low-level input thread; bounded
 event transport; tested four/eight-slice gesture state machine; automatic edge
-assist; display/DPI rebuild handling; and focus/timing instrumentation.
+assist; display/DPI rebuild handling; input-hook recovery; a native health tray
+icon; and focus/timing instrumentation.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -64,8 +65,14 @@ execute launcher actions; release only writes `slice_selected` with
 The display under the M4-down cursor selects the prewarmed overlay window.
 Display, work-area, or DPI changes cancel an active gesture and rebuild the
 window pool before M4 is accepted again. Every overlay is click-through and
-never intentionally takes focus. Stop the debug process with `Ctrl+C` in the
-terminal or the stop button in VS Code.
+never intentionally takes focus.
+
+Gradial keeps a notification-area icon visible while it runs. Its icon and
+first menu line show `Healthy`, `Recovering input`, or `Input faulted`. A missed
+input heartbeat triggers automatic recovery after 750 ms. Queue overflow and
+startup failures remain faulted with M4 passed through until **Retry input** is
+chosen. The same menu provides **Exit Gradial**. Input is also re-registered
+after resume, session unlock, or an Explorer restart.
 
 Run all local checks with:
 
@@ -81,3 +88,5 @@ and the per-display pool evidence is in
 [`Documentation/milestone-1-overlay-pool-results.md`](Documentation/milestone-1-overlay-pool-results.md).
 Four/eight geometry results are recorded in
 [`Documentation/milestone-1-slice-geometry-results.md`](Documentation/milestone-1-slice-geometry-results.md).
+Input recovery and tray results are recorded in
+[`Documentation/milestone-1-input-recovery-results.md`](Documentation/milestone-1-input-recovery-results.md).

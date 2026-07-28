@@ -18,7 +18,12 @@ param(
     [ValidateRange(0, 15)]
     [int]$MonitorIndex = 0,
 
-    [switch]$SimulateDisplayChange
+    [switch]$SimulateDisplayChange,
+
+    [switch]$SimulateInputReregistration,
+
+    [ValidateSet("none", "heartbeat", "queue-overflow")]
+    [string]$SimulateInputFault = "none"
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,6 +61,24 @@ public static class GradialSmokeNative
         public MouseInput Mouse;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NotificationIconIdentifier
+    {
+        public uint Size;
+        public IntPtr Window;
+        public uint Id;
+        public Guid Item;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     private delegate bool EnumWindowsProc(IntPtr window, IntPtr data);
 
     [DllImport("user32.dll")]
@@ -78,6 +101,12 @@ public static class GradialSmokeNative
 
     [DllImport("user32.dll")]
     private static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
+
+    [DllImport("shell32.dll")]
+    private static extern int Shell_NotifyIconGetRect(
+        ref NotificationIconIdentifier identifier,
+        out Rect iconLocation
+    );
 
     public static uint ForegroundProcessId()
     {
@@ -110,14 +139,65 @@ public static class GradialSmokeNative
 
     public static int NotifyDisplayChangeForProcess(uint processId)
     {
+        return PostMessageForProcess(processId, 0x007Eu, UIntPtr.Zero);
+    }
+
+    public static int NotifyResumeForProcess(uint processId)
+    {
+        return PostMessageForProcess(processId, 0x0218u, new UIntPtr(0x12u));
+    }
+
+    public static int SimulateInputFaultForProcess(uint processId, bool queueOverflow)
+    {
+        return PostMessageForProcess(
+            processId,
+            queueOverflow ? 0x8248u : 0x8247u,
+            UIntPtr.Zero
+        );
+    }
+
+    public static int RetryInputForProcess(uint processId)
+    {
+        return PostMessageForProcess(processId, 0x8249u, UIntPtr.Zero);
+    }
+
+    public static bool HasTrayIcon(uint processId)
+    {
+        var found = false;
+        EnumWindows((window, data) => {
+            uint windowProcessId;
+            GetWindowThreadProcessId(window, out windowProcessId);
+            if (windowProcessId != processId) return true;
+            var identifier = new NotificationIconIdentifier {
+                Size = (uint)Marshal.SizeOf(typeof(NotificationIconIdentifier)),
+                Window = window,
+                Id = 1,
+                Item = Guid.Empty
+            };
+            Rect iconLocation;
+            if (Shell_NotifyIconGetRect(ref identifier, out iconLocation) == 0) {
+                found = true;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    private static int PostMessageForProcess(
+        uint processId,
+        uint message,
+        UIntPtr wparam
+    )
+    {
         var count = 0;
         EnumWindows((window, data) => {
             uint windowProcessId;
             GetWindowThreadProcessId(window, out windowProcessId);
             if (windowProcessId == processId && PostMessage(
                 window,
-                0x007Eu,
-                IntPtr.Zero,
+                message,
+                new IntPtr(unchecked((long)wparam.ToUInt64())),
                 IntPtr.Zero
             )) count++;
             return true;
@@ -151,6 +231,9 @@ $workspace = Resolve-Path (Join-Path $PSScriptRoot "..")
 $executable = Join-Path $workspace "target\$Configuration\gradial.exe"
 if (-not (Test-Path -LiteralPath $executable)) {
     throw "Build Gradial before running the live smoke check."
+}
+if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
+    throw "Input fault simulation is available only in a debug build."
 }
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
     throw "Close the existing Gradial process before running the isolated live smoke check."
@@ -197,6 +280,137 @@ try {
     if ($gradial.HasExited) {
         throw "Gradial exited during startup with code $($gradial.ExitCode)."
     }
+    if (-not [GradialSmokeNative]::HasTrayIcon([uint32]$gradial.Id)) {
+        throw "Gradial did not register its notification-area icon."
+    }
+    $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
+    $startupLog = Get-Content -Raw -LiteralPath $logPath
+    $responsiveBeforeRecovery = (
+        [regex]::Matches($startupLog, "event_code=hook_thread_responsive")
+    ).Count
+
+    if ($SimulateInputReregistration) {
+        $reregistrationBefore = (
+            [regex]::Matches($startupLog, "event_code=input_reregistration_requested")
+        ).Count
+        $notifiedWindows = [GradialSmokeNative]::NotifyResumeForProcess(
+            [uint32]$gradial.Id
+        )
+        if ($notifiedWindows -eq 0) {
+            throw "Could not deliver a resume notification to Gradial."
+        }
+        $recoveryDeadline = [DateTime]::UtcNow.AddSeconds(4)
+        do {
+            Start-Sleep -Milliseconds 100
+            $recoveryLog = Get-Content -Raw -LiteralPath $logPath
+            $responsiveAfterRecovery = (
+                [regex]::Matches($recoveryLog, "event_code=hook_thread_responsive")
+            ).Count
+            $reregistrationAfter = (
+                [regex]::Matches($recoveryLog, "event_code=input_reregistration_requested")
+            ).Count
+        } while (
+            [DateTime]::UtcNow -lt $recoveryDeadline -and
+            (
+                $responsiveAfterRecovery -le $responsiveBeforeRecovery -or
+                $reregistrationAfter -le $reregistrationBefore
+            )
+        )
+        if (
+            $responsiveAfterRecovery -le $responsiveBeforeRecovery -or
+            $reregistrationAfter -le $reregistrationBefore
+        ) {
+            throw "Gradial did not re-register input after the resume notification."
+        }
+        $responsiveBeforeRecovery = $responsiveAfterRecovery
+        $startupLog = $recoveryLog
+    }
+
+    if ($SimulateInputFault -ne "none") {
+        $faultPattern = if ($SimulateInputFault -eq "heartbeat") {
+            "event_code=hook_thread_unresponsive"
+        }
+        else {
+            "event_code=input_fault_requires_retry"
+        }
+        $faultCountBefore = ([regex]::Matches($startupLog, $faultPattern)).Count
+        $queueOverflow = $SimulateInputFault -eq "queue-overflow"
+        $notifiedWindows = [GradialSmokeNative]::SimulateInputFaultForProcess(
+            [uint32]$gradial.Id,
+            $queueOverflow
+        )
+        if ($notifiedWindows -eq 0) {
+            throw "Could not deliver the debug input-fault notification to Gradial."
+        }
+        $faultDeadline = [DateTime]::UtcNow.AddSeconds(4)
+        do {
+            Start-Sleep -Milliseconds 100
+            $faultLog = Get-Content -Raw -LiteralPath $logPath
+            $faultCountAfter = ([regex]::Matches($faultLog, $faultPattern)).Count
+            $responsiveAfterRecovery = (
+                [regex]::Matches($faultLog, "event_code=hook_thread_responsive")
+            ).Count
+            $automaticRecoveryComplete = (
+                $SimulateInputFault -eq "heartbeat" -and
+                $responsiveAfterRecovery -gt $responsiveBeforeRecovery
+            )
+            $manualFaultReached = (
+                $SimulateInputFault -eq "queue-overflow" -and
+                $faultCountAfter -gt $faultCountBefore
+            )
+        } while (
+            [DateTime]::UtcNow -lt $faultDeadline -and
+            (
+                $faultCountAfter -le $faultCountBefore -or
+                (-not $automaticRecoveryComplete -and -not $manualFaultReached)
+            )
+        )
+        if ($faultCountAfter -le $faultCountBefore) {
+            throw "Gradial did not report the simulated $SimulateInputFault fault."
+        }
+        if ($SimulateInputFault -eq "heartbeat") {
+            if (-not $automaticRecoveryComplete) {
+                throw "Gradial did not automatically restart input after the heartbeat fault."
+            }
+        }
+        else {
+            $invocationsBeforePassThrough = (
+                [regex]::Matches($faultLog, "event_code=invocation_started")
+            ).Count
+            [GradialSmokeNative]::SendM4($true)
+            $m4IsDown = $true
+            Start-Sleep -Milliseconds 100
+            [GradialSmokeNative]::SendM4($false)
+            $m4IsDown = $false
+            Start-Sleep -Milliseconds 150
+            $passThroughLog = Get-Content -Raw -LiteralPath $logPath
+            $invocationsAfterPassThrough = (
+                [regex]::Matches($passThroughLog, "event_code=invocation_started")
+            ).Count
+            if ($invocationsAfterPassThrough -ne $invocationsBeforePassThrough) {
+                throw "Gradial accepted M4 while its input health was faulted."
+            }
+            if (
+                [GradialSmokeNative]::RetryInputForProcess([uint32]$gradial.Id) -eq 0
+            ) {
+                throw "Could not deliver the debug Retry Input command to Gradial."
+            }
+            $retryDeadline = [DateTime]::UtcNow.AddSeconds(4)
+            do {
+                Start-Sleep -Milliseconds 100
+                $retryLog = Get-Content -Raw -LiteralPath $logPath
+                $responsiveAfterRecovery = (
+                    [regex]::Matches($retryLog, "event_code=hook_thread_responsive")
+                ).Count
+            } while (
+                [DateTime]::UtcNow -lt $retryDeadline -and
+                $responsiveAfterRecovery -le $responsiveBeforeRecovery
+            )
+            if ($responsiveAfterRecovery -le $responsiveBeforeRecovery) {
+                throw "Retry Input did not restart input after queue overflow."
+            }
+        }
+    }
     if ($SimulateDisplayChange) {
         [GradialSmokeNative]::SendM4($true)
         $m4IsDown = $true
@@ -208,7 +422,6 @@ try {
             throw "Could not deliver a display-change notification to Gradial."
         }
 
-        $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
         $rebuildDeadline = [DateTime]::UtcNow.AddSeconds(4)
         $poolRebuilt = $false
         $activeGestureCancelled = $false

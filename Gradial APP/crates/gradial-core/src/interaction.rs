@@ -181,6 +181,7 @@ pub enum CancelReason {
     NoSelection,
     InputQueueOverflow,
     HookUnresponsive,
+    InputReregistration,
     DisplayTopologyChange,
     Shutdown,
 }

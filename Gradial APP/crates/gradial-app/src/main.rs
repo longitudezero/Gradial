@@ -8,6 +8,7 @@ mod interaction;
 mod options;
 mod overlay;
 mod platform;
+mod tray;
 
 use std::sync::Arc;
 

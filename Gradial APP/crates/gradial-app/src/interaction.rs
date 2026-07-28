@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU8;
+
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
@@ -49,11 +52,14 @@ struct EffectDispatcher<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeControl {
     DisplayTopologyChanged,
+    ReregisterInput,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeEvent {
     DisplayRebuildReady,
+    InputRecoveryReady,
+    InputFaulted,
 }
 
 #[derive(Debug)]
@@ -64,6 +70,8 @@ pub(crate) struct InteractionRuntime {
     join_handle: Option<JoinHandle<()>>,
     control_sender: Sender<RuntimeControl>,
     events: Receiver<RuntimeEvent>,
+    #[cfg(debug_assertions)]
+    debug_failure: Arc<AtomicU8>,
 }
 
 impl InteractionRuntime {
@@ -79,10 +87,15 @@ impl InteractionRuntime {
         let hook_thread =
             HookThread::spawn(producer, input_configuration, Arc::clone(&accepting_input))?;
         let hook_metrics = hook_thread.metrics.clone();
+        let thread_accepting_input = Arc::clone(&accepting_input);
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let (control_sender, controls) = bounded(RUNTIME_CHANNEL_CAPACITY);
         let (event_sender, events) = bounded(RUNTIME_CHANNEL_CAPACITY);
+        #[cfg(debug_assertions)]
+        let debug_failure = Arc::new(AtomicU8::new(0));
+        #[cfg(debug_assertions)]
+        let thread_debug_failure = Arc::clone(&debug_failure);
 
         let join_handle = thread::Builder::new()
             .name("gradial-interaction".to_owned())
@@ -93,6 +106,9 @@ impl InteractionRuntime {
                     &event_sender,
                     &egui_context,
                     &hook_metrics,
+                    &thread_accepting_input,
+                    #[cfg(debug_assertions)]
+                    &thread_debug_failure,
                     &thread_shutdown,
                     &timing_markers,
                     &routes,
@@ -108,6 +124,8 @@ impl InteractionRuntime {
             join_handle: Some(join_handle),
             control_sender,
             events,
+            #[cfg(debug_assertions)]
+            debug_failure,
         })
     }
 
@@ -118,8 +136,27 @@ impl InteractionRuntime {
             .context("could not request display-topology cancellation")
     }
 
+    pub(crate) fn begin_input_recovery(&self) -> Result<()> {
+        self.accepting_input.store(false, Ordering::Release);
+        self.control_sender
+            .try_send(RuntimeControl::ReregisterInput)
+            .context("could not request input re-registration")
+    }
+
     pub(crate) fn try_event(&self) -> Option<RuntimeEvent> {
         self.events.try_recv().ok()
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_simulate_hook_unresponsive(&self) {
+        self.accepting_input.store(false, Ordering::Release);
+        self.debug_failure.store(1, Ordering::Release);
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_simulate_queue_overflow(&self) {
+        self.accepting_input.store(false, Ordering::Release);
+        self.debug_failure.store(2, Ordering::Release);
     }
 }
 
@@ -167,6 +204,8 @@ fn run_interaction_thread(
     event_sender: &Sender<RuntimeEvent>,
     egui_context: &eframe::egui::Context,
     metrics: &HookThreadMetrics,
+    accepting_input: &Arc<AtomicBool>,
+    #[cfg(debug_assertions)] debug_failure: &Arc<AtomicU8>,
     shutdown: &Arc<AtomicBool>,
     timing_markers: &TimingMarkers,
     routes: &[OverlayRoute],
@@ -180,62 +219,73 @@ fn run_interaction_thread(
     let dispatcher = EffectDispatcher { egui_context, timing_markers, routes, slice_count };
     let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
-    let mut display_rebuild_pending = false;
+    let mut runtime_stop_pending = false;
 
     while !shutdown.load(Ordering::Acquire) {
-        if let Ok(RuntimeControl::DisplayTopologyChanged) = controls.try_recv() {
-            if let Some(effect) = controller.cancel(CancelReason::DisplayTopologyChange) {
-                dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
-                let _ = controller.activation_up();
-            }
-            active_snapshot = None;
-            active_route = None;
-            display_rebuild_pending = true;
-            log::info!(
-                target: "renderer",
-                "component=renderer event_code=display_rebuild_requested result_code=ok \
-                 config_revision=0"
+        #[cfg(debug_assertions)]
+        let simulated_failure = debug_failure.swap(0, Ordering::AcqRel);
+        #[cfg(not(debug_assertions))]
+        let simulated_failure = 0_u8;
+
+        if let Ok(control) = controls.try_recv() {
+            handle_runtime_control(
+                control,
+                &mut controller,
+                &mut active_snapshot,
+                &mut active_route,
+                event_sender,
+                &dispatcher,
             );
-            if let Err(error) = event_sender.try_send(RuntimeEvent::DisplayRebuildReady) {
-                log_runtime_event_error(error);
-            }
-            egui_context.request_repaint_of(eframe::egui::ViewportId::ROOT);
+            runtime_stop_pending = true;
         }
 
-        if display_rebuild_pending {
+        if runtime_stop_pending {
             thread::sleep(IDLE_POLL_INTERVAL);
             continue;
         }
 
-        if metrics.queue_overflow.swap(false, Ordering::AcqRel) {
+        if simulated_failure == 2 || metrics.queue_overflow.swap(false, Ordering::AcqRel) {
+            accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::InputQueueOverflow) {
                 dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
-                active_snapshot = None;
-                active_route = None;
             }
+            active_snapshot = None;
+            active_route = None;
+            runtime_stop_pending = true;
             log::error!(
                 target: "input",
                 "component=input event_code=input_queue_overflow result_code=failure \
                  config_revision=0 capacity={INPUT_QUEUE_CAPACITY}"
             );
+            if let Err(error) = event_sender.try_send(RuntimeEvent::InputFaulted) {
+                log_runtime_event_error(error);
+            }
+            platform::request_controller_repaint();
+            continue;
         }
 
         let now = query_qpc();
         let heartbeat = metrics.heartbeat_qpc.load(Ordering::Acquire);
-        if is_active(controller.state())
-            && qpc_frequency > 0
-            && now.saturating_sub(heartbeat) > hook_timeout_qpc
+        if simulated_failure == 1
+            || heartbeat_is_unresponsive(qpc_frequency, now, heartbeat, hook_timeout_qpc)
         {
+            accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::HookUnresponsive) {
                 dispatch_effect(effect, now, active_snapshot, active_route, &dispatcher);
-                active_snapshot = None;
-                active_route = None;
             }
+            active_snapshot = None;
+            active_route = None;
+            runtime_stop_pending = true;
             log::error!(
                 target: "input",
                 "component=input event_code=hook_thread_unresponsive result_code=failure \
                  config_revision=0 timeout_ms={HOOK_UNRESPONSIVE_AFTER_MS}"
             );
+            if let Err(error) = event_sender.try_send(RuntimeEvent::InputRecoveryReady) {
+                log_runtime_event_error(error);
+            }
+            platform::request_controller_repaint();
+            continue;
         }
 
         let mut handled_event = false;
@@ -259,6 +309,10 @@ fn run_interaction_thread(
     if let Some(effect) = controller.fault(CancelReason::Shutdown) {
         dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
     }
+    log_interaction_stopped(&counters);
+}
+
+fn log_interaction_stopped(counters: &EventCounters) {
     log::info!(
         target: "interaction",
         "component=interaction event_code=interaction_thread_stopped result_code=ok \
@@ -270,6 +324,41 @@ fn run_interaction_thread(
         counters.raw_pointer_delta,
         counters.cancel
     );
+}
+
+fn handle_runtime_control(
+    control: RuntimeControl,
+    controller: &mut InteractionController,
+    active_snapshot: &mut Option<InvocationSnapshot>,
+    active_route: &mut Option<usize>,
+    event_sender: &Sender<RuntimeEvent>,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    let (reason, event, event_code) = match control {
+        RuntimeControl::DisplayTopologyChanged => (
+            CancelReason::DisplayTopologyChange,
+            RuntimeEvent::DisplayRebuildReady,
+            "display_rebuild_requested",
+        ),
+        RuntimeControl::ReregisterInput => (
+            CancelReason::InputReregistration,
+            RuntimeEvent::InputRecoveryReady,
+            "input_reregistration_started",
+        ),
+    };
+    if let Some(effect) = controller.fault(reason) {
+        dispatch_effect(effect, query_qpc(), *active_snapshot, *active_route, dispatcher);
+    }
+    *active_snapshot = None;
+    *active_route = None;
+    log::info!(
+        target: "interaction",
+        "component=interaction event_code={event_code} result_code=ok config_revision=0"
+    );
+    if let Err(error) = event_sender.try_send(event) {
+        log_runtime_event_error(error);
+    }
+    platform::request_controller_repaint();
 }
 
 fn handle_input_event(
@@ -471,20 +560,10 @@ fn active_overlay_route(
 fn log_runtime_event_error(error: TrySendError<RuntimeEvent>) {
     let reason = if matches!(error, TrySendError::Full(_)) { "queue_full" } else { "queue_closed" };
     log::error!(
-        target: "renderer",
-        "component=renderer event_code=display_rebuild_signal_failed result_code=failure \
+        target: "interaction",
+        "component=interaction event_code=runtime_signal_failed result_code=failure \
          config_revision=0 reason={reason}"
     );
-}
-
-const fn is_active(state: InteractionState) -> bool {
-    matches!(
-        state,
-        InteractionState::Opening
-            | InteractionState::Tracking
-            | InteractionState::Cancelling
-            | InteractionState::Closing
-    )
 }
 
 fn query_qpc() -> i64 {
@@ -497,4 +576,32 @@ fn query_qpc_frequency() -> i64 {
     let mut frequency = 0_i64;
     // SAFETY: the output pointer refers to a live local i64.
     if unsafe { QueryPerformanceFrequency(&raw mut frequency) }.is_ok() { frequency } else { 0 }
+}
+
+const fn heartbeat_is_unresponsive(
+    qpc_frequency: i64,
+    now: i64,
+    heartbeat: i64,
+    timeout_qpc: i64,
+) -> bool {
+    qpc_frequency > 0 && heartbeat > 0 && now.saturating_sub(heartbeat) > timeout_qpc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::heartbeat_is_unresponsive;
+
+    #[test]
+    fn heartbeat_faults_only_after_three_missed_intervals() {
+        let frequency = 10_000_i64;
+        let timeout = frequency * 750 / 1_000;
+        assert!(!heartbeat_is_unresponsive(frequency, 8_500, 1_000, timeout));
+        assert!(heartbeat_is_unresponsive(frequency, 8_501, 1_000, timeout));
+    }
+
+    #[test]
+    fn heartbeat_does_not_fault_before_initial_sample() {
+        assert!(!heartbeat_is_unresponsive(10_000, 100_000, 0, 7_500));
+        assert!(!heartbeat_is_unresponsive(0, 100_000, 1, 7_500));
+    }
 }

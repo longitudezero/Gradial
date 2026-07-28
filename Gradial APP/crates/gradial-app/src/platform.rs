@@ -2,9 +2,12 @@ use std::{
     mem::size_of,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
 };
+
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU8;
 
 use anyhow::{Context, Result, bail};
 use gradial_core::{MonitorGeometry, ScreenPoint, ScreenRect};
@@ -14,16 +17,22 @@ use windows::Win32::{
     Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, InvalidateRect, MONITORINFO,
     },
+    System::RemoteDesktop::{
+        NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+    },
     UI::{
         HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
             FindWindowW, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
-            GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, PostMessageW,
-            SET_WINDOW_POS_FLAGS, SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW,
-            SetWindowPos, ShowWindow, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE,
-            WM_NCDESTROY, WM_NCHITTEST, WM_SETTINGCHANGE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE,
+            PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY,
+            PBT_APMRESUMESUSPEND, PostMessageW, RegisterWindowMessageW, SET_WINDOW_POS_FLAGS,
+            SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+            WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST,
+            WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WTS_SESSION_UNLOCK,
         },
     },
 };
@@ -32,10 +41,28 @@ use windows::core::{BOOL, PCWSTR};
 const OVERLAY_SUBCLASS_ID: usize = 0x4752_444C;
 const WM_GRADIAL_SHOW_OVERLAY: u32 = WM_APP + 0x244;
 const WM_GRADIAL_HIDE_OVERLAY: u32 = WM_APP + 0x245;
+#[cfg(debug_assertions)]
+const WM_GRADIAL_DEBUG_HOOK_UNRESPONSIVE: u32 = WM_APP + 0x247;
+#[cfg(debug_assertions)]
+const WM_GRADIAL_DEBUG_QUEUE_OVERFLOW: u32 = WM_APP + 0x248;
+#[cfg(debug_assertions)]
+const WM_GRADIAL_DEBUG_RETRY_INPUT: u32 = WM_APP + 0x249;
 static DISPLAY_TOPOLOGY_MONITORING: AtomicBool = AtomicBool::new(false);
 static DISPLAY_TOPOLOGY_CHANGED: AtomicBool = AtomicBool::new(false);
 static CONTROLLER_WINDOW_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static CONTROLLER_REPAINT_CONTEXT: OnceLock<eframe::egui::Context> = OnceLock::new();
+static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
+static TRAY_READD_REQUESTED: AtomicBool = AtomicBool::new(false);
+static INPUT_REREGISTRATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(debug_assertions)]
+static DEBUG_INPUT_FAILURE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DebugInputFailure {
+    HookUnresponsive,
+    QueueOverflow,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ForegroundWindowIdentity {
@@ -75,6 +102,34 @@ pub(crate) fn set_display_topology_monitoring(enabled: bool) {
 
 pub(crate) fn take_display_topology_changed() -> bool {
     DISPLAY_TOPOLOGY_CHANGED.swap(false, Ordering::AcqRel)
+}
+
+pub(crate) fn controller_window_address() -> usize {
+    CONTROLLER_WINDOW_ADDRESS.load(Ordering::Acquire)
+}
+
+pub(crate) fn take_tray_readd_requested() -> bool {
+    TRAY_READD_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+pub(crate) fn take_input_reregistration_requested() -> bool {
+    INPUT_REREGISTRATION_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn take_debug_input_failure() -> Option<DebugInputFailure> {
+    match DEBUG_INPUT_FAILURE.swap(0, Ordering::AcqRel) {
+        1 => Some(DebugInputFailure::HookUnresponsive),
+        2 => Some(DebugInputFailure::QueueOverflow),
+        _ => None,
+    }
+}
+
+pub(crate) fn request_controller_repaint() {
+    if let Some(context) = CONTROLLER_REPAINT_CONTEXT.get() {
+        context.request_repaint_of(eframe::egui::ViewportId::ROOT);
+    }
+    invalidate_controller();
 }
 
 pub(crate) fn request_overlay_wake(handle: OverlayWakeHandle, origin: ScreenPoint) -> Result<()> {
@@ -175,6 +230,20 @@ pub(crate) fn configure_overlay_window(
     let hwnd = window_handle(window)?;
     CONTROLLER_WINDOW_ADDRESS.store(hwnd.0.addr(), Ordering::Release);
     let _existing_context = CONTROLLER_REPAINT_CONTEXT.set(creation_context.egui_ctx.clone());
+    let taskbar_created = wide("TaskbarCreated");
+    // SAFETY: the input is a live, null-terminated system message name.
+    let taskbar_message =
+        unsafe { RegisterWindowMessageW(PCWSTR::from_raw(taskbar_created.as_ptr())) };
+    if taskbar_message == 0 {
+        bail!("Windows could not register the TaskbarCreated message");
+    }
+    TASKBAR_CREATED_MESSAGE.store(taskbar_message, Ordering::Release);
+    // SAFETY: the live root window receives notifications only for the current
+    // session and unregisters during destruction.
+    unsafe {
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
+            .context("could not register session-unlock notifications")?;
+    }
 
     window.set_cursor_hittest(false).context("could not make the overlay click-through")?;
 
@@ -337,7 +406,27 @@ unsafe extern "system" fn overlay_subclass_proc(
     _subclass_id: usize,
     _reference_data: usize,
 ) -> LRESULT {
+    #[cfg(debug_assertions)]
+    if handle_debug_message(hwnd, message) {
+        return LRESULT(0);
+    }
+
+    let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire);
+    if taskbar_created != 0 && message == taskbar_created {
+        TRAY_READD_REQUESTED.store(true, Ordering::Release);
+        request_input_reregistration("explorer_restart");
+        // SAFETY: the registered message must continue through the subclass
+        // chain after Gradial records it.
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
+
     match message {
+        crate::tray::CALLBACK_MESSAGE => {
+            if crate::tray::handle_callback(hwnd, lparam.0) {
+                request_controller_repaint();
+            }
+            LRESULT(0)
+        }
         WM_GRADIAL_SHOW_OVERLAY => {
             let encoded_x = u32::try_from(wparam.0).unwrap_or_default();
             let origin = ScreenPoint::new(
@@ -375,9 +464,43 @@ unsafe extern "system" fn overlay_subclass_proc(
             // Windows subclass chain.
             unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
         }
+        WM_POWERBROADCAST
+            if matches!(
+                u32::try_from(wparam.0).unwrap_or_default(),
+                PBT_APMRESUMEAUTOMATIC
+                    | PBT_APMRESUMECRITICAL
+                    | PBT_APMRESUMESTANDBY
+                    | PBT_APMRESUMESUSPEND
+            ) =>
+        {
+            request_input_reregistration("system_resume");
+            // SAFETY: the power message must continue through the subclass
+            // chain.
+            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        }
+        WM_WTSSESSION_CHANGE
+            if u32::try_from(wparam.0).unwrap_or_default() == WTS_SESSION_UNLOCK =>
+        {
+            request_input_reregistration("session_unlock");
+            // SAFETY: the session message must continue through the subclass
+            // chain.
+            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        }
         WM_MOUSEACTIVATE => LRESULT(isize::try_from(MA_NOACTIVATE).expect("constant fits isize")),
         WM_NCHITTEST => LRESULT(isize::try_from(HTTRANSPARENT).expect("constant fits isize")),
         WM_NCDESTROY => {
+            if hwnd.0.addr() == CONTROLLER_WINDOW_ADDRESS.load(Ordering::Acquire) {
+                // SAFETY: the root window registered this exact notification
+                // scope during construction.
+                if let Err(error) = unsafe { WTSUnRegisterSessionNotification(hwnd) } {
+                    log::warn!(
+                        target: "input",
+                        "component=input event_code=session_notification_cleanup_failed \
+                         result_code=failure config_revision=0 error={error}"
+                    );
+                }
+                CONTROLLER_WINDOW_ADDRESS.store(0, Ordering::Release);
+            }
             // SAFETY: this removes the exact callback installed on this same
             // UI thread, then forwards destruction to the next procedure.
             let _removed = unsafe {
@@ -395,6 +518,21 @@ unsafe extern "system" fn overlay_subclass_proc(
     }
 }
 
+#[cfg(debug_assertions)]
+fn handle_debug_message(hwnd: HWND, message: u32) -> bool {
+    if hwnd.0.addr() != CONTROLLER_WINDOW_ADDRESS.load(Ordering::Acquire) {
+        return false;
+    }
+    match message {
+        WM_GRADIAL_DEBUG_HOOK_UNRESPONSIVE => DEBUG_INPUT_FAILURE.store(1, Ordering::Release),
+        WM_GRADIAL_DEBUG_QUEUE_OVERFLOW => DEBUG_INPUT_FAILURE.store(2, Ordering::Release),
+        WM_GRADIAL_DEBUG_RETRY_INPUT => crate::tray::request_debug_retry(),
+        _ => return false,
+    }
+    request_controller_repaint();
+    true
+}
+
 fn mark_display_topology_changed() {
     if DISPLAY_TOPOLOGY_MONITORING.load(Ordering::Acquire) {
         let already_changed = DISPLAY_TOPOLOGY_CHANGED.swap(true, Ordering::AcqRel);
@@ -405,20 +543,36 @@ fn mark_display_topology_changed() {
                  config_revision=0"
             );
         }
-        if let Some(context) = CONTROLLER_REPAINT_CONTEXT.get() {
-            context.request_repaint_of(eframe::egui::ViewportId::ROOT);
-        }
-        let controller_address = CONTROLLER_WINDOW_ADDRESS.load(Ordering::Acquire);
-        if controller_address != 0 {
-            let controller = HWND(std::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(
-                controller_address,
-            ));
-            // SAFETY: the address belongs to Gradial's live root viewport.
-            // Invalidating it wakes winit's hidden-window redraw path so the
-            // controller can consume the atomic topology signal.
-            unsafe {
-                let _invalidated = InvalidateRect(Some(controller), None, false);
-            }
-        }
+        request_controller_repaint();
     }
+}
+
+fn request_input_reregistration(source: &str) {
+    let already_requested = INPUT_REREGISTRATION_REQUESTED.swap(true, Ordering::AcqRel);
+    if !already_requested {
+        log::info!(
+            target: "input",
+            "component=input event_code=input_reregistration_requested result_code=ok \
+             config_revision=0 source={source}"
+        );
+    }
+    request_controller_repaint();
+}
+
+fn invalidate_controller() {
+    let controller_address = CONTROLLER_WINDOW_ADDRESS.load(Ordering::Acquire);
+    if controller_address == 0 {
+        return;
+    }
+    let controller =
+        HWND(std::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(controller_address));
+    // SAFETY: the address belongs to Gradial's live root viewport. Invalidating
+    // it wakes winit's hidden-window redraw path.
+    unsafe {
+        let _invalidated = InvalidateRect(Some(controller), None, false);
+    }
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }

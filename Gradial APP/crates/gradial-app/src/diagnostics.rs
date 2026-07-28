@@ -17,7 +17,7 @@ const MAX_ARCHIVED_LOG_FILES: usize = MAX_LOG_FILES - 1;
 pub(crate) fn initialize(log_directory: &Path) -> Result<LoggerHandle> {
     let handle = Logger::try_with_str(
         "warn,startup=info,input=info,interaction=info,renderer=info,focus=info,\
-             diagnostics=info",
+             diagnostics=info,tray=info",
     )?
     .use_utc()
     .log_to_file(

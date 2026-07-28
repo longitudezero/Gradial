@@ -564,6 +564,7 @@ impl HookCallbackState {
 
     fn push(&mut self, event: InputEvent) {
         if self.producer.push(event).is_err() {
+            self.accepting_input.store(false, Ordering::Release);
             self.queue_overflow.store(true, Ordering::Release);
         }
     }
@@ -746,6 +747,21 @@ mod tests {
 
         assert!(!state.handle_mouse(WM_XBUTTONDOWN, &mouse(ScreenPoint::default(), XBUTTON1), 10));
         assert!(consumer.pop().is_err());
+    }
+
+    #[test]
+    fn queue_overflow_immediately_suspends_new_input() {
+        let (mut state, _consumer) = callback_state();
+        for timestamp in 0..17 {
+            state.push(InputEvent::new(
+                timestamp,
+                ScreenPoint::default(),
+                InputEventKind::PointerMoved,
+            ));
+        }
+
+        assert!(state.queue_overflow.load(Ordering::Acquire));
+        assert!(!state.accepting_input.load(Ordering::Acquire));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 ## Current milestone scope
 
-The foundation, Milestone 0 interaction spike, and first bounded Milestone 1
-slice establish:
+The foundation, Milestone 0 interaction spike, and current bounded Milestone 1
+slices establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -29,10 +29,14 @@ slice establish:
 - Display/DPI/work-area change detection that suspends new gestures, cancels an
   active gesture, replaces the overlay pool, and restarts input only after every
   new viewport is warm.
+- An always-visible native tray icon with Healthy, Recovering, and Faulted input
+  states plus Retry Input and Exit commands.
+- Automatic full input-runtime replacement after three missed 250 ms
+  heartbeats, and input re-registration after resume, session unlock, or
+  Explorer restart.
 
-It intentionally does not create a tray icon, save configuration, validate
-targets, or execute actions. A release logs the chosen slice but cannot launch
-anything.
+It intentionally does not save configuration, validate targets, or execute
+actions. A release logs the chosen slice but cannot launch anything.
 
 ## Workspace layout
 
@@ -97,8 +101,9 @@ When topology changes, an atomic gate first makes new M4 presses pass through,
 then the interaction thread closes any active invocation, the old hook runtime
 stops, and a replacement starts with the newly enumerated displays. Overflow
 sets an atomic fault flag. The interaction thread then closes any active
-invocation and enters a fail-safe fault state; restart the development build to
-recover.
+invocation, closes the complete input runtime, and enters a fail-safe fault
+state. M4 passes through while faulted; recovery requires **Retry input** from
+the tray menu.
 
 At M4-down, the interaction thread maps the signed physical cursor coordinate
 to the same monitor ordering used by the overlay pool. It updates only that
@@ -107,9 +112,21 @@ independent repaint. Open and close also post private native messages directly
 to the selected window, so they do not wait for the hidden controller's
 throttled repaint cycle. None of this work occurs in a low-level hook callback.
 
-The hook thread owns a 250 ms message-loop heartbeat. An active invocation is
-faulted when the heartbeat is more than 750 ms old. On graceful shutdown,
-Gradial logs the maximum observed hook-callback duration.
+The hook thread owns a 250 ms message-loop heartbeat. The interaction thread
+checks it whether or not a gesture is active. Once it is more than 750 ms old
+(three missed intervals), new M4 presses are immediately passed through, any
+active invocation is cancelled, and the entire hook/raw-input/queue/consumer
+runtime is replaced. If replacement cannot start, Gradial remains faulted until
+manual retry. On graceful shutdown, Gradial logs the maximum observed
+hook-callback duration.
+
+The tray health state is `Recovering input` during startup, input replacement,
+and display rebuild; `Healthy` only after a new hook thread reports responsive;
+and `Input faulted` after queue overflow or a failed start. Its menu contains
+the non-interactive current state, **Retry input**, and **Exit Gradial**.
+Explorer's `TaskbarCreated` message restores the icon and re-registers input.
+Power-resume and current-session unlock notifications also re-register the
+complete runtime. These signals do not silently clear a queue-overflow fault.
 
 M4 down and its matching release are suppressed while Gradial runs. In
 fixed-origin mode, pointer movement passes through normally and absolute cursor
@@ -239,7 +256,8 @@ Run the full display-event capture from an elevated PowerShell. Pass
 
 ## Manual interaction check
 
-1. Start `cargo run --package gradial-app`. No menu should be visible.
+1. Start `cargo run --package gradial-app`. No overlay should be visible; the
+   Gradial notification-area icon should report Healthy.
 2. Put another application in the foreground and note that it has keyboard
    focus.
 3. Hold M4. The menu should appear centered on the cursor without changing
@@ -260,10 +278,12 @@ Run the full display-event capture from an elevated PowerShell. Pass
    `hook_thread_responsive`, `invocation_started`, three
    `focus_checkpoint` records, `slice_selected` or `invocation_cancelled`, and
    `hook_thread_stopped`.
+10. Open the tray icon and confirm its status line, **Retry input**, and
+    **Exit Gradial** commands are present.
 
 This is a global input development build. Save important work before manual
-testing. If the overlay or hook becomes unresponsive, stop Gradial from its
-terminal or the VS Code debug controls.
+testing. If input becomes faulted, use **Retry input**. Stop Gradial with its
+tray **Exit Gradial** command, its terminal, or the VS Code debug controls.
 
 The repeatable live smoke helper builds on the same contract. It temporarily
 moves the cursor, starts the hidden debug executable, sends one synthetic M4
@@ -276,6 +296,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry edge-assist
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -MonitorIndex 1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateDisplayChange
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputReregistration
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault heartbeat
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault queue-overflow
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -287,6 +310,12 @@ selects and validates the corresponding startup geometry.
 `-SimulateDisplayChange` holds M4, posts the same notification used by the
 native rebuild path, verifies the active invocation is cancelled, waits until
 generation 1 is fully rewarmed, and then sends a fresh gesture.
+Every run confirms that Windows can locate Gradial's live notification icon.
+`-SimulateInputReregistration` posts a resume notification and verifies that a
+new hook runtime becomes responsive. Debug-only `-SimulateInputFault heartbeat`
+verifies automatic replacement; `queue-overflow` verifies the manual Faulted
+state, M4 pass-through, and recovery through the same Retry Input command path
+used by the tray menu.
 
 ## Checks
 
