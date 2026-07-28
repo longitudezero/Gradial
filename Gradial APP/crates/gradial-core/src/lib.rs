@@ -6,7 +6,9 @@ pub mod paths;
 
 pub use geometry::{Point, SliceCount};
 pub use interaction::{
-    CancelReason, GestureConfig, InputEvent, InputEventKind, InteractionController,
-    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, ScreenPoint,
+    CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, InputEvent,
+    InputEventKind, InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
+    InvocationGeometry, InvocationSnapshot, MonitorGeometry, ResolvedGeometry, ScreenPoint,
+    ScreenRect, resolve_invocation_geometry,
 };
 pub use paths::{AppPaths, AppPathsError};

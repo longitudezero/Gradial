@@ -2,7 +2,7 @@
 
 ## Current milestone scope
 
-The foundation and M4 interaction-spine milestones establish:
+The foundation and Milestone 0 interaction spike establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -18,6 +18,11 @@ The foundation and M4 interaction-spine milestones establish:
 - An explicit, pure gesture state machine with eight slices and hysteresis.
 - Hidden-at-idle overlay lifecycle, physical-pixel positioning, and selection
   highlighting.
+- Automatic fixed-origin/edge-assist resolution from signed work-area geometry.
+- A raw-input message window and virtual gesture pointer for edge assist.
+- Focus checkpoints at activation, after the first rendered-frame checkpoint,
+  and after close.
+- An ETW provider whose invocation markers can be correlated with PresentMon.
 
 It intentionally does not create a tray icon, save configuration, validate
 targets, or execute actions. A release logs the chosen slice but cannot launch
@@ -32,7 +37,10 @@ Gradial APP\
         gradial-core\    Pure geometry, gesture state, and application paths
         gradial-app\     Windows input, executable, and overlay renderer
     scripts\
-        check.ps1        Complete local verification
+        check.ps1          Complete local code verification
+        check-focus.ps1    Validate the latest completed focus trace
+        capture-timing.ps1 Capture ETW markers and presented-frame timings
+        smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
 ```
 
 `gradial-core` must remain free of UI and Windows windowing dependencies. Pure
@@ -69,15 +77,19 @@ Gradial uses three execution contexts:
 
 | Context | Responsibility | May block or allocate? |
 | --- | --- | --- |
-| Win32 hook thread | Classify M4, movement, Escape, and cancellation input | No, inside callbacks |
+| Win32 input thread | Classify M4, raw deltas, movement, Escape, and cancellation input | No, inside callbacks |
 | Interaction thread | Snapshot invocation state and advance the pure gesture controller | Yes, outside callbacks |
 | eframe UI thread | Move, show, paint, and hide the overlay | Yes |
 
-The hook callback copies fixed-size events into an `rtrb` SPSC ring buffer with
-a capacity of 4,096. It never logs, waits, paints, takes a contended lock, or
-calls action code. Overflow sets an atomic fault flag. The interaction thread
-then closes any active invocation and enters a fail-safe fault state; restart
-the development build to recover.
+The input thread owns the low-level hooks, heartbeat timer, and a message-only
+window registered for raw mouse input. Both event sources execute serially on
+that one thread and feed one producer. The hook callback copies fixed-size
+events into an `rtrb` SPSC ring buffer with a capacity of 4,096. It never logs,
+waits, paints, takes a contended lock, enumerates displays, or calls action
+code. Display work areas are collected at startup and treated as immutable by
+the callback. Overflow sets an atomic fault flag. The interaction thread then
+closes any active invocation and enters a fail-safe fault state; restart the
+development build to recover.
 
 The interaction-to-UI channel is bounded to 64 commands. Selection repaint
 commands can be dropped with an explicit log if the UI falls behind. Open and
@@ -88,11 +100,15 @@ The hook thread owns a 250 ms message-loop heartbeat. An active invocation is
 faulted when the heartbeat is more than 750 ms old. On graceful shutdown,
 Gradial logs the maximum observed hook-callback duration.
 
-M4 down and its matching release are suppressed while Gradial runs. Pointer
-movement passes through normally. During an invocation, Escape and another
-mouse-button click cancel the gesture; their matching releases are suppressed
-to avoid leaking half of a click. Events stamped with Gradial's private
-injection marker are passed through and never interpreted as activation.
+M4 down and its matching release are suppressed while Gradial runs. In
+fixed-origin mode, pointer movement passes through normally and absolute cursor
+positions drive the gesture. In edge-assist mode, low-level movement is
+suppressed so the system cursor remains at M4-down; raw mouse deltas accumulate
+into a virtual gesture pointer instead. During an invocation, Escape and
+another mouse-button click cancel the gesture; their matching releases are
+suppressed to avoid leaking half of a click. Events stamped with Gradial's
+private injection marker are passed through and never interpreted as
+activation.
 
 ## Gesture contract
 
@@ -107,9 +123,30 @@ the invocation monitor's effective DPI:
 - Escape closes once, then waits for M4 release before returning to idle.
 
 Each invocation captures a UUID, QPC timestamp, foreground window handle and
-process ID, cursor origin, and effective monitor DPI. These immutable fields
-are the beginning of the full v0.2 invocation snapshot; target identity and
-profile resolution belong to a later milestone.
+process ID, cursor origin, effective monitor DPI, resolved geometry behavior,
+and visual ring origin. These immutable fields are the beginning of the full
+v0.2 invocation snapshot; target identity and profile resolution belong to a
+later milestone.
+
+## Edge behavior
+
+The default `--geometry=auto` mode uses fixed origin whenever a 288 DIP square
+centered at M4-down fits in the monitor work area. Otherwise it selects edge
+assist and clamps the visual origin far enough inward for the complete overlay
+to fit. Work-area coordinates remain signed, so monitors above or left of the
+primary display are handled without unsigned conversion.
+
+Comparison overrides are available without changing code:
+
+```powershell
+cargo run --package gradial-app -- --geometry=fixed-origin
+cargo run --package gradial-app -- --geometry=edge-assist
+```
+
+The system cursor is never warped and Gradial does not synthesize pointer
+movement. Raw input is used only during an active edge-assisted invocation.
+The eight-direction mapping, forced modes, corner insets at 200% DPI, and
+absolute-motion suppression are unit tested.
 
 ## Overlay guarantees in this milestone
 
@@ -127,12 +164,50 @@ The root viewport starts hidden and is:
 eframe/winit finalizes some extended styles after constructing the application.
 Gradial therefore applies and reads back the required styles during construction
 and the first two logic passes. Logic passes run when the hidden window receives
-a cross-thread repaint request. It does no style polling after the window
-reaches its steady state.
+a cross-thread repaint request. eframe intentionally delays repaint requests
+for invisible Windows windows by 100 ms. On an open effect, Gradial first posts
+a private message that the overlay subclass handles on the UI thread; it
+positions and shows the prewarmed window with no-activation flags. The following
+repaint request then bypasses that invisible-window delay. Gradial does no style
+polling after the window reaches its steady state.
 
 This is one development preview window, not the final per-monitor pool. The
 production core will prewarm one overlay per connected monitor and keep them
 hidden until activation.
+
+## Focus and timing diagnostics
+
+`FocusProbe` records the foreground window at activation, after the next UI
+frame checkpoint, and immediately after hiding the overlay. A checkpoint passes
+when the same window remains foreground or when the target process itself
+changed its foreground window. Gradial never calls an API that activates or
+restores the foreground window.
+
+After completing an M4 gesture that was held long enough to render a frame,
+validate the latest invocation with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-focus.ps1
+```
+
+Gradial registers ETW provider
+`{3c55b348-69f8-4d33-8e81-62ba761d4f52}`. Its marker strings contain the
+invocation UUID and the source hook's QPC value. Markers cover activation
+dequeue, open and native-wake requests, overlay show, first-frame checkpoint,
+highlight request and application, release dequeue, close request, and overlay
+hide. They are intended to be correlated with actual display events; the UI
+checkpoint alone is not claimed as proof that a frame reached the screen.
+
+With Gradial already running, capture both streams for 15 seconds with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-timing.ps1
+```
+
+The helper uses the installed PresentMon executable and Windows `logman`. It
+writes ignored `.csv` and `.etl` diagnostics under `Gradial APP\captures`.
+Run the full display-event capture from an elevated PowerShell. Pass
+`-MarkersOnly` when only the Gradial ETW stream is needed.
 
 ## Manual interaction check
 
@@ -145,22 +220,48 @@ hidden until activation.
 5. Release M4. The menu should hide; no application should launch.
 6. Hold M4 again and press Escape. The menu should hide, and Escape should not
    reach the foreground application.
-7. Stop Gradial and inspect
+7. Put the cursor within five physical pixels of a work-area corner. Hold M4
+   and move in an outward direction. The complete ring should be inset, the
+   outward slice should highlight, and the system cursor should remain in
+   place.
+8. Stop Gradial and inspect
    `%LOCALAPPDATA%\Gradial\logs\gradial_rCURRENT.log` for
-   `hook_thread_responsive`, `invocation_started`, `slice_selected` or
-   `invocation_cancelled`, and `hook_thread_stopped`.
+   `hook_thread_responsive`, `invocation_started`, three
+   `focus_checkpoint` records, `slice_selected` or `invocation_cancelled`, and
+   `hook_thread_stopped`.
 
 This is a global input development build. Save important work before manual
 testing. If the overlay or hook becomes unresponsive, stop Gradial from its
 terminal or the VS Code debug controls.
 
+The repeatable live smoke helper builds on the same contract. It temporarily
+moves the cursor, starts the hidden debug executable, sends one synthetic M4
+gesture, verifies foreground identity and edge cursor retention, restores the
+cursor, and closes only the process it started:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry edge-assist
+```
+
+Add `-CaptureTiming` to the second command to run the documented ETW and
+PresentMon capture around the synthetic gesture. In a non-elevated development
+shell, add `-TimingMarkersOnly`. Pass `-Configuration release` after building
+with `cargo build --release` for performance-oriented checks.
+
 ## Checks
 
 `scripts\check.ps1` runs, in order:
 
-1. `cargo fmt --all --check`
-2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-3. `cargo test --workspace --all-features`
-4. `cargo build --workspace --all-features`
+1. PowerShell syntax checks for every script in `scripts`.
+2. `cargo fmt --all --check`
+3. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+4. `cargo test --workspace --all-features`
+5. `cargo build --workspace --all-features`
 
 The script stops on the first failure.
+
+The prototype helpers make the plan's measurements repeatable, but they do not
+replace the required hardware matrix, 1,000-invocation latency runs, 320 corner
+trials, or 10,000-invocation focus campaign. Those release-gate datasets remain
+future validation work.

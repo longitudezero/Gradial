@@ -1,7 +1,14 @@
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use uuid::Uuid;
 
 use crate::{
+    diagnostics::TimingMarkers,
+    focus::FocusProbe,
+    input::InputConfiguration,
     interaction::{InteractionRuntime, OverlayCommand},
+    options::StartupOptions,
     overlay::{FoundationOverlayRenderer, OverlayRenderer},
     platform,
 };
@@ -10,20 +17,45 @@ pub(crate) struct GradialApp {
     renderer: FoundationOverlayRenderer,
     interaction: InteractionRuntime,
     native_style_passes: u8,
+    timing_markers: Arc<TimingMarkers>,
+    focus_probe: FocusProbe,
+    first_frame_pending: Option<Uuid>,
 }
 
 impl GradialApp {
     const REQUIRED_NATIVE_STYLE_PASSES: u8 = 2;
 
-    pub(crate) fn new(creation_context: &eframe::CreationContext<'_>) -> Result<Self> {
+    pub(crate) fn new(
+        creation_context: &eframe::CreationContext<'_>,
+        startup_options: StartupOptions,
+        timing_markers: Arc<TimingMarkers>,
+    ) -> Result<Self> {
         platform::configure_overlay_window(creation_context)?;
-        let interaction = InteractionRuntime::start(creation_context.egui_ctx.clone())?;
+        let overlay_wake_handle = platform::overlay_wake_handle(creation_context)?;
+        let monitors =
+            platform::monitor_work_areas().context("could not read the display work areas")?;
+        log::info!(
+            target: "startup",
+            "component=app event_code=input_geometry_ready result_code=ok config_revision=0 \
+             geometry_mode={} monitor_count={}",
+            startup_options.geometry_mode.as_str(),
+            monitors.len()
+        );
+        let interaction = InteractionRuntime::start(
+            creation_context.egui_ctx.clone(),
+            InputConfiguration { geometry_mode: startup_options.geometry_mode, monitors },
+            Arc::clone(&timing_markers),
+            overlay_wake_handle,
+        )?;
         creation_context.egui_ctx.request_repaint();
 
         Ok(Self {
             renderer: FoundationOverlayRenderer::default(),
             interaction,
             native_style_passes: 0,
+            timing_markers,
+            focus_probe: FocusProbe::default(),
+            first_frame_pending: None,
         })
     }
 }
@@ -34,6 +66,16 @@ impl eframe::App for GradialApp {
     }
 
     fn logic(&mut self, context: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        if let Some(invocation_id) = self.first_frame_pending.take() {
+            self.timing_markers.emit(
+                "first_frame_checkpoint",
+                Some(invocation_id),
+                0,
+                "correlate_with_presentmon=true",
+            );
+            self.focus_probe.after_first_frame(invocation_id);
+        }
+
         if self.native_style_passes < Self::REQUIRED_NATIVE_STYLE_PASSES {
             if let Err(error) = platform::enforce_overlay_window_styles(frame) {
                 log::error!(
@@ -70,17 +112,41 @@ impl eframe::App for GradialApp {
 
         while let Some(command) = self.interaction.try_command() {
             let result = match command {
-                OverlayCommand::Open { origin } => {
+                OverlayCommand::Open { snapshot } => {
                     self.renderer.set_selected_slice(None);
-                    platform::position_and_show_overlay(frame, origin)
+                    self.focus_probe.begin(snapshot);
+                    platform::position_and_show_overlay(
+                        frame,
+                        snapshot.geometry.overlay_origin_physical_px,
+                    )
+                    .map(|()| {
+                        self.timing_markers.emit(
+                            "overlay_shown",
+                            Some(snapshot.invocation_id),
+                            snapshot.qpc_timestamp,
+                            &format!("geometry={}", snapshot.geometry.behavior.as_str()),
+                        );
+                        self.first_frame_pending = Some(snapshot.invocation_id);
+                        context.request_repaint();
+                    })
                 }
-                OverlayCommand::SelectionChanged { selected_slice } => {
+                OverlayCommand::SelectionChanged { invocation_id, selected_slice } => {
                     self.renderer.set_selected_slice(selected_slice);
+                    self.timing_markers.emit(
+                        "highlight_applied",
+                        Some(invocation_id),
+                        0,
+                        &format!("selected_slice={selected_slice:?}"),
+                    );
                     Ok(())
                 }
-                OverlayCommand::Close => {
+                OverlayCommand::Close { invocation_id } => {
                     self.renderer.set_selected_slice(None);
-                    platform::hide_overlay(frame)
+                    self.first_frame_pending = None;
+                    platform::hide_overlay(frame).map(|()| {
+                        self.timing_markers.emit("overlay_hidden", Some(invocation_id), 0, "");
+                        self.focus_probe.after_close(invocation_id);
+                    })
                 }
             };
 

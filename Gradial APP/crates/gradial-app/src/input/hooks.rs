@@ -10,7 +10,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::bounded;
-use gradial_core::{CancelReason, InputEvent, InputEventKind, ScreenPoint};
+use gradial_core::{
+    CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, InputEvent, InputEventKind, ResolvedGeometry,
+    ScreenPoint, resolve_invocation_geometry,
+};
 use rtrb::Producer;
 use windows::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
@@ -28,7 +31,7 @@ use windows::Win32::{
     },
 };
 
-use super::GRADIAL_INJECTED_MARKER;
+use super::{GRADIAL_INJECTED_MARKER, InputConfiguration, raw_input::RawInputWindow};
 
 const HEARTBEAT_INTERVAL_MS: u32 = 250;
 const HEARTBEAT_TIMER_ID: usize = 0x4752_4842;
@@ -98,14 +101,19 @@ pub(crate) struct HookThread {
 }
 
 impl HookThread {
-    pub(crate) fn spawn(producer: Producer<InputEvent>) -> Result<Self> {
+    pub(crate) fn spawn(
+        producer: Producer<InputEvent>,
+        configuration: InputConfiguration,
+    ) -> Result<Self> {
         let metrics = HookThreadMetrics::new();
         let thread_metrics = metrics.clone();
         let (startup_sender, startup_receiver) = bounded::<Result<u32, String>>(1);
 
         let join_handle = thread::Builder::new()
             .name("gradial-input".to_owned())
-            .spawn(move || run_hook_thread(producer, &thread_metrics, &startup_sender))
+            .spawn(move || {
+                run_hook_thread(producer, configuration, &thread_metrics, &startup_sender);
+            })
             .context("could not spawn the dedicated input-hook thread")?;
 
         let startup = startup_receiver
@@ -157,20 +165,32 @@ impl Drop for HookThread {
 
 fn run_hook_thread(
     producer: Producer<InputEvent>,
+    configuration: InputConfiguration,
     metrics: &HookThreadMetrics,
     startup_sender: &crossbeam_channel::Sender<Result<u32, String>>,
 ) {
     CALLBACK_STATE.with(|slot| {
-        slot.replace(Some(HookCallbackState::new(producer, metrics)));
+        slot.replace(Some(HookCallbackState::new(producer, configuration, metrics)));
     });
 
     let thread_id = unsafe { GetCurrentThreadId() };
+    let raw_input_window = match RawInputWindow::create() {
+        Ok(window) => window,
+        Err(error) => {
+            CALLBACK_STATE.with(|slot| {
+                slot.replace(None);
+            });
+            let _ = startup_sender.send(Err(error.to_string()));
+            return;
+        }
+    };
     let hooks = match install_hooks() {
         Ok(hooks) => hooks,
         Err(error) => {
             CALLBACK_STATE.with(|slot| {
                 slot.replace(None);
             });
+            drop(raw_input_window);
             let _ = startup_sender.send(Err(error.to_string()));
             return;
         }
@@ -243,6 +263,7 @@ fn run_hook_thread(
     CALLBACK_STATE.with(|slot| {
         slot.replace(None);
     });
+    drop(raw_input_window);
 }
 
 #[derive(Debug)]
@@ -359,23 +380,38 @@ fn record_callback_duration(started: i64) {
     });
 }
 
+pub(super) fn dispatch_raw_delta(dx: i32, dy: i32) {
+    let timestamp = query_qpc();
+    CALLBACK_STATE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.handle_raw_delta(dx, dy, timestamp);
+        }
+    });
+}
+
 struct HookCallbackState {
     producer: Producer<InputEvent>,
     queue_overflow: Arc<AtomicBool>,
     maximum_callback_qpc: Arc<AtomicI64>,
     #[cfg(debug_assertions)]
     debug: DebugHookMetrics,
+    configuration: InputConfiguration,
     suppression: SuppressionState,
 }
 
 impl HookCallbackState {
-    fn new(producer: Producer<InputEvent>, metrics: &HookThreadMetrics) -> Self {
+    fn new(
+        producer: Producer<InputEvent>,
+        configuration: InputConfiguration,
+        metrics: &HookThreadMetrics,
+    ) -> Self {
         Self {
             producer,
             queue_overflow: Arc::clone(&metrics.queue_overflow),
             maximum_callback_qpc: Arc::clone(&metrics.maximum_callback_qpc),
             #[cfg(debug_assertions)]
             debug: metrics.debug.clone(),
+            configuration,
             suppression: SuppressionState::default(),
         }
     }
@@ -391,16 +427,26 @@ impl HookCallbackState {
         let point = ScreenPoint::new(mouse.pt.x, mouse.pt.y);
         match message {
             WM_XBUTTONDOWN if high_word(mouse.mouseData) == XBUTTON1 => {
-                if !self.suppression.activation_down {
-                    self.suppression.activation_down = true;
+                if self.suppression.geometry.is_none() {
+                    let geometry = resolve_invocation_geometry(
+                        self.configuration.geometry_mode,
+                        point,
+                        &self.configuration.monitors,
+                        DEFAULT_OVERLAY_HALF_EXTENT_DIP,
+                    );
+                    self.suppression.geometry = Some(geometry.behavior);
                     self.suppression.cancel_sent = false;
-                    self.push(InputEvent::new(timestamp, point, InputEventKind::ActivationDown));
+                    self.push(InputEvent::new(
+                        timestamp,
+                        point,
+                        InputEventKind::ActivationDown(geometry),
+                    ));
                 }
                 true
             }
             WM_XBUTTONUP if high_word(mouse.mouseData) == XBUTTON1 => {
-                if self.suppression.activation_down {
-                    self.suppression.activation_down = false;
+                if self.suppression.geometry.is_some() {
+                    self.suppression.geometry = None;
                     self.suppression.cancel_sent = false;
                     self.push(InputEvent::new(timestamp, point, InputEventKind::ActivationUp));
                     true
@@ -408,21 +454,26 @@ impl HookCallbackState {
                     false
                 }
             }
-            WM_MOUSEMOVE if self.suppression.activation_down => {
-                self.push(InputEvent::new(timestamp, point, InputEventKind::PointerMoved));
-                false
+            WM_MOUSEMOVE if self.suppression.geometry.is_some() => {
+                if self.suppression.geometry == Some(ResolvedGeometry::EdgeAssist) {
+                    true
+                } else {
+                    self.push(InputEvent::new(timestamp, point, InputEventKind::PointerMoved));
+                    false
+                }
             }
-            WM_LBUTTONDOWN if self.suppression.activation_down => {
+            WM_LBUTTONDOWN if self.suppression.geometry.is_some() => {
                 self.cancel_from_mouse(point, timestamp, SUPPRESSED_LEFT)
             }
-            WM_RBUTTONDOWN if self.suppression.activation_down => {
+            WM_RBUTTONDOWN if self.suppression.geometry.is_some() => {
                 self.cancel_from_mouse(point, timestamp, SUPPRESSED_RIGHT)
             }
-            WM_MBUTTONDOWN if self.suppression.activation_down => {
+            WM_MBUTTONDOWN if self.suppression.geometry.is_some() => {
                 self.cancel_from_mouse(point, timestamp, SUPPRESSED_MIDDLE)
             }
             WM_XBUTTONDOWN
-                if self.suppression.activation_down && high_word(mouse.mouseData) == XBUTTON2 =>
+                if self.suppression.geometry.is_some()
+                    && high_word(mouse.mouseData) == XBUTTON2 =>
             {
                 self.cancel_from_mouse(point, timestamp, SUPPRESSED_XBUTTON2)
             }
@@ -439,6 +490,16 @@ impl HookCallbackState {
         }
     }
 
+    fn handle_raw_delta(&mut self, dx: i32, dy: i32, timestamp: i64) {
+        if self.suppression.geometry == Some(ResolvedGeometry::EdgeAssist) {
+            self.push(InputEvent::new(
+                timestamp,
+                ScreenPoint::default(),
+                InputEventKind::RawPointerDelta { dx, dy },
+            ));
+        }
+    }
+
     fn handle_keyboard(
         &mut self,
         message: u32,
@@ -452,7 +513,7 @@ impl HookCallbackState {
         }
 
         match message {
-            WM_KEYDOWN | WM_SYSKEYDOWN if self.suppression.activation_down => {
+            WM_KEYDOWN | WM_SYSKEYDOWN if self.suppression.geometry.is_some() => {
                 if !self.suppression.escape_down {
                     self.suppression.escape_down = true;
                     self.send_cancel(ScreenPoint::default(), timestamp, CancelReason::Escape);
@@ -489,7 +550,7 @@ impl HookCallbackState {
 
 #[derive(Debug, Default)]
 struct SuppressionState {
-    activation_down: bool,
+    geometry: Option<ResolvedGeometry>,
     cancel_sent: bool,
     escape_down: bool,
     suppressed_mouse_buttons: u8,
@@ -516,7 +577,10 @@ fn query_qpc() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use gradial_core::{CancelReason, InputEvent, InputEventKind, ScreenPoint};
+    use gradial_core::{
+        CancelReason, GeometryMode, InputEvent, InputEventKind, InvocationGeometry,
+        MonitorGeometry, ResolvedGeometry, ScreenPoint, ScreenRect,
+    };
     use rtrb::{Consumer, RingBuffer};
     use windows::Win32::{
         Foundation::POINT,
@@ -529,11 +593,29 @@ mod tests {
         },
     };
 
-    use super::{GRADIAL_INJECTED_MARKER, HookCallbackState, XBUTTON1};
+    use super::{GRADIAL_INJECTED_MARKER, HookCallbackState, InputConfiguration, XBUTTON1};
 
     fn callback_state() -> (HookCallbackState, Consumer<InputEvent>) {
+        callback_state_for(GeometryMode::Auto)
+    }
+
+    fn callback_state_for(
+        geometry_mode: GeometryMode,
+    ) -> (HookCallbackState, Consumer<InputEvent>) {
         let (producer, consumer) = RingBuffer::new(16);
-        (HookCallbackState::new(producer, &super::HookThreadMetrics::new()), consumer)
+        let virtual_screen = ScreenRect::new(-2_000, -2_000, 2_000, 2_000);
+        let configuration = InputConfiguration {
+            geometry_mode,
+            monitors: vec![MonitorGeometry {
+                bounds: virtual_screen,
+                work_area: virtual_screen,
+                dpi: 96,
+            }],
+        };
+        (
+            HookCallbackState::new(producer, configuration, &super::HookThreadMetrics::new()),
+            consumer,
+        )
     }
 
     fn mouse(point: ScreenPoint, xbutton: u16) -> MSLLHOOKSTRUCT {
@@ -551,7 +633,14 @@ mod tests {
         let m4 = mouse(origin, XBUTTON1);
 
         assert!(state.handle_mouse(WM_XBUTTONDOWN, &m4, 10));
-        assert_eq!(consumer.pop(), Ok(InputEvent::new(10, origin, InputEventKind::ActivationDown)));
+        assert_eq!(
+            consumer.pop(),
+            Ok(InputEvent::new(
+                10,
+                origin,
+                InputEventKind::ActivationDown(InvocationGeometry::fixed(origin, 96)),
+            ))
+        );
 
         assert!(state.handle_mouse(WM_XBUTTONDOWN, &m4, 11));
         assert!(consumer.pop().is_err(), "auto-repeat must not duplicate activation");
@@ -569,6 +658,41 @@ mod tests {
             Ok(InputEvent::new(13, moved_point, InputEventKind::ActivationUp))
         );
         assert!(!state.handle_mouse(WM_XBUTTONUP, &m4, 14));
+    }
+
+    #[test]
+    fn edge_assist_suppresses_cursor_motion_and_forwards_raw_deltas() {
+        let (mut state, mut consumer) = callback_state_for(GeometryMode::EdgeAssist);
+        let origin = ScreenPoint::new(0, 0);
+        let m4 = mouse(origin, XBUTTON1);
+
+        assert!(state.handle_mouse(WM_XBUTTONDOWN, &m4, 10));
+        assert_eq!(
+            consumer.pop(),
+            Ok(InputEvent::new(
+                10,
+                origin,
+                InputEventKind::ActivationDown(InvocationGeometry {
+                    behavior: ResolvedGeometry::EdgeAssist,
+                    overlay_origin_physical_px: origin,
+                    monitor_dpi: 96,
+                }),
+            ))
+        );
+
+        let moved_point = ScreenPoint::new(60, 0);
+        assert!(state.handle_mouse(WM_MOUSEMOVE, &mouse(moved_point, 0), 11));
+        assert!(consumer.pop().is_err(), "absolute cursor motion is not a gesture event");
+
+        state.handle_raw_delta(60, 0, 12);
+        assert_eq!(
+            consumer.pop(),
+            Ok(InputEvent::new(
+                12,
+                ScreenPoint::default(),
+                InputEventKind::RawPointerDelta { dx: 60, dy: 0 },
+            ))
+        );
     }
 
     #[test]

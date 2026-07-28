@@ -1,21 +1,109 @@
+use std::mem::size_of;
+
 use anyhow::{Context, Result, bail};
-use gradial_core::ScreenPoint;
+use gradial_core::{MonitorGeometry, ScreenPoint, ScreenRect};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM},
+    Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO},
     UI::{
+        HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, HTTRANSPARENT, HWND_TOPMOST,
-            MA_NOACTIVATE, SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW,
-            SetWindowPos, ShowWindow, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+            GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, PostMessageW,
+            SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+            WM_APP, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
         },
     },
 };
+use windows::core::BOOL;
 
 const OVERLAY_SUBCLASS_ID: usize = 0x4752_444C;
+const WM_GRADIAL_SHOW_OVERLAY: u32 = WM_APP + 0x244;
+const WM_GRADIAL_HIDE_OVERLAY: u32 = WM_APP + 0x245;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ForegroundWindowIdentity {
+    pub(crate) window: usize,
+    pub(crate) process_id: u32,
+}
+
+pub(crate) fn foreground_window_identity() -> ForegroundWindowIdentity {
+    // SAFETY: GetForegroundWindow has no preconditions and the optional
+    // process-ID output refers to a live local value.
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_invalid() {
+        return ForegroundWindowIdentity::default();
+    }
+
+    let mut process_id = 0_u32;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&raw mut process_id));
+    }
+    ForegroundWindowIdentity { window: window.0.addr(), process_id }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OverlayWakeHandle {
+    window_address: usize,
+}
+
+pub(crate) fn overlay_wake_handle(
+    creation_context: &eframe::CreationContext<'_>,
+) -> Result<OverlayWakeHandle> {
+    let window =
+        creation_context.winit_window().context("eframe did not expose its root Windows window")?;
+    let hwnd = window_handle(window)?;
+    Ok(OverlayWakeHandle { window_address: hwnd.0.addr() })
+}
+
+pub(crate) fn request_overlay_wake(handle: OverlayWakeHandle, origin: ScreenPoint) -> Result<()> {
+    let window = HWND(std::ptr::with_exposed_provenance_mut(handle.window_address));
+    let encoded_x = usize::try_from(u32::from_ne_bytes(origin.x.to_ne_bytes()))
+        .context("x coordinate does not fit WPARAM")?;
+    let encoded_y = isize::try_from(origin.y).context("y coordinate does not fit LPARAM")?;
+
+    // SAFETY: the handle identifies Gradial's live root window. This posts a
+    // private message and never synchronously enters the UI thread.
+    unsafe {
+        PostMessageW(Some(window), WM_GRADIAL_SHOW_OVERLAY, WPARAM(encoded_x), LPARAM(encoded_y))
+            .context("could not wake the hidden overlay window")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn request_overlay_hide(handle: OverlayWakeHandle) -> Result<()> {
+    let window = HWND(std::ptr::with_exposed_provenance_mut(handle.window_address));
+    // SAFETY: the handle identifies Gradial's live root window. This posts a
+    // private fail-safe hide request without entering the UI thread.
+    unsafe {
+        PostMessageW(Some(window), WM_GRADIAL_HIDE_OVERLAY, WPARAM(0), LPARAM(0))
+            .context("could not request a fail-safe overlay hide")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn monitor_work_areas() -> Result<Vec<MonitorGeometry>> {
+    let mut monitors = Vec::new();
+    let address = isize::try_from((&raw mut monitors).addr())
+        .context("monitor collection pointer does not fit LPARAM")?;
+
+    // SAFETY: the callback is synchronous. `address` identifies `monitors`,
+    // which remains live and exclusively borrowed until enumeration returns.
+    let completed =
+        unsafe { EnumDisplayMonitors(None, None, Some(collect_monitor), LPARAM(address)) };
+    if !completed.as_bool() {
+        bail!("Windows could not enumerate display work areas");
+    }
+    if monitors.is_empty() {
+        bail!("Windows reported no active display work areas");
+    }
+
+    Ok(monitors)
+}
 
 pub(crate) fn configure_overlay_window(
     creation_context: &eframe::CreationContext<'_>,
@@ -34,6 +122,10 @@ pub(crate) fn enforce_overlay_window_styles(frame: &eframe::Frame) -> Result<()>
 
 pub(crate) fn position_and_show_overlay(frame: &eframe::Frame, origin: ScreenPoint) -> Result<()> {
     let hwnd = window_handle(frame)?;
+    position_and_show_window(hwnd, origin)
+}
+
+fn position_and_show_window(hwnd: HWND, origin: ScreenPoint) -> Result<()> {
     let mut rectangle = RECT::default();
 
     // SAFETY: `hwnd` is eframe's live root window and the output pointer
@@ -119,6 +211,56 @@ fn window_handle(window: &impl HasWindowHandle) -> Result<HWND> {
     Ok(HWND(handle.hwnd.get() as *mut core::ffi::c_void))
 }
 
+unsafe extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _device_context: HDC,
+    _monitor_rect: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let Ok(address) = usize::try_from(data.0) else {
+        return BOOL(0);
+    };
+    // SAFETY: `monitor_work_areas` supplies the address of its live Vec and
+    // EnumDisplayMonitors invokes this callback synchronously.
+    let monitors =
+        unsafe { &mut *std::ptr::with_exposed_provenance_mut::<Vec<MonitorGeometry>>(address) };
+
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(size_of::<MONITORINFO>()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    // SAFETY: `monitor` is supplied by Windows and `info` is a valid output.
+    if !unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
+        return BOOL(0);
+    }
+
+    let mut dpi_x = 96_u32;
+    let mut dpi_y = 96_u32;
+    // SAFETY: both DPI output pointers remain valid for this call.
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi_x, &raw mut dpi_y) }
+        .is_err()
+    {
+        dpi_x = 96;
+    }
+
+    monitors.push(MonitorGeometry {
+        bounds: ScreenRect::new(
+            info.rcMonitor.left,
+            info.rcMonitor.top,
+            info.rcMonitor.right,
+            info.rcMonitor.bottom,
+        ),
+        work_area: ScreenRect::new(
+            info.rcWork.left,
+            info.rcWork.top,
+            info.rcWork.right,
+            info.rcWork.bottom,
+        ),
+        dpi: dpi_x,
+    });
+    BOOL(1)
+}
+
 unsafe extern "system" fn overlay_subclass_proc(
     hwnd: HWND,
     message: u32,
@@ -128,6 +270,29 @@ unsafe extern "system" fn overlay_subclass_proc(
     _reference_data: usize,
 ) -> LRESULT {
     match message {
+        WM_GRADIAL_SHOW_OVERLAY => {
+            let encoded_x = u32::try_from(wparam.0).unwrap_or_default();
+            let origin = ScreenPoint::new(
+                i32::from_ne_bytes(encoded_x.to_ne_bytes()),
+                i32::try_from(lparam.0).unwrap_or_default(),
+            );
+            if let Err(error) = position_and_show_window(hwnd, origin) {
+                log::error!(
+                    target: "renderer",
+                    "component=renderer event_code=overlay_early_wake_failed \
+                     result_code=failure config_revision=0 error={error}"
+                );
+            }
+            LRESULT(0)
+        }
+        WM_GRADIAL_HIDE_OVERLAY => {
+            // SAFETY: `hwnd` is Gradial's live root window and hiding it does
+            // not activate or destroy it.
+            unsafe {
+                let _was_visible = ShowWindow(hwnd, SW_HIDE);
+            }
+            LRESULT(0)
+        }
         WM_MOUSEACTIVATE => LRESULT(isize::try_from(MA_NOACTIVATE).expect("constant fits isize")),
         WM_NCHITTEST => LRESULT(isize::try_from(HTTRANSPARENT).expect("constant fits isize")),
         WM_NCDESTROY => {

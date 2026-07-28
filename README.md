@@ -3,7 +3,8 @@
 Gradial is a Windows 11 radial launcher built around a hold, flick, and release
 gesture. The current development build includes the first complete interaction
 spine: a non-activating GPU overlay, dedicated low-level input thread, bounded
-event transport, and a tested eight-slice gesture state machine.
+event transport, tested eight-slice gesture state machine, automatic edge
+assist, and focus/timing instrumentation.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -31,6 +32,18 @@ The app starts hidden. While this development build is running:
 - Release M4 to log the selected slice and close the menu.
 - Press Escape, or press another mouse button, to cancel.
 
+Gradial normally keeps the gesture fixed at M4-down. If the complete ring would
+clip the current monitor's work area, it automatically insets the ring and uses
+raw mouse deltas as a virtual pointer. The system cursor stays at the invocation
+point during that edge-assisted gesture.
+
+The two Milestone 0 prototypes can also be forced for comparison:
+
+```powershell
+cargo run --package gradial-app -- --geometry=fixed-origin
+cargo run --package gradial-app -- --geometry=edge-assist
+```
+
 **M4 is dedicated to Gradial while the app runs.** Its normal browser
 back/navigation behavior is suppressed. This milestone deliberately does not
 execute launcher actions; release only writes `slice_selected` with
@@ -46,4 +59,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
 ```
 
 See [`Documentation/development.md`](Documentation/development.md) for the
-threading model, safety boundaries, workspace layout, and current limitations.
+threading model, safety boundaries, timing capture, workspace layout, and
+current limitations. The latest bounded interaction evidence is recorded in
+[`Documentation/milestone-0-smoke-results.md`](Documentation/milestone-0-smoke-results.md).

@@ -4,6 +4,8 @@ use uuid::Uuid;
 
 use crate::SliceCount;
 
+pub const DEFAULT_OVERLAY_HALF_EXTENT_DIP: u32 = 144;
+
 /// A signed physical-pixel coordinate in the Windows virtual screen.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScreenPoint {
@@ -16,6 +18,135 @@ impl ScreenPoint {
     pub const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
+}
+
+/// Startup behavior used to compare the Milestone 0 edge prototypes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GeometryMode {
+    #[default]
+    Auto,
+    FixedOrigin,
+    EdgeAssist,
+}
+
+impl GeometryMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::FixedOrigin => "fixed-origin",
+            Self::EdgeAssist => "edge-assist",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedGeometry {
+    FixedOrigin,
+    EdgeAssist,
+}
+
+impl ResolvedGeometry {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FixedOrigin => "fixed-origin",
+            Self::EdgeAssist => "edge-assist",
+        }
+    }
+}
+
+/// A signed, right-and-bottom-exclusive physical-pixel rectangle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ScreenRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl ScreenRect {
+    #[must_use]
+    pub const fn new(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+        Self { left, top, right, bottom }
+    }
+
+    #[must_use]
+    pub const fn contains(self, point: ScreenPoint) -> bool {
+        point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
+    }
+
+    #[must_use]
+    pub const fn centered_content_fits(self, point: ScreenPoint, half_extent_px: i32) -> bool {
+        point.x.saturating_sub(half_extent_px) >= self.left
+            && point.x.saturating_add(half_extent_px) <= self.right
+            && point.y.saturating_sub(half_extent_px) >= self.top
+            && point.y.saturating_add(half_extent_px) <= self.bottom
+    }
+
+    #[must_use]
+    pub const fn inset_center(self, point: ScreenPoint, half_extent_px: i32) -> ScreenPoint {
+        let minimum_x = self.left.saturating_add(half_extent_px);
+        let maximum_x = self.right.saturating_sub(half_extent_px);
+        let minimum_y = self.top.saturating_add(half_extent_px);
+        let maximum_y = self.bottom.saturating_sub(half_extent_px);
+
+        ScreenPoint::new(
+            clamp_or_midpoint(point.x, minimum_x, maximum_x),
+            clamp_or_midpoint(point.y, minimum_y, maximum_y),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MonitorGeometry {
+    pub bounds: ScreenRect,
+    pub work_area: ScreenRect,
+    pub dpi: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvocationGeometry {
+    pub behavior: ResolvedGeometry,
+    pub overlay_origin_physical_px: ScreenPoint,
+    pub monitor_dpi: u32,
+}
+
+impl InvocationGeometry {
+    #[must_use]
+    pub const fn fixed(origin: ScreenPoint, monitor_dpi: u32) -> Self {
+        Self {
+            behavior: ResolvedGeometry::FixedOrigin,
+            overlay_origin_physical_px: origin,
+            monitor_dpi,
+        }
+    }
+}
+
+/// Resolves the visual origin and gesture behavior without doing Win32 work.
+#[must_use]
+pub fn resolve_invocation_geometry(
+    mode: GeometryMode,
+    cursor: ScreenPoint,
+    monitors: &[MonitorGeometry],
+    overlay_half_extent_dip: u32,
+) -> InvocationGeometry {
+    let Some(monitor) = monitor_for_point(cursor, monitors) else {
+        return InvocationGeometry::fixed(cursor, 96);
+    };
+    let half_extent_px = scale_dip_ceil(overlay_half_extent_dip, monitor.dpi);
+    let fixed_fits = monitor.work_area.centered_content_fits(cursor, half_extent_px);
+    let behavior = match mode {
+        GeometryMode::Auto if fixed_fits => ResolvedGeometry::FixedOrigin,
+        GeometryMode::FixedOrigin => ResolvedGeometry::FixedOrigin,
+        GeometryMode::Auto | GeometryMode::EdgeAssist => ResolvedGeometry::EdgeAssist,
+    };
+    let overlay_origin_physical_px = match behavior {
+        ResolvedGeometry::FixedOrigin => cursor,
+        ResolvedGeometry::EdgeAssist => monitor.work_area.inset_center(cursor, half_extent_px),
+    };
+
+    InvocationGeometry { behavior, overlay_origin_physical_px, monitor_dpi: monitor.dpi.max(96) }
 }
 
 /// A fixed-size event copied out of a low-level input hook.
@@ -35,8 +166,9 @@ impl InputEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEventKind {
-    ActivationDown,
+    ActivationDown(InvocationGeometry),
     PointerMoved,
+    RawPointerDelta { dx: i32, dy: i32 },
     ActivationUp,
     Cancel(CancelReason),
 }
@@ -63,6 +195,7 @@ pub struct InvocationSnapshot {
     pub foreground_pid: u32,
     pub cursor_physical_px: ScreenPoint,
     pub monitor_dpi: u32,
+    pub geometry: InvocationGeometry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,12 +246,19 @@ pub struct InteractionController {
     config: GestureConfig,
     snapshot: Option<InvocationSnapshot>,
     selected_slice: Option<usize>,
+    virtual_pointer: ScreenPoint,
 }
 
 impl InteractionController {
     #[must_use]
     pub const fn new(config: GestureConfig) -> Self {
-        Self { state: InteractionState::Idle, config, snapshot: None, selected_slice: None }
+        Self {
+            state: InteractionState::Idle,
+            config,
+            snapshot: None,
+            selected_slice: None,
+            virtual_pointer: ScreenPoint::new(0, 0),
+        }
     }
 
     #[must_use]
@@ -143,11 +283,26 @@ impl InteractionController {
 
         self.state = InteractionState::Opening;
         self.selected_slice = None;
+        self.virtual_pointer = snapshot.cursor_physical_px;
         self.snapshot = Some(snapshot);
         Some(InteractionEffect::Open {
             invocation_id: snapshot.invocation_id,
-            origin: snapshot.cursor_physical_px,
+            origin: snapshot.geometry.overlay_origin_physical_px,
         })
+    }
+
+    pub fn raw_pointer_delta(&mut self, dx: i32, dy: i32) -> Option<InteractionEffect> {
+        if self.snapshot.map(|snapshot| snapshot.geometry.behavior)
+            != Some(ResolvedGeometry::EdgeAssist)
+        {
+            return None;
+        }
+
+        self.virtual_pointer = ScreenPoint::new(
+            self.virtual_pointer.x.saturating_add(dx),
+            self.virtual_pointer.y.saturating_add(dy),
+        );
+        self.pointer_moved(self.virtual_pointer)
     }
 
     pub fn pointer_moved(&mut self, point: ScreenPoint) -> Option<InteractionEffect> {
@@ -273,7 +428,52 @@ impl InteractionController {
         self.state = InteractionState::Idle;
         self.selected_slice = None;
         self.snapshot = None;
+        self.virtual_pointer = ScreenPoint::new(0, 0);
     }
+}
+
+const fn clamp_or_midpoint(value: i32, minimum: i32, maximum: i32) -> i32 {
+    if minimum <= maximum {
+        if value < minimum {
+            minimum
+        } else if value > maximum {
+            maximum
+        } else {
+            value
+        }
+    } else {
+        minimum.saturating_add(maximum).div_euclid(2)
+    }
+}
+
+fn monitor_for_point(point: ScreenPoint, monitors: &[MonitorGeometry]) -> Option<MonitorGeometry> {
+    monitors.iter().copied().find(|monitor| monitor.bounds.contains(point)).or_else(|| {
+        monitors.iter().copied().min_by_key(|monitor| distance_to_rect(point, monitor.bounds))
+    })
+}
+
+fn distance_to_rect(point: ScreenPoint, rectangle: ScreenRect) -> i64 {
+    let dx = if point.x < rectangle.left {
+        rectangle.left.saturating_sub(point.x)
+    } else if point.x >= rectangle.right {
+        point.x.saturating_sub(rectangle.right.saturating_sub(1))
+    } else {
+        0
+    };
+    let dy = if point.y < rectangle.top {
+        rectangle.top.saturating_sub(point.y)
+    } else if point.y >= rectangle.bottom {
+        point.y.saturating_sub(rectangle.bottom.saturating_sub(1))
+    } else {
+        0
+    };
+
+    i64::from(dx).saturating_mul(i64::from(dx)) + i64::from(dy).saturating_mul(i64::from(dy))
+}
+
+fn scale_dip_ceil(dip: u32, dpi: u32) -> i32 {
+    let scaled = dip.saturating_mul(dpi.max(96)).saturating_add(95) / 96;
+    i32::try_from(scaled).unwrap_or(i32::MAX)
 }
 
 /// Resolves a signed screen-space delta to a slice.
@@ -351,8 +551,10 @@ fn shortest_angular_distance(left: f64, right: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, GestureConfig, InteractionController, InteractionEffect, InteractionOutcome,
-        InteractionState, InvocationSnapshot, ScreenPoint, slice_for_angle, slice_for_delta,
+        CancelReason, GeometryMode, GestureConfig, InteractionController, InteractionEffect,
+        InteractionOutcome, InteractionState, InvocationGeometry, InvocationSnapshot,
+        MonitorGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, resolve_invocation_geometry,
+        slice_for_angle, slice_for_delta,
     };
     use crate::SliceCount;
     use uuid::Uuid;
@@ -365,6 +567,7 @@ mod tests {
             foreground_pid: 7,
             cursor_physical_px: origin,
             monitor_dpi: 96,
+            geometry: InvocationGeometry::fixed(origin, 96),
         }
     }
 
@@ -467,6 +670,124 @@ mod tests {
         assert_eq!(controller.cancel(CancelReason::Escape), None);
         assert_eq!(controller.activation_up(), None);
         assert_eq!(controller.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn automatic_geometry_keeps_center_invocations_fixed() {
+        let monitor = MonitorGeometry {
+            bounds: ScreenRect::new(0, 0, 1_920, 1_080),
+            work_area: ScreenRect::new(0, 0, 1_920, 1_040),
+            dpi: 96,
+        };
+
+        assert_eq!(
+            resolve_invocation_geometry(
+                GeometryMode::Auto,
+                ScreenPoint::new(960, 520),
+                &[monitor],
+                144,
+            ),
+            InvocationGeometry {
+                behavior: ResolvedGeometry::FixedOrigin,
+                overlay_origin_physical_px: ScreenPoint::new(960, 520),
+                monitor_dpi: 96,
+            }
+        );
+    }
+
+    #[test]
+    fn automatic_geometry_insets_all_corners_with_negative_coordinates() {
+        let monitor = MonitorGeometry {
+            bounds: ScreenRect::new(-2_560, -1_440, 0, 0),
+            work_area: ScreenRect::new(-2_560, -1_400, 0, 0),
+            dpi: 192,
+        };
+        let cases = [
+            (ScreenPoint::new(-2_559, -1_399), ScreenPoint::new(-2_272, -1_112)),
+            (ScreenPoint::new(-1, -1_399), ScreenPoint::new(-288, -1_112)),
+            (ScreenPoint::new(-2_559, -1), ScreenPoint::new(-2_272, -288)),
+            (ScreenPoint::new(-1, -1), ScreenPoint::new(-288, -288)),
+        ];
+
+        for (cursor, expected_origin) in cases {
+            let geometry = resolve_invocation_geometry(GeometryMode::Auto, cursor, &[monitor], 144);
+            assert_eq!(geometry.behavior, ResolvedGeometry::EdgeAssist);
+            assert_eq!(geometry.overlay_origin_physical_px, expected_origin);
+            assert_eq!(geometry.monitor_dpi, 192);
+        }
+    }
+
+    #[test]
+    fn comparison_overrides_force_each_geometry() {
+        let monitor = MonitorGeometry {
+            bounds: ScreenRect::new(0, 0, 1_000, 800),
+            work_area: ScreenRect::new(0, 0, 1_000, 760),
+            dpi: 96,
+        };
+        let corner = ScreenPoint::new(2, 2);
+        let center = ScreenPoint::new(500, 380);
+
+        assert_eq!(
+            resolve_invocation_geometry(GeometryMode::FixedOrigin, corner, &[monitor], 144,)
+                .behavior,
+            ResolvedGeometry::FixedOrigin
+        );
+        assert_eq!(
+            resolve_invocation_geometry(GeometryMode::EdgeAssist, center, &[monitor], 144,)
+                .behavior,
+            ResolvedGeometry::EdgeAssist
+        );
+    }
+
+    #[test]
+    fn raw_deltas_drive_all_edge_assist_directions_without_moving_the_origin() {
+        let origin = ScreenPoint::new(0, 0);
+        let mut edge_snapshot = snapshot(origin);
+        edge_snapshot.geometry = InvocationGeometry {
+            behavior: ResolvedGeometry::EdgeAssist,
+            overlay_origin_physical_px: ScreenPoint::new(144, 144),
+            monitor_dpi: 96,
+        };
+
+        let deltas = [
+            ((0, -60), 0),
+            ((60, -60), 1),
+            ((60, 0), 2),
+            ((60, 60), 3),
+            ((0, 60), 4),
+            ((-60, 60), 5),
+            ((-60, 0), 6),
+            ((-60, -60), 7),
+        ];
+
+        for ((dx, dy), expected_slice) in deltas {
+            let mut controller = InteractionController::new(GestureConfig::default());
+            assert_eq!(
+                controller.activation_down(edge_snapshot),
+                Some(InteractionEffect::Open {
+                    invocation_id: Uuid::nil(),
+                    origin: ScreenPoint::new(144, 144),
+                })
+            );
+            assert_eq!(
+                controller.raw_pointer_delta(dx, dy),
+                Some(InteractionEffect::SelectionChanged {
+                    invocation_id: Uuid::nil(),
+                    selected_slice: Some(expected_slice),
+                })
+            );
+            assert_eq!(controller.snapshot(), Some(edge_snapshot));
+        }
+    }
+
+    #[test]
+    fn fixed_origin_ignores_raw_deltas() {
+        let origin = ScreenPoint::new(500, 500);
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller.activation_down(snapshot(origin)).expect("open");
+
+        assert_eq!(controller.raw_pointer_delta(100, 0), None);
+        assert_eq!(controller.selected_slice(), None);
     }
 
     #[test]
