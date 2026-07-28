@@ -8,26 +8,26 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     CancelReason, GestureConfig, InputEvent, InputEventKind, InteractionController,
     InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot,
+    monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
-use uuid::Uuid;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use crate::{
     diagnostics::TimingMarkers,
     input::{HookThread, HookThreadMetrics, InputConfiguration},
+    overlay::OverlayRoute,
     platform,
 };
 
 const INPUT_QUEUE_CAPACITY: usize = 4_096;
-const OVERLAY_COMMAND_CAPACITY: usize = 64;
+const RUNTIME_CHANNEL_CAPACITY: usize = 4;
 const HOOK_UNRESPONSIVE_AFTER_MS: i64 = 750;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default)]
 struct EventCounters {
@@ -40,25 +40,29 @@ struct EventCounters {
 
 #[derive(Debug)]
 struct EffectDispatcher<'a> {
-    command_sender: &'a Sender<OverlayCommand>,
     egui_context: &'a eframe::egui::Context,
     timing_markers: &'a TimingMarkers,
-    overlay_wake_handle: platform::OverlayWakeHandle,
+    routes: &'a [OverlayRoute],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OverlayCommand {
-    Open { snapshot: InvocationSnapshot },
-    SelectionChanged { invocation_id: Uuid, selected_slice: Option<usize> },
-    Close { invocation_id: Uuid },
+enum RuntimeControl {
+    DisplayTopologyChanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeEvent {
+    DisplayRebuildReady,
 }
 
 #[derive(Debug)]
 pub(crate) struct InteractionRuntime {
     hook_thread: HookThread,
+    accepting_input: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     join_handle: Option<JoinHandle<()>>,
-    commands: Receiver<OverlayCommand>,
+    control_sender: Sender<RuntimeControl>,
+    events: Receiver<RuntimeEvent>,
 }
 
 impl InteractionRuntime {
@@ -66,40 +70,59 @@ impl InteractionRuntime {
         egui_context: eframe::egui::Context,
         input_configuration: InputConfiguration,
         timing_markers: Arc<TimingMarkers>,
-        overlay_wake_handle: platform::OverlayWakeHandle,
+        routes: Vec<OverlayRoute>,
     ) -> Result<Self> {
         let (producer, consumer) = RingBuffer::new(INPUT_QUEUE_CAPACITY);
-        let hook_thread = HookThread::spawn(producer, input_configuration)?;
+        let accepting_input = Arc::new(AtomicBool::new(true));
+        let hook_thread =
+            HookThread::spawn(producer, input_configuration, Arc::clone(&accepting_input))?;
         let hook_metrics = hook_thread.metrics.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
-        let (command_sender, commands) = bounded(OVERLAY_COMMAND_CAPACITY);
+        let (control_sender, controls) = bounded(RUNTIME_CHANNEL_CAPACITY);
+        let (event_sender, events) = bounded(RUNTIME_CHANNEL_CAPACITY);
 
         let join_handle = thread::Builder::new()
             .name("gradial-interaction".to_owned())
             .spawn(move || {
                 run_interaction_thread(
                     consumer,
-                    &command_sender,
+                    &controls,
+                    &event_sender,
                     &egui_context,
                     &hook_metrics,
                     &thread_shutdown,
                     &timing_markers,
-                    overlay_wake_handle,
+                    &routes,
                 );
             })
             .context("could not spawn the interaction thread")?;
 
-        Ok(Self { hook_thread, shutdown, join_handle: Some(join_handle), commands })
+        Ok(Self {
+            hook_thread,
+            accepting_input,
+            shutdown,
+            join_handle: Some(join_handle),
+            control_sender,
+            events,
+        })
     }
 
-    pub(crate) fn try_command(&self) -> Option<OverlayCommand> {
-        self.commands.try_recv().ok()
+    pub(crate) fn begin_display_rebuild(&self) -> Result<()> {
+        self.accepting_input.store(false, Ordering::Release);
+        self.control_sender
+            .try_send(RuntimeControl::DisplayTopologyChanged)
+            .context("could not request display-topology cancellation")
+    }
+
+    pub(crate) fn try_event(&self) -> Option<RuntimeEvent> {
+        self.events.try_recv().ok()
     }
 }
 
 impl Drop for InteractionRuntime {
     fn drop(&mut self) {
+        self.accepting_input.store(false, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         self.hook_thread.stop();
 
@@ -134,28 +157,56 @@ impl Drop for InteractionRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_interaction_thread(
     mut consumer: Consumer<InputEvent>,
-    command_sender: &Sender<OverlayCommand>,
+    controls: &Receiver<RuntimeControl>,
+    event_sender: &Sender<RuntimeEvent>,
     egui_context: &eframe::egui::Context,
     metrics: &HookThreadMetrics,
     shutdown: &Arc<AtomicBool>,
     timing_markers: &TimingMarkers,
-    overlay_wake_handle: platform::OverlayWakeHandle,
+    routes: &[OverlayRoute],
 ) {
     let mut controller = InteractionController::new(GestureConfig::default());
     let mut active_snapshot = None;
+    let mut active_route = None;
     let mut counters = EventCounters::default();
-    let dispatcher =
-        EffectDispatcher { command_sender, egui_context, timing_markers, overlay_wake_handle };
+    let dispatcher = EffectDispatcher { egui_context, timing_markers, routes };
     let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
+    let mut display_rebuild_pending = false;
 
     while !shutdown.load(Ordering::Acquire) {
+        if let Ok(RuntimeControl::DisplayTopologyChanged) = controls.try_recv() {
+            if let Some(effect) = controller.cancel(CancelReason::DisplayTopologyChange) {
+                dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
+                let _ = controller.activation_up();
+            }
+            active_snapshot = None;
+            active_route = None;
+            display_rebuild_pending = true;
+            log::info!(
+                target: "renderer",
+                "component=renderer event_code=display_rebuild_requested result_code=ok \
+                 config_revision=0"
+            );
+            if let Err(error) = event_sender.try_send(RuntimeEvent::DisplayRebuildReady) {
+                log_runtime_event_error(error);
+            }
+            egui_context.request_repaint_of(eframe::egui::ViewportId::ROOT);
+        }
+
+        if display_rebuild_pending {
+            thread::sleep(IDLE_POLL_INTERVAL);
+            continue;
+        }
+
         if metrics.queue_overflow.swap(false, Ordering::AcqRel) {
             if let Some(effect) = controller.fault(CancelReason::InputQueueOverflow) {
-                dispatch_effect(effect, query_qpc(), active_snapshot, &dispatcher);
+                dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
                 active_snapshot = None;
+                active_route = None;
             }
             log::error!(
                 target: "input",
@@ -171,8 +222,9 @@ fn run_interaction_thread(
             && now.saturating_sub(heartbeat) > hook_timeout_qpc
         {
             if let Some(effect) = controller.fault(CancelReason::HookUnresponsive) {
-                dispatch_effect(effect, now, active_snapshot, &dispatcher);
+                dispatch_effect(effect, now, active_snapshot, active_route, &dispatcher);
                 active_snapshot = None;
+                active_route = None;
             }
             log::error!(
                 target: "input",
@@ -188,6 +240,7 @@ fn run_interaction_thread(
                 event,
                 &mut controller,
                 &mut active_snapshot,
+                &mut active_route,
                 &mut counters,
                 &dispatcher,
             );
@@ -199,7 +252,7 @@ fn run_interaction_thread(
     }
 
     if let Some(effect) = controller.fault(CancelReason::Shutdown) {
-        dispatch_effect(effect, query_qpc(), active_snapshot, &dispatcher);
+        dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
     }
     log::info!(
         target: "interaction",
@@ -218,6 +271,7 @@ fn handle_input_event(
     event: InputEvent,
     controller: &mut InteractionController,
     active_snapshot: &mut Option<InvocationSnapshot>,
+    active_route: &mut Option<usize>,
     counters: &mut EventCounters,
     dispatcher: &EffectDispatcher<'_>,
 ) {
@@ -227,6 +281,7 @@ fn handle_input_event(
             counters.activation_down = counters.activation_down.saturating_add(1);
             let snapshot = capture_snapshot(event, geometry);
             *active_snapshot = Some(snapshot);
+            *active_route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
             dispatcher.timing_markers.emit(
                 "activation_dequeued",
                 Some(snapshot.invocation_id),
@@ -260,10 +315,11 @@ fn handle_input_event(
     };
 
     if let Some(effect) = effect {
-        dispatch_effect(effect, source_qpc, *active_snapshot, dispatcher);
+        dispatch_effect(effect, source_qpc, *active_snapshot, *active_route, dispatcher);
     }
     if matches!(controller.state(), InteractionState::Idle | InteractionState::Faulted) {
         *active_snapshot = None;
+        *active_route = None;
     }
 }
 
@@ -273,7 +329,7 @@ fn capture_snapshot(
 ) -> InvocationSnapshot {
     let foreground = platform::foreground_window_identity();
     InvocationSnapshot {
-        invocation_id: Uuid::new_v4(),
+        invocation_id: uuid::Uuid::new_v4(),
         qpc_timestamp: event.qpc_timestamp,
         foreground_window: foreground.window,
         foreground_pid: foreground.process_id,
@@ -283,13 +339,23 @@ fn capture_snapshot(
     }
 }
 
+fn route_for_point(point: gradial_core::ScreenPoint, routes: &[OverlayRoute]) -> Option<usize> {
+    let monitors: Vec<_> = routes.iter().map(OverlayRoute::monitor).collect();
+    monitor_index_for_point(point, &monitors)
+}
+
 fn dispatch_effect(
     effect: InteractionEffect,
     source_qpc: i64,
     active_snapshot: Option<InvocationSnapshot>,
+    active_route: Option<usize>,
     dispatcher: &EffectDispatcher<'_>,
 ) {
-    let command = match effect {
+    let Some((route_index, route)) = active_overlay_route(active_route, dispatcher.routes) else {
+        return;
+    };
+
+    match effect {
         InteractionEffect::Open { invocation_id, .. } => {
             let Some(snapshot) =
                 active_snapshot.filter(|snapshot| snapshot.invocation_id == invocation_id)
@@ -304,7 +370,8 @@ fn dispatch_effect(
             log::info!(
                 target: "interaction",
                 "component=interaction event_code=invocation_started result_code=ok \
-                 config_revision=0 invocation_id={invocation_id} geometry={}",
+                 config_revision=0 invocation_id={invocation_id} monitor_index={route_index} \
+                 geometry={}",
                 snapshot.geometry.behavior.as_str()
             );
             dispatcher.timing_markers.emit(
@@ -313,25 +380,16 @@ fn dispatch_effect(
                 source_qpc,
                 &format!("geometry={}", snapshot.geometry.behavior.as_str()),
             );
-            if let Err(error) = platform::request_overlay_wake(
-                dispatcher.overlay_wake_handle,
-                snapshot.geometry.overlay_origin_physical_px,
-            ) {
+            if let Err(error) =
+                route.open(dispatcher.egui_context, dispatcher.timing_markers, snapshot)
+            {
                 log::error!(
                     target: "renderer",
                     "component=renderer event_code=overlay_wake_request_failed \
                      result_code=failure config_revision=0 invocation_id={invocation_id} \
                      error={error}"
                 );
-            } else {
-                dispatcher.timing_markers.emit(
-                    "overlay_wake_requested",
-                    Some(invocation_id),
-                    source_qpc,
-                    "",
-                );
             }
-            OverlayCommand::Open { snapshot }
         }
         InteractionEffect::SelectionChanged { invocation_id, selected_slice } => {
             log::debug!(
@@ -346,7 +404,7 @@ fn dispatch_effect(
                 source_qpc,
                 &format!("selected_slice={selected_slice:?}"),
             );
-            OverlayCommand::SelectionChanged { invocation_id, selected_slice }
+            route.set_selection(dispatcher.egui_context, invocation_id, selected_slice);
         }
         InteractionEffect::Close { invocation_id, outcome } => {
             match outcome {
@@ -367,83 +425,50 @@ fn dispatch_effect(
                 }
             }
             dispatcher.timing_markers.emit("close_requested", Some(invocation_id), source_qpc, "");
-            OverlayCommand::Close { invocation_id }
+            if let Err(error) =
+                route.close(dispatcher.egui_context, dispatcher.timing_markers, invocation_id)
+            {
+                log::error!(
+                    target: "renderer",
+                    "component=renderer event_code=overlay_hide_request_failed \
+                     result_code=failure config_revision=0 invocation_id={invocation_id} \
+                     error={error}"
+                );
+            }
         }
-    };
-
-    let lifecycle = matches!(command, OverlayCommand::Open { .. } | OverlayCommand::Close { .. });
-    let enqueued =
-        send_overlay_command(command, dispatcher.command_sender, dispatcher.egui_context);
-    if lifecycle
-        && !enqueued
-        && let Err(error) = platform::request_overlay_hide(dispatcher.overlay_wake_handle)
-    {
-        log::error!(
-            target: "renderer",
-            "component=renderer event_code=overlay_fail_safe_hide_failed \
-             result_code=failure config_revision=0 error={error}"
-        );
     }
 }
 
-fn send_overlay_command(
-    command: OverlayCommand,
-    command_sender: &Sender<OverlayCommand>,
-    egui_context: &eframe::egui::Context,
-) -> bool {
-    match command_sender.try_send(command) {
-        Ok(()) => {
-            egui_context.request_repaint();
-            true
-        }
-        Err(TrySendError::Full(
-            command @ (OverlayCommand::Open { .. } | OverlayCommand::Close { .. }),
-        )) => {
-            // A selection repaint may be dropped under pressure, but the
-            // overlay's visible lifetime must remain balanced. Wake the UI and
-            // give it one bounded opportunity to drain without ever blocking
-            // the low-level hook callback.
-            egui_context.request_repaint();
-            match command_sender.send_timeout(command, LIFECYCLE_COMMAND_TIMEOUT) {
-                Ok(()) => {
-                    egui_context.request_repaint();
-                    true
-                }
-                Err(SendTimeoutError::Timeout(_)) => {
-                    log::error!(
-                        target: "interaction",
-                        "component=interaction event_code=overlay_lifecycle_command_timeout \
-                         result_code=failure config_revision=0 timeout_ms=50"
-                    );
-                    false
-                }
-                Err(SendTimeoutError::Disconnected(_)) => {
-                    log::warn!(
-                        target: "interaction",
-                        "component=interaction event_code=overlay_command_queue_closed \
-                         result_code=failure config_revision=0"
-                    );
-                    false
-                }
-            }
-        }
-        Err(TrySendError::Full(_)) => {
-            log::error!(
-                target: "interaction",
-                "component=interaction event_code=overlay_command_queue_full result_code=failure \
-                 config_revision=0 capacity={OVERLAY_COMMAND_CAPACITY}"
-            );
-            false
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            log::warn!(
-                target: "interaction",
-                "component=interaction event_code=overlay_command_queue_closed result_code=failure \
-                 config_revision=0"
-            );
-            false
-        }
+fn active_overlay_route(
+    route_index: Option<usize>,
+    routes: &[OverlayRoute],
+) -> Option<(usize, &OverlayRoute)> {
+    let Some(route_index) = route_index else {
+        log::error!(
+            target: "renderer",
+            "component=renderer event_code=overlay_route_missing result_code=failure \
+             config_revision=0"
+        );
+        return None;
+    };
+    let route = routes.get(route_index);
+    if route.is_none() {
+        log::error!(
+            target: "renderer",
+            "component=renderer event_code=overlay_route_missing result_code=failure \
+             config_revision=0 monitor_index={route_index}"
+        );
     }
+    route.map(|route| (route_index, route))
+}
+
+fn log_runtime_event_error(error: TrySendError<RuntimeEvent>) {
+    let reason = if matches!(error, TrySendError::Full(_)) { "queue_full" } else { "queue_closed" };
+    log::error!(
+        target: "renderer",
+        "component=renderer event_code=display_rebuild_signal_failed result_code=failure \
+         config_revision=0 reason={reason}"
+    );
 }
 
 const fn is_active(state: InteractionState) -> bool {

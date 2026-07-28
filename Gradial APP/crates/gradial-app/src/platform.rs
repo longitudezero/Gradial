@@ -1,29 +1,41 @@
-use std::mem::size_of;
+use std::{
+    mem::size_of,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
 
 use anyhow::{Context, Result, bail};
 use gradial_core::{MonitorGeometry, ScreenPoint, ScreenRect};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM},
-    Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO},
+    Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, InvalidateRect, MONITORINFO,
+    },
     UI::{
-        HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+        HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+            FindWindowW, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
             GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, PostMessageW,
-            SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-            WM_APP, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW,
+            SET_WINDOW_POS_FLAGS, SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW,
+            SetWindowPos, ShowWindow, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE,
+            WM_NCDESTROY, WM_NCHITTEST, WM_SETTINGCHANGE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         },
     },
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, PCWSTR};
 
 const OVERLAY_SUBCLASS_ID: usize = 0x4752_444C;
 const WM_GRADIAL_SHOW_OVERLAY: u32 = WM_APP + 0x244;
 const WM_GRADIAL_HIDE_OVERLAY: u32 = WM_APP + 0x245;
+static DISPLAY_TOPOLOGY_MONITORING: AtomicBool = AtomicBool::new(false);
+static DISPLAY_TOPOLOGY_CHANGED: AtomicBool = AtomicBool::new(false);
+static CONTROLLER_WINDOW_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+static CONTROLLER_REPAINT_CONTEXT: OnceLock<eframe::egui::Context> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ForegroundWindowIdentity {
@@ -51,13 +63,18 @@ pub(crate) struct OverlayWakeHandle {
     window_address: usize,
 }
 
-pub(crate) fn overlay_wake_handle(
-    creation_context: &eframe::CreationContext<'_>,
-) -> Result<OverlayWakeHandle> {
-    let window =
-        creation_context.winit_window().context("eframe did not expose its root Windows window")?;
-    let hwnd = window_handle(window)?;
-    Ok(OverlayWakeHandle { window_address: hwnd.0.addr() })
+pub(crate) fn set_display_topology_monitoring(enabled: bool) {
+    if enabled {
+        DISPLAY_TOPOLOGY_CHANGED.store(false, Ordering::Release);
+        DISPLAY_TOPOLOGY_MONITORING.store(true, Ordering::Release);
+    } else {
+        DISPLAY_TOPOLOGY_MONITORING.store(false, Ordering::Release);
+        DISPLAY_TOPOLOGY_CHANGED.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) fn take_display_topology_changed() -> bool {
+    DISPLAY_TOPOLOGY_CHANGED.swap(false, Ordering::AcqRel)
 }
 
 pub(crate) fn request_overlay_wake(handle: OverlayWakeHandle, origin: ScreenPoint) -> Result<()> {
@@ -66,7 +83,7 @@ pub(crate) fn request_overlay_wake(handle: OverlayWakeHandle, origin: ScreenPoin
         .context("x coordinate does not fit WPARAM")?;
     let encoded_y = isize::try_from(origin.y).context("y coordinate does not fit LPARAM")?;
 
-    // SAFETY: the handle identifies Gradial's live root window. This posts a
+    // SAFETY: the handle identifies a live Gradial overlay window. This posts a
     // private message and never synchronously enters the UI thread.
     unsafe {
         PostMessageW(Some(window), WM_GRADIAL_SHOW_OVERLAY, WPARAM(encoded_x), LPARAM(encoded_y))
@@ -77,13 +94,58 @@ pub(crate) fn request_overlay_wake(handle: OverlayWakeHandle, origin: ScreenPoin
 
 pub(crate) fn request_overlay_hide(handle: OverlayWakeHandle) -> Result<()> {
     let window = HWND(std::ptr::with_exposed_provenance_mut(handle.window_address));
-    // SAFETY: the handle identifies Gradial's live root window. This posts a
+    // SAFETY: the handle identifies a live Gradial overlay window. This posts a
     // private fail-safe hide request without entering the UI thread.
     unsafe {
         PostMessageW(Some(window), WM_GRADIAL_HIDE_OVERLAY, WPARAM(0), LPARAM(0))
             .context("could not request a fail-safe overlay hide")?;
     }
     Ok(())
+}
+
+pub(crate) fn overlay_window_by_title(title: &str) -> Option<OverlayWakeHandle> {
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: the class name is absent and `wide` is a live, null-terminated
+    // title string for the duration of the lookup.
+    let window = unsafe { FindWindowW(None, PCWSTR::from_raw(wide.as_ptr())) }.ok()?;
+    Some(OverlayWakeHandle { window_address: window.0.addr() })
+}
+
+pub(crate) fn configure_overlay_handle(handle: OverlayWakeHandle) -> Result<()> {
+    apply_native_window_styles_hwnd(hwnd_from_handle(handle))
+}
+
+pub(crate) fn position_hidden_overlay(
+    handle: OverlayWakeHandle,
+    origin: ScreenPoint,
+) -> Result<()> {
+    let hwnd = hwnd_from_handle(handle);
+    let mut rectangle = RECT::default();
+
+    // SAFETY: the handle identifies a live Gradial viewport and the output
+    // points to a local RECT.
+    unsafe {
+        let _was_visible = ShowWindow(hwnd, SW_HIDE);
+        GetWindowRect(hwnd, &raw mut rectangle).context("could not measure the overlay window")?;
+    }
+
+    let width = rectangle.right.saturating_sub(rectangle.left);
+    let height = rectangle.bottom.saturating_sub(rectangle.top);
+    let x = origin.x.saturating_sub(width / 2);
+    let y = origin.y.saturating_sub(height / 2);
+
+    // SAFETY: this keeps the live viewport hidden and inactive while moving it
+    // onto the display whose DPI it must adopt.
+    unsafe {
+        SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
+            .context("could not preposition the hidden overlay")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn overlay_window_dpi(handle: OverlayWakeHandle) -> u32 {
+    // SAFETY: the handle identifies a live Gradial viewport.
+    unsafe { GetDpiForWindow(hwnd_from_handle(handle)) }
 }
 
 pub(crate) fn monitor_work_areas() -> Result<Vec<MonitorGeometry>> {
@@ -110,6 +172,9 @@ pub(crate) fn configure_overlay_window(
 ) -> Result<()> {
     let window =
         creation_context.winit_window().context("eframe did not expose its root Windows window")?;
+    let hwnd = window_handle(window)?;
+    CONTROLLER_WINDOW_ADDRESS.store(hwnd.0.addr(), Ordering::Release);
+    let _existing_context = CONTROLLER_REPAINT_CONTEXT.set(creation_context.egui_ctx.clone());
 
     window.set_cursor_hittest(false).context("could not make the overlay click-through")?;
 
@@ -120,15 +185,10 @@ pub(crate) fn enforce_overlay_window_styles(frame: &eframe::Frame) -> Result<()>
     apply_native_window_styles(frame)
 }
 
-pub(crate) fn position_and_show_overlay(frame: &eframe::Frame, origin: ScreenPoint) -> Result<()> {
-    let hwnd = window_handle(frame)?;
-    position_and_show_window(hwnd, origin)
-}
-
 fn position_and_show_window(hwnd: HWND, origin: ScreenPoint) -> Result<()> {
     let mut rectangle = RECT::default();
 
-    // SAFETY: `hwnd` is eframe's live root window and the output pointer
+    // SAFETY: `hwnd` is a live eframe overlay window and the output pointer
     // refers to a local RECT.
     unsafe {
         GetWindowRect(hwnd, &raw mut rectangle).context("could not measure the overlay window")?;
@@ -140,7 +200,7 @@ fn position_and_show_window(hwnd: HWND, origin: ScreenPoint) -> Result<()> {
     let y = origin.y.saturating_sub(height / 2);
     let flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
 
-    // SAFETY: the live root window is moved in physical screen coordinates,
+    // SAFETY: the live overlay window is moved in physical screen coordinates,
     // preserving its size and activation state.
     unsafe {
         SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, flags)
@@ -149,6 +209,10 @@ fn position_and_show_window(hwnd: HWND, origin: ScreenPoint) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn hwnd_from_handle(handle: OverlayWakeHandle) -> HWND {
+    HWND(std::ptr::with_exposed_provenance_mut(handle.window_address))
 }
 
 pub(crate) fn hide_overlay(frame: &eframe::Frame) -> Result<()> {
@@ -163,10 +227,14 @@ pub(crate) fn hide_overlay(frame: &eframe::Frame) -> Result<()> {
 
 fn apply_native_window_styles(window: &impl HasWindowHandle) -> Result<()> {
     let hwnd = window_handle(window)?;
+    apply_native_window_styles_hwnd(hwnd)
+}
+
+fn apply_native_window_styles_hwnd(hwnd: HWND) -> Result<()> {
     let required_style = isize::try_from((WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW).0)
         .context("required overlay styles do not fit this Windows target")?;
 
-    // SAFETY: `hwnd` is the live root window owned by this UI thread. The
+    // SAFETY: `hwnd` is a live Gradial window owned by this UI thread. The
     // style update, subclass, and position call do not retain Rust references.
     unsafe {
         let current_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -286,12 +354,26 @@ unsafe extern "system" fn overlay_subclass_proc(
             LRESULT(0)
         }
         WM_GRADIAL_HIDE_OVERLAY => {
-            // SAFETY: `hwnd` is Gradial's live root window and hiding it does
+            // SAFETY: `hwnd` is a live Gradial overlay and hiding it does
             // not activate or destroy it.
             unsafe {
                 let _was_visible = ShowWindow(hwnd, SW_HIDE);
             }
             LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            mark_display_topology_changed();
+            // SAFETY: unhandled window messages must continue through the
+            // Windows subclass chain.
+            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        }
+        WM_SETTINGCHANGE
+            if wparam.0 == usize::try_from(SPI_SETWORKAREA.0).unwrap_or(usize::MAX) =>
+        {
+            mark_display_topology_changed();
+            // SAFETY: unhandled window messages must continue through the
+            // Windows subclass chain.
+            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
         }
         WM_MOUSEACTIVATE => LRESULT(isize::try_from(MA_NOACTIVATE).expect("constant fits isize")),
         WM_NCHITTEST => LRESULT(isize::try_from(HTTRANSPARENT).expect("constant fits isize")),
@@ -309,6 +391,34 @@ unsafe extern "system" fn overlay_subclass_proc(
             // SAFETY: forwarding unhandled window messages is required by the
             // Windows subclass contract.
             unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        }
+    }
+}
+
+fn mark_display_topology_changed() {
+    if DISPLAY_TOPOLOGY_MONITORING.load(Ordering::Acquire) {
+        let already_changed = DISPLAY_TOPOLOGY_CHANGED.swap(true, Ordering::AcqRel);
+        if !already_changed {
+            log::info!(
+                target: "renderer",
+                "component=renderer event_code=display_topology_signal_observed result_code=ok \
+                 config_revision=0"
+            );
+        }
+        if let Some(context) = CONTROLLER_REPAINT_CONTEXT.get() {
+            context.request_repaint_of(eframe::egui::ViewportId::ROOT);
+        }
+        let controller_address = CONTROLLER_WINDOW_ADDRESS.load(Ordering::Acquire);
+        if controller_address != 0 {
+            let controller = HWND(std::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(
+                controller_address,
+            ));
+            // SAFETY: the address belongs to Gradial's live root viewport.
+            // Invalidating it wakes winit's hidden-window redraw path so the
+            // controller can consume the atomic topology signal.
+            unsafe {
+                let _invalidated = InvalidateRect(Some(controller), None, false);
+            }
         }
     }
 }

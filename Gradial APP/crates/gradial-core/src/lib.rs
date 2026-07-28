@@ -9,6 +9,6 @@ pub use interaction::{
     CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, InputEvent,
     InputEventKind, InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
     InvocationGeometry, InvocationSnapshot, MonitorGeometry, ResolvedGeometry, ScreenPoint,
-    ScreenRect, resolve_invocation_geometry,
+    ScreenRect, monitor_index_for_point, resolve_invocation_geometry,
 };
 pub use paths::{AppPaths, AppPathsError};

@@ -131,9 +131,10 @@ pub fn resolve_invocation_geometry(
     monitors: &[MonitorGeometry],
     overlay_half_extent_dip: u32,
 ) -> InvocationGeometry {
-    let Some(monitor) = monitor_for_point(cursor, monitors) else {
+    let Some(monitor_index) = monitor_index_for_point(cursor, monitors) else {
         return InvocationGeometry::fixed(cursor, 96);
     };
+    let monitor = monitors[monitor_index];
     let half_extent_px = scale_dip_ceil(overlay_half_extent_dip, monitor.dpi);
     let fixed_fits = monitor.work_area.centered_content_fits(cursor, half_extent_px);
     let behavior = match mode {
@@ -180,6 +181,7 @@ pub enum CancelReason {
     NoSelection,
     InputQueueOverflow,
     HookUnresponsive,
+    DisplayTopologyChange,
     Shutdown,
 }
 
@@ -446,9 +448,14 @@ const fn clamp_or_midpoint(value: i32, minimum: i32, maximum: i32) -> i32 {
     }
 }
 
-fn monitor_for_point(point: ScreenPoint, monitors: &[MonitorGeometry]) -> Option<MonitorGeometry> {
-    monitors.iter().copied().find(|monitor| monitor.bounds.contains(point)).or_else(|| {
-        monitors.iter().copied().min_by_key(|monitor| distance_to_rect(point, monitor.bounds))
+#[must_use]
+pub fn monitor_index_for_point(point: ScreenPoint, monitors: &[MonitorGeometry]) -> Option<usize> {
+    monitors.iter().position(|monitor| monitor.bounds.contains(point)).or_else(|| {
+        monitors
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, monitor)| distance_to_rect(point, monitor.bounds))
+            .map(|(index, _)| index)
     })
 }
 
@@ -553,8 +560,8 @@ mod tests {
     use super::{
         CancelReason, GeometryMode, GestureConfig, InteractionController, InteractionEffect,
         InteractionOutcome, InteractionState, InvocationGeometry, InvocationSnapshot,
-        MonitorGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, resolve_invocation_geometry,
-        slice_for_angle, slice_for_delta,
+        MonitorGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, monitor_index_for_point,
+        resolve_invocation_geometry, slice_for_angle, slice_for_delta,
     };
     use crate::SliceCount;
     use uuid::Uuid;
@@ -693,6 +700,27 @@ mod tests {
                 monitor_dpi: 96,
             }
         );
+    }
+
+    #[test]
+    fn monitor_routing_handles_negative_coordinates_and_nearest_fallback() {
+        let monitors = [
+            MonitorGeometry {
+                bounds: ScreenRect::new(-1_920, 0, 0, 1_080),
+                work_area: ScreenRect::new(-1_920, 0, 0, 1_040),
+                dpi: 96,
+            },
+            MonitorGeometry {
+                bounds: ScreenRect::new(0, 0, 2_560, 1_440),
+                work_area: ScreenRect::new(0, 0, 2_560, 1_400),
+                dpi: 144,
+            },
+        ];
+
+        assert_eq!(monitor_index_for_point(ScreenPoint::new(-500, 200), &monitors), Some(0));
+        assert_eq!(monitor_index_for_point(ScreenPoint::new(500, 200), &monitors), Some(1));
+        assert_eq!(monitor_index_for_point(ScreenPoint::new(3_000, 200), &monitors), Some(1));
+        assert_eq!(monitor_index_for_point(ScreenPoint::default(), &[]), None);
     }
 
     #[test]

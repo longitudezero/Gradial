@@ -2,9 +2,10 @@
 
 Gradial is a Windows 11 radial launcher built around a hold, flick, and release
 gesture. The current development build includes the first complete interaction
-spine: a non-activating GPU overlay, dedicated low-level input thread, bounded
-event transport, tested eight-slice gesture state machine, automatic edge
-assist, and focus/timing instrumentation.
+spine and the first bounded Milestone 1 slice: a prewarmed, non-activating GPU
+overlay for every connected display; dedicated low-level input thread; bounded
+event transport; tested eight-slice gesture state machine; automatic edge
+assist; display/DPI rebuild handling; and focus/timing instrumentation.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -49,8 +50,11 @@ back/navigation behavior is suppressed. This milestone deliberately does not
 execute launcher actions; release only writes `slice_selected` with
 `action_executed=false` to the local log.
 
-The overlay is click-through and never intentionally takes focus. Stop the
-debug process with `Ctrl+C` in the terminal or the stop button in VS Code.
+The display under the M4-down cursor selects the prewarmed overlay window.
+Display, work-area, or DPI changes cancel an active gesture and rebuild the
+window pool before M4 is accepted again. Every overlay is click-through and
+never intentionally takes focus. Stop the debug process with `Ctrl+C` in the
+terminal or the stop button in VS Code.
 
 Run all local checks with:
 
@@ -61,4 +65,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
 See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
-[`Documentation/milestone-0-smoke-results.md`](Documentation/milestone-0-smoke-results.md).
+[`Documentation/milestone-0-smoke-results.md`](Documentation/milestone-0-smoke-results.md),
+and the per-display pool evidence is in
+[`Documentation/milestone-1-overlay-pool-results.md`](Documentation/milestone-1-overlay-pool-results.md).

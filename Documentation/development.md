@@ -2,12 +2,14 @@
 
 ## Current milestone scope
 
-The foundation and Milestone 0 interaction spike establish:
+The foundation, Milestone 0 interaction spike, and first bounded Milestone 1
+slice establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
 - A Windows `gradial` executable rendered by egui through wgpu.
-- A transparent, borderless, topmost, click-through overlay.
+- One prewarmed transparent, borderless, topmost, click-through overlay per
+  active display.
 - Per-Monitor V2 DPI awareness through the embedded application manifest.
 - `%LOCALAPPDATA%\Gradial` directories for configuration, icons, and bounded
   local logs.
@@ -23,6 +25,9 @@ The foundation and Milestone 0 interaction spike establish:
 - Focus checkpoints at activation, after the first rendered-frame checkpoint,
   and after close.
 - An ETW provider whose invocation markers can be correlated with PresentMon.
+- Display/DPI/work-area change detection that suspends new gestures, cancels an
+  active gesture, replaces the overlay pool, and restarts input only after every
+  new viewport is warm.
 
 It intentionally does not create a tray icon, save configuration, validate
 targets, or execute actions. A release logs the chosen slice but cannot launch
@@ -79,22 +84,27 @@ Gradial uses three execution contexts:
 | --- | --- | --- |
 | Win32 input thread | Classify M4, raw deltas, movement, Escape, and cancellation input | No, inside callbacks |
 | Interaction thread | Snapshot invocation state and advance the pure gesture controller | Yes, outside callbacks |
-| eframe UI thread | Move, show, paint, and hide the overlay | Yes |
+| eframe UI thread | Maintain the hidden controller and paint independent per-display viewports | Yes |
 
 The input thread owns the low-level hooks, heartbeat timer, and a message-only
 window registered for raw mouse input. Both event sources execute serially on
 that one thread and feed one producer. The hook callback copies fixed-size
 events into an `rtrb` SPSC ring buffer with a capacity of 4,096. It never logs,
 waits, paints, takes a contended lock, enumerates displays, or calls action
-code. Display work areas are collected at startup and treated as immutable by
-the callback. Overflow sets an atomic fault flag. The interaction thread then
-closes any active invocation and enters a fail-safe fault state; restart the
-development build to recover.
+code. Display work areas are immutable for the lifetime of one hook runtime.
+When topology changes, an atomic gate first makes new M4 presses pass through,
+then the interaction thread closes any active invocation, the old hook runtime
+stops, and a replacement starts with the newly enumerated displays. Overflow
+sets an atomic fault flag. The interaction thread then closes any active
+invocation and enters a fail-safe fault state; restart the development build to
+recover.
 
-The interaction-to-UI channel is bounded to 64 commands. Selection repaint
-commands can be dropped with an explicit log if the UI falls behind. Open and
-close lifecycle commands receive one bounded 50 ms drain opportunity so menu
-visibility remains balanced without ever delaying the hook callback.
+At M4-down, the interaction thread maps the signed physical cursor coordinate
+to the same monitor ordering used by the overlay pool. It updates only that
+viewport's small shared presentation state and requests that child viewport's
+independent repaint. Open and close also post private native messages directly
+to the selected window, so they do not wait for the hidden controller's
+throttled repaint cycle. None of this work occurs in a low-level hook callback.
 
 The hook thread owns a 250 ms message-loop heartbeat. An active invocation is
 faulted when the heartbeat is more than 750 ms old. On graceful shutdown,
@@ -148,9 +158,13 @@ movement. Raw input is used only during an active edge-assisted invocation.
 The eight-direction mapping, forced modes, corner insets at 200% DPI, and
 absolute-motion suppression are unit tested.
 
-## Overlay guarantees in this milestone
+## Per-display overlay guarantees
 
-The root viewport starts hidden and is:
+The root viewport is a permanently hidden controller. At startup, Gradial
+creates one independent 288 DIP deferred viewport for every active monitor.
+Each child is moved onto its assigned monitor while hidden, checked with
+`GetDpiForWindow`, painted enough times to make its graphics resources resident,
+and only then exposed to the input runtime. Every child is:
 
 - transparent and borderless;
 - rendered with wgpu;
@@ -161,24 +175,25 @@ The root viewport starts hidden and is:
 - returning `MA_NOACTIVATE` for `WM_MOUSEACTIVATE`;
 - returning `HTTRANSPARENT` for `WM_NCHITTEST`.
 
-eframe/winit finalizes some extended styles after constructing the application.
-Gradial therefore applies and reads back the required styles during construction
-and the first two logic passes. Logic passes run when the hidden window receives
-a cross-thread repaint request. eframe intentionally delays repaint requests
-for invisible Windows windows by 100 ms. On an open effect, Gradial first posts
-a private message that the overlay subclass handles on the UI thread; it
-positions and shows the prewarmed window with no-activation flags. The following
-repaint request then bypasses that invisible-window delay. Gradial does no style
-polling after the window reaches its steady state.
+eframe/winit finalizes some extended styles after constructing a viewport.
+Gradial therefore applies and reads back the required styles during prewarming,
+then keeps the viewport hidden until activation. On an open effect, a private
+message handled by that child's native subclass positions and shows it with
+no-activation flags. The matching child repaint is independent of the invisible
+root-controller repaint cycle.
 
-This is one development preview window, not the final per-monitor pool. The
-production core will prewarm one overlay per connected monitor and keep them
-hidden until activation.
+`WM_DISPLAYCHANGE`, `WM_DPICHANGED`, and `WM_SETTINGCHANGE` for the work area
+invalidate the pool. Monitoring is deliberately disabled while windows are
+being placed, because initial PMv2 placement can itself emit DPI messages. A
+real change suspends M4, cancels an open invocation with
+`DisplayTopologyChange`, hides the routed child, destroys the old runtime/pool,
+enumerates signed work areas again, and prewarms a new generation. Input resumes
+only after all new child windows report the expected DPI.
 
 ## Focus and timing diagnostics
 
-`FocusProbe` records the foreground window at activation, after the next UI
-frame checkpoint, and immediately after hiding the overlay. A checkpoint passes
+Focus diagnostics compare the foreground window at activation, after the next
+child-viewport frame checkpoint, and immediately after hiding the overlay. A checkpoint passes
 when the same window remains foreground or when the target process itself
 changed its foreground window. Gradial never calls an API that activates or
 restores the foreground window.
@@ -224,7 +239,10 @@ Run the full display-event capture from an elevated PowerShell. Pass
    and move in an outward direction. The complete ring should be inset, the
    outward slice should highlight, and the system cursor should remain in
    place.
-8. Stop Gradial and inspect
+8. Change display scaling, work area, or the connected-display layout. An open
+   gesture should cancel, and M4 should become available again after
+   `overlay_pool_ready` reports the next generation.
+9. Stop Gradial and inspect
    `%LOCALAPPDATA%\Gradial\logs\gradial_rCURRENT.log` for
    `hook_thread_responsive`, `invocation_started`, three
    `focus_checkpoint` records, `slice_selected` or `invocation_cancelled`, and
@@ -242,12 +260,18 @@ cursor, and closes only the process it started:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry edge-assist
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -MonitorIndex 1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateDisplayChange
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
 PresentMon capture around the synthetic gesture. In a non-elevated development
 shell, add `-TimingMarkersOnly`. Pass `-Configuration release` after building
-with `cargo build --release` for performance-oriented checks.
+with `cargo build --release` for performance-oriented checks. `-MonitorIndex`
+selects an entry from Windows' current display list. `-SimulateDisplayChange`
+holds M4, posts the same notification used by the native rebuild path, verifies
+the active invocation is cancelled, waits until generation 1 is fully rewarmed,
+and then sends a fresh gesture.
 
 ## Checks
 

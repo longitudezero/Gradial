@@ -10,7 +10,12 @@ param(
     [switch]$TimingMarkersOnly,
 
     [ValidateRange(1, 30)]
-    [int]$CaptureDurationSeconds = 4
+    [int]$CaptureDurationSeconds = 4,
+
+    [ValidateRange(0, 15)]
+    [int]$MonitorIndex = 0,
+
+    [switch]$SimulateDisplayChange
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,6 +105,23 @@ public static class GradialSmokeNative
         foreach (var window in windows) PostMessage(window, 0x0010u, IntPtr.Zero, IntPtr.Zero);
     }
 
+    public static int NotifyDisplayChangeForProcess(uint processId)
+    {
+        var count = 0;
+        EnumWindows((window, data) => {
+            uint windowProcessId;
+            GetWindowThreadProcessId(window, out windowProcessId);
+            if (windowProcessId == processId && PostMessage(
+                window,
+                0x007Eu,
+                IntPtr.Zero,
+                IntPtr.Zero
+            )) count++;
+            return true;
+        }, IntPtr.Zero);
+        return count;
+    }
+
     private static void SendMouse(int dx, int dy, uint data, uint flags)
     {
         var inputs = new[] {
@@ -142,7 +164,11 @@ $gradial = $null
 $timingCapture = $null
 
 try {
-    $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $screens = [System.Windows.Forms.Screen]::AllScreens
+    if ($MonitorIndex -ge $screens.Count) {
+        throw "Monitor index $MonitorIndex is unavailable; Windows reported $($screens.Count) display(s)."
+    }
+    $workArea = $screens[$MonitorIndex].WorkingArea
     if ($Geometry -eq "fixed-origin") {
         $testX = $workArea.Left + [int]($workArea.Width / 2)
         $testY = $workArea.Top + [int]($workArea.Height / 2)
@@ -167,6 +193,47 @@ try {
     Start-Sleep -Milliseconds 1200
     if ($gradial.HasExited) {
         throw "Gradial exited during startup with code $($gradial.ExitCode)."
+    }
+    if ($SimulateDisplayChange) {
+        [GradialSmokeNative]::SendM4($true)
+        $m4IsDown = $true
+        Start-Sleep -Milliseconds 180
+        $notifiedWindows = [GradialSmokeNative]::NotifyDisplayChangeForProcess(
+            [uint32]$gradial.Id
+        )
+        if ($notifiedWindows -eq 0) {
+            throw "Could not deliver a display-change notification to Gradial."
+        }
+
+        $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
+        $rebuildDeadline = [DateTime]::UtcNow.AddSeconds(4)
+        $poolRebuilt = $false
+        $activeGestureCancelled = $false
+        while ([DateTime]::UtcNow -lt $rebuildDeadline) {
+            if (Test-Path -LiteralPath $logPath) {
+                $logContents = Get-Content -Raw -LiteralPath $logPath
+                $poolRebuilt = $logContents -match `
+                    "event_code=overlay_pool_ready.*generation=1"
+                $activeGestureCancelled = $logContents -match `
+                    "event_code=invocation_cancelled.*reason=DisplayTopologyChange"
+                if ($poolRebuilt -and $activeGestureCancelled) {
+                    break
+                }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $poolRebuilt) {
+            throw "Gradial did not rebuild and rewarm its overlay pool after the display change."
+        }
+        if (-not $activeGestureCancelled) {
+            throw "Gradial did not cancel the active gesture during the display change."
+        }
+        if ($gradial.HasExited) {
+            throw "Gradial exited while rebuilding its overlay pool."
+        }
+        [GradialSmokeNative]::SendM4($false)
+        $m4IsDown = $false
+        Start-Sleep -Milliseconds 100
     }
     if ($CaptureTiming) {
         $captureScript = Join-Path $PSScriptRoot "capture-timing.ps1"
@@ -256,4 +323,4 @@ if ($log -notmatch "event_code=focus_checkpoint .*phase=after_close .*accepted=t
     throw "The live check did not complete the focus checkpoints."
 }
 
-Write-Host "Live $Configuration $Geometry smoke check passed."
+Write-Host "Live $Configuration $Geometry smoke check passed on monitor $MonitorIndex."

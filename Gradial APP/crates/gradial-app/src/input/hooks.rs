@@ -104,6 +104,7 @@ impl HookThread {
     pub(crate) fn spawn(
         producer: Producer<InputEvent>,
         configuration: InputConfiguration,
+        accepting_input: Arc<AtomicBool>,
     ) -> Result<Self> {
         let metrics = HookThreadMetrics::new();
         let thread_metrics = metrics.clone();
@@ -112,7 +113,13 @@ impl HookThread {
         let join_handle = thread::Builder::new()
             .name("gradial-input".to_owned())
             .spawn(move || {
-                run_hook_thread(producer, configuration, &thread_metrics, &startup_sender);
+                run_hook_thread(
+                    producer,
+                    configuration,
+                    accepting_input,
+                    &thread_metrics,
+                    &startup_sender,
+                );
             })
             .context("could not spawn the dedicated input-hook thread")?;
 
@@ -166,11 +173,17 @@ impl Drop for HookThread {
 fn run_hook_thread(
     producer: Producer<InputEvent>,
     configuration: InputConfiguration,
+    accepting_input: Arc<AtomicBool>,
     metrics: &HookThreadMetrics,
     startup_sender: &crossbeam_channel::Sender<Result<u32, String>>,
 ) {
     CALLBACK_STATE.with(|slot| {
-        slot.replace(Some(HookCallbackState::new(producer, configuration, metrics)));
+        slot.replace(Some(HookCallbackState::new(
+            producer,
+            configuration,
+            accepting_input,
+            metrics,
+        )));
     });
 
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -396,6 +409,7 @@ struct HookCallbackState {
     #[cfg(debug_assertions)]
     debug: DebugHookMetrics,
     configuration: InputConfiguration,
+    accepting_input: Arc<AtomicBool>,
     suppression: SuppressionState,
 }
 
@@ -403,6 +417,7 @@ impl HookCallbackState {
     fn new(
         producer: Producer<InputEvent>,
         configuration: InputConfiguration,
+        accepting_input: Arc<AtomicBool>,
         metrics: &HookThreadMetrics,
     ) -> Self {
         Self {
@@ -412,6 +427,7 @@ impl HookCallbackState {
             #[cfg(debug_assertions)]
             debug: metrics.debug.clone(),
             configuration,
+            accepting_input,
             suppression: SuppressionState::default(),
         }
     }
@@ -428,6 +444,9 @@ impl HookCallbackState {
         match message {
             WM_XBUTTONDOWN if high_word(mouse.mouseData) == XBUTTON1 => {
                 if self.suppression.geometry.is_none() {
+                    if !self.accepting_input.load(Ordering::Acquire) {
+                        return false;
+                    }
                     let geometry = resolve_invocation_geometry(
                         self.configuration.geometry_mode,
                         point,
@@ -491,7 +510,9 @@ impl HookCallbackState {
     }
 
     fn handle_raw_delta(&mut self, dx: i32, dy: i32, timestamp: i64) {
-        if self.suppression.geometry == Some(ResolvedGeometry::EdgeAssist) {
+        if self.accepting_input.load(Ordering::Acquire)
+            && self.suppression.geometry == Some(ResolvedGeometry::EdgeAssist)
+        {
             self.push(InputEvent::new(
                 timestamp,
                 ScreenPoint::default(),
@@ -577,6 +598,11 @@ fn query_qpc() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use gradial_core::{
         CancelReason, GeometryMode, InputEvent, InputEventKind, InvocationGeometry,
         MonitorGeometry, ResolvedGeometry, ScreenPoint, ScreenRect,
@@ -613,7 +639,12 @@ mod tests {
             }],
         };
         (
-            HookCallbackState::new(producer, configuration, &super::HookThreadMetrics::new()),
+            HookCallbackState::new(
+                producer,
+                configuration,
+                Arc::new(AtomicBool::new(true)),
+                &super::HookThreadMetrics::new(),
+            ),
             consumer,
         )
     }
@@ -705,6 +736,15 @@ mod tests {
         };
 
         assert!(!state.handle_mouse(WM_XBUTTONDOWN, &injected, 10));
+        assert!(consumer.pop().is_err());
+    }
+
+    #[test]
+    fn suspended_input_passes_new_m4_gestures_through() {
+        let (mut state, mut consumer) = callback_state();
+        state.accepting_input.store(false, Ordering::Release);
+
+        assert!(!state.handle_mouse(WM_XBUTTONDOWN, &mouse(ScreenPoint::default(), XBUTTON1), 10));
         assert!(consumer.pop().is_err());
     }
 
