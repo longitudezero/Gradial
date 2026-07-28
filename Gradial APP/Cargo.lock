@@ -941,12 +941,15 @@ name = "gradial-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "eframe",
  "embed-resource",
  "flexi_logger",
  "gradial-core",
  "log",
  "raw-window-handle",
+ "rtrb",
+ "uuid",
  "windows",
 ]
 
@@ -956,6 +959,7 @@ version = "0.1.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
@@ -2169,6 +2173,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "rtrb"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2663,6 +2673,11 @@ name = "uuid"
 version = "1.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+dependencies = [
+ "getrandom",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "vello_common"

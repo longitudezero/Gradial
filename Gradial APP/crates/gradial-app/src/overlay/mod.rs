@@ -18,7 +18,8 @@ pub(crate) fn native_options() -> eframe::NativeOptions {
             .with_always_on_top()
             .with_taskbar(false)
             .with_mouse_passthrough(true)
-            .with_active(false),
+            .with_active(false)
+            .with_visible(false),
         renderer: eframe::Renderer::Wgpu,
         centered: true,
         persist_window: false,

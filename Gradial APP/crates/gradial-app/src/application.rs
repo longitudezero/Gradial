@@ -1,12 +1,14 @@
 use anyhow::Result;
 
 use crate::{
+    interaction::{InteractionRuntime, OverlayCommand},
     overlay::{FoundationOverlayRenderer, OverlayRenderer},
     platform,
 };
 
 pub(crate) struct GradialApp {
     renderer: FoundationOverlayRenderer,
+    interaction: InteractionRuntime,
     native_style_passes: u8,
 }
 
@@ -15,8 +17,14 @@ impl GradialApp {
 
     pub(crate) fn new(creation_context: &eframe::CreationContext<'_>) -> Result<Self> {
         platform::configure_overlay_window(creation_context)?;
+        let interaction = InteractionRuntime::start(creation_context.egui_ctx.clone())?;
+        creation_context.egui_ctx.request_repaint();
 
-        Ok(Self { renderer: FoundationOverlayRenderer, native_style_passes: 0 })
+        Ok(Self {
+            renderer: FoundationOverlayRenderer::default(),
+            interaction,
+            native_style_passes: 0,
+        })
     }
 }
 
@@ -25,7 +33,7 @@ impl eframe::App for GradialApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
+    fn logic(&mut self, context: &eframe::egui::Context, frame: &mut eframe::Frame) {
         if self.native_style_passes < Self::REQUIRED_NATIVE_STYLE_PASSES {
             if let Err(error) = platform::enforce_overlay_window_styles(frame) {
                 log::error!(
@@ -33,14 +41,26 @@ impl eframe::App for GradialApp {
                     "component=renderer event_code=renderer_unavailable result_code=failure \
                      config_revision=0 error={error}"
                 );
-                ui.ctx().send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+                context.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
                 return;
             }
 
             self.native_style_passes += 1;
             if self.native_style_passes < Self::REQUIRED_NATIVE_STYLE_PASSES {
-                ui.ctx().request_repaint();
+                context.request_repaint();
             } else {
+                // eframe deliberately shows its root window after the first
+                // completed paint, even when the viewport requested hidden.
+                // Reassert Gradial's idle state after that initialization pass.
+                if let Err(error) = platform::hide_overlay(frame) {
+                    log::error!(
+                        target: "renderer",
+                        "component=renderer event_code=initial_overlay_hide_failed \
+                         result_code=failure config_revision=0 error={error}"
+                    );
+                    context.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+                    return;
+                }
                 log::info!(
                     target: "renderer",
                     "component=renderer event_code=overlay_ready result_code=ok config_revision=0"
@@ -48,6 +68,40 @@ impl eframe::App for GradialApp {
             }
         }
 
-        self.renderer.render(ui);
+        while let Some(command) = self.interaction.try_command() {
+            let result = match command {
+                OverlayCommand::Open { origin } => {
+                    self.renderer.set_selected_slice(None);
+                    platform::position_and_show_overlay(frame, origin)
+                }
+                OverlayCommand::SelectionChanged { selected_slice } => {
+                    self.renderer.set_selected_slice(selected_slice);
+                    Ok(())
+                }
+                OverlayCommand::Close => {
+                    self.renderer.set_selected_slice(None);
+                    platform::hide_overlay(frame)
+                }
+            };
+
+            if let Err(error) = result {
+                log::error!(
+                    target: "renderer",
+                    "component=renderer event_code=overlay_command_failed result_code=failure \
+                     config_revision=0 error={error}"
+                );
+                context.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+                return;
+            }
+        }
+    }
+
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe makes its root window visible after the first rendered frame.
+        // Keep that initialization frame fully transparent; the second logic
+        // pass re-hides the native window before Gradial paints menu content.
+        if self.native_style_passes >= Self::REQUIRED_NATIVE_STYLE_PASSES {
+            self.renderer.render(ui);
+        }
     }
 }

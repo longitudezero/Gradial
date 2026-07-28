@@ -2,6 +2,8 @@
 
 mod application;
 mod diagnostics;
+mod input;
+mod interaction;
 mod overlay;
 mod platform;
 
@@ -12,7 +14,7 @@ fn main() -> Result<()> {
     let paths = AppPaths::discover().context("could not resolve Gradial's local data directory")?;
     paths.ensure_directories().context("could not prepare Gradial's local data directories")?;
 
-    let _logger =
+    let logger =
         diagnostics::initialize(&paths.logs).context("could not initialize local logging")?;
     log::info!(
         target: "startup",
@@ -29,7 +31,7 @@ fn main() -> Result<()> {
         }),
     );
 
-    match run_result {
+    let result = match run_result {
         Ok(()) => {
             log::info!(
                 target: "startup",
@@ -44,5 +46,10 @@ fn main() -> Result<()> {
             );
             Err(anyhow!("Gradial's window loop failed: {error}"))
         }
-    }
+    };
+
+    // The file writer is asynchronous. Explicit shutdown drains its queue so
+    // the final interaction and hook metrics survive a short development run.
+    logger.shutdown();
+    result
 }

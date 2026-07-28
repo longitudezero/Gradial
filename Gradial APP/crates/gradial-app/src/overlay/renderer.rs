@@ -1,4 +1,7 @@
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Stroke, epaint::CircleShape};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Pos2, Stroke,
+    epaint::{CircleShape, Shape},
+};
 use gradial_core::SliceCount;
 
 const RING_RADIUS_DIP: f32 = 84.0;
@@ -6,6 +9,8 @@ const RING_WIDTH_DIP: f32 = 46.0;
 const INNER_RADIUS_DIP: f32 = RING_RADIUS_DIP - RING_WIDTH_DIP / 2.0;
 const OUTER_RADIUS_DIP: f32 = RING_RADIUS_DIP + RING_WIDTH_DIP / 2.0;
 const LABEL_RADIUS_DIP: f32 = 84.0;
+const SELECTED_ARC_STEPS: u8 = 24;
+const SELECTED_ARC_INSET_RADIANS: f32 = 0.035;
 
 /// Narrow rendering boundary used by the interaction layer.
 pub(crate) trait OverlayRenderer {
@@ -13,7 +18,15 @@ pub(crate) trait OverlayRenderer {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct FoundationOverlayRenderer;
+pub(crate) struct FoundationOverlayRenderer {
+    selected_slice: Option<usize>,
+}
+
+impl FoundationOverlayRenderer {
+    pub(crate) fn set_selected_slice(&mut self, selected_slice: Option<usize>) {
+        self.selected_slice = selected_slice;
+    }
+}
 
 impl OverlayRenderer for FoundationOverlayRenderer {
     fn render(&mut self, ui: &mut egui::Ui) {
@@ -26,6 +39,10 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             fill: Color32::TRANSPARENT,
             stroke: Stroke::new(RING_WIDTH_DIP, Color32::from_rgba_unmultiplied(18, 23, 35, 224)),
         });
+
+        if let Some(selected_slice) = self.selected_slice {
+            draw_selected_slice(painter, center, selected_slice);
+        }
 
         painter.circle_stroke(
             center,
@@ -45,11 +62,32 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         painter.text(
             center,
             Align2::CENTER_CENTER,
-            "GRADIAL",
+            "M4",
             FontId::proportional(11.0),
             Color32::from_rgba_unmultiplied(225, 232, 255, 245),
         );
     }
+}
+
+fn draw_selected_slice(painter: &egui::Painter, center: Pos2, selected_slice: usize) {
+    let center_angle =
+        SliceCount::Eight.center_angle(selected_slice).expect("selected slice is validated");
+    let half_slice_angle = std::f32::consts::FRAC_PI_8;
+    let start_angle = center_angle - half_slice_angle + SELECTED_ARC_INSET_RADIANS;
+    let end_angle = center_angle + half_slice_angle - SELECTED_ARC_INSET_RADIANS;
+    let mut points = Vec::with_capacity(usize::from(SELECTED_ARC_STEPS) + 1);
+
+    for step in 0..=SELECTED_ARC_STEPS {
+        let progress = f32::from(step) / f32::from(SELECTED_ARC_STEPS);
+        let angle = start_angle + (end_angle - start_angle) * progress;
+        let direction = egui::Vec2::new(angle.sin(), -angle.cos());
+        points.push(center + direction * RING_RADIUS_DIP);
+    }
+
+    painter.add(Shape::line(
+        points,
+        Stroke::new(RING_WIDTH_DIP - 5.0, Color32::from_rgba_unmultiplied(91, 135, 255, 242)),
+    ));
 }
 
 fn draw_slice_boundaries(painter: &egui::Painter, center: Pos2) {

@@ -12,11 +12,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+crossbeam-channel.workspace = true
 eframe.workspace = true
 flexi_logger.workspace = true
 gradial-core = { path = "../gradial-core" }
 log.workspace = true
 raw-window-handle.workspace = true
+rtrb.workspace = true
+uuid.workspace = true
 windows.workspace = true
 
 [build-dependencies]
@@ -24,4 +27,3 @@ embed-resource = "3.0"
 
 [lints]
 workspace = true
-

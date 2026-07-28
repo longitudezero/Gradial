@@ -1,14 +1,16 @@
 use anyhow::{Context, Result, bail};
+use gradial_core::ScreenPoint;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, LRESULT, SetLastError, WIN32_ERROR, WPARAM},
+    Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM},
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE,
-            SET_WINDOW_POS_FLAGS, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-            SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_MOUSEACTIVATE,
-            WM_NCDESTROY, WM_NCHITTEST, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, HTTRANSPARENT, HWND_TOPMOST,
+            MA_NOACTIVATE, SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW,
+            SetWindowPos, ShowWindow, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -30,12 +32,45 @@ pub(crate) fn enforce_overlay_window_styles(frame: &eframe::Frame) -> Result<()>
     apply_native_window_styles(frame)
 }
 
+pub(crate) fn position_and_show_overlay(frame: &eframe::Frame, origin: ScreenPoint) -> Result<()> {
+    let hwnd = window_handle(frame)?;
+    let mut rectangle = RECT::default();
+
+    // SAFETY: `hwnd` is eframe's live root window and the output pointer
+    // refers to a local RECT.
+    unsafe {
+        GetWindowRect(hwnd, &raw mut rectangle).context("could not measure the overlay window")?;
+    }
+
+    let width = rectangle.right.saturating_sub(rectangle.left);
+    let height = rectangle.bottom.saturating_sub(rectangle.top);
+    let x = origin.x.saturating_sub(width / 2);
+    let y = origin.y.saturating_sub(height / 2);
+    let flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+
+    // SAFETY: the live root window is moved in physical screen coordinates,
+    // preserving its size and activation state.
+    unsafe {
+        SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, flags)
+            .context("could not position and show the overlay")?;
+        let _was_visible = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn hide_overlay(frame: &eframe::Frame) -> Result<()> {
+    let hwnd = window_handle(frame)?;
+    // SAFETY: `hwnd` is eframe's live root window. Hiding does not activate
+    // or destroy it.
+    unsafe {
+        let _was_visible = ShowWindow(hwnd, SW_HIDE);
+    }
+    Ok(())
+}
+
 fn apply_native_window_styles(window: &impl HasWindowHandle) -> Result<()> {
-    let handle = window.window_handle().context("could not acquire the overlay window handle")?;
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        bail!("Gradial requires a Win32 window handle");
-    };
-    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+    let hwnd = window_handle(window)?;
     let required_style = isize::try_from((WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW).0)
         .context("required overlay styles do not fit this Windows target")?;
 
@@ -71,11 +106,17 @@ fn apply_native_window_styles(window: &impl HasWindowHandle) -> Result<()> {
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags)
             .context("could not make the overlay topmost without activation")?;
-
-        let _was_visible = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 
     Ok(())
+}
+
+fn window_handle(window: &impl HasWindowHandle) -> Result<HWND> {
+    let handle = window.window_handle().context("could not acquire the overlay window handle")?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        bail!("Gradial requires a Win32 window handle");
+    };
+    Ok(HWND(handle.hwnd.get() as *mut core::ffi::c_void))
 }
 
 unsafe extern "system" fn overlay_subclass_proc(
