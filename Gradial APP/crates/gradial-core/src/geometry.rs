@@ -15,9 +15,10 @@ impl Point {
 }
 
 /// The menu sizes supported by the v1 interaction contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SliceCount {
     Four,
+    #[default]
     Eight,
 }
 
@@ -27,6 +28,14 @@ impl SliceCount {
         match self {
             Self::Four => 4,
             Self::Eight => 8,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Four => "4",
+            Self::Eight => "8",
         }
     }
 

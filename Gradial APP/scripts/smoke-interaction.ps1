@@ -2,6 +2,9 @@ param(
     [ValidateSet("auto", "fixed-origin", "edge-assist")]
     [string]$Geometry = "auto",
 
+    [ValidateSet("4", "8")]
+    [string]$Slices = "8",
+
     [ValidateSet("debug", "release")]
     [string]$Configuration = "debug",
 
@@ -186,7 +189,7 @@ try {
     }
 
     $gradial = Start-Process -FilePath $executable `
-        -ArgumentList "--geometry=$Geometry" `
+        -ArgumentList @("--geometry=$Geometry", "--slices=$Slices") `
         -WorkingDirectory $workspace `
         -PassThru `
         -WindowStyle Hidden
@@ -306,8 +309,8 @@ finally {
 
 $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
 $log = Get-Content -LiteralPath $logPath -Raw
-if ($log -notmatch "event_code=input_geometry_ready .*geometry_mode=$Geometry") {
-    throw "The log does not confirm geometry mode '$Geometry'."
+if ($log -notmatch "event_code=input_geometry_ready .*geometry_mode=$Geometry .*slice_count=$Slices") {
+    throw "The log does not confirm geometry mode '$Geometry' with $Slices slices."
 }
 if ($log -notmatch "event_code=invocation_started ") {
     throw "The live check did not produce a Gradial invocation."
@@ -316,11 +319,12 @@ $expectedBehavior = if ($Geometry -eq "fixed-origin") { "fixed-origin" } else { 
 if ($log -notmatch "event_code=invocation_started .*geometry=$expectedBehavior") {
     throw "The invocation did not resolve to expected behavior '$expectedBehavior'."
 }
-if ($log -notmatch "event_code=slice_selected .*slice_index=2 ") {
+$expectedEastSlice = if ($Slices -eq "4") { 1 } else { 2 }
+if ($log -notmatch "event_code=slice_selected .*slice_index=$expectedEastSlice ") {
     throw "The live eastward gesture did not select the east slice."
 }
 if ($log -notmatch "event_code=focus_checkpoint .*phase=after_close .*accepted=true") {
     throw "The live check did not complete the focus checkpoints."
 }
 
-Write-Host "Live $Configuration $Geometry smoke check passed on monitor $MonitorIndex."
+Write-Host "Live $Configuration $Geometry $Slices-slice smoke check passed on monitor $MonitorIndex."

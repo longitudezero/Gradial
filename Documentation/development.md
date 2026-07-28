@@ -17,7 +17,8 @@ slice establish:
 - A dedicated Win32 low-level mouse/keyboard hook thread.
 - M4 as a suppressed development trigger and Escape as cancellation.
 - A fixed-capacity, single-producer/single-consumer input queue.
-- An explicit, pure gesture state machine with eight slices and hysteresis.
+- An explicit, pure gesture state machine with four/eight slices and
+  hysteresis.
 - Hidden-at-idle overlay lifecycle, physical-pixel positioning, and selection
   highlighting.
 - Automatic fixed-origin/edge-assist resolution from signed work-area geometry.
@@ -128,7 +129,8 @@ the invocation monitor's effective DPI:
 - center cancellation radius: 24 DIP;
 - initial selection radius: 36 DIP;
 - boundary hysteresis: 5 degrees;
-- eight slices, with north at index 0 and indices increasing clockwise;
+- four or eight slices, with north at index 0 and indices increasing
+  clockwise;
 - release in the center/no-selection zone cancels;
 - Escape closes once, then waits for M4 release before returning to idle.
 
@@ -155,8 +157,19 @@ cargo run --package gradial-app -- --geometry=edge-assist
 
 The system cursor is never warped and Gradial does not synthesize pointer
 movement. Raw input is used only during an active edge-assisted invocation.
-The eight-direction mapping, forced modes, corner insets at 200% DPI, and
+The four/eight-direction mappings, forced modes, corner insets at 200% DPI, and
 absolute-motion suppression are unit tested.
+
+Eight slices are the default. `--slices=4` selects a cardinal N/E/S/W ring, and
+`--slices=8` selects N/NE/E/SE/S/SW/W/NW. Both counts use the same radii and
+five-degree boundary hysteresis; only the angular width, labels, selection
+indices, and highlight arc change. This is a development override rather than
+persistent configuration:
+
+```powershell
+cargo run --package gradial-app -- --slices=4
+cargo run --package gradial-app -- --geometry=edge-assist --slices=8
+```
 
 ## Per-display overlay guarantees
 
@@ -259,6 +272,7 @@ cursor, and closes only the process it started:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -Slices 4
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry edge-assist
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -MonitorIndex 1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateDisplayChange
@@ -268,10 +282,11 @@ Add `-CaptureTiming` to the second command to run the documented ETW and
 PresentMon capture around the synthetic gesture. In a non-elevated development
 shell, add `-TimingMarkersOnly`. Pass `-Configuration release` after building
 with `cargo build --release` for performance-oriented checks. `-MonitorIndex`
-selects an entry from Windows' current display list. `-SimulateDisplayChange`
-holds M4, posts the same notification used by the native rebuild path, verifies
-the active invocation is cancelled, waits until generation 1 is fully rewarmed,
-and then sends a fresh gesture.
+selects an entry from Windows' current display list. `-Slices 4` or `-Slices 8`
+selects and validates the corresponding startup geometry.
+`-SimulateDisplayChange` holds M4, posts the same notification used by the
+native rebuild path, verifies the active invocation is cancelled, waits until
+generation 1 is fully rewarmed, and then sends a fresh gesture.
 
 ## Checks
 

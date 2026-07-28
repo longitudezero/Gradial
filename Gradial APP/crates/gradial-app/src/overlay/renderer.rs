@@ -19,10 +19,15 @@ pub(crate) trait OverlayRenderer {
 
 #[derive(Debug, Default)]
 pub(crate) struct FoundationOverlayRenderer {
+    slice_count: SliceCount,
     selected_slice: Option<usize>,
 }
 
 impl FoundationOverlayRenderer {
+    pub(crate) const fn new(slice_count: SliceCount) -> Self {
+        Self { slice_count, selected_slice: None }
+    }
+
     pub(crate) fn set_selected_slice(&mut self, selected_slice: Option<usize>) {
         self.selected_slice = selected_slice;
     }
@@ -41,7 +46,7 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         });
 
         if let Some(selected_slice) = self.selected_slice {
-            draw_selected_slice(painter, center, selected_slice);
+            draw_selected_slice(painter, center, self.slice_count, selected_slice);
         }
 
         painter.circle_stroke(
@@ -55,8 +60,8 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(124, 154, 255, 125)),
         );
 
-        draw_slice_boundaries(painter, center);
-        draw_slice_labels(painter, center);
+        draw_slice_boundaries(painter, center, self.slice_count);
+        draw_slice_labels(painter, center, self.slice_count);
 
         painter.circle_filled(center, 28.0, Color32::from_rgba_unmultiplied(8, 12, 20, 235));
         painter.text(
@@ -69,10 +74,15 @@ impl OverlayRenderer for FoundationOverlayRenderer {
     }
 }
 
-fn draw_selected_slice(painter: &egui::Painter, center: Pos2, selected_slice: usize) {
+fn draw_selected_slice(
+    painter: &egui::Painter,
+    center: Pos2,
+    slice_count: SliceCount,
+    selected_slice: usize,
+) {
     let center_angle =
-        SliceCount::Eight.center_angle(selected_slice).expect("selected slice is validated");
-    let half_slice_angle = std::f32::consts::FRAC_PI_8;
+        slice_count.center_angle(selected_slice).expect("selected slice is validated");
+    let half_slice_angle = half_slice_angle(slice_count);
     let start_angle = center_angle - half_slice_angle + SELECTED_ARC_INSET_RADIANS;
     let end_angle = center_angle + half_slice_angle - SELECTED_ARC_INSET_RADIANS;
     let mut points = Vec::with_capacity(usize::from(SELECTED_ARC_STEPS) + 1);
@@ -90,11 +100,11 @@ fn draw_selected_slice(painter: &egui::Painter, center: Pos2, selected_slice: us
     ));
 }
 
-fn draw_slice_boundaries(painter: &egui::Painter, center: Pos2) {
-    let half_slice_angle = std::f32::consts::FRAC_PI_8;
+fn draw_slice_boundaries(painter: &egui::Painter, center: Pos2, slice_count: SliceCount) {
+    let half_slice_angle = half_slice_angle(slice_count);
 
-    for index in 0..SliceCount::Eight.get() {
-        let center_angle = SliceCount::Eight.center_angle(index).expect("valid foundation slice");
+    for index in 0..slice_count.get() {
+        let center_angle = slice_count.center_angle(index).expect("valid foundation slice");
         let boundary_angle = center_angle - half_slice_angle;
         let direction = egui::Vec2::new(boundary_angle.sin(), -boundary_angle.cos());
 
@@ -105,11 +115,10 @@ fn draw_slice_boundaries(painter: &egui::Painter, center: Pos2) {
     }
 }
 
-fn draw_slice_labels(painter: &egui::Painter, center: Pos2) {
-    const LABELS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
-
-    for (index, label) in LABELS.into_iter().enumerate() {
-        let direction = SliceCount::Eight.unit_vector(index).expect("valid foundation slice");
+fn draw_slice_labels(painter: &egui::Painter, center: Pos2, slice_count: SliceCount) {
+    for index in 0..slice_count.get() {
+        let label = slice_label(slice_count, index).expect("valid foundation slice");
+        let direction = slice_count.unit_vector(index).expect("valid foundation slice");
         let label_position = center + egui::Vec2::new(direction.x, direction.y) * LABEL_RADIUS_DIP;
 
         painter.text(
@@ -118,6 +127,64 @@ fn draw_slice_labels(painter: &egui::Painter, center: Pos2) {
             label,
             FontId::monospace(12.0),
             Color32::from_rgba_unmultiplied(225, 232, 255, 230),
+        );
+    }
+}
+
+const fn half_slice_angle(slice_count: SliceCount) -> f32 {
+    match slice_count {
+        SliceCount::Four => std::f32::consts::FRAC_PI_4,
+        SliceCount::Eight => std::f32::consts::FRAC_PI_8,
+    }
+}
+
+fn slice_label(slice_count: SliceCount, index: usize) -> Option<&'static str> {
+    match slice_count {
+        SliceCount::Four => ["N", "E", "S", "W"].get(index).copied(),
+        SliceCount::Eight => ["N", "NE", "E", "SE", "S", "SW", "W", "NW"].get(index).copied(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gradial_core::SliceCount;
+
+    use super::{FoundationOverlayRenderer, half_slice_angle, slice_label};
+
+    #[test]
+    fn four_slice_renderer_uses_cardinal_labels_and_quadrants() {
+        let labels: Vec<_> =
+            (0..SliceCount::Four.get()).map(|index| slice_label(SliceCount::Four, index)).collect();
+        assert_eq!(labels, [Some("N"), Some("E"), Some("S"), Some("W")]);
+        assert!(
+            (half_slice_angle(SliceCount::Four) - std::f32::consts::FRAC_PI_4).abs() < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn renderer_rejects_labels_outside_the_selected_geometry() {
+        assert_eq!(slice_label(SliceCount::Four, 4), None);
+        assert_eq!(slice_label(SliceCount::Eight, 8), None);
+    }
+
+    #[test]
+    fn default_renderer_preserves_the_eight_direction_contract() {
+        let renderer = FoundationOverlayRenderer::default();
+        let labels: Vec<_> = (0..SliceCount::Eight.get())
+            .map(|index| slice_label(renderer.slice_count, index))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                Some("N"),
+                Some("NE"),
+                Some("E"),
+                Some("SE"),
+                Some("S"),
+                Some("SW"),
+                Some("W"),
+                Some("NW"),
+            ]
         );
     }
 }

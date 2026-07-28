@@ -626,6 +626,29 @@ mod tests {
     }
 
     #[test]
+    fn four_slice_controller_selects_east_as_slice_one() {
+        let origin = ScreenPoint::new(200, 300);
+        let config = GestureConfig { slice_count: SliceCount::Four, ..GestureConfig::default() };
+        let mut controller = InteractionController::new(config);
+        controller.activation_down(snapshot(origin)).expect("open");
+
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(260, 300)),
+            Some(InteractionEffect::SelectionChanged {
+                invocation_id: Uuid::nil(),
+                selected_slice: Some(1),
+            })
+        );
+        assert_eq!(
+            controller.activation_up(),
+            Some(InteractionEffect::Close {
+                invocation_id: Uuid::nil(),
+                outcome: InteractionOutcome::Selected { slice_index: 1 },
+            })
+        );
+    }
+
+    #[test]
     fn returning_to_center_clears_selection() {
         let origin = ScreenPoint::new(100, 100);
         let mut controller = InteractionController::new(GestureConfig::default());

@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
-use gradial_core::{InvocationSnapshot, MonitorGeometry, ScreenPoint};
+use gradial_core::{InvocationSnapshot, MonitorGeometry, ScreenPoint, SliceCount};
 use uuid::Uuid;
 
 use crate::{
@@ -40,6 +40,7 @@ struct OverlaySlot {
 pub(crate) struct OverlayPool {
     monitors: Vec<MonitorGeometry>,
     slots: Vec<OverlaySlot>,
+    slice_count: SliceCount,
     timing_markers: Arc<TimingMarkers>,
 }
 
@@ -47,6 +48,7 @@ impl OverlayPool {
     pub(crate) fn new(
         generation: u64,
         monitors: Vec<MonitorGeometry>,
+        slice_count: SliceCount,
         timing_markers: Arc<TimingMarkers>,
     ) -> Self {
         let process_id = std::process::id();
@@ -62,7 +64,7 @@ impl OverlayPool {
             })
             .collect();
 
-        Self { monitors, slots, timing_markers }
+        Self { monitors, slots, slice_count, timing_markers }
     }
 
     pub(crate) fn monitors(&self) -> &[MonitorGeometry] {
@@ -75,6 +77,7 @@ impl OverlayPool {
             let title = slot.title.clone();
             let monitor = slot.monitor;
             let state = Arc::clone(&slot.state);
+            let slice_count = self.slice_count;
             let timing_markers = Arc::clone(&self.timing_markers);
             let builder = ViewportBuilder::default()
                 .with_title(&title)
@@ -141,7 +144,7 @@ impl OverlayPool {
                     state.selected_slice
                 };
 
-                let mut renderer = FoundationOverlayRenderer::default();
+                let mut renderer = FoundationOverlayRenderer::new(slice_count);
                 renderer.set_selected_slice(selected_slice);
                 renderer.render(ui);
             });

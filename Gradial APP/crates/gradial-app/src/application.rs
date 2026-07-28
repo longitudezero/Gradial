@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gradial_core::GeometryMode;
+use gradial_core::{GeometryMode, SliceCount};
 
 use crate::{
     diagnostics::TimingMarkers,
@@ -14,6 +14,7 @@ use crate::{
 
 pub(crate) struct GradialApp {
     geometry_mode: GeometryMode,
+    slice_count: SliceCount,
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
     native_style_passes: u8,
@@ -37,15 +38,18 @@ impl GradialApp {
         log::info!(
             target: "startup",
             "component=app event_code=input_geometry_ready result_code=ok config_revision=0 \
-             geometry_mode={} monitor_count={}",
+             geometry_mode={} slice_count={} monitor_count={}",
             startup_options.geometry_mode.as_str(),
+            startup_options.slice_count.as_str(),
             monitors.len()
         );
-        let overlay_pool = OverlayPool::new(0, monitors, Arc::clone(&timing_markers));
+        let overlay_pool =
+            OverlayPool::new(0, monitors, startup_options.slice_count, Arc::clone(&timing_markers));
         creation_context.egui_ctx.request_repaint();
 
         Ok(Self {
             geometry_mode: startup_options.geometry_mode,
+            slice_count: startup_options.slice_count,
             overlay_pool,
             interaction: None,
             native_style_passes: 0,
@@ -86,8 +90,12 @@ impl GradialApp {
             }
         };
         self.pool_generation = self.pool_generation.saturating_add(1);
-        self.overlay_pool =
-            OverlayPool::new(self.pool_generation, monitors, Arc::clone(&self.timing_markers));
+        self.overlay_pool = OverlayPool::new(
+            self.pool_generation,
+            monitors,
+            self.slice_count,
+            Arc::clone(&self.timing_markers),
+        );
         self.rebuild_in_progress = false;
         log::info!(
             target: "renderer",
@@ -122,6 +130,7 @@ impl GradialApp {
             self.overlay_pool = OverlayPool::new(
                 self.pool_generation,
                 current_monitors,
+                self.slice_count,
                 Arc::clone(&self.timing_markers),
             );
             context.request_repaint();
@@ -135,6 +144,7 @@ impl GradialApp {
             input_configuration,
             Arc::clone(&self.timing_markers),
             routes,
+            self.slice_count,
         ) {
             Ok(interaction) => interaction,
             Err(error) => {

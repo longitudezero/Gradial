@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     CancelReason, GestureConfig, InputEvent, InputEventKind, InteractionController,
-    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot,
+    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, SliceCount,
     monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
@@ -43,6 +43,7 @@ struct EffectDispatcher<'a> {
     egui_context: &'a eframe::egui::Context,
     timing_markers: &'a TimingMarkers,
     routes: &'a [OverlayRoute],
+    slice_count: SliceCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +72,7 @@ impl InteractionRuntime {
         input_configuration: InputConfiguration,
         timing_markers: Arc<TimingMarkers>,
         routes: Vec<OverlayRoute>,
+        slice_count: SliceCount,
     ) -> Result<Self> {
         let (producer, consumer) = RingBuffer::new(INPUT_QUEUE_CAPACITY);
         let accepting_input = Arc::new(AtomicBool::new(true));
@@ -94,6 +96,7 @@ impl InteractionRuntime {
                     &thread_shutdown,
                     &timing_markers,
                     &routes,
+                    slice_count,
                 );
             })
             .context("could not spawn the interaction thread")?;
@@ -167,12 +170,14 @@ fn run_interaction_thread(
     shutdown: &Arc<AtomicBool>,
     timing_markers: &TimingMarkers,
     routes: &[OverlayRoute],
+    slice_count: SliceCount,
 ) {
-    let mut controller = InteractionController::new(GestureConfig::default());
+    let gesture_config = GestureConfig { slice_count, ..GestureConfig::default() };
+    let mut controller = InteractionController::new(gesture_config);
     let mut active_snapshot = None;
     let mut active_route = None;
     let mut counters = EventCounters::default();
-    let dispatcher = EffectDispatcher { egui_context, timing_markers, routes };
+    let dispatcher = EffectDispatcher { egui_context, timing_markers, routes, slice_count };
     let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut display_rebuild_pending = false;
@@ -371,8 +376,9 @@ fn dispatch_effect(
                 target: "interaction",
                 "component=interaction event_code=invocation_started result_code=ok \
                  config_revision=0 invocation_id={invocation_id} monitor_index={route_index} \
-                 geometry={}",
-                snapshot.geometry.behavior.as_str()
+                 geometry={} slice_count={}",
+                snapshot.geometry.behavior.as_str(),
+                dispatcher.slice_count.as_str()
             );
             dispatcher.timing_markers.emit(
                 "open_requested",
