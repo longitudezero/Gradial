@@ -1,0 +1,129 @@
+krita
+
+Clip Studio Paint
+PaintTool SAI
+
+Ideas:
+
+Brush size (distance controls size)
+Brush opacity
+Layer operations
+Blend modes
+Selection tools
+Color history
+
+
+---
+
+
+figma
+Affinity Designer
+
+Examples:
+
+Alignment
+Boolean operations
+Auto Layout
+Frame presets
+Constraints
+Export presets
+
+---
+
+This community already embraces pie menus.
+
+Blender 
+Autodesk Maya 
+Maxon Cinema 4D 
+
+Potential:
+
+Object mode
+Snap modes
+Pivot point
+Transform orientation
+Modifier presets
+
+---
+
+Visual Studio Code 
+JetBrains 
+Neovim 
+
+Ideas:
+
+Git actions
+Refactoring
+Run/debug
+AI prompts
+Terminal commands
+Snippets
+
+---
+
+Writing / Knowledge work
+
+Less obvious, but useful.
+
+Obsidian
+Notion
+Logseq
+
+Imagine:
+
+Insert template
+Toggle callout
+AI summarize
+Move note
+Link note
+
+---
+
+Games
+
+Games with lots of repetitive actions could expose Gradial plugins:
+
+Minecraft modding
+Factorio
+Satisfactory
+RimWorld
+
+Or even stream overlays and macro tools.
+
+---
+
+Video editing
+
+Fantastic fit.
+
+DaVinci Resolve ⭐⭐⭐⭐⭐
+Adobe Premiere Pro ⭐⭐⭐⭐☆
+Final Cut Pro ⭐⭐⭐⭐☆
+🎵 Audio
+REAPER ⭐⭐⭐⭐⭐
+Ableton Live ⭐⭐⭐⭐☆
+FL Studio ⭐⭐⭐⭐☆
+
+Imagine radial macros for:
+
+Quantize
+Split
+Normalize
+Render
+Add effect
+Record arm
+📊 CAD / Engineering
+
+Huge shortcut users.
+
+Autodesk Fusion
+SolidWorks
+FreeCAD
+🌍 GIS
+
+Surprisingly good.
+
+QGIS
+Esri
+
+Lots of repetitive tool switching.

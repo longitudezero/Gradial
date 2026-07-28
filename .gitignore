@@ -1,0 +1,14 @@
+# Rust build output
+/Gradial APP/target/
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local diagnostics and profiling captures
+*.etl
+*.wpax
+*.csv
+

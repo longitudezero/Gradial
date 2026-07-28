@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Gradial: debug overlay",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "gradial-app"
+        ],
+        "filter": {
+          "name": "gradial",
+          "kind": "bin"
+        }
+      },
+      "cwd": "${workspaceFolder}/Gradial APP",
+      "sourceLanguages": [
+        "rust"
+      ]
+    }
+  ]
+}
+
