@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     ActionErrorCode, ActionResult, DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation,
-    ExecutionPlan, InvocationContext, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
+    ExecutionPlan, ExecutionStep, InvocationContext, MAX_ACTION_SEQUENCE_DURATION_MS,
+    MAX_ACTION_SEQUENCE_STEPS,
 };
 use uuid::Uuid;
 
@@ -154,7 +155,7 @@ impl ActionExecutor {
             target: "actions",
             "component=actions event_code=action_executor_ready result_code=ok \
              config_revision={config_revision} \
-             supported_operations=delay,send_shortcut,type_text \
+             supported_operations=delay,send_shortcut,type_text,open_url,open_path \
              per_step_timeout_ms={DEFAULT_ACTION_STEP_TIMEOUT_MS} \
              maximum_duration_ms={MAX_ACTION_SEQUENCE_DURATION_MS} \
              maximum_steps={MAX_ACTION_SEQUENCE_STEPS} cancellation_poll_ms={} \
@@ -364,6 +365,8 @@ fn execute_plan(
             ExecutionOperation::Delay { .. }
                 | ExecutionOperation::SendShortcut { .. }
                 | ExecutionOperation::TypeText { .. }
+                | ExecutionOperation::OpenUrl { .. }
+                | ExecutionOperation::OpenPath { .. }
         )
     }) {
         return failure(ActionErrorCode::UnsupportedAction, "this action type is not enabled yet");
@@ -385,50 +388,26 @@ fn execute_plan(
         let step_started = Instant::now();
         let check_deadline_after_step = matches!(
             step.operation(),
-            ExecutionOperation::SendShortcut { .. } | ExecutionOperation::TypeText { .. }
+            ExecutionOperation::SendShortcut { .. }
+                | ExecutionOperation::TypeText { .. }
+                | ExecutionOperation::OpenUrl { .. }
+                | ExecutionOperation::OpenPath { .. }
         );
-        let result = match step.operation() {
-            ExecutionOperation::Delay { milliseconds } => execute_delay(
-                Duration::from_millis(u64::from(*milliseconds)),
+        let result = execute_step(
+            step,
+            StepRuntime {
+                invocation_id,
+                config_revision: plan.config_revision(),
+                target,
+                cancellation_requested,
+                shutdown_requested,
                 plan_started,
                 maximum_duration,
+                step_started,
                 per_step_timeout,
-                cancellation_requested,
-                shutdown_requested,
-                policy.cancellation_poll_interval,
-            ),
-            ExecutionOperation::SendShortcut { modifiers, key } => Some(crate::shortcut::execute(
-                target,
-                modifiers,
-                *key,
-                cancellation_requested,
-                shutdown_requested,
-            )),
-            ExecutionOperation::TypeText { text } => {
-                log::info!(
-                    target: "actions",
-                    "component=actions event_code=text_step_started result_code=ok \
-                     config_revision={} invocation_id={invocation_id} action_id={} \
-                     character_count={}",
-                    plan.config_revision(),
-                    step.source_action_id(),
-                    text.chars().count()
-                );
-                Some(crate::unicode_text::execute(
-                    target,
-                    text,
-                    cancellation_requested,
-                    shutdown_requested,
-                    crate::unicode_text::TextDeadlines::new(
-                        step_started,
-                        per_step_timeout,
-                        plan_started,
-                        maximum_duration,
-                    ),
-                ))
-            }
-            _ => unreachable!("the complete plan was preflighted before execution"),
-        };
+                cancellation_poll_interval: policy.cancellation_poll_interval,
+            },
+        );
         if let Some(result) = result
             && result != ActionResult::Success
         {
@@ -445,6 +424,109 @@ fn execute_plan(
         }
     }
     ActionResult::Success
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StepRuntime<'a> {
+    invocation_id: Uuid,
+    config_revision: u64,
+    target: &'a InvocationContext,
+    cancellation_requested: &'a AtomicBool,
+    shutdown_requested: &'a AtomicBool,
+    plan_started: Instant,
+    maximum_duration: Duration,
+    step_started: Instant,
+    per_step_timeout: Duration,
+    cancellation_poll_interval: Duration,
+}
+
+fn execute_step(step: &ExecutionStep, runtime: StepRuntime<'_>) -> Option<ActionResult> {
+    match step.operation() {
+        ExecutionOperation::Delay { milliseconds } => execute_delay(
+            Duration::from_millis(u64::from(*milliseconds)),
+            runtime.plan_started,
+            runtime.maximum_duration,
+            runtime.per_step_timeout,
+            runtime.cancellation_requested,
+            runtime.shutdown_requested,
+            runtime.cancellation_poll_interval,
+        ),
+        ExecutionOperation::SendShortcut { modifiers, key } => Some(crate::shortcut::execute(
+            runtime.target,
+            modifiers,
+            *key,
+            runtime.cancellation_requested,
+            runtime.shutdown_requested,
+        )),
+        ExecutionOperation::TypeText { text } => {
+            log::info!(
+                target: "actions",
+                "component=actions event_code=text_step_started result_code=ok \
+                 config_revision={} invocation_id={} action_id={} character_count={}",
+                runtime.config_revision,
+                runtime.invocation_id,
+                step.source_action_id(),
+                text.chars().count()
+            );
+            Some(crate::unicode_text::execute(
+                runtime.target,
+                text,
+                runtime.cancellation_requested,
+                runtime.shutdown_requested,
+                crate::unicode_text::TextDeadlines::new(
+                    runtime.step_started,
+                    runtime.per_step_timeout,
+                    runtime.plan_started,
+                    runtime.maximum_duration,
+                ),
+            ))
+        }
+        operation @ (ExecutionOperation::OpenUrl { .. } | ExecutionOperation::OpenPath { .. }) => {
+            Some(execute_shell_open_step(
+                operation,
+                crate::shell_open::OpenLogContext::new(
+                    runtime.config_revision,
+                    runtime.invocation_id,
+                    step.source_action_id(),
+                ),
+                runtime.cancellation_requested,
+                runtime.shutdown_requested,
+                crate::shell_open::OpenDeadlines::new(
+                    runtime.step_started,
+                    runtime.per_step_timeout,
+                    runtime.plan_started,
+                    runtime.maximum_duration,
+                ),
+            ))
+        }
+        _ => unreachable!("the complete plan was preflighted before execution"),
+    }
+}
+
+fn execute_shell_open_step(
+    operation: &ExecutionOperation,
+    log_context: crate::shell_open::OpenLogContext,
+    cancellation_requested: &AtomicBool,
+    shutdown_requested: &AtomicBool,
+    deadlines: crate::shell_open::OpenDeadlines,
+) -> ActionResult {
+    match operation {
+        ExecutionOperation::OpenUrl { url } => crate::shell_open::open_url(
+            url,
+            cancellation_requested,
+            shutdown_requested,
+            deadlines,
+            log_context,
+        ),
+        ExecutionOperation::OpenPath { path } => crate::shell_open::open_path(
+            path,
+            cancellation_requested,
+            shutdown_requested,
+            deadlines,
+            log_context,
+        ),
+        _ => unreachable!("the caller accepts only shell-open operations"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -538,7 +620,7 @@ fn log_completion(completion: &ActionCompletion) {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
     use gradial_core::{
         ActionDefinition, ActionErrorCode, ActionKind, ActionPlanCompiler, ActionResult,
@@ -591,6 +673,34 @@ mod tests {
         };
         let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
         Arc::new(compiler.compile_plan(Uuid::from_u128(1), revision).expect("plan"))
+    }
+
+    fn open_path_sequence_plan(path: PathBuf, revision: u64) -> Arc<gradial_core::ExecutionPlan> {
+        let configuration = Configuration {
+            config_revision: revision,
+            actions: vec![
+                ActionDefinition {
+                    id: Uuid::from_u128(1),
+                    name: "Delay".to_owned(),
+                    kind: ActionKind::Delay { milliseconds: 10 },
+                },
+                ActionDefinition {
+                    id: Uuid::from_u128(2),
+                    name: "Path".to_owned(),
+                    kind: ActionKind::OpenPath { path },
+                },
+                ActionDefinition {
+                    id: Uuid::from_u128(3),
+                    name: "Sequence".to_owned(),
+                    kind: ActionKind::Sequence {
+                        actions: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+                    },
+                },
+            ],
+            ..Configuration::default()
+        };
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        Arc::new(compiler.compile_plan(Uuid::from_u128(3), revision).expect("plan"))
     }
 
     fn wait_for_completion(executor: &ActionExecutor) -> super::ActionCompletion {
@@ -724,6 +834,28 @@ mod tests {
     }
 
     #[test]
+    fn enabled_sequence_reaches_missing_path_without_shell_dispatch() {
+        let missing_path =
+            std::env::temp_dir().join(format!("gradial-missing-{}.txt", Uuid::new_v4()));
+        assert!(!missing_path.exists());
+        let executor = ActionExecutor::start(1).expect("executor");
+        assert_eq!(
+            dispatch(
+                &executor.handle(),
+                Uuid::from_u128(37),
+                open_path_sequence_plan(missing_path, 1),
+            ),
+            ActionDispatch::Accepted
+        );
+        let completion = wait_for_completion(&executor);
+        assert_eq!(completion.step_count, 2);
+        assert!(matches!(
+            completion.result,
+            ActionResult::Failure { code: ActionErrorCode::PathNotFound, .. }
+        ));
+    }
+
+    #[test]
     fn unsupported_plans_fail_before_any_step_runs() {
         let configuration = Configuration {
             config_revision: 1,
@@ -735,8 +867,12 @@ mod tests {
                 },
                 ActionDefinition {
                     id: Uuid::from_u128(2),
-                    name: "URL".to_owned(),
-                    kind: ActionKind::OpenUrl { url: "https://example.com".to_owned() },
+                    name: "Executable".to_owned(),
+                    kind: ActionKind::RunExecutable {
+                        executable: PathBuf::from(r"C:\Example\example.exe"),
+                        arguments: Vec::new(),
+                        working_directory: None,
+                    },
                 },
                 ActionDefinition {
                     id: Uuid::from_u128(3),

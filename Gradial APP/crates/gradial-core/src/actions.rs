@@ -553,6 +553,8 @@ pub enum ActionErrorCode {
     ElevatedTarget,
     ExecutorUnavailable,
     InputInjectionFailed,
+    PathNotFound,
+    ProcessLaunchFailed,
     StaleTarget,
     StepLimitExceeded,
     StepTimeout,
@@ -568,6 +570,8 @@ impl ActionErrorCode {
             Self::ElevatedTarget => "elevated_target",
             Self::ExecutorUnavailable => "executor_unavailable",
             Self::InputInjectionFailed => "input_injection_failed",
+            Self::PathNotFound => "path_not_found",
+            Self::ProcessLaunchFailed => "process_launch_failed",
             Self::StaleTarget => "stale_target",
             Self::StepLimitExceeded => "step_limit_exceeded",
             Self::StepTimeout => "step_timeout",
@@ -590,7 +594,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ActionDefinition, ActionKind, ActionPlanCompiler, ExecutionOperation,
+        ActionDefinition, ActionErrorCode, ActionKind, ActionPlanCompiler, ExecutionOperation,
         MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
         MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier,
     };
@@ -937,5 +941,11 @@ mod tests {
         value["actions"][0]["kind"]["unexpected"] = serde_json::Value::Bool(true);
 
         assert!(serde_json::from_value::<Configuration>(value).is_err());
+    }
+
+    #[test]
+    fn shell_open_failures_have_stable_public_codes() {
+        assert_eq!(ActionErrorCode::PathNotFound.as_str(), "path_not_found");
+        assert_eq!(ActionErrorCode::ProcessLaunchFailed.as_str(), "process_launch_failed");
     }
 }

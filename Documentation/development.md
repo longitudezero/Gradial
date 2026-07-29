@@ -55,12 +55,14 @@ slices, and the first two bounded Milestone 2 slices establish:
   shortcuts with synthesized-key cleanup.
 - Literal UTF-16 Unicode text entry with per-event target revalidation and
   in-flight code-unit cleanup.
+- HTTP/HTTPS URL and existing absolute file/folder opening through Windows
+  shell associations, with literal payloads and redacted diagnostics.
 
 It intentionally does not expose configuration editing, perform release-time
-launch/open actions, or window manipulation. A release logs the chosen slice,
+executable launch, or window manipulation. A release logs the chosen slice,
 compiles its assigned plan, and submits it to the coordinator. Delay, keyboard
-shortcuts, and Unicode text can succeed; all remaining action families fail
-before any prefix runs.
+shortcuts, Unicode text, URL open, and file/folder open can succeed; all
+remaining action families fail before any prefix runs.
 
 ## Workspace layout
 
@@ -80,6 +82,8 @@ Gradial APP\
         smoke-shortcut-executor.ps1 Verify scan-code shortcut delivery
         smoke-text-executor.ps1 Verify exact private Unicode delivery
         input-smoke-target.ps1 Capture key and Unicode messages safely
+        smoke-open-executor.ps1 Verify an isolated Windows file association
+        open-smoke-receiver.ps1 Capture the exact associated file path
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
@@ -273,7 +277,7 @@ steps, and attaches the immutable plan to the invocation. Every plan records a
 The single-worker executor accepts at most one pending or running plan. A
 second dispatch returns `action_busy` immediately and is never queued. Before
 its first step, the worker verifies that every operation is Delay,
-SendShortcut, or TypeText; other or mixed plans fail as
+SendShortcut, TypeText, OpenUrl, or OpenPath; other or mixed plans fail as
 `unsupported_action` without partially running.
 
 Delay uses monotonic time and checks cancellation/shutdown in increments no
@@ -306,11 +310,24 @@ If the target changes, cancellation arrives, or Windows rejects an event, a
 guard releases the one pending Unicode unit before execution stops. The same
 boundaries enforce the plan's step and overall deadlines during long text.
 
+OpenUrl accepts only the configuration model's HTTP/HTTPS URLs. OpenPath
+rechecks that its absolute file or folder still exists immediately before
+dispatch and returns `path_not_found` without calling the shell if it does
+not. Both actions send one literal, null-terminated UTF-16 value to
+`ShellExecuteExW` with the `open` verb, no parameters, no working directory,
+no `cmd.exe`, and no environment-expansion flag. The worker initializes an STA
+COM apartment and uses `SEE_MASK_NOASYNC` because it is a background thread
+without a message loop; this completes the association handshake before the
+call returns without waiting for the opened application's lifetime.
+`SEE_MASK_FLAG_NO_UI` prevents shell error dialogs. Success means Windows
+accepted the association request. Other rejection returns
+`process_launch_failed`.
+
 Successful plans record `action_executed=true`. Empty slices still record
 `EmptySlice`; a defensive compilation mismatch records `ActionPlanInvalid`.
 The overlay begins its close animation immediately and never waits for action
-completion. Logs record Unicode scalar counts but never text content. URL/path
-opening, executable launch, and window commands remain disabled.
+completion. Logs record Unicode scalar counts and open-request kinds but never
+text, URLs, or paths. Executable launch and window commands remain disabled.
 
 ## Edge behavior
 
@@ -513,6 +530,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-delay-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-shortcut-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-text-executor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-open-executor.ps1
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -552,6 +570,13 @@ literal string containing environment-like tokens, BMP Unicode, and a
 surrogate pair. It requires the exact UTF-16 message sequence, confirms the
 tokens were not expanded, and searches Gradial's isolated log for a private
 sentinel to prove the payload was not recorded.
+`smoke-open-executor.ps1` creates a randomly named per-user test extension and
+hidden receiver, dispatches an existing path containing environment-like and
+command-shell metacharacters, and requires the exact literal path. It also
+checks that the private path sentinel is absent from Gradial's isolated log.
+Its `finally` block removes the association, receiver data, and isolated
+configuration; it never changes a normal file association or opens one of the
+user's applications.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

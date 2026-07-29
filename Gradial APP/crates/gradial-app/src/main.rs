@@ -11,6 +11,7 @@ mod interaction;
 mod options;
 mod overlay;
 mod platform;
+mod shell_open;
 mod shortcut;
 mod tray;
 mod unicode_text;

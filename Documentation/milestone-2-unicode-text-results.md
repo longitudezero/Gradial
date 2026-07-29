@@ -100,3 +100,6 @@ while the between-event check intentionally avoids reopening the process for
 every code unit and protects live HWND/PID/foreground ownership. Physical
 elevated and mid-send target-replacement campaigns remain hardening gates;
 their result paths and cleanup invariants are covered deterministically here.
+
+HTTP/HTTPS URL and file/folder opening were completed in the subsequent
+[`milestone-2-shell-open-results.md`](milestone-2-shell-open-results.md) slice.

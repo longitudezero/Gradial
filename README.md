@@ -21,7 +21,10 @@ timeouts and shutdown. The next executor slice adds stale/elevated target
 validation and scan-code keyboard shortcuts with strict synthesized-key
 cleanup. Unicode text entry now shares that target boundary, emits literal
 UTF-16 input without using the clipboard, revalidates throughout long sends,
-and cleans up an in-flight code unit on cancellation or failure.
+and cleans up an in-flight code unit on cancellation or failure. The next
+action slice opens HTTP/HTTPS URLs and existing absolute files or folders
+through Windows shell associations without command-shell interpolation or
+payload logging.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -83,14 +86,16 @@ cargo run --package gradial-app -- --reduced-motion
 
 **M4 is dedicated to Gradial while the app runs.** Its normal browser
 back/navigation behavior is suppressed. An assigned slice is compiled into an
-immutable, bounded plan at release. Delay, keyboard-shortcut, and Unicode-text
-steps execute on one worker; another dispatch while it is busy fails
-immediately instead of queuing. Before input, Gradial verifies that the
-captured window still has the same process/start time, remains foreground, and
-is not at higher integrity. Text is sent as literal Unicode without clipboard
-access or environment expansion, and the target is checked between input
-events. Unassigned slices cancel as `EmptySlice`, and plans containing any
-other action family fail safely as `unsupported_action`.
+immutable, bounded plan at release. Delay, keyboard-shortcut, Unicode-text,
+URL-open, and path-open steps execute on one worker; another dispatch while it
+is busy fails immediately instead of queuing. Before input, Gradial verifies
+that the captured window still has the same process/start time, remains
+foreground, and is not at higher integrity. Text is sent as literal Unicode
+without clipboard access or environment expansion, and the target is checked
+between input events. Open actions use the Windows association API directly;
+missing paths fail without dispatch and URLs/paths are omitted from logs.
+Unassigned slices cancel as `EmptySlice`, and plans containing any other
+action family fail safely as `unsupported_action`.
 
 The display under the M4-down cursor selects the prewarmed overlay window.
 Display, work-area, or DPI changes cancel an active gesture and rebuild the
@@ -115,8 +120,9 @@ primary. Application-profile rules are resolved at every activation. The
 selected profile's complete menu—including optional action UUIDs—is frozen for
 the invocation, so title or configuration changes cannot switch geometry,
 labels, or the selected action while a gesture is open. Delay, keyboard
-shortcut, and Unicode text execution are enabled; URL/path, executable,
-window-action, and settings-editor support are not present yet.
+shortcut, Unicode text, HTTP/HTTPS URL, and existing absolute file/folder
+execution are enabled; executable, window-action, and settings-editor support
+are not present yet.
 
 Run all local checks with:
 
@@ -159,3 +165,5 @@ Target validation and keyboard-shortcut results are recorded in
 [`Documentation/milestone-2-keyboard-shortcut-results.md`](Documentation/milestone-2-keyboard-shortcut-results.md).
 Unicode text-entry and privacy results are recorded in
 [`Documentation/milestone-2-unicode-text-results.md`](Documentation/milestone-2-unicode-text-results.md).
+URL/file/folder association results are recorded in
+[`Documentation/milestone-2-shell-open-results.md`](Documentation/milestone-2-shell-open-results.md).
