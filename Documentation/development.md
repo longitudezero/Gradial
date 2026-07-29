@@ -34,6 +34,8 @@ slices establish:
 - Automatic full input-runtime replacement after three missed 250 ms
   heartbeats, and input re-registration after resume, session unlock, or
   Explorer restart.
+- Persistent per-monitor geometry caches and bounded 60/35/50 ms
+  open/selection/close animation state.
 
 It intentionally does not save configuration, validate targets, or execute
 actions. A release logs the chosen slice but cannot launch anything.
@@ -188,6 +190,14 @@ cargo run --package gradial-app -- --slices=4
 cargo run --package gradial-app -- --geometry=edge-assist --slices=8
 ```
 
+`--reduced-motion` removes scale, opacity, and selection-color interpolation
+without changing recognition or close timing. It is a temporary startup
+override until appearance configuration is persisted:
+
+```powershell
+cargo run --package gradial-app -- --slices=4 --reduced-motion
+```
+
 ## Per-display overlay guarantees
 
 The root viewport is a permanently hidden controller. At startup, Gradial
@@ -212,6 +222,13 @@ message handled by that child's native subclass positions and shows it with
 no-activation flags. The matching child repaint is independent of the invisible
 root-controller repaint cycle.
 
+Each child owns a persistent renderer. During pool construction it caches that
+slice count's boundary segments, label offsets, and 24-segment highlight arcs.
+Rendering reuses those structures; display/DPI pool replacement constructs one
+new cache for each replacement child. Selection animation uses fixed-size
+eight-entry state and can retarget from its current color without rebuilding
+geometry.
+
 `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, and `WM_SETTINGCHANGE` for the work area
 invalidate the pool. Monitoring is deliberately disabled while windows are
 being placed, because initial PMv2 placement can itself emit DPI messages. A
@@ -219,6 +236,28 @@ real change suspends M4, cancels an open invocation with
 `DisplayTopologyChange`, hides the routed child, destroys the old runtime/pool,
 enumerates signed work areas again, and prewarms a new generation. Input resumes
 only after all new child windows report the expected DPI.
+
+## Animation contract
+
+Opening starts with the complete usable ring at 96% scale and 85% opacity, then
+uses cubic ease-out to reach its final state at 60 ms. A selected slice fades
+between its old and new color over 35 ms. Selection retargeting samples the
+current transition before starting the next one, avoiding a flash or restart
+from zero.
+
+Release finalizes the gesture immediately and starts a 50 ms opacity fade. The
+native overlay remains click-through and non-activating during that fade, then
+receives its private hide request. Action dispatch will therefore not wait for
+the close animation when actions are introduced. A new invocation can safely
+supersede a closing one; the prior overlay is hidden and its focus checkpoint
+is completed before the next wake request. Pool replacement and shutdown use
+the same forced-hide fallback instead of waiting for an obsolete animation.
+
+Standard animation requests a child-viewport repaint no more frequently than
+every 8 ms. Reduced motion snaps the visuals but retains the 60 ms opening state
+and 50 ms close lifecycle, scheduling only their completion frames. Gesture
+selection is advanced on the interaction thread, so a valid flick can release
+before the first rendered frame and still select its slice.
 
 ## Focus and timing diagnostics
 
@@ -280,6 +319,8 @@ Run the full display-event capture from an elevated PowerShell. Pass
    `hook_thread_stopped`.
 10. Open the tray icon and confirm its status line, **Retry input**, and
     **Exit Gradial** commands are present.
+11. Repeat once with `--reduced-motion`; selection and close behavior should be
+    identical without interpolated visuals.
 
 This is a global input development build. Save important work before manual
 testing. If input becomes faulted, use **Retry input**. Stop Gradial with its
@@ -299,6 +340,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputReregistration
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault heartbeat
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault queue-overflow
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ReducedMotion
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -316,6 +359,12 @@ new hook runtime becomes responsive. Debug-only `-SimulateInputFault heartbeat`
 verifies automatic replacement; `queue-overflow` verifies the manual Faulted
 state, M4 pass-through, and recovery through the same Retry Input command path
 used by the tray menu.
+`-ReducedMotion` confirms that the same cached timing contract is initialized
+without interpolation. `-QuickFlick` submits press, movement, and release
+without an animation wait, proving that rendering is not a prerequisite for
+selection. Every normal run also correlates the selected invocation with its
+animated hide and checks the observed close lifecycle against the 50 ms target
+with scheduler tolerance.
 
 ## Checks
 

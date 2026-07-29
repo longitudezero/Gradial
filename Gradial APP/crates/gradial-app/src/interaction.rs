@@ -520,16 +520,7 @@ fn dispatch_effect(
                 }
             }
             dispatcher.timing_markers.emit("close_requested", Some(invocation_id), source_qpc, "");
-            if let Err(error) =
-                route.close(dispatcher.egui_context, dispatcher.timing_markers, invocation_id)
-            {
-                log::error!(
-                    target: "renderer",
-                    "component=renderer event_code=overlay_hide_request_failed \
-                     result_code=failure config_revision=0 invocation_id={invocation_id} \
-                     error={error}"
-                );
-            }
+            route.close(dispatcher.egui_context, dispatcher.timing_markers, invocation_id);
         }
     }
 }

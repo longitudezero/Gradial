@@ -23,7 +23,11 @@ param(
     [switch]$SimulateInputReregistration,
 
     [ValidateSet("none", "heartbeat", "queue-overflow")]
-    [string]$SimulateInputFault = "none"
+    [string]$SimulateInputFault = "none",
+
+    [switch]$ReducedMotion,
+
+    [switch]$QuickFlick
 )
 
 $ErrorActionPreference = "Stop"
@@ -235,6 +239,9 @@ if (-not (Test-Path -LiteralPath $executable)) {
 if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
     throw "Input fault simulation is available only in a debug build."
 }
+if ($QuickFlick -and $Geometry -ne "fixed-origin") {
+    throw "Quick-flick validation currently requires fixed-origin geometry."
+}
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
     throw "Close the existing Gradial process before running the isolated live smoke check."
 }
@@ -271,8 +278,12 @@ try {
         throw "Could not read the positioned cursor."
     }
 
+    $startupArguments = @("--geometry=$Geometry", "--slices=$Slices")
+    if ($ReducedMotion) {
+        $startupArguments += "--reduced-motion"
+    }
     $gradial = Start-Process -FilePath $executable `
-        -ArgumentList @("--geometry=$Geometry", "--slices=$Slices") `
+        -ArgumentList $startupArguments `
         -WorkingDirectory $workspace `
         -PassThru `
         -WindowStyle Hidden
@@ -471,9 +482,13 @@ try {
 
     [GradialSmokeNative]::SendM4($true)
     $m4IsDown = $true
-    Start-Sleep -Milliseconds 180
+    if (-not $QuickFlick) {
+        Start-Sleep -Milliseconds 180
+    }
     [GradialSmokeNative]::SendRelativeMove(80, 0)
-    Start-Sleep -Milliseconds 180
+    if (-not $QuickFlick) {
+        Start-Sleep -Milliseconds 180
+    }
 
     $cursorDuringGesture = New-Object GradialSmokeNative+Point
     [GradialSmokeNative]::GetCursorPos([ref]$cursorDuringGesture) | Out-Null
@@ -525,6 +540,16 @@ $log = Get-Content -LiteralPath $logPath -Raw
 if ($log -notmatch "event_code=input_geometry_ready .*geometry_mode=$Geometry .*slice_count=$Slices") {
     throw "The log does not confirm geometry mode '$Geometry' with $Slices slices."
 }
+$expectedReducedMotion = if ($ReducedMotion) { "true" } else { "false" }
+if (
+    $log -notmatch (
+        "event_code=renderer_geometry_cache_ready .*slice_count=$Slices " +
+        ".*reduced_motion=$expectedReducedMotion .*open_ms=60 " +
+        ".*selection_ms=35 .*close_ms=50"
+    )
+) {
+    throw "The renderer cache and animation contract was not initialized as requested."
+}
 if ($log -notmatch "event_code=invocation_started ") {
     throw "The live check did not produce a Gradial invocation."
 }
@@ -539,5 +564,43 @@ if ($log -notmatch "event_code=slice_selected .*slice_index=$expectedEastSlice "
 if ($log -notmatch "event_code=focus_checkpoint .*phase=after_close .*accepted=true") {
     throw "The live check did not complete the focus checkpoints."
 }
+if (
+    $log -notmatch (
+        "event_code=close_animation_completed .*duration_ms=50 forced=false"
+    )
+) {
+    throw "The live check did not complete the bounded close animation."
+}
+$selectionRecords = [regex]::Matches(
+    $log,
+    "(?m)^(?<time>\S+) .*event_code=slice_selected .*" +
+    "invocation_id=(?<invocation>[0-9a-f-]+)"
+)
+$selectionRecord = $selectionRecords[$selectionRecords.Count - 1]
+$invocationId = $selectionRecord.Groups["invocation"].Value
+$closeRecord = [regex]::Match(
+    $log,
+    "(?m)^(?<time>\S+) .*event_code=close_animation_completed .*" +
+    "invocation_id=$invocationId .*duration_ms=50 forced=false"
+)
+if (-not $closeRecord.Success) {
+    throw "The selected invocation did not reach its normal animated close."
+}
+$selectionTime = [DateTimeOffset]::Parse(
+    $selectionRecord.Groups["time"].Value,
+    [Globalization.CultureInfo]::InvariantCulture
+)
+$closeTime = [DateTimeOffset]::Parse(
+    $closeRecord.Groups["time"].Value,
+    [Globalization.CultureInfo]::InvariantCulture
+)
+$observedCloseMs = ($closeTime - $selectionTime).TotalMilliseconds
+if ($observedCloseMs -lt 45 -or $observedCloseMs -gt 250) {
+    throw "Observed close lifecycle was $observedCloseMs ms; expected 50 ms with scheduler tolerance."
+}
 
-Write-Host "Live $Configuration $Geometry $Slices-slice smoke check passed on monitor $MonitorIndex."
+Write-Host (
+    "Live $Configuration $Geometry $Slices-slice smoke check passed on " +
+    "monitor $MonitorIndex (reduced motion: $expectedReducedMotion, " +
+    "observed close: $observedCloseMs ms)."
+)

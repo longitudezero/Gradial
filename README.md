@@ -6,7 +6,8 @@ spine and several bounded Milestone 1 slices: a prewarmed, non-activating GPU
 overlay for every connected display; dedicated low-level input thread; bounded
 event transport; tested four/eight-slice gesture state machine; automatic edge
 assist; display/DPI rebuild handling; input-hook recovery; a native health tray
-icon; and focus/timing instrumentation.
+icon; cached overlay geometry; bounded animations; and focus/timing
+instrumentation.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -57,6 +58,15 @@ cargo run --package gradial-app -- --slices=4
 temporary; persisted per-profile selection remains part of the profiles
 milestone.
 
+The overlay opens from 96% scale and 85% opacity over 60 ms, changes selection
+color over 35 ms, and fades out over 50 ms. Gesture recognition and release do
+not wait for those animations. A temporary development override removes visual
+interpolation while preserving the same lifecycle timing:
+
+```powershell
+cargo run --package gradial-app -- --reduced-motion
+```
+
 **M4 is dedicated to Gradial while the app runs.** Its normal browser
 back/navigation behavior is suppressed. This milestone deliberately does not
 execute launcher actions; release only writes `slice_selected` with
@@ -90,3 +100,5 @@ Four/eight geometry results are recorded in
 [`Documentation/milestone-1-slice-geometry-results.md`](Documentation/milestone-1-slice-geometry-results.md).
 Input recovery and tray results are recorded in
 [`Documentation/milestone-1-input-recovery-results.md`](Documentation/milestone-1-input-recovery-results.md).
+Renderer cache and animation results are recorded in
+[`Documentation/milestone-1-renderer-animation-results.md`](Documentation/milestone-1-renderer-animation-results.md).

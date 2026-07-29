@@ -1,8 +1,10 @@
+mod animation;
 mod pool;
 mod renderer;
 
+pub(crate) use animation::AnimationMode;
 pub(crate) use pool::{OverlayPool, OverlayRoute};
-pub(crate) use renderer::{FoundationOverlayRenderer, OverlayRenderer};
+pub(crate) use renderer::{FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer};
 
 pub(super) const OVERLAY_SIZE_DIP: f32 = 288.0;
 

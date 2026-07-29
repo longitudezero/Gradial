@@ -8,7 +8,7 @@ use crate::{
     input::InputConfiguration,
     interaction::{InteractionRuntime, RuntimeEvent},
     options::StartupOptions,
-    overlay::OverlayPool,
+    overlay::{AnimationMode, OverlayPool},
     platform,
     tray::{TrayCommand, TrayHealth, TrayIcon},
 };
@@ -16,6 +16,7 @@ use crate::{
 pub(crate) struct GradialApp {
     geometry_mode: GeometryMode,
     slice_count: SliceCount,
+    animation_mode: AnimationMode,
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
     native_style_passes: u8,
@@ -43,18 +44,30 @@ impl GradialApp {
         log::info!(
             target: "startup",
             "component=app event_code=input_geometry_ready result_code=ok config_revision=0 \
-             geometry_mode={} slice_count={} monitor_count={}",
+             geometry_mode={} slice_count={} reduced_motion={} monitor_count={}",
             startup_options.geometry_mode.as_str(),
             startup_options.slice_count.as_str(),
+            startup_options.reduced_motion,
             monitors.len()
         );
-        let overlay_pool =
-            OverlayPool::new(0, monitors, startup_options.slice_count, Arc::clone(&timing_markers));
+        let animation_mode = if startup_options.reduced_motion {
+            AnimationMode::ReducedMotion
+        } else {
+            AnimationMode::Standard
+        };
+        let overlay_pool = OverlayPool::new(
+            0,
+            monitors,
+            startup_options.slice_count,
+            animation_mode,
+            Arc::clone(&timing_markers),
+        );
         creation_context.egui_ctx.request_repaint();
 
         Ok(Self {
             geometry_mode: startup_options.geometry_mode,
             slice_count: startup_options.slice_count,
+            animation_mode,
             overlay_pool,
             interaction: None,
             native_style_passes: 0,
@@ -104,6 +117,7 @@ impl GradialApp {
             self.pool_generation,
             monitors,
             self.slice_count,
+            self.animation_mode,
             Arc::clone(&self.timing_markers),
         );
         self.rebuild_in_progress = false;
@@ -234,6 +248,7 @@ impl GradialApp {
                 self.pool_generation,
                 current_monitors,
                 self.slice_count,
+                self.animation_mode,
                 Arc::clone(&self.timing_markers),
             );
             context.request_repaint();

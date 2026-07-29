@@ -5,7 +5,7 @@ pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
 Usage:
-  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8]
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--reduced-motion]
 
 Geometry modes:
   auto          Use edge assist only when the complete ring would clip.
@@ -15,18 +15,23 @@ Geometry modes:
 Slice counts:
   4             Use the cardinal N/E/S/W menu.
   8             Use the eight-direction menu (default).
+
+Animation:
+  --reduced-motion  Remove visual interpolation without changing gesture timing.
 ";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StartupOptions {
     pub(crate) geometry_mode: GeometryMode,
     pub(crate) slice_count: SliceCount,
+    pub(crate) reduced_motion: bool,
 }
 
 impl StartupOptions {
     pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut geometry_mode = GeometryMode::Auto;
         let mut slice_count = SliceCount::Eight;
+        let mut reduced_motion = false;
         let mut arguments = arguments.into_iter();
 
         while let Some(argument) = arguments.next() {
@@ -43,12 +48,14 @@ impl StartupOptions {
                 let value =
                     arguments.next().ok_or_else(|| anyhow::anyhow!("--slices requires 4 or 8"))?;
                 slice_count = parse_slice_count(&value)?;
+            } else if argument == "--reduced-motion" {
+                reduced_motion = true;
             } else {
                 bail!("unknown Gradial argument: {argument}");
             }
         }
 
-        Ok(Self { geometry_mode, slice_count })
+        Ok(Self { geometry_mode, slice_count, reduced_motion })
     }
 }
 
@@ -80,6 +87,7 @@ mod tests {
         let options = StartupOptions::parse(Vec::new()).expect("default options");
         assert_eq!(options.geometry_mode, GeometryMode::Auto);
         assert_eq!(options.slice_count, SliceCount::Eight);
+        assert!(!options.reduced_motion);
     }
 
     #[test]
@@ -126,5 +134,18 @@ mod tests {
         let error =
             StartupOptions::parse(["--slices=6".to_owned()]).expect_err("unsupported count");
         assert!(error.to_string().contains("invalid slice count"));
+    }
+
+    #[test]
+    fn reduced_motion_combines_with_other_development_options() {
+        let options = StartupOptions::parse([
+            "--geometry=edge-assist".to_owned(),
+            "--slices=4".to_owned(),
+            "--reduced-motion".to_owned(),
+        ])
+        .expect("reduced-motion options");
+        assert_eq!(options.geometry_mode, GeometryMode::EdgeAssist);
+        assert_eq!(options.slice_count, SliceCount::Four);
+        assert!(options.reduced_motion);
     }
 }
