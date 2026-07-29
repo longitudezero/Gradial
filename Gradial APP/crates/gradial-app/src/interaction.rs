@@ -13,9 +13,9 @@ use std::sync::atomic::AtomicU8;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
-    CancelReason, GestureConfig, InputEvent, InputEventKind, InteractionController,
-    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, ProfileResolver,
-    ProfileTarget, ResolvedMenu, monitor_index_for_point,
+    ActionPlanCompiler, CancelReason, ExecutionPlan, GestureConfig, InputEvent, InputEventKind,
+    InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
+    InvocationSnapshot, ProfileResolver, ProfileTarget, ResolvedMenu, monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -46,6 +46,8 @@ struct ActiveInvocation {
     snapshot: Option<InvocationSnapshot>,
     profile_id: Option<uuid::Uuid>,
     menu: Option<Arc<ResolvedMenu>>,
+    action_id: Option<uuid::Uuid>,
+    execution_plan: Option<Arc<ExecutionPlan>>,
     route: Option<usize>,
 }
 
@@ -54,6 +56,8 @@ impl ActiveInvocation {
         self.snapshot = None;
         self.profile_id = None;
         self.menu = None;
+        self.action_id = None;
+        self.execution_plan = None;
         self.route = None;
     }
 }
@@ -63,6 +67,7 @@ struct EffectDispatcher<'a> {
     egui_context: &'a eframe::egui::Context,
     timing_markers: &'a TimingMarkers,
     routes: &'a [OverlayRoute],
+    action_plan_compiler: &'a ActionPlanCompiler,
     config_revision: u64,
 }
 
@@ -93,12 +98,14 @@ pub(crate) struct InteractionRuntime {
 }
 
 impl InteractionRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         egui_context: eframe::egui::Context,
         input_configuration: InputConfiguration,
         timing_markers: Arc<TimingMarkers>,
         routes: Vec<OverlayRoute>,
         profile_resolver: Arc<ProfileResolver>,
+        action_plan_compiler: Arc<ActionPlanCompiler>,
         debug_menu_override: Option<Arc<ResolvedMenu>>,
         config_revision: u64,
     ) -> Result<Self> {
@@ -133,6 +140,7 @@ impl InteractionRuntime {
                     &timing_markers,
                     &routes,
                     &profile_resolver,
+                    &action_plan_compiler,
                     debug_menu_override.as_ref(),
                     config_revision,
                 );
@@ -236,13 +244,20 @@ fn run_interaction_thread(
     timing_markers: &TimingMarkers,
     routes: &[OverlayRoute],
     profile_resolver: &ProfileResolver,
+    action_plan_compiler: &ActionPlanCompiler,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
     config_revision: u64,
 ) {
     let mut controller = InteractionController::new(GestureConfig::default());
     let mut active = ActiveInvocation::default();
     let mut counters = EventCounters::default();
-    let dispatcher = EffectDispatcher { egui_context, timing_markers, routes, config_revision };
+    let dispatcher = EffectDispatcher {
+        egui_context,
+        timing_markers,
+        routes,
+        action_plan_compiler,
+        config_revision,
+    };
     let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut runtime_stop_pending = false;
@@ -272,15 +287,7 @@ fn run_interaction_thread(
         if simulated_failure == 2 || metrics.queue_overflow.swap(false, Ordering::AcqRel) {
             accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::InputQueueOverflow) {
-                dispatch_effect(
-                    effect,
-                    query_qpc(),
-                    active.snapshot.as_ref(),
-                    active.profile_id,
-                    active.menu.as_ref(),
-                    active.route,
-                    &dispatcher,
-                );
+                dispatch_effect(effect, query_qpc(), &active, &dispatcher);
             }
             active.clear();
             runtime_stop_pending = true;
@@ -303,15 +310,7 @@ fn run_interaction_thread(
         {
             accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::HookUnresponsive) {
-                dispatch_effect(
-                    effect,
-                    now,
-                    active.snapshot.as_ref(),
-                    active.profile_id,
-                    active.menu.as_ref(),
-                    active.route,
-                    &dispatcher,
-                );
+                dispatch_effect(effect, now, &active, &dispatcher);
             }
             active.clear();
             runtime_stop_pending = true;
@@ -347,15 +346,7 @@ fn run_interaction_thread(
     }
 
     if let Some(effect) = controller.fault(CancelReason::Shutdown) {
-        dispatch_effect(
-            effect,
-            query_qpc(),
-            active.snapshot.as_ref(),
-            active.profile_id,
-            active.menu.as_ref(),
-            active.route,
-            &dispatcher,
-        );
+        dispatch_effect(effect, query_qpc(), &active, &dispatcher);
     }
     log_interaction_stopped(&counters, config_revision);
 }
@@ -394,15 +385,7 @@ fn handle_runtime_control(
         ),
     };
     if let Some(effect) = controller.fault(reason) {
-        dispatch_effect(
-            effect,
-            query_qpc(),
-            active.snapshot.as_ref(),
-            active.profile_id,
-            active.menu.as_ref(),
-            active.route,
-            dispatcher,
-        );
+        dispatch_effect(effect, query_qpc(), active, dispatcher);
     }
     active.clear();
     log::info!(
@@ -456,7 +439,14 @@ fn handle_input_event(
                 source_qpc,
                 "",
             );
-            controller.activation_up()
+            let effect = controller.activation_up();
+            prepare_selected_action(
+                effect,
+                active,
+                dispatcher.action_plan_compiler,
+                dispatcher.config_revision,
+            );
+            effect
         }
         InputEventKind::Cancel(reason) => {
             counters.cancel = counters.cancel.saturating_add(1);
@@ -465,18 +455,44 @@ fn handle_input_event(
     };
 
     if let Some(effect) = effect {
-        dispatch_effect(
-            effect,
-            source_qpc,
-            active.snapshot.as_ref(),
-            active.profile_id,
-            active.menu.as_ref(),
-            active.route,
-            dispatcher,
-        );
+        dispatch_effect(effect, source_qpc, active, dispatcher);
     }
     if matches!(controller.state(), InteractionState::Idle | InteractionState::Faulted) {
         active.clear();
+    }
+}
+
+fn prepare_selected_action(
+    effect: Option<InteractionEffect>,
+    active: &mut ActiveInvocation,
+    action_plan_compiler: &ActionPlanCompiler,
+    active_config_revision: u64,
+) {
+    let Some(InteractionEffect::Close {
+        outcome: InteractionOutcome::Selected { slice_index },
+        ..
+    }) = effect
+    else {
+        return;
+    };
+    let Some(action_id) = active.menu.as_ref().and_then(|menu| menu.action_id(slice_index)) else {
+        return;
+    };
+    active.action_id = Some(action_id);
+    let invocation_config_revision = active
+        .snapshot
+        .as_ref()
+        .map_or(active_config_revision, |snapshot| snapshot.context.config_revision);
+    match action_plan_compiler.compile_plan(action_id, invocation_config_revision) {
+        Ok(plan) => active.execution_plan = Some(Arc::new(plan)),
+        Err(error) => {
+            log::error!(
+                target: "actions",
+                "component=actions event_code=action_plan_compile_failed \
+                 result_code=failure error_code=config_invalid \
+                 config_revision={invocation_config_revision} action_id={action_id} error={error}"
+            );
+        }
     }
 }
 
@@ -583,14 +599,16 @@ fn route_for_point(point: gradial_core::ScreenPoint, routes: &[OverlayRoute]) ->
 fn dispatch_effect(
     effect: InteractionEffect,
     source_qpc: i64,
-    active_snapshot: Option<&InvocationSnapshot>,
-    active_profile_id: Option<uuid::Uuid>,
-    active_menu: Option<&Arc<ResolvedMenu>>,
-    active_route: Option<usize>,
+    active: &ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
 ) {
+    let active_snapshot = active.snapshot.as_ref();
+    let active_profile_id = active.profile_id;
+    let active_menu = active.menu.as_ref();
+    let active_action_id = active.action_id;
+    let active_execution_plan = active.execution_plan.as_ref();
     let Some((route_index, route)) =
-        active_overlay_route(active_route, dispatcher.routes, dispatcher.config_revision)
+        active_overlay_route(active.route, dispatcher.routes, dispatcher.config_revision)
     else {
         return;
     };
@@ -629,15 +647,26 @@ fn dispatch_effect(
         InteractionEffect::Close { invocation_id, outcome } => {
             match outcome {
                 InteractionOutcome::Selected { slice_index } => {
+                    let action_assigned = active_action_id.is_some();
+                    let plan_compiled = active_execution_plan.is_some();
                     log::info!(
                         target: "interaction",
                         "component=interaction event_code=slice_selected result_code=ok \
                          config_revision={} invocation_id={invocation_id} profile_id={} \
-                         slice_index={slice_index} action_executed=false",
+                         slice_index={slice_index} action_assigned={action_assigned} \
+                         plan_compiled={plan_compiled} action_executed=false",
                         active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
                             snapshot.context.config_revision
                         }),
                         active_profile_id.unwrap_or_default()
+                    );
+                    log_selected_action_outcome(
+                        invocation_id,
+                        active_action_id,
+                        active_execution_plan,
+                        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
+                            snapshot.context.config_revision
+                        }),
                     );
                 }
                 InteractionOutcome::Cancelled { reason } => {
@@ -653,6 +682,46 @@ fn dispatch_effect(
             }
             dispatcher.timing_markers.emit("close_requested", Some(invocation_id), source_qpc, "");
             route.close(dispatcher.egui_context, dispatcher.timing_markers, invocation_id);
+        }
+    }
+}
+
+fn log_selected_action_outcome(
+    invocation_id: uuid::Uuid,
+    action_id: Option<uuid::Uuid>,
+    execution_plan: Option<&Arc<ExecutionPlan>>,
+    config_revision: u64,
+) {
+    match (action_id, execution_plan) {
+        (Some(action_id), Some(plan)) => {
+            log::info!(
+                target: "actions",
+                "component=actions event_code=action_plan_compiled result_code=ok \
+                 config_revision={} invocation_id={invocation_id} action_id={action_id} \
+                 step_count={} per_step_timeout_ms={} maximum_duration_ms={} \
+                 action_executed=false",
+                plan.config_revision(),
+                plan.steps().len(),
+                plan.per_step_timeout_ms(),
+                plan.maximum_duration_ms()
+            );
+        }
+        (Some(action_id), None) => {
+            log::error!(
+                target: "actions",
+                "component=actions event_code=invocation_cancelled result_code=cancelled \
+                 error_code=config_invalid config_revision={config_revision} \
+                 invocation_id={invocation_id} action_id={action_id} \
+                 reason=ActionPlanInvalid action_executed=false"
+            );
+        }
+        (None, _) => {
+            log::info!(
+                target: "actions",
+                "component=actions event_code=invocation_cancelled result_code=cancelled \
+                 config_revision={config_revision} invocation_id={invocation_id} \
+                 reason=EmptySlice action_executed=false"
+            );
         }
     }
 }
@@ -772,7 +841,16 @@ const fn heartbeat_is_unresponsive(
 
 #[cfg(test)]
 mod tests {
-    use super::heartbeat_is_unresponsive;
+    use std::sync::Arc;
+
+    use gradial_core::{
+        ActionDefinition, ActionKind, ActionPlanCompiler, Configuration, InteractionEffect,
+        InteractionOutcome, InvocationContext, InvocationGeometry, InvocationSnapshot,
+        ResolvedMenu, ScreenPoint, SliceCount,
+    };
+    use uuid::Uuid;
+
+    use super::{ActiveInvocation, heartbeat_is_unresponsive, prepare_selected_action};
 
     #[test]
     fn heartbeat_faults_only_after_three_missed_intervals() {
@@ -786,5 +864,58 @@ mod tests {
     fn heartbeat_does_not_fault_before_initial_sample() {
         assert!(!heartbeat_is_unresponsive(10_000, 100_000, 0, 7_500));
         assert!(!heartbeat_is_unresponsive(0, 100_000, 1, 7_500));
+    }
+
+    #[test]
+    fn release_compiles_the_frozen_slice_action_for_the_invocation_revision() {
+        let action_id = Uuid::from_u128(41);
+        let invocation_id = Uuid::from_u128(42);
+        let configuration = Configuration {
+            config_revision: 9,
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Pause".to_owned(),
+                kind: ActionKind::Delay { milliseconds: 10 },
+            }],
+            ..Configuration::default()
+        };
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        let menu = ResolvedMenu::new(
+            SliceCount::Four,
+            ["North", "East", "South", "West"].map(str::to_owned).into(),
+            vec![Some(action_id), None, None, None].into(),
+        )
+        .expect("menu");
+        let mut active = ActiveInvocation {
+            snapshot: Some(InvocationSnapshot {
+                invocation_id,
+                qpc_timestamp: 1,
+                cursor_physical_px: ScreenPoint::new(10, 20),
+                monitor_dpi: 96,
+                geometry: InvocationGeometry::fixed(ScreenPoint::new(10, 20), 96),
+                context: Arc::new(InvocationContext {
+                    config_revision: 9,
+                    ..InvocationContext::default()
+                }),
+            }),
+            menu: Some(Arc::new(menu)),
+            ..ActiveInvocation::default()
+        };
+
+        prepare_selected_action(
+            Some(InteractionEffect::Close {
+                invocation_id,
+                outcome: InteractionOutcome::Selected { slice_index: 0 },
+            }),
+            &mut active,
+            &compiler,
+            99,
+        );
+
+        assert_eq!(active.action_id, Some(action_id));
+        let plan = active.execution_plan.expect("immutable release plan");
+        assert_eq!(plan.root_action_id(), action_id);
+        assert_eq!(plan.config_revision(), 9);
+        assert_eq!(plan.steps().len(), 1);
     }
 }

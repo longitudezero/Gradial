@@ -1,14 +1,21 @@
 //! Platform-independent building blocks for Gradial.
 
+pub mod actions;
 pub mod configuration;
 pub mod geometry;
 pub mod interaction;
 pub mod paths;
 pub mod profiles;
 
+pub use actions::{
+    ActionDefinition, ActionKind, ActionPlanCompiler, ActionPlanError,
+    DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation, ExecutionPlan, ExecutionStep,
+    MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
+    MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
+};
 pub use configuration::{
-    ApplicationProfile, CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError, Menu, MenuSlice,
-    Profile, ProfileRule,
+    ApplicationProfile, CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError,
+    LEGACY_CONFIG_SCHEMA_VERSION, Menu, MenuSlice, Profile, ProfileRule,
 };
 pub use geometry::{Point, SliceCount};
 pub use interaction::{

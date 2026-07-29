@@ -91,3 +91,7 @@ action-free. Release logs a valid selected slice with
 `action_executed=false`. The next bounded slice can introduce validated action
 definitions and immutable execution-plan compilation without revisiting
 profile matching or menu rendering.
+
+That boundary was completed in the subsequent
+[`milestone-2-action-model-results.md`](milestone-2-action-model-results.md)
+slice.

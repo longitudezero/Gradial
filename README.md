@@ -12,7 +12,10 @@ direction, corner/edge, rapid-use, focus, display-routing, topology, and
 recovery scenarios. The first Milestone 2 foundation adds schema-versioned
 configuration, atomic backup recovery, complete invocation target identity,
 deterministic application-profile resolution, and profile-driven four/eight
-slice menus whose configured labels are rendered directly.
+slice menus whose configured labels are rendered directly. The next bounded
+Milestone 2 slice adds schema-two built-in action definitions, validated menu
+references and reusable sequences, safe schema-one migration, and immutable
+release-time action-plan compilation.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -74,8 +77,9 @@ cargo run --package gradial-app -- --reduced-motion
 
 **M4 is dedicated to Gradial while the app runs.** Its normal browser
 back/navigation behavior is suppressed. This milestone deliberately does not
-execute launcher actions; release only writes `slice_selected` with
-`action_executed=false` to the local log.
+execute launcher actions. An assigned slice is compiled into an immutable,
+bounded plan at release; an unassigned slice cancels as `EmptySlice`. Both
+paths record `action_executed=false`.
 
 The display under the M4-down cursor selects the prewarmed overlay window.
 Display, work-area, or DPI changes cancel an active gesture and rebuild the
@@ -89,14 +93,17 @@ startup failures remain faulted with M4 passed through until **Retry input** is
 chosen. The same menu provides **Exit Gradial**. Input is also re-registered
 after resume, session unlock, or an Explorer restart.
 
-First startup now creates `%LOCALAPPDATA%\Gradial\config.json` with schema 1,
-revision 1, and a global eight-slice profile. Configuration replacement is
-validated and atomic, preserves the previous valid primary as
+First startup now creates `%LOCALAPPDATA%\Gradial\config.json` with schema 2,
+revision 1, a global eight-slice profile, and an empty action catalog. Existing
+schema-one files are migrated to schema two in memory without being rewritten;
+the next explicit successful save will persist schema two. Configuration
+replacement is validated and atomic, preserves the previous valid primary as
 `config.json.bak`, and recovers from that backup without overwriting a broken
-primary. Application-profile rules are resolved at every activation, but
-actions and the settings editor are not present yet. The selected profile's
-complete menu is frozen for the invocation, so title or configuration changes
-cannot switch geometry or labels while a gesture is open.
+primary. Application-profile rules are resolved at every activation. The
+selected profile's complete menu—including optional action UUIDs—is frozen for
+the invocation, so title or configuration changes cannot switch geometry,
+labels, or the selected action while a gesture is open. Action execution and
+the settings editor are not present yet.
 
 Run all local checks with:
 
@@ -131,3 +138,5 @@ Configuration, snapshot, persistence, and resolver results are recorded in
 [`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).
 Profile-driven gesture and renderer results are recorded in
 [`Documentation/milestone-2-profile-menu-results.md`](Documentation/milestone-2-profile-menu-results.md).
+Schema-two action validation and plan-compilation results are recorded in
+[`Documentation/milestone-2-action-model-results.md`](Documentation/milestone-2-action-model-results.md).

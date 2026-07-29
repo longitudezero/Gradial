@@ -401,6 +401,7 @@ mod tests {
                 "Tests".to_owned(),
                 "Terminal".to_owned(),
             ]),
+            vec![None; 4].into(),
         )
         .expect("complete custom menu");
         let labels: Vec<_> =

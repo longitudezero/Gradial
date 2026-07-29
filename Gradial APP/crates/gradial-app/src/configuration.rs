@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use gradial_core::{AppPaths, CONFIG_SCHEMA_VERSION, Configuration};
+use gradial_core::{AppPaths, CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION};
 use windows::{
     Win32::Storage::FileSystem::{
         MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
@@ -37,7 +37,14 @@ impl ConfigurationSource {
 pub(crate) struct LoadedConfiguration {
     pub(crate) configuration: Configuration,
     pub(crate) source: ConfigurationSource,
+    pub(crate) migration: Option<ConfigurationMigration>,
     pub(crate) warning: Option<ConfigurationWarning>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConfigurationMigration {
+    pub(crate) from_schema: u32,
+    pub(crate) to_schema: u32,
 }
 
 #[derive(Debug)]
@@ -58,16 +65,18 @@ impl ConfigStore {
 
     pub(crate) fn load_or_initialize(&self) -> Result<LoadedConfiguration> {
         match read_configuration(&self.paths.config) {
-            Ok(configuration) => Ok(LoadedConfiguration {
-                configuration,
+            Ok(read) => Ok(LoadedConfiguration {
+                configuration: read.configuration,
                 source: ConfigurationSource::Primary,
+                migration: read.migration,
                 warning: None,
             }),
             Err(primary_error @ ConfigurationFileError::Missing { .. }) => {
                 match read_configuration(&self.paths.config_backup) {
-                    Ok(configuration) => Ok(LoadedConfiguration {
-                        configuration,
+                    Ok(read) => Ok(LoadedConfiguration {
+                        configuration: read.configuration,
                         source: ConfigurationSource::BackupRecovery,
+                        migration: read.migration,
                         warning: Some(ConfigurationWarning {
                             primary_error: primary_error.to_string(),
                             backup_error: None,
@@ -81,6 +90,7 @@ impl ConfigStore {
                         Ok(LoadedConfiguration {
                             configuration,
                             source: ConfigurationSource::InitializedDefault,
+                            migration: None,
                             warning: None,
                         })
                     }
@@ -88,9 +98,10 @@ impl ConfigStore {
                 }
             }
             Err(primary_error) => match read_configuration(&self.paths.config_backup) {
-                Ok(configuration) => Ok(LoadedConfiguration {
-                    configuration,
+                Ok(read) => Ok(LoadedConfiguration {
+                    configuration: read.configuration,
                     source: ConfigurationSource::BackupRecovery,
+                    migration: read.migration,
                     warning: Some(ConfigurationWarning {
                         primary_error: primary_error.to_string(),
                         backup_error: None,
@@ -147,6 +158,7 @@ impl ConfigStore {
         Ok(LoadedConfiguration {
             configuration,
             source: ConfigurationSource::InMemoryRecoveryDefault,
+            migration: None,
             warning: Some(ConfigurationWarning {
                 primary_error: primary_error.to_string(),
                 backup_error: Some(backup_error.to_string()),
@@ -191,9 +203,18 @@ enum ConfigurationFileError {
         #[source]
         source: gradial_core::ConfigurationError,
     },
+
+    #[error("configuration file {path} cannot migrate from schema one: {reason}")]
+    InvalidMigration { path: PathBuf, reason: &'static str },
 }
 
-fn read_configuration(path: &Path) -> Result<Configuration, ConfigurationFileError> {
+#[derive(Debug)]
+struct ReadConfiguration {
+    configuration: Configuration,
+    migration: Option<ConfigurationMigration>,
+}
+
+fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFileError> {
     let bytes = fs::read(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             ConfigurationFileError::Missing { path: path.to_path_buf() }
@@ -203,8 +224,11 @@ fn read_configuration(path: &Path) -> Result<Configuration, ConfigurationFileErr
     })?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|source| ConfigurationFileError::Parse { path: path.to_path_buf(), source })?;
-    if let Some(schema_version) = value.get("schema_version").and_then(serde_json::Value::as_u64)
+    let schema_version = value.get("schema_version").and_then(serde_json::Value::as_u64);
+    let migrating_schema_one = schema_version == Some(u64::from(LEGACY_CONFIG_SCHEMA_VERSION));
+    if let Some(schema_version) = schema_version
         && schema_version != u64::from(CONFIG_SCHEMA_VERSION)
+        && !migrating_schema_one
     {
         return Err(ConfigurationFileError::UnsupportedSchema {
             path: path.to_path_buf(),
@@ -212,12 +236,50 @@ fn read_configuration(path: &Path) -> Result<Configuration, ConfigurationFileErr
             supported: CONFIG_SCHEMA_VERSION,
         });
     }
-    let configuration: Configuration = serde_json::from_value(value)
+    if migrating_schema_one && schema_one_contains_action_fields(&value) {
+        return Err(ConfigurationFileError::InvalidMigration {
+            path: path.to_path_buf(),
+            reason: "schema-one files cannot contain actions or action references",
+        });
+    }
+    let mut configuration: Configuration = serde_json::from_value(value)
         .map_err(|source| ConfigurationFileError::Parse { path: path.to_path_buf(), source })?;
+    let migration = migrating_schema_one.then_some(ConfigurationMigration {
+        from_schema: LEGACY_CONFIG_SCHEMA_VERSION,
+        to_schema: CONFIG_SCHEMA_VERSION,
+    });
+    if migrating_schema_one {
+        configuration.schema_version = CONFIG_SCHEMA_VERSION;
+    }
     configuration
         .validate()
         .map_err(|source| ConfigurationFileError::Invalid { path: path.to_path_buf(), source })?;
-    Ok(configuration)
+    Ok(ReadConfiguration { configuration, migration })
+}
+
+fn schema_one_contains_action_fields(value: &serde_json::Value) -> bool {
+    if value.get("actions").is_some() {
+        return true;
+    }
+    let global_has_action =
+        value.get("global_profile").is_some_and(profile_contains_action_reference);
+    let application_has_action = value
+        .get("application_profiles")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|profiles| {
+            profiles.iter().any(|application_profile| {
+                application_profile.get("profile").is_some_and(profile_contains_action_reference)
+            })
+        });
+    global_has_action || application_has_action
+}
+
+fn profile_contains_action_reference(profile: &serde_json::Value) -> bool {
+    profile
+        .get("menu")
+        .and_then(|menu| menu.get("slices"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|slices| slices.iter().any(|slice| slice.get("action_id").is_some()))
 }
 
 fn write_temporary_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -279,9 +341,14 @@ fn wide_path(path: &Path) -> Vec<u16> {
 mod tests {
     use std::fs;
 
-    use gradial_core::{AppPaths, CONFIG_SCHEMA_VERSION, Configuration};
+    use gradial_core::{
+        AppPaths, CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION,
+    };
 
-    use super::{ConfigStore, ConfigurationSource, SaveInterruption, read_configuration};
+    use super::{
+        ConfigStore, ConfigurationMigration, ConfigurationSource, SaveInterruption,
+        read_configuration,
+    };
 
     fn store() -> (tempfile::TempDir, AppPaths, ConfigStore) {
         let temporary_directory = tempfile::tempdir().expect("temporary directory");
@@ -291,18 +358,40 @@ mod tests {
         (temporary_directory, paths, store)
     }
 
+    fn active_configuration(path: &std::path::Path) -> Configuration {
+        read_configuration(path).expect("configuration").configuration
+    }
+
+    fn schema_one_bytes() -> Vec<u8> {
+        let mut value =
+            serde_json::to_value(Configuration::default()).expect("configuration value");
+        let root = value.as_object_mut().expect("configuration object");
+        root.insert(
+            "schema_version".to_owned(),
+            serde_json::Value::from(LEGACY_CONFIG_SCHEMA_VERSION),
+        );
+        root.remove("actions");
+        let slices = root
+            .get_mut("global_profile")
+            .and_then(|profile| profile.get_mut("menu"))
+            .and_then(|menu| menu.get_mut("slices"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("global menu slices");
+        for slice in slices {
+            slice.as_object_mut().expect("slice object").remove("action_id");
+        }
+        serde_json::to_vec_pretty(&value).expect("legacy bytes")
+    }
+
     #[test]
-    fn first_load_atomically_initializes_schema_one() {
+    fn first_load_atomically_initializes_schema_two() {
         let (_temporary_directory, paths, store) = store();
         let loaded = store.load_or_initialize().expect("initialize configuration");
 
         assert_eq!(loaded.source, ConfigurationSource::InitializedDefault);
         assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(loaded.configuration.config_revision, 1);
-        assert_eq!(
-            read_configuration(&paths.config).expect("saved configuration"),
-            loaded.configuration
-        );
+        assert_eq!(active_configuration(&paths.config), loaded.configuration);
         assert!(!paths.config_temporary.exists());
     }
 
@@ -316,8 +405,8 @@ mod tests {
         let second = store.save(&first, &proposed).expect("replacement");
 
         assert_eq!(second.config_revision, 2);
-        assert_eq!(read_configuration(&paths.config).expect("primary"), second);
-        assert_eq!(read_configuration(&paths.config_backup).expect("backup"), first);
+        assert_eq!(active_configuration(&paths.config), second);
+        assert_eq!(active_configuration(&paths.config_backup), first);
     }
 
     #[test]
@@ -330,7 +419,7 @@ mod tests {
         assert!(
             store.save_internal(&first, &proposed, SaveInterruption::AfterTemporaryFlush).is_err()
         );
-        assert_eq!(read_configuration(&paths.config).expect("primary"), first);
+        assert_eq!(active_configuration(&paths.config), first);
         assert!(paths.config_temporary.exists());
     }
 
@@ -383,6 +472,58 @@ mod tests {
 
         assert!(store.save(&first, &invalid).is_err());
         assert_eq!(first.config_revision, 1);
-        assert_eq!(read_configuration(&paths.config).expect("primary"), first);
+        assert_eq!(active_configuration(&paths.config), first);
+    }
+
+    #[test]
+    fn schema_one_migrates_only_in_memory_and_keeps_original_bytes() {
+        let (_temporary_directory, paths, store) = store();
+        let legacy = schema_one_bytes();
+        fs::write(&paths.config, &legacy).expect("legacy configuration");
+
+        let loaded = store.load_or_initialize().expect("migrated configuration");
+
+        assert_eq!(loaded.source, ConfigurationSource::Primary);
+        assert_eq!(
+            loaded.migration,
+            Some(ConfigurationMigration {
+                from_schema: LEGACY_CONFIG_SCHEMA_VERSION,
+                to_schema: CONFIG_SCHEMA_VERSION,
+            })
+        );
+        assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
+        assert!(loaded.configuration.actions.is_empty());
+        assert!(
+            loaded
+                .configuration
+                .global_profile
+                .menu
+                .slices
+                .iter()
+                .all(|slice| slice.action_id.is_none())
+        );
+        assert_eq!(fs::read(&paths.config).expect("legacy retained"), legacy);
+    }
+
+    #[test]
+    fn schema_one_cannot_smuggle_schema_two_action_fields() {
+        let (_temporary_directory, paths, store) = store();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&schema_one_bytes()).expect("legacy value");
+        value["actions"] = serde_json::Value::Array(Vec::new());
+        fs::write(&paths.config, serde_json::to_vec_pretty(&value).expect("legacy bytes"))
+            .expect("legacy configuration");
+
+        let loaded = store.load_or_initialize().expect("recovery configuration");
+
+        assert_eq!(loaded.source, ConfigurationSource::InMemoryRecoveryDefault);
+        assert!(loaded.migration.is_none());
+        assert!(
+            loaded
+                .warning
+                .expect("migration warning")
+                .primary_error
+                .contains("cannot migrate from schema one")
+        );
     }
 }

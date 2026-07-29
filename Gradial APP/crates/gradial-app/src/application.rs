@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gradial_core::{GeometryMode, ProfileResolver, ResolvedMenu};
+use gradial_core::{ActionPlanCompiler, GeometryMode, ProfileResolver, ResolvedMenu};
 
 use crate::{
     diagnostics::TimingMarkers,
@@ -26,6 +26,7 @@ pub(crate) struct GradialApp {
     manual_input_fault: bool,
     timing_markers: Arc<TimingMarkers>,
     profile_resolver: Arc<ProfileResolver>,
+    action_plan_compiler: Arc<ActionPlanCompiler>,
     config_revision: u64,
     tray_icon: TrayIcon,
 }
@@ -38,6 +39,7 @@ impl GradialApp {
         startup_options: StartupOptions,
         timing_markers: Arc<TimingMarkers>,
         profile_resolver: Arc<ProfileResolver>,
+        action_plan_compiler: Arc<ActionPlanCompiler>,
         config_revision: u64,
     ) -> Result<Self> {
         platform::set_display_topology_monitoring(false);
@@ -92,6 +94,7 @@ impl GradialApp {
             manual_input_fault: false,
             timing_markers,
             profile_resolver,
+            action_plan_compiler,
             config_revision,
             tray_icon,
         })
@@ -293,6 +296,7 @@ impl GradialApp {
             Arc::clone(&self.timing_markers),
             routes,
             Arc::clone(&self.profile_resolver),
+            Arc::clone(&self.action_plan_compiler),
             self.debug_menu_override.clone(),
             self.config_revision,
         ) {

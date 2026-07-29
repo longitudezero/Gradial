@@ -663,10 +663,11 @@ $log = Get-Content -LiteralPath $logPath -Raw
 $configurationRecord = [regex]::Match(
     $log,
     "event_code=config_loaded .*config_revision=(?<revision>[1-9][0-9]*) " +
-    "schema_version=1 source=(?<source>[a-z_]+)"
+    "schema_version=2 source=(?<source>[a-z_]+) " +
+    "migrated_from_schema=(?<migration>none|1) action_count=(?<actions>[0-9]+)"
 )
 if (-not $configurationRecord.Success) {
-    throw "The live check did not load a validated schema-one configuration."
+    throw "The live check did not load a validated schema-two configuration."
 }
 $activeConfigRevision = $configurationRecord.Groups["revision"].Value
 $expectedDebugOverride = if ($Configuration -eq "debug") { $Slices } else { "none" }
@@ -726,10 +727,26 @@ if ($menuFrameRecords.Count -lt $minimumMenuFrames) {
 $selectionRecords = [regex]::Matches(
     $log,
     "(?m)^(?<time>\S+) .*event_code=slice_selected .*" +
-    "invocation_id=(?<invocation>[0-9a-f-]+) .*slice_index=(?<slice>[0-7]) "
+    "invocation_id=(?<invocation>[0-9a-f-]+) .*slice_index=(?<slice>[0-7]) " +
+    "action_assigned=(?<assigned>true|false) plan_compiled=(?<compiled>true|false) " +
+    "action_executed=false"
 )
 if ($selectionRecords.Count -ne $expectedInvocations) {
     throw "Expected $expectedInvocations selected gestures; observed $($selectionRecords.Count)."
+}
+if ($log -match "action_executed=true") {
+    throw "The plan-only action milestone unexpectedly executed an action."
+}
+$actionOutcomeRecords = [regex]::Matches(
+    $log,
+    "target=actions .*event_code=(?:action_plan_compiled|invocation_cancelled) .*" +
+    "invocation_id=[0-9a-f-]+ .*action_executed=false"
+)
+if ($actionOutcomeRecords.Count -ne $expectedInvocations) {
+    throw (
+        "Expected $expectedInvocations non-executing action outcomes; " +
+        "observed $($actionOutcomeRecords.Count)."
+    )
 }
 foreach ($expectedDirection in $directions) {
     $expectedSlice = $directionSlices[$expectedDirection]

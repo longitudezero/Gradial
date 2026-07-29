@@ -5,17 +5,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::SliceCount;
+use crate::{
+    SliceCount,
+    actions::{ActionDefinition, ShortcutModifier, validate_actions},
+};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_GLOBAL_PROFILE_ID: Uuid =
     Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0001);
 
-/// The action-free configuration foundation used by the profile milestone.
-///
-/// Menu action references and action definitions are deliberately introduced
-/// with the executor slice. Keeping them out of this schema prevents the
-/// persistence layer from accepting unvalidated placeholder actions.
+/// The complete schema-two configuration model.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
@@ -23,6 +23,8 @@ pub struct Configuration {
     pub config_revision: u64,
     pub global_profile: Profile,
     pub application_profiles: Vec<ApplicationProfile>,
+    #[serde(default)]
+    pub actions: Vec<ActionDefinition>,
 }
 
 impl Configuration {
@@ -52,6 +54,7 @@ impl Configuration {
             }
             profile_ids.push(application_profile.profile.id);
         }
+        validate_actions(self)?;
         Ok(())
     }
 
@@ -78,6 +81,7 @@ impl Default for Configuration {
                 menu: Menu::eight_slice_default(),
             },
             application_profiles: Vec::new(),
+            actions: Vec::new(),
         }
     }
 }
@@ -119,7 +123,7 @@ impl Menu {
         Self {
             slice_count: 8,
             slices: ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-                .map(|label| MenuSlice { label: label.to_owned() })
+                .map(|label| MenuSlice { label: label.to_owned(), action_id: None })
                 .into(),
         }
     }
@@ -138,6 +142,8 @@ impl Menu {
 #[serde(deny_unknown_fields)]
 pub struct MenuSlice {
     pub label: String,
+    #[serde(default)]
+    pub action_id: Option<Uuid>,
 }
 
 fn validate_profile(profile: &Profile) -> Result<(), ConfigurationError> {
@@ -208,6 +214,59 @@ pub enum ConfigurationError {
     #[error("profile UUID {profile_id} appears more than once")]
     DuplicateProfileId { profile_id: Uuid },
 
+    #[error("action UUID {action_id} appears more than once")]
+    DuplicateActionId { action_id: Uuid },
+
+    #[error("action {action_id} has an empty name")]
+    EmptyActionName { action_id: Uuid },
+
+    #[error("shortcut action {action_id} has scan code zero")]
+    InvalidShortcutScanCode { action_id: Uuid },
+
+    #[error("shortcut action {action_id} repeats modifier {modifier:?}")]
+    DuplicateShortcutModifier { action_id: Uuid, modifier: ShortcutModifier },
+
+    #[error("text action {action_id} contains {bytes} bytes; the maximum is {maximum}")]
+    TypedTextTooLong { action_id: Uuid, bytes: usize, maximum: usize },
+
+    #[error("URL action {action_id} must contain an absolute http or https URL")]
+    InvalidActionUrl { action_id: Uuid },
+
+    #[error("action {action_id} field {field} must be an absolute path")]
+    ActionPathNotAbsolute { action_id: Uuid, field: &'static str },
+
+    #[error("action {action_id} field {field} contains a null character")]
+    ActionPathContainsNul { action_id: Uuid, field: &'static str },
+
+    #[error("run action {action_id} argument {index} contains a null character")]
+    ExecutableArgumentContainsNul { action_id: Uuid, index: usize },
+
+    #[error("delay action {action_id} uses {milliseconds} ms; expected 10 through 10000")]
+    InvalidDelay { action_id: Uuid, milliseconds: u32 },
+
+    #[error(
+        "sequence action {action_id} contains {found} references; expected 1 through {maximum}"
+    )]
+    InvalidSequenceLength { action_id: Uuid, found: usize, maximum: usize },
+
+    #[error("profile {profile_id} slice {slice_index} references missing action {action_id}")]
+    MissingMenuActionReference { profile_id: Uuid, slice_index: usize, action_id: Uuid },
+
+    #[error("sequence {sequence_id} item {index} references missing action {action_id}")]
+    MissingSequenceActionReference { sequence_id: Uuid, index: usize, action_id: Uuid },
+
+    #[error("sequence graph contains a cycle through action {action_id}")]
+    SequenceCycle { action_id: Uuid },
+
+    #[error("sequence {action_id} reaches depth {depth}; the maximum is {maximum}")]
+    SequenceDepthLimitExceeded { action_id: Uuid, depth: u8, maximum: u8 },
+
+    #[error("sequence {action_id} expands to {steps} steps; the maximum is {maximum}")]
+    SequenceStepLimitExceeded { action_id: Uuid, steps: usize, maximum: usize },
+
+    #[error("sequence {action_id} contains {milliseconds} ms of delays; the maximum is {maximum}")]
+    SequenceDelayLimitExceeded { action_id: Uuid, milliseconds: u32, maximum: u32 },
+
     #[error("application profile {profile_id} has an empty executable path")]
     EmptyExecutablePath { profile_id: Uuid },
 
@@ -255,11 +314,13 @@ mod tests {
     }
 
     #[test]
-    fn default_configuration_is_valid_and_action_free() {
+    fn default_schema_two_configuration_is_valid_and_action_free() {
         let configuration = Configuration::default();
         configuration.validate().expect("default configuration");
+        assert_eq!(configuration.schema_version, 2);
         assert_eq!(configuration.global_profile.menu.slices.len(), 8);
         assert!(configuration.application_profiles.is_empty());
+        assert!(configuration.actions.is_empty());
     }
 
     #[test]

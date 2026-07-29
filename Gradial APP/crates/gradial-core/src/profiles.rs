@@ -54,6 +54,13 @@ impl ProfileResolver {
                                 .iter()
                                 .map(|slice| slice.label.clone())
                                 .collect::<Arc<[_]>>(),
+                            application_profile
+                                .profile
+                                .menu
+                                .slices
+                                .iter()
+                                .map(|slice| slice.action_id)
+                                .collect::<Arc<[_]>>(),
                         )
                         .ok_or(
                             ConfigurationError::IncorrectMenuLength {
@@ -93,6 +100,13 @@ impl ProfileResolver {
                         .slices
                         .iter()
                         .map(|slice| slice.label.clone())
+                        .collect::<Arc<[_]>>(),
+                    configuration
+                        .global_profile
+                        .menu
+                        .slices
+                        .iter()
+                        .map(|slice| slice.action_id)
                         .collect::<Arc<[_]>>(),
                 )
                 .ok_or(ConfigurationError::IncorrectMenuLength {
@@ -198,13 +212,20 @@ impl ProfileResolution {
 pub struct ResolvedMenu {
     slice_count: SliceCount,
     labels: Arc<[String]>,
+    action_ids: Arc<[Option<Uuid>]>,
 }
 
 impl ResolvedMenu {
-    /// Creates a menu only when every supported slice has exactly one label.
+    /// Creates a menu only when every supported slice has exactly one label
+    /// and one optional action reference.
     #[must_use]
-    pub fn new(slice_count: SliceCount, labels: Arc<[String]>) -> Option<Self> {
-        (labels.len() == slice_count.get()).then_some(Self { slice_count, labels })
+    pub fn new(
+        slice_count: SliceCount,
+        labels: Arc<[String]>,
+        action_ids: Arc<[Option<Uuid>]>,
+    ) -> Option<Self> {
+        (labels.len() == slice_count.get() && action_ids.len() == slice_count.get())
+            .then_some(Self { slice_count, labels, action_ids })
     }
 
     #[must_use]
@@ -217,6 +238,11 @@ impl ResolvedMenu {
         &self.labels
     }
 
+    #[must_use]
+    pub fn action_id(&self, slice_index: usize) -> Option<Uuid> {
+        self.action_ids.get(slice_index).copied().flatten()
+    }
+
     /// Creates the direction-labelled menu used by debug interaction checks.
     #[must_use]
     pub fn directional(slice_count: SliceCount) -> Self {
@@ -224,7 +250,11 @@ impl ResolvedMenu {
             SliceCount::Four => &["N", "E", "S", "W"],
             SliceCount::Eight => &["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
         };
-        Self { slice_count, labels: labels.iter().map(|label| (*label).to_owned()).collect() }
+        Self {
+            slice_count,
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            action_ids: vec![None; slice_count.get()].into(),
+        }
     }
 }
 
@@ -452,7 +482,7 @@ mod tests {
         application_profile.profile.menu = Menu {
             slice_count: 4,
             slices: ["Build", "Search", "Tests", "Terminal"]
-                .map(|label| MenuSlice { label: label.to_owned() })
+                .map(|label| MenuSlice { label: label.to_owned(), action_id: None })
                 .into(),
         };
         let mut configuration = Configuration {
@@ -474,10 +504,29 @@ mod tests {
 
     #[test]
     fn resolved_menu_rejects_incomplete_label_sets() {
-        assert!(super::ResolvedMenu::new(SliceCount::Four, Arc::from([])).is_none());
+        assert!(super::ResolvedMenu::new(SliceCount::Four, Arc::from([]), Arc::from([])).is_none());
         assert!(
-            super::ResolvedMenu::new(SliceCount::Eight, Arc::from(["only one".to_owned()]))
-                .is_none()
+            super::ResolvedMenu::new(
+                SliceCount::Eight,
+                Arc::from(["only one".to_owned()]),
+                vec![None; 8].into(),
+            )
+            .is_none()
         );
+    }
+
+    #[test]
+    fn resolved_menu_freezes_action_references_with_labels() {
+        let action_id = Uuid::from_u128(77);
+        let menu = super::ResolvedMenu::new(
+            SliceCount::Four,
+            ["One", "Two", "Three", "Four"].map(str::to_owned).into(),
+            vec![Some(action_id), None, None, None].into(),
+        )
+        .expect("complete menu");
+
+        assert_eq!(menu.action_id(0), Some(action_id));
+        assert_eq!(menu.action_id(1), None);
+        assert_eq!(menu.action_id(4), None);
     }
 }

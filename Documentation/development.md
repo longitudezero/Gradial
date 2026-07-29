@@ -36,7 +36,8 @@ slices, and the first two bounded Milestone 2 slices establish:
   Explorer restart.
 - Persistent per-monitor geometry caches and bounded 60/35/50 ms
   open/selection/close animation state.
-- A validated schema-one configuration with atomic primary/backup replacement.
+- A validated schema-two configuration with safe in-memory schema-one migration
+  and atomic primary/backup replacement.
 - Complete immutable target/display/modifier identity for every invocation.
 - A compiled, deterministic application-profile resolver with explanation
   data.
@@ -44,10 +45,15 @@ slices, and the first two bounded Milestone 2 slices establish:
   and rendering.
 - Prewarmed four/eight geometry caches on every display and rendering of
   configured profile labels.
+- Validated built-in action definitions and optional menu-slice action UUIDs.
+- Cycle-, depth-, step-, and delay-bounded sequence validation.
+- Immutable release-time execution-plan compilation tied to the invocation's
+  frozen configuration revision.
 
 It intentionally does not expose configuration editing, perform release-time
-action-target validation, or execute actions. A release logs the chosen slice
-and resolved profile but cannot launch anything.
+action-target validation, or execute plans. A release logs the chosen slice
+and either compiles its assigned plan or cancels an empty slice, but cannot
+launch or inject anything.
 
 ## Workspace layout
 
@@ -84,11 +90,18 @@ On first run, Gradial creates:
     logs\
 ```
 
-`config.json` starts at schema 1 and revision 1 with the stable global profile
-and an eight-slice label-only menu. A successful later replacement preserves
-the previous valid primary as `config.json.bak`; `config.json.tmp` exists only
-during a save. The current bounded schema deliberately has no action
-definitions or references.
+`config.json` starts at schema 2 and revision 1 with the stable global profile,
+an eight-slice menu, and an empty action catalog. Each menu slice has an
+optional action UUID. A successful later replacement preserves the previous
+valid primary as `config.json.bak`; `config.json.tmp` exists only during a
+save.
+
+Existing schema-one files are accepted only when they contain no schema-two
+action fields. Gradial adds the empty action catalog and empty slice references
+in memory, validates the complete schema-two model, and leaves the original
+bytes untouched. Migration is persisted only through a later explicit,
+successful save. This prevents startup from silently rewriting either a valid
+legacy file or a file containing ambiguous fields.
 
 Configuration is parsed and completely validated before input starts. Profile
 regular expressions are compiled into the retained resolver at load rather
@@ -100,8 +113,10 @@ settings editor will surface that same warning visually when it is introduced.
 Logs are local and rotate at 1 MiB. At most five log files are retained.
 Gradial uses its own filter so a host-level `RUST_LOG` setting cannot silence
 lifecycle and safety events. Gradial-authored records use component and event
-codes; dependency warnings may also appear. It does not log window titles,
-typed text, executable arguments, clipboard contents, or selected files.
+codes; dependency warnings may also appear. Action records contain UUIDs,
+step counts, and bounded timing metadata only. They do not contain
+window titles, typed text, executable arguments, clipboard contents, URLs, or
+selected files.
 
 ## Input and interaction architecture
 
@@ -189,11 +204,12 @@ written to routine logs.
 
 ## Configuration and profile resolution
 
-The current action-free configuration model contains one global profile and
-zero or more application profiles. Every profile has an immutable UUID, name,
-and complete four- or eight-slice label menu. Application rules require an
-executable path and may add window-class and title-regex predicates with an
-explicit priority from 0 through 100.
+The configuration model contains one global profile and zero or more
+application profiles. Every profile has an immutable UUID, name, and complete
+four- or eight-slice menu. Each slice contains its visible label and an
+optional action UUID. Application rules require an executable path and may add
+window-class and title-regex predicates with an explicit priority from 0
+through 100.
 
 Executable separators and case are normalized without expanding environment
 variables. Class matching is case-insensitive exact; title regex matching uses
@@ -208,9 +224,44 @@ immutable copy of that profile's complete menu. The interaction log records
 the explanation without target path, class, title, or menu-label content.
 
 The selected menu is frozen with the active invocation. Its slice count drives
-gesture recognition and chooses the matching renderer cache; its label list is
-passed to the same frame. A title change after activation therefore cannot
-switch profiles or produce a gesture/render mismatch.
+gesture recognition and chooses the matching renderer cache; its label and
+action-reference lists remain paired. A title change after activation
+therefore cannot switch profiles or produce a gesture/render/action mismatch.
+
+## Action model and plan compilation
+
+Schema two supports the complete v1 action family:
+
+- keyboard shortcut by scan code, extended-key flag, and explicit left/right
+  modifiers;
+- UTF-8 Unicode text;
+- HTTP or HTTPS URL;
+- absolute file or folder path;
+- absolute executable path, argument array, and optional absolute working
+  directory;
+- close, minimize, maximize, or restore the invocation window;
+- delay from 10 through 10,000 ms;
+- reusable linear sequence of action UUIDs.
+
+The model rejects empty action names, duplicate action UUIDs, malformed
+shortcuts, text above 8 KiB UTF-8, disallowed URLs, relative paths, embedded
+nulls, missing menu/sequence references, empty or oversized sequences, direct
+or indirect cycles, nesting beyond four sequence levels, expansion beyond 32
+leaf steps, and a statically known delay total above 30 seconds.
+
+The validated catalog is cloned into an immutable `ActionPlanCompiler` when
+configuration loads. On release, the selected action UUID comes from the
+invocation's frozen menu. The compiler requires the same frozen
+`config_revision`, recursively replaces reusable sequences with ordered leaf
+steps, and attaches the immutable plan to the invocation. Every plan records a
+5-second per-step timeout and 30-second overall ceiling for the future
+executor.
+
+This slice has no executor and makes no OS action calls. Assigned slices record
+`action_plan_compiled` with safe metadata and `action_executed=false`.
+Unassigned slices record `EmptySlice`; a defensive compilation mismatch
+records `ActionPlanInvalid`. The overlay still begins its close animation
+immediately in all three cases.
 
 ## Edge behavior
 
