@@ -158,6 +158,18 @@ pub(crate) fn request_overlay_hide(handle: OverlayWakeHandle) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn request_overlay_repaint(handle: OverlayWakeHandle) -> Result<()> {
+    let window = hwnd_from_handle(handle);
+    // SAFETY: the handle identifies a live Gradial overlay. Invalidating its
+    // client area wakes the visible child even when the root controller is
+    // hidden and throttled.
+    let invalidated = unsafe { InvalidateRect(Some(window), None, false) };
+    if !invalidated.as_bool() {
+        bail!("Windows could not invalidate the overlay window");
+    }
+    Ok(())
+}
+
 pub(crate) fn overlay_window_by_title(title: &str) -> Option<OverlayWakeHandle> {
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: the class name is absent and `wide` is a live, null-terminated

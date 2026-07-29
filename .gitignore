@@ -8,7 +8,7 @@ Thumbs.db
 *.swo
 
 # Local diagnostics and profiling captures
+/Gradial APP/captures/
 *.etl
 *.wpax
 *.csv
-

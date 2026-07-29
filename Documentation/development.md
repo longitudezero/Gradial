@@ -53,6 +53,7 @@ Gradial APP\
         check-focus.ps1    Validate the latest completed focus trace
         capture-timing.ps1 Capture ETW markers and presented-frame timings
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
+        run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
 `gradial-core` must remain free of UI and Windows windowing dependencies. Pure
@@ -253,6 +254,14 @@ supersede a closing one; the prior overlay is hidden and its focus checkpoint
 is completed before the next wake request. Pool replacement and shutdown use
 the same forced-hide fallback instead of waiting for an obsolete animation.
 
+Close also registers its deadline with one pool-wide, bounded coordinator.
+This is a lifecycle fallback rather than a second animation driver: the child
+viewport normally completes its own close, while the coordinator guarantees
+the final native hide if a completion repaint is missed. It checks the
+invocation UUID before changing state, and the hide request plus state reset
+are serialized under the same viewport lock so an old close cannot hide a
+newer invocation. No thread is created per gesture or per monitor.
+
 Standard animation requests a child-viewport repaint no more frequently than
 every 8 ms. Reduced motion snaps the visuals but retains the 60 ms opening state
 and 50 ms close lifecycle, scheduling only their completion frames. Gesture
@@ -327,9 +336,9 @@ testing. If input becomes faulted, use **Retry input**. Stop Gradial with its
 tray **Exit Gradial** command, its terminal, or the VS Code debug controls.
 
 The repeatable live smoke helper builds on the same contract. It temporarily
-moves the cursor, starts the hidden debug executable, sends one synthetic M4
-gesture, verifies foreground identity and edge cursor retention, restores the
-cursor, and closes only the process it started:
+moves the cursor, starts the hidden executable, sends one or more synthetic M4
+gestures, verifies expected slices, foreground identity, and edge cursor
+retention, restores the cursor, and closes only the process it started:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin
@@ -342,6 +351,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault queue-overflow
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ReducedMotion
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint top-left -AllDirections
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint center -Direction SW -InvocationCount 20 -QuickFlick -InterInvocationDelayMilliseconds 10
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -366,6 +377,31 @@ selection. Every normal run also correlates the selected invocation with its
 animated hide and checks the observed close lifecycle against the 50 ms target
 with scheduler tolerance.
 
+For matrix validation, first build the selected configuration, then run one of
+the versioned suites:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interaction-matrix.ps1 -Suite quick
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interaction-matrix.ps1 -Suite standard
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interaction-matrix.ps1 -Suite extended
+```
+
+The quick suite is a short regression subset. Standard adds four-slice center
+coverage, all four corners and edge midpoints, per-monitor routing, topology,
+and recovery cases. Extended defaults to ten repetitions of all eight
+directions from all four corners, yielding 320 automated repetitions, and
+raises the rapid-invocation count to 100. Counts can be set explicitly with
+`-CornerTrialsPerDirection` and `-RapidInvocationCount`. Automated repetitions
+do not measure the plan's human direction-error or selection-time gates.
+
+Each run creates an ignored timestamped directory under
+`captures\interaction-matrix` containing `interaction-matrix.json`,
+`scenarios.csv`, and `coverage.csv`. The JSON starts with `schema_version: 1`
+and includes host/display metadata, exact scenario arguments, captured output,
+exit codes, timings, and a coverage table. Missing mixed-DPI, negative-origin,
+or high-refresh hardware is reported as `unavailable`; physical events and
+long-run campaigns that were not performed are reported as `not_run`.
+
 ## Checks
 
 `scripts\check.ps1` runs, in order:
@@ -378,7 +414,9 @@ with scheduler tolerance.
 
 The script stops on the first failure.
 
-The prototype helpers make the plan's measurements repeatable, but they do not
-replace the required hardware matrix, 1,000-invocation latency runs, 320 corner
-trials, or 10,000-invocation focus campaign. Those release-gate datasets remain
-future validation work.
+The harness makes the plan's automated interaction checks repeatable and can
+produce a 320-repetition corner stress dataset, but it cannot create absent
+hardware or replace physical state changes and the required participant
+validation. The 1,000-invocation presented-frame latency run,
+10,000-invocation focus campaign, and remaining hardware/human datasets stay
+separate release gates.

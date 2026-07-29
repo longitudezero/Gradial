@@ -1,9 +1,11 @@
 use std::{
     sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
     time::Instant,
 };
 
 use anyhow::{Context as _, Result};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
 use gradial_core::{InvocationSnapshot, MonitorGeometry, ScreenPoint, SliceCount};
 use uuid::Uuid;
@@ -17,10 +19,11 @@ use crate::{
 use super::{
     AnimationMode, FoundationOverlayRenderer, OVERLAY_SIZE_DIP, OverlayRenderFrame,
     OverlayRenderer,
-    animation::{FRAME_INTERVAL, PresenceFrame, closing_frame, opening_frame},
+    animation::{CLOSE_DURATION, FRAME_INTERVAL, PresenceFrame, closing_frame, opening_frame},
 };
 
 const REQUIRED_PREWARM_PASSES: u8 = 3;
+const CLOSE_COORDINATOR_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default)]
 enum VisualPhase {
@@ -78,6 +81,7 @@ pub(crate) struct OverlayPool {
     slots: Vec<OverlaySlot>,
     animation_mode: AnimationMode,
     timing_markers: Arc<TimingMarkers>,
+    close_coordinator: CloseCoordinator,
 }
 
 impl OverlayPool {
@@ -89,6 +93,7 @@ impl OverlayPool {
         timing_markers: Arc<TimingMarkers>,
     ) -> Self {
         let process_id = std::process::id();
+        let close_coordinator = CloseCoordinator::start(Arc::clone(&timing_markers));
         let slots: Vec<_> = monitors
             .iter()
             .copied()
@@ -111,7 +116,7 @@ impl OverlayPool {
             animation_mode.is_reduced()
         );
 
-        Self { monitors, slots, animation_mode, timing_markers }
+        Self { monitors, slots, animation_mode, timing_markers, close_coordinator }
     }
 
     pub(crate) fn monitors(&self) -> &[MonitorGeometry] {
@@ -176,6 +181,7 @@ impl OverlayPool {
                     monitor: slot.monitor,
                     native_handle,
                     animation_mode: self.animation_mode,
+                    close_sender: self.close_coordinator.sender.clone(),
                     state: Arc::clone(&slot.state),
                 })
             })
@@ -185,15 +191,19 @@ impl OverlayPool {
 
 impl Drop for OverlayPool {
     fn drop(&mut self) {
+        self.close_coordinator.stop();
         for slot in &self.slots {
             let completed_close = {
                 let mut state =
                     slot.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let native_handle = state.native_handle;
+                let hide_requested = native_handle.map(|handle| request_native_hide(handle, true));
                 let snapshot = state.reset_visuals();
-                state.native_handle.map(|native_handle| CompletedClose {
+                native_handle.map(|native_handle| CompletedClose {
                     native_handle,
                     snapshot,
                     forced: true,
+                    hide_requested,
                 })
             };
             if let Some(completed_close) = completed_close {
@@ -209,6 +219,7 @@ pub(crate) struct OverlayRoute {
     monitor: MonitorGeometry,
     native_handle: OverlayWakeHandle,
     animation_mode: AnimationMode,
+    close_sender: Sender<CloseCommand>,
     state: Arc<Mutex<OverlayViewportState>>,
 }
 
@@ -243,6 +254,7 @@ impl OverlayRoute {
                     native_handle: self.native_handle,
                     snapshot: Some(interrupted_snapshot),
                     forced: true,
+                    hide_requested: None,
                 },
                 timing_markers,
             );
@@ -318,6 +330,19 @@ impl OverlayRoute {
             }
         };
         if scheduled {
+            if let Err(error) = self.close_sender.try_send(CloseCommand::Schedule(ScheduledClose {
+                deadline: started_at + CLOSE_DURATION,
+                invocation_id,
+                native_handle: self.native_handle,
+                state: Arc::clone(&self.state),
+            })) {
+                log::error!(
+                    target: "renderer",
+                    "component=renderer event_code=close_watchdog_schedule_failed \
+                     result_code=failure config_revision=0 invocation_id={invocation_id} \
+                     error={error}"
+                );
+            }
             timing_markers.emit(
                 "close_animation_started",
                 Some(invocation_id),
@@ -332,6 +357,14 @@ impl OverlayRoute {
                 self.animation_mode.is_reduced()
             );
             context.request_repaint_of(self.viewport_id);
+            if let Err(error) = platform::request_overlay_repaint(self.native_handle) {
+                log::error!(
+                    target: "renderer",
+                    "component=renderer event_code=close_repaint_wake_failed \
+                     result_code=failure config_revision=0 invocation_id={invocation_id} \
+                     error={error}"
+                );
+            }
         }
     }
 
@@ -342,6 +375,140 @@ impl OverlayRoute {
         } else {
             None
         }
+    }
+}
+
+#[derive(Debug)]
+enum CloseCommand {
+    Schedule(ScheduledClose),
+    Stop,
+}
+
+#[derive(Debug)]
+struct ScheduledClose {
+    deadline: Instant,
+    invocation_id: Uuid,
+    native_handle: OverlayWakeHandle,
+    state: Arc<Mutex<OverlayViewportState>>,
+}
+
+#[derive(Debug)]
+struct CloseCoordinator {
+    sender: Sender<CloseCommand>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl CloseCoordinator {
+    fn start(timing_markers: Arc<TimingMarkers>) -> Self {
+        let (sender, receiver) = bounded(CLOSE_COORDINATOR_CAPACITY);
+        let join_handle = match thread::Builder::new()
+            .name("gradial-overlay-close".to_owned())
+            .spawn(move || run_close_coordinator(&receiver, &timing_markers))
+        {
+            Ok(join_handle) => Some(join_handle),
+            Err(error) => {
+                log::error!(
+                    target: "renderer",
+                    "component=renderer event_code=close_watchdog_start_failed \
+                     result_code=failure config_revision=0 error={error}"
+                );
+                None
+            }
+        };
+        Self { sender, join_handle }
+    }
+
+    fn stop(&mut self) {
+        if self.join_handle.is_none() {
+            return;
+        }
+        if let Err(error) = self.sender.send(CloseCommand::Stop) {
+            log::warn!(
+                target: "renderer",
+                "component=renderer event_code=close_watchdog_stop_signal_failed \
+                 result_code=failure config_revision=0 error={error}"
+            );
+        }
+        if let Some(join_handle) = self.join_handle.take()
+            && join_handle.join().is_err()
+        {
+            log::error!(
+                target: "renderer",
+                "component=renderer event_code=close_watchdog_panicked result_code=failure \
+                 config_revision=0"
+            );
+        }
+    }
+}
+
+impl Drop for CloseCoordinator {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_close_coordinator(receiver: &Receiver<CloseCommand>, timing_markers: &TimingMarkers) {
+    let mut pending: Vec<ScheduledClose> = Vec::new();
+    loop {
+        let command_result =
+            if let Some(next_deadline) = pending.iter().map(|close| close.deadline).min() {
+                receiver.recv_timeout(next_deadline.saturating_duration_since(Instant::now()))
+            } else {
+                match receiver.recv() {
+                    Ok(command) => Ok(command),
+                    Err(_) => break,
+                }
+            };
+
+        match command_result {
+            Ok(CloseCommand::Schedule(scheduled)) => {
+                pending.retain(|existing| !Arc::ptr_eq(&existing.state, &scheduled.state));
+                pending.push(scheduled);
+            }
+            Ok(CloseCommand::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        let now = Instant::now();
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].deadline > now {
+                index += 1;
+                continue;
+            }
+            let scheduled = pending.swap_remove(index);
+            complete_scheduled_close(&scheduled, timing_markers);
+        }
+    }
+}
+
+fn complete_scheduled_close(scheduled: &ScheduledClose, timing_markers: &TimingMarkers) {
+    let completion = {
+        let mut state = scheduled.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matching = state
+            .snapshot
+            .is_some_and(|snapshot| snapshot.invocation_id == scheduled.invocation_id)
+            && matches!(state.phase, VisualPhase::Closing { .. });
+        if !matching {
+            return;
+        }
+        let hidden = request_native_hide(scheduled.native_handle, false);
+        let snapshot = state.reset_visuals();
+        snapshot.map(|snapshot| {
+            (
+                CompletedClose {
+                    native_handle: scheduled.native_handle,
+                    snapshot: Some(snapshot),
+                    forced: false,
+                    hide_requested: Some(hidden),
+                },
+                hidden,
+            )
+        })
+    };
+
+    if let Some((completed, hidden)) = completion {
+        record_finished_close(completed, hidden, timing_markers);
     }
 }
 
@@ -357,6 +524,7 @@ struct CompletedClose {
     native_handle: OverlayWakeHandle,
     snapshot: Option<InvocationSnapshot>,
     forced: bool,
+    hide_requested: Option<bool>,
 }
 
 fn prepare_overlay_frame(
@@ -394,11 +562,14 @@ fn prepare_overlay_frame(
     };
 
     let completed_close = if matches!(phase, VisualPhase::Closing { .. }) && presence.complete {
+        let native_handle = state.native_handle;
+        let hide_requested = native_handle.map(|handle| request_native_hide(handle, false));
         let snapshot = state.reset_visuals();
-        state.native_handle.map(|native_handle| CompletedClose {
+        native_handle.map(|native_handle| CompletedClose {
             native_handle,
             snapshot,
             forced: false,
+            hide_requested,
         })
     } else {
         process_pending_markers(context, viewport_id, &mut state, timing_markers);
@@ -461,18 +632,27 @@ fn process_pending_markers(
 }
 
 fn finish_close(completed: CompletedClose, timing_markers: &TimingMarkers) {
-    let hidden = match platform::request_overlay_hide(completed.native_handle) {
+    let hidden = completed
+        .hide_requested
+        .unwrap_or_else(|| request_native_hide(completed.native_handle, completed.forced));
+    record_finished_close(completed, hidden, timing_markers);
+}
+
+fn request_native_hide(native_handle: OverlayWakeHandle, forced: bool) -> bool {
+    match platform::request_overlay_hide(native_handle) {
         Ok(()) => true,
         Err(error) => {
             log::error!(
                 target: "renderer",
                 "component=renderer event_code=overlay_hide_request_failed result_code=failure \
-                 config_revision=0 forced={} error={error}",
-                completed.forced
+                 config_revision=0 forced={forced} error={error}"
             );
             false
         }
-    };
+    }
+}
+
+fn record_finished_close(completed: CompletedClose, hidden: bool, timing_markers: &TimingMarkers) {
     if let Some(snapshot) = completed.snapshot {
         timing_markers.emit(
             "overlay_hidden",

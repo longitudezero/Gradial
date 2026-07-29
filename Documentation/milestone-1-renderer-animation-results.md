@@ -20,6 +20,9 @@ hide safety, and the temporary reduced-motion development override.
   fades to zero over 50 ms and is then hidden.
 - Pool destruction, display rebuild, and an overlapping new invocation retain
   an immediate native hide fallback.
+- One pool-wide bounded close coordinator guarantees the final hide deadline if
+  a child viewport misses its completion repaint, while invocation identity
+  checks prevent a stale close from hiding a newer gesture.
 - `--reduced-motion` removes interpolation while preserving the 60 ms opening
   state and 50 ms close lifecycle.
 - Standard animation schedules frames at an 8 ms minimum interval. Reduced
@@ -50,6 +53,7 @@ workspace configurations compile.
 | Display change during held M4 | Pass; active pool forced hidden, rebuilt, and rewarmed |
 | Foreground focus after animated close | Pass |
 | Renderer cache/timing contract in local diagnostics | Pass |
+| Three repeated 20-invocation rapid-close runs | Pass; final closes observed at 50-51 ms |
 
 Observed close values include Windows scheduling and asynchronous local logging;
 the renderer's interpolation itself clamps to its pure 50 ms endpoint.
@@ -58,6 +62,7 @@ the renderer's interpolation itself clamps to its pure 50 ms endpoint.
 
 PresentMon correlation must still confirm that the first actually presented
 frame meets the 85% opacity requirement across the complete display matrix.
-The long-run latency/focus campaign, animation behavior under GPU pressure, and
-appearance settings backed by persistent configuration remain future release
-gates.
+The standard interaction matrix now covers bounded rapid-close cleanup and is
+recorded in `milestone-1-interaction-matrix-results.md`. PresentMon latency and
+long-run focus campaigns, animation behavior under GPU pressure, and appearance
+settings backed by persistent configuration remain future release gates.

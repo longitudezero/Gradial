@@ -7,7 +7,9 @@ overlay for every connected display; dedicated low-level input thread; bounded
 event transport; tested four/eight-slice gesture state machine; automatic edge
 assist; display/DPI rebuild handling; input-hook recovery; a native health tray
 icon; cached overlay geometry; bounded animations; and focus/timing
-instrumentation.
+instrumentation. A versioned interaction-matrix harness now covers repeatable
+direction, corner/edge, rapid-use, focus, display-routing, topology, and
+recovery scenarios.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -90,6 +92,15 @@ Run all local checks with:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
 ```
 
+Run the standard live interaction matrix after building the debug executable:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interaction-matrix.ps1 -Suite standard
+```
+
+It writes ignored, versioned JSON and CSV results under
+`Gradial APP\captures\interaction-matrix`.
+
 See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
@@ -102,3 +113,5 @@ Input recovery and tray results are recorded in
 [`Documentation/milestone-1-input-recovery-results.md`](Documentation/milestone-1-input-recovery-results.md).
 Renderer cache and animation results are recorded in
 [`Documentation/milestone-1-renderer-animation-results.md`](Documentation/milestone-1-renderer-animation-results.md).
+The repeatable interaction-matrix contract and current coverage are recorded in
+[`Documentation/milestone-1-interaction-matrix-results.md`](Documentation/milestone-1-interaction-matrix-results.md).

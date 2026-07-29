@@ -27,7 +27,35 @@ param(
 
     [switch]$ReducedMotion,
 
-    [switch]$QuickFlick
+    [switch]$QuickFlick,
+
+    [ValidateSet(
+        "default",
+        "center",
+        "top-edge",
+        "right-edge",
+        "bottom-edge",
+        "left-edge",
+        "top-left",
+        "top-right",
+        "bottom-right",
+        "bottom-left"
+    )]
+    [string]$ActivationPoint = "default",
+
+    [ValidateSet("N", "NE", "E", "SE", "S", "SW", "W", "NW")]
+    [string]$Direction = "E",
+
+    [switch]$AllDirections,
+
+    [ValidateRange(1, 1000)]
+    [int]$InvocationCount = 1,
+
+    [ValidateRange(0, 1000)]
+    [int]$GestureDelayMilliseconds = 180,
+
+    [ValidateRange(0, 1000)]
+    [int]$InterInvocationDelayMilliseconds = 75
 )
 
 $ErrorActionPreference = "Stop"
@@ -239,8 +267,8 @@ if (-not (Test-Path -LiteralPath $executable)) {
 if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
     throw "Input fault simulation is available only in a debug build."
 }
-if ($QuickFlick -and $Geometry -ne "fixed-origin") {
-    throw "Quick-flick validation currently requires fixed-origin geometry."
+if ($Slices -eq "4" -and -not $AllDirections -and $Direction.Length -ne 1) {
+    throw "Four-slice validation accepts only N, E, S, or W."
 }
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
     throw "Close the existing Gradial process before running the isolated live smoke check."
@@ -262,13 +290,71 @@ try {
         throw "Monitor index $MonitorIndex is unavailable; Windows reported $($screens.Count) display(s)."
     }
     $workArea = $screens[$MonitorIndex].WorkingArea
-    if ($Geometry -eq "fixed-origin") {
-        $testX = $workArea.Left + [int]($workArea.Width / 2)
-        $testY = $workArea.Top + [int]($workArea.Height / 2)
+    $resolvedActivationPoint = if ($ActivationPoint -eq "default") {
+        if ($Geometry -eq "fixed-origin") { "center" } else { "top-left" }
+    } else {
+        $ActivationPoint
     }
-    else {
-        $testX = $workArea.Left + 2
-        $testY = $workArea.Top + 2
+    $centerX = $workArea.Left + [int]($workArea.Width / 2)
+    $centerY = $workArea.Top + [int]($workArea.Height / 2)
+    switch ($resolvedActivationPoint) {
+        "center" {
+            $testX = $centerX
+            $testY = $centerY
+        }
+        "top-edge" {
+            $testX = $centerX
+            $testY = $workArea.Top + 2
+        }
+        "right-edge" {
+            $testX = $workArea.Right - 3
+            $testY = $centerY
+        }
+        "bottom-edge" {
+            $testX = $centerX
+            $testY = $workArea.Bottom - 3
+        }
+        "left-edge" {
+            $testX = $workArea.Left + 2
+            $testY = $centerY
+        }
+        "top-left" {
+            $testX = $workArea.Left + 2
+            $testY = $workArea.Top + 2
+        }
+        "top-right" {
+            $testX = $workArea.Right - 3
+            $testY = $workArea.Top + 2
+        }
+        "bottom-right" {
+            $testX = $workArea.Right - 3
+            $testY = $workArea.Bottom - 3
+        }
+        "bottom-left" {
+            $testX = $workArea.Left + 2
+            $testY = $workArea.Bottom - 3
+        }
+    }
+    $directionVectors = @{
+        N  = @(0, -80)
+        NE = @(57, -57)
+        E  = @(80, 0)
+        SE = @(57, 57)
+        S  = @(0, 80)
+        SW = @(-57, 57)
+        W  = @(-80, 0)
+        NW = @(-57, -57)
+    }
+    $directionSlices = if ($Slices -eq "4") {
+        @{ N = 0; E = 1; S = 2; W = 3 }
+    } else {
+        @{ N = 0; NE = 1; E = 2; SE = 3; S = 4; SW = 5; W = 6; NW = 7 }
+    }
+    $directions = if ($AllDirections) {
+        if ($Slices -eq "4") { @("N", "E", "S", "W") }
+        else { @("N", "NE", "E", "SE", "S", "SW", "W", "NW") }
+    } else {
+        @($Direction)
     }
     if (-not [GradialSmokeNative]::SetCursorPos($testX, $testY)) {
         throw "Could not position the cursor for the smoke check."
@@ -480,20 +566,51 @@ try {
         }
     }
 
-    [GradialSmokeNative]::SendM4($true)
-    $m4IsDown = $true
-    if (-not $QuickFlick) {
-        Start-Sleep -Milliseconds 180
-    }
-    [GradialSmokeNative]::SendRelativeMove(80, 0)
-    if (-not $QuickFlick) {
-        Start-Sleep -Milliseconds 180
-    }
+    # Recovery pass-through checks may legitimately let the foreground
+    # application handle M4. Establish the focus baseline immediately before
+    # the measured Gradial invocation set so only Gradial-caused changes fail.
+    $foregroundWindow = [GradialSmokeNative]::GetForegroundWindow()
+    $foregroundProcess = [GradialSmokeNative]::ForegroundProcessId()
+    $gestureDelay = if ($QuickFlick) { 0 } else { $GestureDelayMilliseconds }
+    $maxCursorDistance = 0.0
+    $completedInvocations = 0
+    foreach ($gestureDirection in $directions) {
+        $vector = $directionVectors[$gestureDirection]
+        for ($invocationIndex = 0; $invocationIndex -lt $InvocationCount; $invocationIndex++) {
+            if (-not [GradialSmokeNative]::SetCursorPos($testX, $testY)) {
+                throw "Could not reset the cursor for invocation $invocationIndex."
+            }
+            $cursorAtActivation = New-Object GradialSmokeNative+Point
+            [GradialSmokeNative]::GetCursorPos([ref]$cursorAtActivation) | Out-Null
 
-    $cursorDuringGesture = New-Object GradialSmokeNative+Point
-    [GradialSmokeNative]::GetCursorPos([ref]$cursorDuringGesture) | Out-Null
-    [GradialSmokeNative]::SendM4($false)
-    $m4IsDown = $false
+            [GradialSmokeNative]::SendM4($true)
+            $m4IsDown = $true
+            if ($gestureDelay -gt 0) {
+                Start-Sleep -Milliseconds $gestureDelay
+            }
+            [GradialSmokeNative]::SendRelativeMove($vector[0], $vector[1])
+            if ($gestureDelay -gt 0) {
+                Start-Sleep -Milliseconds $gestureDelay
+            }
+
+            $cursorDuringGesture = New-Object GradialSmokeNative+Point
+            [GradialSmokeNative]::GetCursorPos([ref]$cursorDuringGesture) | Out-Null
+            $cursorDistance = [Math]::Sqrt(
+                [Math]::Pow($cursorDuringGesture.X - $cursorAtActivation.X, 2) +
+                [Math]::Pow($cursorDuringGesture.Y - $cursorAtActivation.Y, 2)
+            )
+            $maxCursorDistance = [Math]::Max($maxCursorDistance, $cursorDistance)
+            [GradialSmokeNative]::SendM4($false)
+            $m4IsDown = $false
+            $completedInvocations++
+            if (
+                $completedInvocations -lt ($directions.Count * $InvocationCount) -and
+                $InterInvocationDelayMilliseconds -gt 0
+            ) {
+                Start-Sleep -Milliseconds $InterInvocationDelayMilliseconds
+            }
+        }
+    }
     Start-Sleep -Milliseconds 250
 
     $foregroundAfter = [GradialSmokeNative]::GetForegroundWindow()
@@ -501,13 +618,16 @@ try {
     if ($foregroundAfter -ne $foregroundWindow -and $foregroundProcessAfter -ne $foregroundProcess) {
         throw "The foreground application changed during the Gradial invocation."
     }
-    if ($Geometry -ne "fixed-origin") {
-        $cursorDistance = [Math]::Sqrt(
-            [Math]::Pow($cursorDuringGesture.X - $cursorAtActivation.X, 2) +
-            [Math]::Pow($cursorDuringGesture.Y - $cursorAtActivation.Y, 2)
-        )
-        if ($cursorDistance -gt 2) {
-            throw "Edge assist moved the system cursor by $cursorDistance pixels."
+    $expectedBehavior = if ($Geometry -eq "fixed-origin") {
+        "fixed-origin"
+    } elseif ($Geometry -eq "edge-assist" -or $resolvedActivationPoint -ne "center") {
+        "edge-assist"
+    } else {
+        "fixed-origin"
+    }
+    if ($expectedBehavior -eq "edge-assist") {
+        if ($maxCursorDistance -gt 2) {
+            throw "Edge assist moved the system cursor by $maxCursorDistance pixels."
         }
     }
     if ($timingCapture) {
@@ -550,19 +670,58 @@ if (
 ) {
     throw "The renderer cache and animation contract was not initialized as requested."
 }
-if ($log -notmatch "event_code=invocation_started ") {
-    throw "The live check did not produce a Gradial invocation."
+$expectedInvocations = $directions.Count * $InvocationCount
+$invocationRecords = [regex]::Matches(
+    $log,
+    "event_code=invocation_started .*geometry=$expectedBehavior"
+)
+if ($invocationRecords.Count -lt $expectedInvocations) {
+    throw "Expected $expectedInvocations '$expectedBehavior' invocations; observed $($invocationRecords.Count)."
 }
-$expectedBehavior = if ($Geometry -eq "fixed-origin") { "fixed-origin" } else { "edge-assist" }
-if ($log -notmatch "event_code=invocation_started .*geometry=$expectedBehavior") {
-    throw "The invocation did not resolve to expected behavior '$expectedBehavior'."
+$selectionRecords = [regex]::Matches(
+    $log,
+    "(?m)^(?<time>\S+) .*event_code=slice_selected .*" +
+    "invocation_id=(?<invocation>[0-9a-f-]+) .*slice_index=(?<slice>[0-7]) "
+)
+if ($selectionRecords.Count -ne $expectedInvocations) {
+    throw "Expected $expectedInvocations selected gestures; observed $($selectionRecords.Count)."
 }
-$expectedEastSlice = if ($Slices -eq "4") { 1 } else { 2 }
-if ($log -notmatch "event_code=slice_selected .*slice_index=$expectedEastSlice ") {
-    throw "The live eastward gesture did not select the east slice."
+foreach ($expectedDirection in $directions) {
+    $expectedSlice = $directionSlices[$expectedDirection]
+    $observedForSlice = (
+        $selectionRecords |
+            Where-Object { [int]$_.Groups["slice"].Value -eq $expectedSlice }
+    ).Count
+    if ($observedForSlice -ne $InvocationCount) {
+        throw (
+            "Direction $expectedDirection expected slice $expectedSlice " +
+            "$InvocationCount time(s); observed $observedForSlice."
+        )
+    }
 }
-if ($log -notmatch "event_code=focus_checkpoint .*phase=after_close .*accepted=true") {
-    throw "The live check did not complete the focus checkpoints."
+if ($log -match "event_code=focus_checkpoint .*accepted=false") {
+    throw "At least one live focus checkpoint failed."
+}
+$activationFocusCount = (
+    [regex]::Matches(
+        $log,
+        "event_code=focus_checkpoint .*phase=activation .*accepted=true"
+    )
+).Count
+$closedFocusCount = (
+    [regex]::Matches(
+        $log,
+        "event_code=focus_checkpoint .*phase=after_close .*accepted=true"
+    )
+).Count
+if (
+    $activationFocusCount -lt $expectedInvocations -or
+    $closedFocusCount -lt $expectedInvocations
+) {
+    throw (
+        "Focus coverage was incomplete: activation=$activationFocusCount, " +
+        "after_close=$closedFocusCount, expected=$expectedInvocations."
+    )
 }
 if (
     $log -notmatch (
@@ -571,11 +730,6 @@ if (
 ) {
     throw "The live check did not complete the bounded close animation."
 }
-$selectionRecords = [regex]::Matches(
-    $log,
-    "(?m)^(?<time>\S+) .*event_code=slice_selected .*" +
-    "invocation_id=(?<invocation>[0-9a-f-]+)"
-)
 $selectionRecord = $selectionRecords[$selectionRecords.Count - 1]
 $invocationId = $selectionRecord.Groups["invocation"].Value
 $closeRecord = [regex]::Match(
@@ -600,7 +754,9 @@ if ($observedCloseMs -lt 45 -or $observedCloseMs -gt 250) {
 }
 
 Write-Host (
-    "Live $Configuration $Geometry $Slices-slice smoke check passed on " +
-    "monitor $MonitorIndex (reduced motion: $expectedReducedMotion, " +
-    "observed close: $observedCloseMs ms)."
+    "Live $Configuration $Geometry $Slices-slice smoke check passed: " +
+    "$expectedInvocations invocation(s), point $resolvedActivationPoint, " +
+    "monitor $MonitorIndex, reduced motion $expectedReducedMotion, " +
+    "maximum retained-cursor movement $maxCursorDistance px, " +
+    "observed close $observedCloseMs ms."
 )
