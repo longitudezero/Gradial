@@ -53,11 +53,13 @@ slices, and the first two bounded Milestone 2 slices establish:
   execution, timeouts, and a two-second shutdown wait.
 - Frozen-target freshness/integrity validation and scan-code keyboard
   shortcuts with synthesized-key cleanup.
+- Literal UTF-16 Unicode text entry with per-event target revalidation and
+  in-flight code-unit cleanup.
 
 It intentionally does not expose configuration editing, perform release-time
-text entry, launch/open actions, or window manipulation. A release logs the
-chosen slice, compiles its assigned plan, and submits it to the coordinator.
-Delay and keyboard shortcuts can succeed; all remaining action families fail
+launch/open actions, or window manipulation. A release logs the chosen slice,
+compiles its assigned plan, and submits it to the coordinator. Delay, keyboard
+shortcuts, and Unicode text can succeed; all remaining action families fail
 before any prefix runs.
 
 ## Workspace layout
@@ -74,7 +76,10 @@ Gradial APP\
         capture-timing.ps1 Capture ETW markers and presented-frame timings
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
         smoke-delay-executor.ps1 Run an isolated Delay action fixture
-        smoke-shortcut-executor.ps1 Run an isolated shortcut/target fixture
+        smoke-input-executor.ps1 Shared isolated input-action fixture
+        smoke-shortcut-executor.ps1 Verify scan-code shortcut delivery
+        smoke-text-executor.ps1 Verify exact private Unicode delivery
+        input-smoke-target.ps1 Capture key and Unicode messages safely
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
@@ -267,9 +272,9 @@ steps, and attaches the immutable plan to the invocation. Every plan records a
 
 The single-worker executor accepts at most one pending or running plan. A
 second dispatch returns `action_busy` immediately and is never queued. Before
-its first step, the worker verifies that every operation is Delay or
-SendShortcut; other or mixed plans fail as `unsupported_action` without
-partially running.
+its first step, the worker verifies that every operation is Delay,
+SendShortcut, or TypeText; other or mixed plans fail as
+`unsupported_action` without partially running.
 
 Delay uses monotonic time and checks cancellation/shutdown in increments no
 larger than 10 ms. The worker defensively enforces the compiled 32-step,
@@ -291,11 +296,21 @@ primary key, and releases synthesized modifiers in reverse order. A cleanup
 guard repeats pending key-up work after failure, cancellation, or unwind and
 never releases a modifier that was already physically held.
 
+Text input is converted from the validated UTF-8 configuration value to UTF-16
+only at dispatch. Every code unit is sent with `KEYEVENTF_UNICODE`, so BMP
+characters and surrogate pairs are delivered literally without keyboard-layout
+translation, clipboard access, or variable/environment expansion. Gradial
+performs the full identity and integrity check before the first unit, then
+checks the HWND, PID, and foreground identity before every key-down and key-up.
+If the target changes, cancellation arrives, or Windows rejects an event, a
+guard releases the one pending Unicode unit before execution stops. The same
+boundaries enforce the plan's step and overall deadlines during long text.
+
 Successful plans record `action_executed=true`. Empty slices still record
 `EmptySlice`; a defensive compilation mismatch records `ActionPlanInvalid`.
 The overlay begins its close animation immediately and never waits for action
-completion. Unicode text, URL/path opening, executable launch, and window
-commands remain disabled.
+completion. Logs record Unicode scalar counts but never text content. URL/path
+opening, executable launch, and window commands remain disabled.
 
 ## Edge behavior
 
@@ -497,6 +512,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint center -Direction SW -InvocationCount 20 -QuickFlick -InterInvocationDelayMilliseconds 10
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-delay-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-shortcut-executor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-text-executor.ps1
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -531,6 +547,11 @@ receiver requires Ctrl down, F13 down/up, and Ctrl up in order, proving the
 production target-validation and `SendInput` path without sending keys to the
 user's applications. It then closes the receiver and removes all temporary
 data.
+`smoke-text-executor.ps1` uses the same isolated receiver and dispatches a
+literal string containing environment-like tokens, BMP Unicode, and a
+surrogate pair. It requires the exact UTF-16 message sequence, confirms the
+tokens were not expanded, and searches Gradial's isolated log for a private
+sentinel to prove the payload was not recorded.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

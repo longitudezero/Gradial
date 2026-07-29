@@ -19,7 +19,9 @@ release-time action-plan compilation. The first executor slice adds a
 single-worker coordinator and cancellable Delay execution with bounded
 timeouts and shutdown. The next executor slice adds stale/elevated target
 validation and scan-code keyboard shortcuts with strict synthesized-key
-cleanup.
+cleanup. Unicode text entry now shares that target boundary, emits literal
+UTF-16 input without using the clipboard, revalidates throughout long sends,
+and cleans up an in-flight code unit on cancellation or failure.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -81,11 +83,13 @@ cargo run --package gradial-app -- --reduced-motion
 
 **M4 is dedicated to Gradial while the app runs.** Its normal browser
 back/navigation behavior is suppressed. An assigned slice is compiled into an
-immutable, bounded plan at release. Delay and keyboard-shortcut steps execute
-on one worker; another dispatch while it is busy fails immediately instead of
-queuing. Before a shortcut, Gradial verifies that the captured window still
-has the same process/start time, remains foreground, and is not at higher
-integrity. Unassigned slices cancel as `EmptySlice`, and plans containing any
+immutable, bounded plan at release. Delay, keyboard-shortcut, and Unicode-text
+steps execute on one worker; another dispatch while it is busy fails
+immediately instead of queuing. Before input, Gradial verifies that the
+captured window still has the same process/start time, remains foreground, and
+is not at higher integrity. Text is sent as literal Unicode without clipboard
+access or environment expansion, and the target is checked between input
+events. Unassigned slices cancel as `EmptySlice`, and plans containing any
 other action family fail safely as `unsupported_action`.
 
 The display under the M4-down cursor selects the prewarmed overlay window.
@@ -110,9 +114,9 @@ replacement is validated and atomic, preserves the previous valid primary as
 primary. Application-profile rules are resolved at every activation. The
 selected profile's complete menu—including optional action UUIDs—is frozen for
 the invocation, so title or configuration changes cannot switch geometry,
-labels, or the selected action while a gesture is open. Delay and keyboard
-shortcut execution are enabled; text, URL/path, executable, window-action, and
-settings-editor support are not present yet.
+labels, or the selected action while a gesture is open. Delay, keyboard
+shortcut, and Unicode text execution are enabled; URL/path, executable,
+window-action, and settings-editor support are not present yet.
 
 Run all local checks with:
 
@@ -153,3 +157,5 @@ Single-plan coordination and Delay execution results are recorded in
 [`Documentation/milestone-2-delay-executor-results.md`](Documentation/milestone-2-delay-executor-results.md).
 Target validation and keyboard-shortcut results are recorded in
 [`Documentation/milestone-2-keyboard-shortcut-results.md`](Documentation/milestone-2-keyboard-shortcut-results.md).
+Unicode text-entry and privacy results are recorded in
+[`Documentation/milestone-2-unicode-text-results.md`](Documentation/milestone-2-unicode-text-results.md).

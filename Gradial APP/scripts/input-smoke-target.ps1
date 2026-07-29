@@ -17,7 +17,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-public sealed class GradialShortcutSmokeTarget : Form
+public sealed class GradialInputSmokeTarget : Form
 {
     private readonly string eventPath;
     private readonly string readyPath;
@@ -25,11 +25,11 @@ public sealed class GradialShortcutSmokeTarget : Form
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr window);
 
-    public GradialShortcutSmokeTarget(string eventPath, string readyPath)
+    public GradialInputSmokeTarget(string eventPath, string readyPath)
     {
         this.eventPath = eventPath;
         this.readyPath = readyPath;
-        Text = "Gradial Shortcut Smoke Target";
+        Text = "Gradial Input Smoke Target";
         Width = 360;
         Height = 120;
         StartPosition = FormStartPosition.CenterScreen;
@@ -38,7 +38,7 @@ public sealed class GradialShortcutSmokeTarget : Form
             AutoSize = true,
             Left = 18,
             Top = 22,
-            Text = "Temporary target for Gradial shortcut validation"
+            Text = "Temporary target for Gradial input validation"
         });
         Shown += (_, __) => {
             Activate();
@@ -54,8 +54,15 @@ public sealed class GradialShortcutSmokeTarget : Form
     {
         const int WmKeyDown = 0x0100;
         const int WmKeyUp = 0x0101;
+        const int WmChar = 0x0102;
         const int WmSysKeyDown = 0x0104;
         const int WmSysKeyUp = 0x0105;
+        if (message.Msg == WmChar) {
+            File.AppendAllText(
+                eventPath,
+                "char," + message.WParam.ToInt64() + Environment.NewLine
+            );
+        }
         if (
             message.Msg == WmKeyDown ||
             message.Msg == WmKeyUp ||
@@ -79,5 +86,5 @@ public sealed class GradialShortcutSmokeTarget : Form
 "@
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
-$form = [GradialShortcutSmokeTarget]::new($EventPath, $ReadyPath)
+$form = [GradialInputSmokeTarget]::new($EventPath, $ReadyPath)
 [System.Windows.Forms.Application]::Run($form)

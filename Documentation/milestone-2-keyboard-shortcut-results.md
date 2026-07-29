@@ -126,3 +126,7 @@ failure toast. Target validation currently protects keyboard shortcuts; it
 will also protect Unicode text when that backend is added. Live elevated and
 target-replacement campaigns remain part of the hardening milestone, while
 their decision paths are covered with deterministic tests here.
+
+Unicode text entry was completed in the subsequent
+[`milestone-2-unicode-text-results.md`](milestone-2-unicode-text-results.md)
+slice.

@@ -25,6 +25,12 @@ pub(crate) fn validate(target: &InvocationContext) -> Result<(), TargetValidatio
     validate_with(&WindowsTargetEnvironment, target)
 }
 
+pub(crate) fn validate_freshness(
+    target: &InvocationContext,
+) -> Result<(), TargetValidationFailure> {
+    validate_freshness_with(&WindowsTargetEnvironment, target)
+}
+
 trait TargetEnvironment {
     fn window_exists(&self, window: usize) -> bool;
     fn window_process_id(&self, window: usize) -> u32;
@@ -57,13 +63,31 @@ fn validate_with(
     Ok(())
 }
 
+fn validate_freshness_with(
+    environment: &impl TargetEnvironment,
+    target: &InvocationContext,
+) -> Result<(), TargetValidationFailure> {
+    if target_window_is_current(environment, target) {
+        Ok(())
+    } else {
+        Err(TargetValidationFailure::StaleTarget)
+    }
+}
+
 fn target_is_current(environment: &impl TargetEnvironment, target: &InvocationContext) -> bool {
+    target_window_is_current(environment, target)
+        && target.process_start_time != 0
+        && environment.process_start_time(target.foreground_pid) == Some(target.process_start_time)
+}
+
+fn target_window_is_current(
+    environment: &impl TargetEnvironment,
+    target: &InvocationContext,
+) -> bool {
     !(target.foreground_window == 0
         || target.foreground_pid == 0
-        || target.process_start_time == 0
         || !environment.window_exists(target.foreground_window)
         || environment.window_process_id(target.foreground_window) != target.foreground_pid
-        || environment.process_start_time(target.foreground_pid) != Some(target.process_start_time)
         || environment.foreground_window() != target.foreground_window)
 }
 
@@ -221,7 +245,9 @@ fn hwnd(address: usize) -> HWND {
 mod tests {
     use gradial_core::InvocationContext;
 
-    use super::{TargetEnvironment, TargetValidationFailure, validate_with};
+    use super::{
+        TargetEnvironment, TargetValidationFailure, validate_freshness_with, validate_with,
+    };
 
     #[derive(Clone, Copy, Debug)]
     struct FakeEnvironment {
@@ -322,6 +348,18 @@ mod tests {
         assert_eq!(
             validate_with(&unreadable, &target()),
             Err(TargetValidationFailure::InspectionFailed)
+        );
+    }
+
+    #[test]
+    fn lightweight_freshness_does_not_reopen_the_process() {
+        let environment =
+            FakeEnvironment { process_start_time: None, ..FakeEnvironment::default() };
+        assert_eq!(validate_freshness_with(&environment, &target()), Ok(()));
+        let background = FakeEnvironment { foreground_window: 30, ..FakeEnvironment::default() };
+        assert_eq!(
+            validate_freshness_with(&background, &target()),
+            Err(TargetValidationFailure::StaleTarget)
         );
     }
 }

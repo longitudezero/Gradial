@@ -33,6 +33,8 @@ param(
 
     [switch]$ExpectShortcutExecution,
 
+    [switch]$ExpectTextExecution,
+
     [ValidateSet(
         "default",
         "center",
@@ -284,11 +286,16 @@ if (-not (Test-Path -LiteralPath $executable)) {
 if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
     throw "Input fault simulation is available only in a debug build."
 }
-if ($ExpectDelayExecution -and $ExpectShortcutExecution) {
+$expectedActionModes = @(
+    $ExpectDelayExecution,
+    $ExpectShortcutExecution,
+    $ExpectTextExecution
+) | Where-Object { $_ }
+if ($expectedActionModes.Count -gt 1) {
     throw "Choose only one expected action execution mode."
 }
 if (
-    ($ExpectDelayExecution -or $ExpectShortcutExecution) -and
+    $expectedActionModes.Count -eq 1 -and
     ($Configuration -ne "release" -or $Slices -ne "8")
 ) {
     throw "Action execution validation requires the release build and its configured eight-slice menu."
@@ -704,12 +711,13 @@ $activeConfigRevision = $configurationRecord.Groups["revision"].Value
 if (
     $log -notmatch (
         "event_code=action_executor_ready .*config_revision=$activeConfigRevision " +
-        ".*supported_operations=delay,send_shortcut .*per_step_timeout_ms=5000 " +
+        ".*supported_operations=delay,send_shortcut,type_text " +
+        ".*per_step_timeout_ms=5000 " +
         ".*maximum_duration_ms=30000 .*maximum_steps=32 " +
         ".*cancellation_poll_ms=10 .*shutdown_wait_ms=2000"
     )
 ) {
-    throw "The bounded Delay executor did not initialize with the required safety limits."
+    throw "The bounded action executor did not initialize with the required safety limits."
 }
 $expectedDebugOverride = if ($Configuration -eq "debug") { $Slices } else { "none" }
 if (
@@ -775,7 +783,7 @@ $selectionRecords = [regex]::Matches(
 if ($selectionRecords.Count -ne $expectedInvocations) {
     throw "Expected $expectedInvocations selected gestures; observed $($selectionRecords.Count)."
 }
-if ($ExpectDelayExecution -or $ExpectShortcutExecution) {
+if ($expectedActionModes.Count -eq 1) {
     $uncompiledSelections = @(
         $selectionRecords |
             Where-Object {

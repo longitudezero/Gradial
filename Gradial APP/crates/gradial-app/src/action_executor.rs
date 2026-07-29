@@ -153,7 +153,8 @@ impl ActionExecutor {
         log::info!(
             target: "actions",
             "component=actions event_code=action_executor_ready result_code=ok \
-             config_revision={config_revision} supported_operations=delay,send_shortcut \
+             config_revision={config_revision} \
+             supported_operations=delay,send_shortcut,type_text \
              per_step_timeout_ms={DEFAULT_ACTION_STEP_TIMEOUT_MS} \
              maximum_duration_ms={MAX_ACTION_SEQUENCE_DURATION_MS} \
              maximum_steps={MAX_ACTION_SEQUENCE_STEPS} cancellation_poll_ms={} \
@@ -296,6 +297,7 @@ fn run_worker(
                     request.plan.steps().len()
                 );
                 let result = execute_plan(
+                    request.invocation_id,
                     &request.plan,
                     &request.target,
                     cancellation_requested,
@@ -343,6 +345,7 @@ fn run_worker(
 }
 
 fn execute_plan(
+    invocation_id: Uuid,
     plan: &ExecutionPlan,
     target: &InvocationContext,
     cancellation_requested: &AtomicBool,
@@ -358,7 +361,9 @@ fn execute_plan(
     if plan.steps().iter().any(|step| {
         !matches!(
             step.operation(),
-            ExecutionOperation::Delay { .. } | ExecutionOperation::SendShortcut { .. }
+            ExecutionOperation::Delay { .. }
+                | ExecutionOperation::SendShortcut { .. }
+                | ExecutionOperation::TypeText { .. }
         )
     }) {
         return failure(ActionErrorCode::UnsupportedAction, "this action type is not enabled yet");
@@ -378,8 +383,10 @@ fn execute_plan(
             .per_step_timeout_override
             .unwrap_or_else(|| Duration::from_millis(u64::from(plan.per_step_timeout_ms())));
         let step_started = Instant::now();
-        let check_deadline_after_step =
-            matches!(step.operation(), ExecutionOperation::SendShortcut { .. });
+        let check_deadline_after_step = matches!(
+            step.operation(),
+            ExecutionOperation::SendShortcut { .. } | ExecutionOperation::TypeText { .. }
+        );
         let result = match step.operation() {
             ExecutionOperation::Delay { milliseconds } => execute_delay(
                 Duration::from_millis(u64::from(*milliseconds)),
@@ -397,6 +404,29 @@ fn execute_plan(
                 cancellation_requested,
                 shutdown_requested,
             )),
+            ExecutionOperation::TypeText { text } => {
+                log::info!(
+                    target: "actions",
+                    "component=actions event_code=text_step_started result_code=ok \
+                     config_revision={} invocation_id={invocation_id} action_id={} \
+                     character_count={}",
+                    plan.config_revision(),
+                    step.source_action_id(),
+                    text.chars().count()
+                );
+                Some(crate::unicode_text::execute(
+                    target,
+                    text,
+                    cancellation_requested,
+                    shutdown_requested,
+                    crate::unicode_text::TextDeadlines::new(
+                        step_started,
+                        per_step_timeout,
+                        plan_started,
+                        maximum_duration,
+                    ),
+                ))
+            }
             _ => unreachable!("the complete plan was preflighted before execution"),
         };
         if let Some(result) = result
@@ -549,6 +579,20 @@ mod tests {
         Arc::new(compiler.compile_plan(Uuid::from_u128(1), revision).expect("plan"))
     }
 
+    fn text_plan(revision: u64) -> Arc<gradial_core::ExecutionPlan> {
+        let configuration = Configuration {
+            config_revision: revision,
+            actions: vec![ActionDefinition {
+                id: Uuid::from_u128(1),
+                name: "Text".to_owned(),
+                kind: ActionKind::TypeText { text: "private text".to_owned() },
+            }],
+            ..Configuration::default()
+        };
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        Arc::new(compiler.compile_plan(Uuid::from_u128(1), revision).expect("plan"))
+    }
+
     fn wait_for_completion(executor: &ActionExecutor) -> super::ActionCompletion {
         for _ in 0..200 {
             if let Some(completion) = executor.try_completion() {
@@ -667,6 +711,19 @@ mod tests {
     }
 
     #[test]
+    fn text_reaches_target_validation_before_any_input_is_sent() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        assert_eq!(
+            dispatch(&executor.handle(), Uuid::from_u128(36), text_plan(1)),
+            ActionDispatch::Accepted
+        );
+        assert!(matches!(
+            wait_for_completion(&executor).result,
+            ActionResult::Failure { code: ActionErrorCode::StaleTarget, .. }
+        ));
+    }
+
+    #[test]
     fn unsupported_plans_fail_before_any_step_runs() {
         let configuration = Configuration {
             config_revision: 1,
@@ -678,8 +735,8 @@ mod tests {
                 },
                 ActionDefinition {
                     id: Uuid::from_u128(2),
-                    name: "Text".to_owned(),
-                    kind: ActionKind::TypeText { text: "must not be typed".to_owned() },
+                    name: "URL".to_owned(),
+                    kind: ActionKind::OpenUrl { url: "https://example.com".to_owned() },
                 },
                 ActionDefinition {
                     id: Uuid::from_u128(3),

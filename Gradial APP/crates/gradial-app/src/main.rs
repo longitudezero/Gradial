@@ -13,6 +13,7 @@ mod overlay;
 mod platform;
 mod shortcut;
 mod tray;
+mod unicode_text;
 
 use std::sync::Arc;
 
