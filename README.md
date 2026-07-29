@@ -29,7 +29,9 @@ payload logging. Direct executable actions now launch existing absolute
 working directory, no shell, and no wait for child exit. Invocation-window
 actions now send one asynchronous minimize, maximize, restore, or polite close
 request only to the window frozen at M4-down after revalidating its identity
-and integrity.
+and integrity. Action failures and cancellations now enter a session-only,
+20-item recent-activity tray panel. Failures also request a native,
+non-focus-stealing Windows notification; successful actions remain silent.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -122,7 +124,10 @@ first menu line show `Healthy`, `Recovering input`, or `Input faulted`. A missed
 input heartbeat triggers automatic recovery after 750 ms. Queue overflow and
 startup failures remain faulted with M4 passed through until **Retry input** is
 chosen. The same menu provides **Cancel current action** while a plan is
-running and **Exit Gradial**. Input is also re-registered after resume, session
+running, a **Recent activity** submenu with **Clear activity**, and **Exit
+Gradial**. Activity is never written to disk. It contains only fixed public
+messages derived from stable error codes, not action text, URLs, paths,
+arguments, or target titles. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
 First startup now creates `%LOCALAPPDATA%\Gradial\config.json` with schema 2,
@@ -186,3 +191,5 @@ Direct executable-launch results are recorded in
 [`Documentation/milestone-2-process-launch-results.md`](Documentation/milestone-2-process-launch-results.md).
 Invocation-window action results are recorded in
 [`Documentation/milestone-2-window-action-results.md`](Documentation/milestone-2-window-action-results.md).
+Action activity and failure-notification results are recorded in
+[`Documentation/milestone-2-action-feedback-results.md`](Documentation/milestone-2-action-feedback-results.md).

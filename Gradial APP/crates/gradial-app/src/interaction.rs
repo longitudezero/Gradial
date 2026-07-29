@@ -25,7 +25,7 @@ use crate::{
     diagnostics::TimingMarkers,
     input::{HookThread, HookThreadMetrics, InputConfiguration},
     overlay::OverlayRoute,
-    platform,
+    platform, tray,
 };
 
 const INPUT_QUEUE_CAPACITY: usize = 4_096;
@@ -734,6 +734,7 @@ fn log_selected_action_outcome(
                         plan.config_revision(),
                         &result,
                     );
+                    tray::record_action_result(&result, plan.config_revision());
                 }
             }
         }

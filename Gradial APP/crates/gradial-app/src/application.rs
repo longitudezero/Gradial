@@ -380,6 +380,7 @@ impl eframe::App for GradialApp {
                         cancellation_requested
                     );
                 }
+                TrayCommand::ClearActivity => crate::tray::clear_activity(self.config_revision),
                 TrayCommand::Exit => {
                     context.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
                     return;
@@ -387,7 +388,20 @@ impl eframe::App for GradialApp {
             }
         }
 
-        while self.action_executor.try_completion().is_some() {}
+        while let Some(completion) = self.action_executor.try_completion() {
+            crate::tray::record_action_result(&completion.result, completion.config_revision);
+        }
+        while let Some(notification) = crate::tray::try_failure_notification() {
+            if let Err(error) = self.tray_icon.show_failure_notification(notification) {
+                log::error!(
+                    target: "tray",
+                    "component=tray event_code=action_failure_notification_failed \
+                     result_code=failure error_code={} config_revision={} error={error}",
+                    notification.error_code().as_str(),
+                    self.config_revision
+                );
+            }
+        }
 
         if let Some(event) = self.interaction.as_ref().and_then(InteractionRuntime::try_event) {
             self.handle_runtime_event(context, event);

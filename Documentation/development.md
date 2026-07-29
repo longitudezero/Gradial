@@ -62,6 +62,10 @@ slices, and the first two bounded Milestone 2 slices establish:
   inherited environment, immediate handle cleanup, and redacted diagnostics.
 - Close, minimize, maximize, and restore for the frozen invocation window,
   with full target revalidation and one asynchronous message dispatch.
+- A session-only, 20-item tray activity panel for action failures and
+  cancellations, with clear-on-command behavior.
+- Native Windows failure notifications that do not activate Gradial; successful
+  actions and cancellations do not notify.
 
 It intentionally does not expose configuration editing. A release logs the
 chosen slice, compiles its assigned plan, and submits it to the coordinator.
@@ -91,6 +95,7 @@ Gradial APP\
         smoke-process-executor.ps1 Verify direct process launch in isolation
         smoke-window-executor.ps1 Verify all invocation-window commands
         window-smoke-target.ps1 Observe isolated window messages and states
+        smoke-action-feedback.ps1 Verify failure activity, notification, focus, and privacy
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
@@ -354,6 +359,24 @@ Successful plans record `action_executed=true`. Empty slices still record
 The overlay begins its close animation immediately and never waits for action
 completion. Logs record Unicode scalar counts and open-request kinds but never
 text, URLs, paths, executable names, working directories, or argument values.
+
+Executor completions and immediate dispatch rejections share one action
+feedback boundary. Success is ignored. Cancellation adds one fixed
+**Cancelled** entry, while failure adds one fixed message selected solely from
+its stable `ActionErrorCode` and queues a native Windows notification. The
+configured `safe_message` is deliberately not copied into either surface, so
+an accidentally dynamic path, URL, target title, text value, or argument cannot
+cross this boundary.
+
+The store is memory-only, keeps the latest 20 failures/cancellations newest
+first, and drops the oldest entry when full. Its pending notification queue is
+bounded to the same size. The tray exposes the snapshot through **Recent
+activity**, and **Clear activity** removes both retained entries and any
+notification not yet submitted to Windows. Notifications use only
+`Shell_NotifyIconW(NIF_INFO)` with an error glyph, no sound, and quiet-time
+respect; the call does not activate or focus Gradial. A Windows notification
+submission failure remains in recent activity and is recorded locally without
+retry. There is no success notification and no persisted activity database.
 
 Window actions use the exact HWND captured at M4-down. Immediately before
 dispatch, the worker checks that the HWND still exists, still belongs to the
@@ -638,6 +661,13 @@ the exact `WM_CLOSE` or `WM_SYSCOMMAND`, verifies minimized/maximized/restored
 state or normal close, and checks that a private target title is absent from
 Gradial's log. Cleanup closes only the receiver processes it started and
 removes the isolated configurations.
+`smoke-action-feedback.ps1` assigns a deliberately missing private executable
+through an isolated release configuration. One real M4 invocation must finish
+with `path_not_found`, enter recent activity, and produce exactly one accepted
+Windows failure-notification request. The shared interaction harness checks
+the foreground application after notification submission, while the wrapper
+confirms that neither its private path sentinel nor its configured argument
+appears in the local log. The isolated configuration is always removed.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

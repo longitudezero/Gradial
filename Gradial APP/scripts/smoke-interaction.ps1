@@ -41,6 +41,8 @@ param(
 
     [switch]$ExpectWindowExecution,
 
+    [switch]$ExpectActionFailure,
+
     [ValidateSet(
         "default",
         "center",
@@ -298,7 +300,8 @@ $expectedActionModes = @(
     $ExpectTextExecution,
     $ExpectOpenExecution,
     $ExpectProcessExecution,
-    $ExpectWindowExecution
+    $ExpectWindowExecution,
+    $ExpectActionFailure
 ) | Where-Object { $_ }
 if ($expectedActionModes.Count -gt 1) {
     throw "Choose only one expected action execution mode."
@@ -807,16 +810,71 @@ if ($expectedActionModes.Count -eq 1) {
     if ($uncompiledSelections.Count -ne 0) {
         throw "At least one action fixture selection did not compile its assigned action."
     }
-    $completedActionRecords = [regex]::Matches(
-        $log,
-        "target=actions .*event_code=action_execution_completed .*result_code=ok " +
-        ".*action_executed=true"
-    )
-    if ($completedActionRecords.Count -ne $expectedInvocations) {
-        throw (
-            "Expected $expectedInvocations completed actions; " +
-            "observed $($completedActionRecords.Count)."
+    if ($ExpectActionFailure) {
+        $failedActionRecords = [regex]::Matches(
+            $log,
+            "target=actions .*event_code=action_execution_completed " +
+            ".*result_code=failure .*error_code=path_not_found " +
+            ".*action_executed=false"
         )
+        if ($failedActionRecords.Count -ne $expectedInvocations) {
+            throw (
+                "Expected $expectedInvocations path-not-found action failures; " +
+                "observed $($failedActionRecords.Count)."
+            )
+        }
+        $activityRecords = [regex]::Matches(
+            $log,
+            "target=tray .*event_code=action_activity_recorded " +
+            ".*result_code=failure .*error_code=path_not_found " +
+            ".*notification_queued=true"
+        )
+        if ($activityRecords.Count -ne $expectedInvocations) {
+            throw (
+                "Expected $expectedInvocations retained failure records; " +
+                "observed $($activityRecords.Count)."
+            )
+        }
+        $notificationRecords = [regex]::Matches(
+            $log,
+            "target=tray .*event_code=action_failure_notification_shown " +
+            ".*result_code=ok .*error_code=path_not_found"
+        )
+        if ($notificationRecords.Count -ne $expectedInvocations) {
+            throw (
+                "Expected $expectedInvocations non-focus-stealing failure notifications; " +
+                "observed $($notificationRecords.Count)."
+            )
+        }
+        if (
+            $log -match (
+                "target=actions .*event_code=action_execution_completed " +
+                ".*result_code=ok .*action_executed=true"
+            )
+        ) {
+            throw "The failing action fixture unexpectedly reported success."
+        }
+    }
+    else {
+        $completedActionRecords = [regex]::Matches(
+            $log,
+            "target=actions .*event_code=action_execution_completed .*result_code=ok " +
+            ".*action_executed=true"
+        )
+        if ($completedActionRecords.Count -ne $expectedInvocations) {
+            throw (
+                "Expected $expectedInvocations completed actions; " +
+                "observed $($completedActionRecords.Count)."
+            )
+        }
+        if (
+            $log -match (
+                "event_code=(?:action_activity_recorded|" +
+                "action_failure_notification_shown)"
+            )
+        ) {
+            throw "A successful action produced user-visible failure activity."
+        }
     }
 }
 elseif ($log -match "action_executed=true") {
