@@ -8,7 +8,7 @@ pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
 Usage:
-  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--reduced-motion]
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--reduced-motion] [--open-settings]
 
 Geometry modes:
   auto          Use edge assist only when the complete ring would clip.
@@ -21,6 +21,9 @@ Slice counts:
 
 Animation:
   --reduced-motion  Remove visual interpolation without changing gesture timing.
+
+Settings:
+  --open-settings   Open the settings window at startup for development checks.
 ";
 
 #[cfg(not(debug_assertions))]
@@ -45,6 +48,7 @@ Menu geometry and labels are selected from the resolved profile configuration.
 pub(crate) struct StartupOptions {
     pub(crate) geometry_mode: GeometryMode,
     pub(crate) debug_slice_override: Option<gradial_core::SliceCount>,
+    pub(crate) debug_open_settings: bool,
     pub(crate) reduced_motion: bool,
 }
 
@@ -56,6 +60,10 @@ impl StartupOptions {
         #[cfg(not(debug_assertions))]
         let debug_slice_override = None;
         let mut reduced_motion = false;
+        #[cfg(debug_assertions)]
+        let mut debug_open_settings = false;
+        #[cfg(not(debug_assertions))]
+        let debug_open_settings = false;
         let mut arguments = arguments.into_iter();
 
         while let Some(argument) = arguments.next() {
@@ -82,12 +90,16 @@ impl StartupOptions {
                         debug_slice_override = Some(parse_slice_count(&value)?);
                         continue;
                     }
+                    if argument == "--open-settings" {
+                        debug_open_settings = true;
+                        continue;
+                    }
                 }
                 bail!("unknown Gradial argument: {argument}");
             }
         }
 
-        Ok(Self { geometry_mode, debug_slice_override, reduced_motion })
+        Ok(Self { geometry_mode, debug_slice_override, debug_open_settings, reduced_motion })
     }
 }
 
@@ -122,6 +134,7 @@ mod tests {
         let options = StartupOptions::parse(Vec::new()).expect("default options");
         assert_eq!(options.geometry_mode, GeometryMode::Auto);
         assert_eq!(options.debug_slice_override, None);
+        assert!(!options.debug_open_settings);
         assert!(!options.reduced_motion);
     }
 
@@ -180,18 +193,22 @@ mod tests {
             "--geometry=edge-assist".to_owned(),
             "--slices=4".to_owned(),
             "--reduced-motion".to_owned(),
+            "--open-settings".to_owned(),
         ])
         .expect("reduced-motion options");
         assert_eq!(options.geometry_mode, GeometryMode::EdgeAssist);
         assert_eq!(options.debug_slice_override, Some(SliceCount::Four));
+        assert!(options.debug_open_settings);
         assert!(options.reduced_motion);
     }
 
     #[test]
     #[cfg(not(debug_assertions))]
-    fn release_build_rejects_the_debug_slice_override() {
-        let error =
-            StartupOptions::parse(["--slices=4".to_owned()]).expect_err("debug-only override");
-        assert!(error.to_string().contains("unknown Gradial argument"));
+    fn release_build_rejects_development_only_options() {
+        for argument in ["--slices=4", "--open-settings"] {
+            let error =
+                StartupOptions::parse([argument.to_owned()]).expect_err("debug-only option");
+            assert!(error.to_string().contains("unknown Gradial argument"));
+        }
     }
 }

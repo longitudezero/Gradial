@@ -66,11 +66,17 @@ slices, and the first two bounded Milestone 2 slices establish:
   cancellations, with clear-on-command behavior.
 - Native Windows failure notifications that do not activate Gradial; successful
   actions and cancellations do not notify.
+- A single-instance native settings window for global-menu four/eight geometry,
+  labels, existing-action assignments, and a production-renderer preview.
+- Draft-safe close confirmation, complete pre-save validation, atomic
+  replacement, and immediate live configuration reload.
 
-It intentionally does not expose configuration editing. A release logs the
-chosen slice, compiles its assigned plan, and submits it to the coordinator.
-Every schema-two leaf action family can now execute through its bounded
-backend.
+Configuration editing is intentionally bounded to the global menu in this
+slice. Action creation, application-profile rules, activation binding,
+appearance, icons, import/export, and onboarding are not exposed yet. A
+release logs the chosen slice, compiles its assigned plan, and submits it to
+the coordinator. Every schema-two leaf action family can execute through its
+bounded backend.
 
 ## Workspace layout
 
@@ -96,6 +102,7 @@ Gradial APP\
         smoke-window-executor.ps1 Verify all invocation-window commands
         window-smoke-target.ps1 Observe isolated window messages and states
         smoke-action-feedback.ps1 Verify failure activity, notification, focus, and privacy
+        smoke-settings-editor.ps1 Verify native draft, save, and live-reload behavior
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
@@ -136,7 +143,7 @@ regular expressions are compiled into the retained resolver at load rather
 than during invocation. An invalid primary loads the backup without rewriting
 either file. If neither file is usable, Gradial runs the built-in default in
 memory, retains the broken files, and writes a `config_recovery_warning`. The
-settings editor will surface that same warning visually when it is introduced.
+settings editor surfaces that warning until a successful explicit save.
 
 Logs are local and rotate at 1 MiB. At most five log files are retained.
 Gradial uses its own filter so a host-level `RUST_LOG` setting cannot silence
@@ -257,6 +264,44 @@ The selected menu is frozen with the active invocation. Its slice count drives
 gesture recognition and chooses the matching renderer cache; its label and
 action-reference lists remain paired. A title change after activation
 therefore cannot switch profiles or produce a gesture/render/action mismatch.
+
+## Settings editor and live reload
+
+The notification-area menu's **Open settings** command opens one normal,
+decorated, resizable taskbar window. Repeating the command focuses that same
+window and preserves its draft. The editor begins from the running
+configuration and modifies a private full-configuration copy; an unfinished
+edit cannot affect an open gesture or a later invocation.
+
+This first editor slice covers the global menu. It can switch between four and
+eight clockwise directions, edit each label, and assign or clear any action
+already present in the validated catalog. Eight-to-four conversion retains the
+four cardinal slices. Diagonal slices are stashed while the draft remains open
+and restored if the user switches back; expanding a configuration that was
+already saved with four slices creates the standard diagonal defaults. The
+selected direction follows its cardinal equivalent across conversions.
+
+The clickable live preview uses `FoundationOverlayRenderer` and
+`ResolvedMenu`, so it shares production geometry, label placement, slice
+ordering, and selection rendering. It does not contain a second gesture or
+layout implementation.
+
+**Save changes** is enabled only for a dirty draft whose required labels,
+configuration references, profile rules, action catalog, and bounded action
+plans all validate and compile. The application repeats that validation before
+disk mutation, performs the existing atomic save/backup procedure, and updates
+the retained resolver, action compiler, overlay revision, executor revision,
+and interaction runtime only after replacement succeeds. A failed save keeps
+the draft open and leaves the running configuration unchanged. A successful
+save increments `config_revision`; fresh M4 invocations immediately use that
+revision.
+
+A normal close with a clean draft closes immediately. A dirty close displays
+exactly **Discard changes** and **Keep editing**. The former abandons the
+private draft and closes; the latter returns to the same unsaved draft.
+**Discard edits** inside the window resets the draft without closing. Startup
+recovery state is shown as a persistent warning and clears only after a
+successful explicit save.
 
 ## Action model and plan compilation
 
@@ -568,8 +613,9 @@ Run the full display-event capture from an elevated PowerShell. Pass
    `hook_thread_responsive`, `invocation_started`, three
    `focus_checkpoint` records, `slice_selected` or `invocation_cancelled`, and
    `hook_thread_stopped`.
-10. Open the tray icon and confirm its status line, **Retry input**,
-    **Cancel current action**, and **Exit Gradial** commands are present.
+10. Open the tray icon and confirm its status line, **Open settings**, **Retry
+    input**, **Cancel current action**, and **Exit Gradial** commands are
+    present.
 11. Repeat once with `--reduced-motion`; selection and close behavior should be
     identical without interpolated visuals.
 
@@ -601,6 +647,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-text-executor.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-open-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-process-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-window-executor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-settings-editor.ps1 -CaptureScreenshot
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -668,6 +715,15 @@ Windows failure-notification request. The shared interaction harness checks
 the foreground application after notification submission, while the wrapper
 confirms that neither its private path sentinel nor its configured argument
 appears in the local log. The isolated configuration is always removed.
+`smoke-settings-editor.ps1` starts the debug executable with a private
+eight-slice configuration and opens its real settings viewport. It verifies
+one visible native window, converts the draft to four slices, sends a normal
+window-close request, observes the unsaved confirmation, keeps editing, saves,
+and then closes the clean editor. It requires revision 2 on disk, the old
+eight-slice revision in `config.json.bak`, preserved cardinal action
+assignments, and a fresh M4 action using the reloaded four-slice menu. Optional
+screenshots cover both the editor and confirmation. The fixture never reads or
+writes the user's Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

@@ -141,10 +141,14 @@ impl ConfigStore {
             bail!("injected interruption after temporary configuration flush");
         }
 
+        let preserve_existing_backup = self.paths.config.exists()
+            && read_configuration(&self.paths.config)
+                .map_or(true, |primary| primary.configuration != *current);
         replace_configuration(
             &self.paths.config,
             &self.paths.config_temporary,
             &self.paths.config_backup,
+            preserve_existing_backup,
         )?;
         Ok(next)
     }
@@ -295,28 +299,50 @@ fn write_temporary_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("could not flush temporary configuration {}", path.display()))
 }
 
-fn replace_configuration(primary: &Path, temporary: &Path, backup: &Path) -> Result<()> {
+fn replace_configuration(
+    primary: &Path,
+    temporary: &Path,
+    backup: &Path,
+    preserve_existing_backup: bool,
+) -> Result<()> {
     let primary_wide = wide_path(primary);
     let temporary_wide = wide_path(temporary);
     if primary.exists() {
-        if backup.exists() {
-            fs::remove_file(backup)
-                .with_context(|| format!("could not remove old backup {}", backup.display()))?;
-        }
-        let backup_wide = wide_path(backup);
-        // SAFETY: all three buffers are live, null-terminated paths on the same
-        // volume. ReplaceFileW atomically exchanges the primary and preserves
-        // the previous valid primary at the backup path.
-        unsafe {
-            ReplaceFileW(
-                PCWSTR::from_raw(primary_wide.as_ptr()),
-                PCWSTR::from_raw(temporary_wide.as_ptr()),
-                PCWSTR::from_raw(backup_wide.as_ptr()),
-                REPLACEFILE_WRITE_THROUGH,
-                None,
-                None,
-            )
-            .context("Windows could not atomically replace config.json")?;
+        if preserve_existing_backup {
+            // SAFETY: both buffers are live, null-terminated same-volume paths.
+            // Omitting a backup keeps the already validated recovery backup
+            // instead of replacing it with the broken primary.
+            unsafe {
+                ReplaceFileW(
+                    PCWSTR::from_raw(primary_wide.as_ptr()),
+                    PCWSTR::from_raw(temporary_wide.as_ptr()),
+                    PCWSTR::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    None,
+                    None,
+                )
+                .context("Windows could not atomically repair config.json")?;
+            }
+        } else {
+            if backup.exists() {
+                fs::remove_file(backup)
+                    .with_context(|| format!("could not remove old backup {}", backup.display()))?;
+            }
+            let backup_wide = wide_path(backup);
+            // SAFETY: all three buffers are live, null-terminated paths on the
+            // same volume. ReplaceFileW atomically exchanges the primary and
+            // preserves the previous valid primary at the backup path.
+            unsafe {
+                ReplaceFileW(
+                    PCWSTR::from_raw(primary_wide.as_ptr()),
+                    PCWSTR::from_raw(temporary_wide.as_ptr()),
+                    PCWSTR::from_raw(backup_wide.as_ptr()),
+                    REPLACEFILE_WRITE_THROUGH,
+                    None,
+                    None,
+                )
+                .context("Windows could not atomically replace config.json")?;
+            }
         }
     } else {
         // SAFETY: both buffers are live, null-terminated same-volume paths.
@@ -438,6 +464,25 @@ mod tests {
         assert_eq!(loaded.configuration, first);
         assert!(loaded.warning.is_some());
         assert_eq!(fs::read(&paths.config).expect("broken primary retained"), b"{ broken");
+    }
+
+    #[test]
+    fn explicit_save_after_backup_recovery_repairs_primary_and_keeps_valid_backup() {
+        let (_temporary_directory, paths, store) = store();
+        let first = store.load_or_initialize().expect("first configuration").configuration;
+        let mut second_proposal = first.clone();
+        second_proposal.global_profile.name = "Second".to_owned();
+        store.save(&first, &second_proposal).expect("second configuration");
+        fs::write(&paths.config, b"{ broken").expect("corrupt primary");
+        let recovered = store.load_or_initialize().expect("backup recovery").configuration;
+        let mut repaired_proposal = recovered.clone();
+        repaired_proposal.global_profile.name = "Repaired".to_owned();
+
+        let repaired = store.save(&recovered, &repaired_proposal).expect("explicit repair");
+
+        assert_eq!(repaired.config_revision, 2);
+        assert_eq!(active_configuration(&paths.config), repaired);
+        assert_eq!(active_configuration(&paths.config_backup), recovered);
     }
 
     #[test]

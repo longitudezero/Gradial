@@ -35,6 +35,7 @@ const RETRY_COMMAND_ID: usize = 1;
 const CANCEL_ACTION_COMMAND_ID: usize = 2;
 const EXIT_COMMAND_ID: usize = 3;
 const CLEAR_ACTIVITY_COMMAND_ID: usize = 4;
+const OPEN_SETTINGS_COMMAND_ID: usize = 5;
 const ACTIVITY_CAPACITY: usize = 20;
 const NOTIFICATION_CAPACITY: usize = 20;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -134,6 +135,7 @@ impl TrayHealth {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrayCommand {
+    OpenSettings,
     RetryInput,
     CancelCurrentAction,
     ClearActivity,
@@ -289,6 +291,7 @@ pub(crate) fn try_command() -> Option<TrayCommand> {
         2 => Some(TrayCommand::CancelCurrentAction),
         3 => Some(TrayCommand::Exit),
         4 => Some(TrayCommand::ClearActivity),
+        5 => Some(TrayCommand::OpenSettings),
         _ => None,
     }
 }
@@ -365,6 +368,7 @@ fn show_menu(window: HWND) -> Result<()> {
     let mut activity_menu_attached = false;
     let result = (|| {
         let status = wide(health.status_text());
+        let open_settings = wide("Open settings");
         let retry = wide("Retry input");
         let cancel_action = wide("Cancel current action");
         let exit = wide("Exit Gradial");
@@ -373,6 +377,15 @@ fn show_menu(window: HWND) -> Result<()> {
         unsafe {
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, PCWSTR(status.as_ptr()))
                 .context("could not add tray status")?;
+            AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
+                .context("could not add tray separator")?;
+            AppendMenuW(
+                menu,
+                MF_STRING | MF_ENABLED,
+                OPEN_SETTINGS_COMMAND_ID,
+                PCWSTR(open_settings.as_ptr()),
+            )
+            .context("could not add Open settings")?;
             AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
                 .context("could not add tray separator")?;
             let retry_flags = if health == TrayHealth::Recovering {
@@ -431,6 +444,7 @@ fn show_menu(window: HWND) -> Result<()> {
             CANCEL_ACTION_COMMAND_ID => PENDING_COMMAND.store(2, Ordering::Release),
             EXIT_COMMAND_ID => PENDING_COMMAND.store(3, Ordering::Release),
             CLEAR_ACTIVITY_COMMAND_ID => PENDING_COMMAND.store(4, Ordering::Release),
+            OPEN_SETTINGS_COMMAND_ID => PENDING_COMMAND.store(5, Ordering::Release),
             _ => {}
         }
         Ok(())

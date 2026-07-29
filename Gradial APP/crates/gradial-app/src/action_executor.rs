@@ -186,6 +186,10 @@ impl ActionExecutor {
         self.completions.try_recv().ok()
     }
 
+    pub(crate) fn set_config_revision(&mut self, config_revision: u64) {
+        self.config_revision = config_revision;
+    }
+
     fn shutdown(&mut self) {
         let Some(join_handle) = self.join_handle.take() else {
             return;

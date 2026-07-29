@@ -12,6 +12,7 @@ mod options;
 mod overlay;
 mod platform;
 mod process_launch;
+mod settings;
 mod shell_open;
 mod shortcut;
 mod tray;
@@ -21,7 +22,7 @@ mod window_action;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use gradial_core::{ActionPlanCompiler, AppPaths, ProfileResolver};
+use gradial_core::AppPaths;
 
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -45,14 +46,6 @@ fn main() -> Result<()> {
         .load_or_initialize()
         .context("could not load Gradial configuration")?;
     let config_revision = loaded_configuration.configuration.config_revision;
-    let profile_resolver = Arc::new(
-        ProfileResolver::compile(&loaded_configuration.configuration)
-            .context("could not compile Gradial profiles")?,
-    );
-    let action_plan_compiler = Arc::new(
-        ActionPlanCompiler::from_configuration(&loaded_configuration.configuration)
-            .context("could not compile Gradial action catalog")?,
-    );
     let migrated_from_schema = loaded_configuration
         .migration
         .map_or_else(|| "none".to_owned(), |migration| migration.from_schema.to_string());
@@ -82,8 +75,9 @@ fn main() -> Result<()> {
 
     let options = overlay::native_options();
     let app_timing_markers = Arc::clone(&timing_markers);
-    let app_profile_resolver = Arc::clone(&profile_resolver);
-    let app_action_plan_compiler = Arc::clone(&action_plan_compiler);
+    let app_config_store = configuration::ConfigStore::new(paths.clone());
+    let app_configuration = loaded_configuration.configuration;
+    let app_recovery_warning = loaded_configuration.warning.is_some();
     let run_result = eframe::run_native(
         "Gradial",
         options,
@@ -92,9 +86,9 @@ fn main() -> Result<()> {
                 creation_context,
                 startup_options,
                 app_timing_markers,
-                app_profile_resolver,
-                app_action_plan_compiler,
-                config_revision,
+                app_config_store,
+                app_configuration,
+                app_recovery_warning,
             )?;
             Ok(Box::new(app))
         }),

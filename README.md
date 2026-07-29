@@ -32,6 +32,10 @@ request only to the window frozen at M4-down after revalidating its identity
 and integrity. Action failures and cancellations now enter a session-only,
 20-item recent-activity tray panel. Failures also request a native,
 non-focus-stealing Windows notification; successful actions remain silent.
+The first settings-editor slice adds a normal single-instance window for the
+global radial menu, with four/eight-direction editing, existing-action
+assignment, a production-renderer preview, guarded unsaved changes, atomic
+saves, and immediate runtime reload.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -123,10 +127,10 @@ Gradial keeps a notification-area icon visible while it runs. Its icon and
 first menu line show `Healthy`, `Recovering input`, or `Input faulted`. A missed
 input heartbeat triggers automatic recovery after 750 ms. Queue overflow and
 startup failures remain faulted with M4 passed through until **Retry input** is
-chosen. The same menu provides **Cancel current action** while a plan is
-running, a **Recent activity** submenu with **Clear activity**, and **Exit
-Gradial**. Activity is never written to disk. It contains only fixed public
-messages derived from stable error codes, not action text, URLs, paths,
+chosen. The same menu provides **Open settings**, **Cancel current action**
+while a plan is running, a **Recent activity** submenu with **Clear activity**,
+and **Exit Gradial**. Activity is never written to disk. It contains only fixed
+public messages derived from stable error codes, not action text, URLs, paths,
 arguments, or target titles. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
@@ -142,12 +146,29 @@ the invocation, so title or configuration changes cannot switch geometry,
 labels, or the selected action while a gesture is open. Delay, keyboard
 shortcut, Unicode text, HTTP/HTTPS URL, existing absolute file/folder open, and
 direct `.exe` launch are enabled together with close, minimize, maximize, and
-restore for the invocation window. Settings-editor support is not present yet.
+restore for the invocation window.
+
+Choose **Open settings** from the notification-area menu to edit the global
+menu. The window can switch between four and eight directions, edit every
+visible label, assign or clear an action already present in the catalog, and
+select directions directly in the live radial preview. Closing a dirty draft
+requires **Discard changes** or **Keep editing**. A successful save validates
+and compiles the complete proposed configuration before atomic replacement,
+advances its revision, and reloads new M4 invocations without restarting
+Gradial. Action creation, application-profile editing, activation binding,
+import/export, icons, and onboarding remain future editor slices.
 
 Run all local checks with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
+```
+
+After building the debug executable, the isolated settings-window smoke check
+can also capture the editor and close-confirmation surfaces:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-settings-editor.ps1 -CaptureScreenshot
 ```
 
 Run the standard live interaction matrix after building the debug executable:
@@ -193,3 +214,5 @@ Invocation-window action results are recorded in
 [`Documentation/milestone-2-window-action-results.md`](Documentation/milestone-2-window-action-results.md).
 Action activity and failure-notification results are recorded in
 [`Documentation/milestone-2-action-feedback-results.md`](Documentation/milestone-2-action-feedback-results.md).
+Global-menu settings-editor and live-reload results are recorded in
+[`Documentation/milestone-2-settings-menu-editor-results.md`](Documentation/milestone-2-settings-menu-editor-results.md).

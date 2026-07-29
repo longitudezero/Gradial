@@ -1,0 +1,881 @@
+use std::{
+    sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
+};
+
+use eframe::egui::{
+    self, Align, Color32, ComboBox, Id, Layout, Modal, RichText, Sense, UiBuilder, Vec2,
+    ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
+};
+use gradial_core::{
+    ActionKind, ActionPlanCompiler, Configuration, Menu, MenuSlice, ProfileResolver, ResolvedMenu,
+    SliceCount,
+};
+use uuid::Uuid;
+
+use crate::overlay::{
+    AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer,
+};
+
+const SETTINGS_SIZE: [f32; 2] = [820.0, 620.0];
+const SETTINGS_MIN_SIZE: [f32; 2] = [720.0, 540.0];
+const PREVIEW_SIZE: f32 = 288.0;
+const PREVIEW_INVOCATION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0901);
+pub(crate) fn settings_viewport_id() -> ViewportId {
+    ViewportId::from_hash_of("gradial-settings")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsDraft {
+    original: Configuration,
+    proposed: Configuration,
+    eight_slice_stash: Option<Vec<MenuSlice>>,
+}
+
+impl SettingsDraft {
+    fn new(configuration: &Configuration) -> Self {
+        Self {
+            original: configuration.clone(),
+            proposed: configuration.clone(),
+            eight_slice_stash: None,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.proposed != self.original
+    }
+
+    fn discard(&mut self) {
+        self.proposed = self.original.clone();
+        self.eight_slice_stash = None;
+    }
+
+    fn accept_saved(&mut self, configuration: &Configuration) {
+        self.original = configuration.clone();
+        self.proposed = configuration.clone();
+        self.eight_slice_stash = None;
+    }
+
+    fn set_slice_count(&mut self, slice_count: SliceCount) {
+        resize_menu(
+            &mut self.proposed.global_profile.menu,
+            slice_count,
+            &mut self.eight_slice_stash,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseOutcome {
+    Closed,
+    ConfirmationShown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EditorLifecycle {
+    #[default]
+    Closed,
+    Editing,
+    ConfirmingClose,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum SaveFeedback {
+    #[default]
+    None,
+    Saved,
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DraftValidationError {
+    EmptyLabel { index: usize, slice_count: SliceCount },
+    InvalidConfiguration,
+}
+
+impl DraftValidationError {
+    fn message(&self) -> String {
+        match self {
+            Self::EmptyLabel { index, slice_count } => {
+                format!("Give {} a label before saving.", direction_name(*index, *slice_count))
+            }
+            Self::InvalidConfiguration => {
+                "These settings cannot be saved yet. Review the menu fields.".to_owned()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsEvent {
+    SaveRequested(Configuration),
+}
+
+#[derive(Debug)]
+pub(crate) struct SettingsEditor {
+    state: Arc<Mutex<SettingsState>>,
+}
+
+impl SettingsEditor {
+    pub(crate) fn new(recovery_warning: bool) -> Self {
+        Self { state: Arc::new(Mutex::new(SettingsState::new(recovery_warning))) }
+    }
+
+    pub(crate) fn open(&self, configuration: &Configuration) -> bool {
+        self.state().open(configuration)
+    }
+
+    pub(crate) fn show(&self, context: &egui::Context) {
+        if self.state().lifecycle == EditorLifecycle::Closed {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        context.show_viewport_deferred(
+            settings_viewport_id(),
+            settings_viewport_builder(),
+            move |ui, viewport_class| {
+                if viewport_class == ViewportClass::EmbeddedWindow {
+                    log::error!(
+                        target: "settings",
+                        "component=settings event_code=settings_viewport_embedded \
+                         result_code=failure config_revision=0"
+                    );
+                }
+                let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let event = state.render(ui);
+                if let Some(event) = event {
+                    state.pending_event = Some(event);
+                    drop(state);
+                    ui.ctx().request_repaint_of(ViewportId::ROOT);
+                }
+            },
+        );
+    }
+
+    pub(crate) fn try_event(&self) -> Option<SettingsEvent> {
+        self.state().pending_event.take()
+    }
+
+    pub(crate) fn accept_saved(&self, configuration: &Configuration) {
+        self.state().accept_saved(configuration);
+    }
+
+    pub(crate) fn save_failed(&self) {
+        self.state().save_failed();
+    }
+
+    fn state(&self) -> MutexGuard<'_, SettingsState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug)]
+struct SettingsState {
+    lifecycle: EditorLifecycle,
+    draft: Option<SettingsDraft>,
+    selected_slice: usize,
+    save_feedback: SaveFeedback,
+    recovery_warning: bool,
+    preview_renderer: FoundationOverlayRenderer,
+    pending_event: Option<SettingsEvent>,
+}
+
+impl SettingsState {
+    fn new(recovery_warning: bool) -> Self {
+        Self {
+            lifecycle: EditorLifecycle::Closed,
+            draft: None,
+            selected_slice: 0,
+            save_feedback: SaveFeedback::None,
+            recovery_warning,
+            preview_renderer: FoundationOverlayRenderer::new(),
+            pending_event: None,
+        }
+    }
+
+    fn open(&mut self, configuration: &Configuration) -> bool {
+        let newly_opened = self.lifecycle == EditorLifecycle::Closed;
+        if newly_opened {
+            self.lifecycle = EditorLifecycle::Editing;
+            self.draft = Some(SettingsDraft::new(configuration));
+            self.selected_slice = 0;
+            self.save_feedback = SaveFeedback::None;
+            log::info!(
+                target: "settings",
+                "component=settings event_code=settings_opened result_code=ok \
+                 config_revision={}",
+                configuration.config_revision
+            );
+        }
+        newly_opened
+    }
+
+    fn accept_saved(&mut self, configuration: &Configuration) {
+        if let Some(draft) = &mut self.draft {
+            draft.accept_saved(configuration);
+        }
+        self.save_feedback = SaveFeedback::Saved;
+        self.recovery_warning = false;
+    }
+
+    fn save_failed(&mut self) {
+        self.save_feedback = SaveFeedback::Error(
+            "Gradial could not save these settings. Your draft is still open.".to_owned(),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_apply_fixture_edit(&mut self) -> bool {
+        let Some(draft) = &mut self.draft else {
+            return false;
+        };
+        draft.set_slice_count(SliceCount::Four);
+        for (slice, label) in draft.proposed.global_profile.menu.slices.iter_mut().zip([
+            "North edited",
+            "East edited",
+            "South edited",
+            "West edited",
+        ]) {
+            label.clone_into(&mut slice.label);
+        }
+        self.selected_slice = 1;
+        self.save_feedback = SaveFeedback::None;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_draft_edited result_code=ok \
+             config_revision={} slice_count=4",
+            draft.original.config_revision
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_keep_editing(&mut self) -> bool {
+        if self.lifecycle != EditorLifecycle::ConfirmingClose {
+            return false;
+        }
+        self.lifecycle = EditorLifecycle::Editing;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_close_cancelled result_code=ok \
+             config_revision={}",
+            self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_save_event(&self) -> Option<SettingsEvent> {
+        let draft = self.draft.as_ref()?;
+        (self.lifecycle == EditorLifecycle::Editing
+            && draft.is_dirty()
+            && validate_draft(&draft.proposed).is_ok())
+        .then(|| SettingsEvent::SaveRequested(draft.proposed.clone()))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render(&mut self, ui: &mut egui::Ui) -> Option<SettingsEvent> {
+        #[cfg(debug_assertions)]
+        let debug_event = if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5))
+        {
+            let _edited = self.debug_apply_fixture_edit();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F7))
+        {
+            let _kept = self.debug_keep_editing();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F8))
+        {
+            self.debug_save_event()
+        } else {
+            None
+        };
+        #[cfg(not(debug_assertions))]
+        let debug_event = None;
+
+        let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+        if close_requested {
+            match self.request_close() {
+                CloseOutcome::Closed => return None,
+                CloseOutcome::ConfirmationShown => {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::CancelClose);
+                }
+            }
+        }
+
+        let Some(mut draft) = self.draft.take() else {
+            self.lifecycle = EditorLifecycle::Closed;
+            return None;
+        };
+        let mut event = debug_event;
+        let validation = validate_draft(&draft.proposed);
+        let dirty = draft.is_dirty();
+
+        egui::Panel::top("settings_header").show(ui, |ui| {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.heading("Gradial settings");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(if dirty { "Unsaved changes" } else { "All changes saved" });
+                });
+            });
+            ui.label("Global menu");
+            if self.recovery_warning {
+                ui.add_space(6.0);
+                ui.colored_label(
+                    Color32::from_rgb(245, 188, 78),
+                    "Gradial recovered a previous configuration. Saving will replace the broken file.",
+                );
+            }
+            ui.add_space(8.0);
+        });
+
+        egui::Panel::bottom("settings_actions").show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let save_enabled = dirty && validation.is_ok();
+                if ui.add_enabled(save_enabled, egui::Button::new("Save changes")).clicked() {
+                    event = Some(SettingsEvent::SaveRequested(draft.proposed.clone()));
+                    self.save_feedback = SaveFeedback::None;
+                }
+                if ui.add_enabled(dirty, egui::Button::new("Discard edits")).clicked() {
+                    draft.discard();
+                    self.selected_slice = self
+                        .selected_slice
+                        .min(draft.proposed.global_profile.menu.slices.len() - 1);
+                    self.save_feedback = SaveFeedback::None;
+                }
+                if let Err(error) = &validation {
+                    ui.colored_label(Color32::from_rgb(239, 113, 113), error.message());
+                } else {
+                    match &self.save_feedback {
+                        SaveFeedback::None => {}
+                        SaveFeedback::Saved => {
+                            ui.colored_label(Color32::from_rgb(112, 205, 151), "Changes saved.");
+                        }
+                        SaveFeedback::Error(error) => {
+                            ui.colored_label(Color32::from_rgb(239, 113, 113), error);
+                        }
+                    }
+                }
+            });
+            ui.add_space(8.0);
+        });
+
+        egui::Panel::left("menu_editor").resizable(false).exact_size(350.0).show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Menu");
+            ui.label("Choose the number of directions, then select one to edit.");
+            ui.add_space(12.0);
+
+            let current_count =
+                draft.proposed.global_profile.menu.resolved_slice_count().unwrap_or_default();
+            let mut selected_count = current_count;
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut selected_count, SliceCount::Four, "4 directions");
+                ui.selectable_value(&mut selected_count, SliceCount::Eight, "8 directions");
+            });
+            if selected_count != current_count {
+                draft.set_slice_count(selected_count);
+                self.selected_slice =
+                    map_selected_slice(self.selected_slice, current_count, selected_count);
+                self.save_feedback = SaveFeedback::None;
+            }
+
+            ui.add_space(18.0);
+            ui.label(RichText::new("Direction").strong());
+            direction_selector(ui, selected_count, &mut self.selected_slice);
+
+            ui.add_space(18.0);
+            let direction = direction_name(self.selected_slice, selected_count);
+            ui.label(RichText::new(direction).strong().size(18.0));
+            let action_options = action_options(&draft.proposed);
+            let action_catalog_empty = draft.proposed.actions.is_empty();
+            if let Some(slice) =
+                draft.proposed.global_profile.menu.slices.get_mut(self.selected_slice)
+            {
+                ui.label("Label");
+                if ui.text_edit_singleline(&mut slice.label).changed() {
+                    self.save_feedback = SaveFeedback::None;
+                }
+
+                ui.add_space(10.0);
+                ui.label("Action");
+                let selected_text = action_option_text(slice.action_id, &action_options);
+                ComboBox::from_id_salt(("slice_action", self.selected_slice))
+                    .width(310.0)
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_value(&mut slice.action_id, None, "No action").changed() {
+                            self.save_feedback = SaveFeedback::None;
+                        }
+                        for (action_id, label) in &action_options {
+                            if ui
+                                .selectable_value(&mut slice.action_id, Some(*action_id), label)
+                                .changed()
+                            {
+                                self.save_feedback = SaveFeedback::None;
+                            }
+                        }
+                    });
+                if action_catalog_empty {
+                    ui.add_space(6.0);
+                    ui.weak("No actions exist yet. Action creation will be added in a later step.");
+                }
+            }
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Live preview");
+            ui.label("Click a direction to select it.");
+            ui.add_space(18.0);
+            ui.vertical_centered(|ui| {
+                self.render_preview(ui, &draft.proposed);
+            });
+        });
+
+        if self.lifecycle == EditorLifecycle::ConfirmingClose {
+            let mut discard = false;
+            let mut keep_editing = false;
+            Modal::new(Id::new("discard_settings_confirmation")).show(ui.ctx(), |ui| {
+                ui.set_min_width(340.0);
+                ui.heading("Discard unsaved changes?");
+                ui.label("Your menu edits have not been saved.");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Discard changes").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("Keep editing").clicked() {
+                        keep_editing = true;
+                    }
+                });
+            });
+            if discard {
+                draft.discard();
+                self.lifecycle = EditorLifecycle::Closed;
+                ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                log::info!(
+                    target: "settings",
+                    "component=settings event_code=settings_closed result_code=ok \
+                     config_revision={} unsaved_changes_discarded=true",
+                    draft.original.config_revision
+                );
+            } else if keep_editing {
+                self.lifecycle = EditorLifecycle::Editing;
+                log::info!(
+                    target: "settings",
+                    "component=settings event_code=settings_close_cancelled result_code=ok \
+                     config_revision={}",
+                    draft.original.config_revision
+                );
+            }
+        }
+
+        self.draft = Some(draft);
+        event
+    }
+
+    fn render_preview(&mut self, ui: &mut egui::Ui, configuration: &Configuration) {
+        let Some(menu) = resolved_global_menu(configuration) else {
+            ui.colored_label(Color32::from_rgb(239, 113, 113), "Preview unavailable.");
+            return;
+        };
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(PREVIEW_SIZE), Sense::click());
+        let mut preview_ui =
+            ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Center)));
+        preview_ui.set_clip_rect(rect);
+        let now = Instant::now();
+        self.preview_renderer.render(
+            &mut preview_ui,
+            OverlayRenderFrame {
+                invocation_id: Some(PREVIEW_INVOCATION_ID),
+                menu: Some(menu),
+                selected_slice: Some(self.selected_slice),
+                selection_changed_at: Some(now),
+                opacity: 1.0,
+                scale: 1.0,
+                animation_mode: AnimationMode::ReducedMotion,
+                now,
+            },
+        );
+        if response.clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+            && let Some(slice) = preview_slice_at(
+                pointer - rect.center(),
+                configuration.global_profile.menu.resolved_slice_count().unwrap_or_default(),
+            )
+        {
+            self.selected_slice = slice;
+        }
+    }
+
+    fn request_close(&mut self) -> CloseOutcome {
+        if self.draft.as_ref().is_some_and(SettingsDraft::is_dirty) {
+            self.lifecycle = EditorLifecycle::ConfirmingClose;
+            log::info!(
+                target: "settings",
+                "component=settings event_code=settings_close_confirmation_shown \
+                 result_code=ok config_revision={}",
+                self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+            );
+            CloseOutcome::ConfirmationShown
+        } else {
+            self.lifecycle = EditorLifecycle::Closed;
+            log::info!(
+                target: "settings",
+                "component=settings event_code=settings_closed result_code=ok \
+                 config_revision={} unsaved_changes_discarded=false",
+                self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+            );
+            CloseOutcome::Closed
+        }
+    }
+}
+
+fn settings_viewport_builder() -> ViewportBuilder {
+    ViewportBuilder::default()
+        .with_app_id("gradial-settings")
+        .with_title("Gradial settings")
+        .with_inner_size(SETTINGS_SIZE)
+        .with_min_inner_size(SETTINGS_MIN_SIZE)
+        .with_resizable(true)
+        .with_decorations(true)
+        .with_taskbar(true)
+        .with_active(true)
+        .with_visible(true)
+}
+
+fn resize_menu(
+    menu: &mut Menu,
+    new_slice_count: SliceCount,
+    eight_slice_stash: &mut Option<Vec<MenuSlice>>,
+) {
+    let Some(current_slice_count) = menu.resolved_slice_count() else {
+        return;
+    };
+    if current_slice_count == new_slice_count {
+        return;
+    }
+    match (current_slice_count, new_slice_count) {
+        (SliceCount::Eight, SliceCount::Four) => {
+            *eight_slice_stash = Some(menu.slices.clone());
+            menu.slices = [0, 2, 4, 6].map(|index| menu.slices[index].clone()).into();
+            menu.slice_count = 4;
+        }
+        (SliceCount::Four, SliceCount::Eight) => {
+            let cardinal_slices = menu.slices.clone();
+            let mut slices = eight_slice_stash
+                .take()
+                .filter(|slices| slices.len() == 8)
+                .unwrap_or_else(|| Menu::eight_slice_default().slices);
+            for (cardinal_index, eight_index) in [0, 2, 4, 6].into_iter().enumerate() {
+                slices[eight_index] = cardinal_slices[cardinal_index].clone();
+            }
+            menu.slices = slices;
+            menu.slice_count = 8;
+        }
+        _ => {}
+    }
+}
+
+fn map_selected_slice(selected_slice: usize, from: SliceCount, to: SliceCount) -> usize {
+    match (from, to) {
+        (SliceCount::Eight, SliceCount::Four) => selected_slice.div_ceil(2) % 4,
+        (SliceCount::Four, SliceCount::Eight) => (selected_slice % 4) * 2,
+        _ => selected_slice.min(to.get() - 1),
+    }
+}
+
+fn direction_selector(ui: &mut egui::Ui, slice_count: SliceCount, selected: &mut usize) {
+    ui.horizontal_wrapped(|ui| {
+        for index in 0..slice_count.get() {
+            ui.selectable_value(selected, index, direction_abbreviation(index, slice_count));
+        }
+    });
+}
+
+fn direction_abbreviation(index: usize, slice_count: SliceCount) -> &'static str {
+    match slice_count {
+        SliceCount::Four => ["N", "E", "S", "W"].get(index).copied().unwrap_or("?"),
+        SliceCount::Eight => {
+            ["N", "NE", "E", "SE", "S", "SW", "W", "NW"].get(index).copied().unwrap_or("?")
+        }
+    }
+}
+
+fn direction_name(index: usize, slice_count: SliceCount) -> &'static str {
+    match slice_count {
+        SliceCount::Four => {
+            ["North", "East", "South", "West"].get(index).copied().unwrap_or("Direction")
+        }
+        SliceCount::Eight => [
+            "North",
+            "North-east",
+            "East",
+            "South-east",
+            "South",
+            "South-west",
+            "West",
+            "North-west",
+        ]
+        .get(index)
+        .copied()
+        .unwrap_or("Direction"),
+    }
+}
+
+fn action_options(configuration: &Configuration) -> Vec<(Uuid, String)> {
+    configuration
+        .actions
+        .iter()
+        .map(|action| (action.id, format!("{} — {}", action.name, action_kind_name(&action.kind))))
+        .collect()
+}
+
+fn action_option_text(action_id: Option<Uuid>, options: &[(Uuid, String)]) -> String {
+    let Some(action_id) = action_id else {
+        return "No action".to_owned();
+    };
+    options
+        .iter()
+        .find(|(candidate, _)| *candidate == action_id)
+        .map_or_else(|| "Unavailable action".to_owned(), |(_, label)| label.clone())
+}
+
+const fn action_kind_name(kind: &ActionKind) -> &'static str {
+    match kind {
+        ActionKind::SendShortcut { .. } => "Keyboard shortcut",
+        ActionKind::TypeText { .. } => "Text",
+        ActionKind::OpenUrl { .. } => "Website",
+        ActionKind::OpenPath { .. } => "File or folder",
+        ActionKind::RunExecutable { .. } => "Application",
+        ActionKind::Window { .. } => "Window",
+        ActionKind::Delay { .. } => "Delay",
+        ActionKind::Sequence { .. } => "Sequence",
+    }
+}
+
+fn resolved_global_menu(configuration: &Configuration) -> Option<Arc<ResolvedMenu>> {
+    let menu = &configuration.global_profile.menu;
+    ResolvedMenu::new(
+        menu.resolved_slice_count()?,
+        menu.slices.iter().map(|slice| slice.label.clone()).collect(),
+        menu.slices.iter().map(|slice| slice.action_id).collect(),
+    )
+    .map(Arc::new)
+}
+
+fn preview_slice_at(offset: Vec2, slice_count: SliceCount) -> Option<usize> {
+    let radius = offset.length();
+    if !(28.0..=116.0).contains(&radius) {
+        return None;
+    }
+    let width = match slice_count {
+        SliceCount::Four => std::f32::consts::FRAC_PI_2,
+        SliceCount::Eight => std::f32::consts::FRAC_PI_4,
+    };
+    let angle = offset.x.atan2(-offset.y).rem_euclid(std::f32::consts::TAU);
+    let rotated = (angle + width / 2.0).rem_euclid(std::f32::consts::TAU);
+    Some(match slice_count {
+        SliceCount::Four => sector_index::<4>(rotated),
+        SliceCount::Eight => sector_index::<8>(rotated),
+    })
+}
+
+fn sector_index<const N: usize>(angle: f32) -> usize {
+    let width = std::f32::consts::TAU
+        / match N {
+            4 => 4.0,
+            8 => 8.0,
+            _ => return 0,
+        };
+    (1..=N)
+        .find_map(|upper| (angle < width * index_as_f32(upper)).then_some(upper - 1))
+        .unwrap_or(0)
+}
+
+const fn index_as_f32(index: usize) -> f32 {
+    match index {
+        1 => 1.0,
+        2 => 2.0,
+        3 => 3.0,
+        4 => 4.0,
+        5 => 5.0,
+        6 => 6.0,
+        7 => 7.0,
+        8 => 8.0,
+        _ => 0.0,
+    }
+}
+
+fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationError> {
+    let slice_count = configuration
+        .global_profile
+        .menu
+        .resolved_slice_count()
+        .ok_or(DraftValidationError::InvalidConfiguration)?;
+    if let Some((index, _)) = configuration
+        .global_profile
+        .menu
+        .slices
+        .iter()
+        .enumerate()
+        .find(|(_, slice)| slice.label.trim().is_empty())
+    {
+        return Err(DraftValidationError::EmptyLabel { index, slice_count });
+    }
+    configuration.validate().map_err(|_error| DraftValidationError::InvalidConfiguration)?;
+    ProfileResolver::compile(configuration)
+        .map_err(|_error| DraftValidationError::InvalidConfiguration)?;
+    ActionPlanCompiler::from_configuration(configuration)
+        .map_err(|_error| DraftValidationError::InvalidConfiguration)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::Vec2;
+    use gradial_core::{ActionDefinition, ActionKind, Configuration, MenuSlice, SliceCount};
+    use uuid::Uuid;
+
+    use super::{
+        CloseOutcome, DraftValidationError, EditorLifecycle, SettingsDraft, SettingsState,
+        map_selected_slice, preview_slice_at, resize_menu, validate_draft,
+    };
+
+    #[test]
+    fn switching_slice_counts_preserves_cardinals_and_restores_diagonals_within_the_draft() {
+        let mut menu = gradial_core::Menu::eight_slice_default();
+        for (index, slice) in menu.slices.iter_mut().enumerate() {
+            slice.label = format!("Slice {index}");
+            slice.action_id = Some(Uuid::from_u128(index as u128 + 1));
+        }
+        let original = menu.clone();
+        let mut stash = None;
+
+        resize_menu(&mut menu, SliceCount::Four, &mut stash);
+        assert_eq!(menu.slice_count, 4);
+        assert_eq!(
+            menu.slices.iter().map(|slice| slice.label.as_str()).collect::<Vec<_>>(),
+            ["Slice 0", "Slice 2", "Slice 4", "Slice 6"]
+        );
+        menu.slices[1].label = "Changed east".to_owned();
+
+        resize_menu(&mut menu, SliceCount::Eight, &mut stash);
+        assert_eq!(menu.slice_count, 8);
+        assert_eq!(menu.slices[2].label, "Changed east");
+        assert_eq!(menu.slices[1], original.slices[1]);
+        assert_eq!(menu.slices[3], original.slices[3]);
+    }
+
+    #[test]
+    fn switching_from_a_saved_four_slice_menu_creates_default_diagonals() {
+        let mut menu = gradial_core::Menu {
+            slice_count: 4,
+            slices: ["One", "Two", "Three", "Four"]
+                .map(|label| MenuSlice { label: label.to_owned(), action_id: None })
+                .into(),
+        };
+        let mut stash = None;
+
+        resize_menu(&mut menu, SliceCount::Eight, &mut stash);
+
+        assert_eq!(menu.slices[0].label, "One");
+        assert_eq!(menu.slices[1].label, "NE");
+        assert_eq!(menu.slices[2].label, "Two");
+        assert_eq!(menu.slices[7].label, "NW");
+    }
+
+    #[test]
+    fn dirty_close_requires_an_explicit_choice_and_keep_editing_preserves_the_draft() {
+        let configuration = Configuration::default();
+        let mut editor = SettingsState::new(false);
+        editor.open(&configuration);
+        editor.draft.as_mut().expect("open draft").proposed.global_profile.menu.slices[0].label =
+            "Changed".to_owned();
+
+        assert_eq!(editor.request_close(), CloseOutcome::ConfirmationShown);
+        assert_eq!(editor.lifecycle, EditorLifecycle::ConfirmingClose);
+
+        editor.lifecycle = EditorLifecycle::Editing;
+        assert_eq!(
+            editor.draft.as_ref().expect("draft retained").proposed.global_profile.menu.slices[0]
+                .label,
+            "Changed"
+        );
+    }
+
+    #[test]
+    fn clean_close_does_not_prompt() {
+        let configuration = Configuration::default();
+        let mut editor = SettingsState::new(false);
+        editor.open(&configuration);
+
+        assert_eq!(editor.request_close(), CloseOutcome::Closed);
+        assert_eq!(editor.lifecycle, EditorLifecycle::Closed);
+    }
+
+    #[test]
+    fn opening_an_existing_editor_preserves_its_unsaved_draft() {
+        let configuration = Configuration { config_revision: 1, ..Configuration::default() };
+        let mut editor = SettingsState::new(false);
+        assert!(editor.open(&configuration));
+        editor.draft.as_mut().expect("open draft").proposed.global_profile.menu.slices[0].label =
+            "Unsaved".to_owned();
+
+        let mut newer_configuration = configuration;
+        newer_configuration.config_revision = 2;
+        assert!(!editor.open(&newer_configuration));
+        let draft = editor.draft.as_ref().expect("existing draft");
+        assert_eq!(draft.original.config_revision, 1);
+        assert_eq!(draft.proposed.global_profile.menu.slices[0].label, "Unsaved");
+    }
+
+    #[test]
+    fn empty_labels_block_save_with_a_field_specific_error() {
+        let mut configuration = Configuration::default();
+        configuration.global_profile.menu.slices[2].label = "   ".to_owned();
+
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::EmptyLabel { index: 2, slice_count: SliceCount::Eight })
+        );
+    }
+
+    #[test]
+    fn existing_action_assignment_remains_valid() {
+        let action_id = Uuid::from_u128(44);
+        let mut configuration = Configuration::default();
+        configuration.actions.push(ActionDefinition {
+            id: action_id,
+            name: "Pause".to_owned(),
+            kind: ActionKind::Delay { milliseconds: 50 },
+        });
+        configuration.global_profile.menu.slices[0].action_id = Some(action_id);
+
+        assert_eq!(validate_draft(&configuration), Ok(()));
+        let draft = SettingsDraft::new(&configuration);
+        assert_eq!(draft.proposed.global_profile.menu.slices[0].action_id, Some(action_id));
+    }
+
+    #[test]
+    fn preview_hit_testing_uses_production_clockwise_slice_order() {
+        assert_eq!(preview_slice_at(Vec2::new(0.0, -84.0), SliceCount::Eight), Some(0));
+        assert_eq!(preview_slice_at(Vec2::new(84.0, 0.0), SliceCount::Eight), Some(2));
+        assert_eq!(preview_slice_at(Vec2::new(0.0, 0.0), SliceCount::Eight), None);
+    }
+
+    #[test]
+    fn selection_mapping_keeps_the_same_cardinal_direction() {
+        assert_eq!(map_selected_slice(2, SliceCount::Eight, SliceCount::Four), 1);
+        assert_eq!(map_selected_slice(1, SliceCount::Four, SliceCount::Eight), 2);
+    }
+}

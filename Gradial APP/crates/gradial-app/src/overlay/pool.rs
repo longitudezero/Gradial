@@ -126,6 +126,10 @@ impl OverlayPool {
         &self.monitors
     }
 
+    pub(crate) fn set_config_revision(&mut self, config_revision: u64) {
+        self.config_revision = config_revision;
+    }
+
     pub(crate) fn show(&self, context: &Context) {
         for (index, slot) in self.slots.iter().enumerate() {
             let viewport_id = slot.viewport_id;

@@ -1,16 +1,20 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use gradial_core::{ActionPlanCompiler, GeometryMode, ProfileResolver, ResolvedMenu};
+use anyhow::{Context, Result, bail};
+use gradial_core::{
+    ActionPlanCompiler, Configuration, GeometryMode, ProfileResolver, ResolvedMenu,
+};
 
 use crate::{
     action_executor::ActionExecutor,
+    configuration::ConfigStore,
     diagnostics::TimingMarkers,
     input::InputConfiguration,
     interaction::{InteractionRuntime, RuntimeEvent},
     options::StartupOptions,
     overlay::{AnimationMode, OverlayPool},
     platform,
+    settings::{SettingsEditor, SettingsEvent, settings_viewport_id},
     tray::{TrayCommand, TrayHealth, TrayIcon},
 };
 
@@ -29,6 +33,9 @@ pub(crate) struct GradialApp {
     timing_markers: Arc<TimingMarkers>,
     profile_resolver: Arc<ProfileResolver>,
     action_plan_compiler: Arc<ActionPlanCompiler>,
+    configuration: Configuration,
+    config_store: ConfigStore,
+    settings: SettingsEditor,
     config_revision: u64,
     tray_icon: TrayIcon,
 }
@@ -40,10 +47,19 @@ impl GradialApp {
         creation_context: &eframe::CreationContext<'_>,
         startup_options: StartupOptions,
         timing_markers: Arc<TimingMarkers>,
-        profile_resolver: Arc<ProfileResolver>,
-        action_plan_compiler: Arc<ActionPlanCompiler>,
-        config_revision: u64,
+        config_store: ConfigStore,
+        configuration: Configuration,
+        recovery_warning: bool,
     ) -> Result<Self> {
+        let config_revision = configuration.config_revision;
+        let profile_resolver = Arc::new(
+            ProfileResolver::compile(&configuration)
+                .context("could not compile Gradial profiles")?,
+        );
+        let action_plan_compiler = Arc::new(
+            ActionPlanCompiler::from_configuration(&configuration)
+                .context("could not compile Gradial action catalog")?,
+        );
         platform::set_display_topology_monitoring(false);
         platform::configure_overlay_window(creation_context)?;
         let tray_icon = TrayIcon::install(platform::controller_window_address())?;
@@ -64,9 +80,11 @@ impl GradialApp {
             target: "startup",
             "component=app event_code=input_geometry_ready result_code=ok \
              config_revision={config_revision} \
-             geometry_mode={} debug_slice_override={} reduced_motion={} monitor_count={}",
+             geometry_mode={} debug_slice_override={} debug_open_settings={} \
+             reduced_motion={} monitor_count={}",
             startup_options.geometry_mode.as_str(),
             debug_slice_override,
+            startup_options.debug_open_settings,
             startup_options.reduced_motion,
             monitors.len()
         );
@@ -83,6 +101,10 @@ impl GradialApp {
             Arc::clone(&timing_markers),
         );
         creation_context.egui_ctx.request_repaint();
+        let settings = SettingsEditor::new(recovery_warning);
+        if startup_options.debug_open_settings {
+            settings.open(&configuration);
+        }
 
         Ok(Self {
             geometry_mode: startup_options.geometry_mode,
@@ -99,6 +121,9 @@ impl GradialApp {
             timing_markers,
             profile_resolver,
             action_plan_compiler,
+            configuration,
+            config_store,
+            settings,
             config_revision,
             tray_icon,
         })
@@ -259,6 +284,79 @@ impl GradialApp {
         }
     }
 
+    fn open_settings(&mut self, context: &eframe::egui::Context) {
+        let newly_opened = self.settings.open(&self.configuration);
+        if newly_opened {
+            context.request_repaint();
+        } else {
+            context
+                .send_viewport_cmd_to(settings_viewport_id(), eframe::egui::ViewportCommand::Focus);
+        }
+    }
+
+    fn save_settings(
+        &mut self,
+        context: &eframe::egui::Context,
+        proposed: &Configuration,
+    ) -> Result<Configuration> {
+        let mut prepared = proposed.clone();
+        prepared.config_revision = self
+            .configuration
+            .config_revision
+            .checked_add(1)
+            .context("configuration revision is exhausted")?;
+        prepared.validate().context("settings draft is invalid")?;
+        let profile_resolver = Arc::new(
+            ProfileResolver::compile(&prepared)
+                .context("could not compile the settings profile rules")?,
+        );
+        let action_plan_compiler = Arc::new(
+            ActionPlanCompiler::from_configuration(&prepared)
+                .context("could not compile the settings action catalog")?,
+        );
+        let saved = self
+            .config_store
+            .save(&self.configuration, proposed)
+            .context("could not atomically save the settings draft")?;
+        if saved != prepared {
+            bail!("saved configuration does not match its validated draft");
+        }
+
+        self.interaction = None;
+        self.profile_resolver = profile_resolver;
+        self.action_plan_compiler = action_plan_compiler;
+        self.config_revision = saved.config_revision;
+        self.configuration = saved.clone();
+        self.overlay_pool.set_config_revision(saved.config_revision);
+        self.action_executor.set_config_revision(saved.config_revision);
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_saved result_code=ok \
+             config_revision={} slice_count={} action_count={}",
+            saved.config_revision,
+            saved.global_profile.menu.slice_count,
+            saved.actions.len()
+        );
+        context.request_repaint();
+        Ok(saved)
+    }
+
+    fn handle_settings_event(&mut self, context: &eframe::egui::Context, event: SettingsEvent) {
+        let SettingsEvent::SaveRequested(proposed) = event;
+        match self.save_settings(context, &proposed) {
+            Ok(saved) => self.settings.accept_saved(&saved),
+            Err(error) => {
+                self.settings.save_failed();
+                log::error!(
+                    target: "settings",
+                    "component=settings event_code=settings_save_failed result_code=failure \
+                     error_code=config_invalid config_revision={} error={error}",
+                    self.config_revision
+                );
+            }
+        }
+    }
+
     fn start_interaction_if_ready(&mut self, context: &eframe::egui::Context) {
         if self.interaction.is_some()
             || self.rebuild_in_progress
@@ -368,6 +466,7 @@ impl eframe::App for GradialApp {
 
         if let Some(command) = crate::tray::try_command() {
             match command {
+                TrayCommand::OpenSettings => self.open_settings(context),
                 TrayCommand::RetryInput => self.retry_input(),
                 TrayCommand::CancelCurrentAction => {
                     let cancellation_requested = self.action_executor.cancel_current();
@@ -432,10 +531,15 @@ impl eframe::App for GradialApp {
             }
         }
 
+        if let Some(event) = self.settings.try_event() {
+            self.handle_settings_event(context, event);
+        }
+
         self.start_interaction_if_ready(context);
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         self.overlay_pool.show(ui.ctx());
+        self.settings.show(ui.ctx());
     }
 }
