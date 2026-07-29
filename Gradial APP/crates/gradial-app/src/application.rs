@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use gradial_core::{ActionPlanCompiler, GeometryMode, ProfileResolver, ResolvedMenu};
 
 use crate::{
+    action_executor::ActionExecutor,
     diagnostics::TimingMarkers,
     input::InputConfiguration,
     interaction::{InteractionRuntime, RuntimeEvent},
@@ -19,6 +20,7 @@ pub(crate) struct GradialApp {
     animation_mode: AnimationMode,
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
+    action_executor: ActionExecutor,
     native_style_passes: u8,
     pool_generation: u64,
     rebuild_in_progress: bool,
@@ -45,6 +47,7 @@ impl GradialApp {
         platform::set_display_topology_monitoring(false);
         platform::configure_overlay_window(creation_context)?;
         let tray_icon = TrayIcon::install(platform::controller_window_address())?;
+        let action_executor = ActionExecutor::start(config_revision)?;
         let monitors =
             platform::monitor_work_areas().context("could not read the display work areas")?;
         #[cfg(debug_assertions)]
@@ -87,6 +90,7 @@ impl GradialApp {
             animation_mode,
             overlay_pool,
             interaction: None,
+            action_executor,
             native_style_passes: 0,
             pool_generation: 0,
             rebuild_in_progress: false,
@@ -297,6 +301,7 @@ impl GradialApp {
             routes,
             Arc::clone(&self.profile_resolver),
             Arc::clone(&self.action_plan_compiler),
+            self.action_executor.handle(),
             self.debug_menu_override.clone(),
             self.config_revision,
         ) {
@@ -364,12 +369,25 @@ impl eframe::App for GradialApp {
         if let Some(command) = crate::tray::try_command() {
             match command {
                 TrayCommand::RetryInput => self.retry_input(),
+                TrayCommand::CancelCurrentAction => {
+                    let cancellation_requested = self.action_executor.cancel_current();
+                    log::info!(
+                        target: "actions",
+                        "component=actions event_code=action_cancellation_requested \
+                         result_code={} config_revision={} source=tray action_running={}",
+                        if cancellation_requested { "ok" } else { "ignored" },
+                        self.config_revision,
+                        cancellation_requested
+                    );
+                }
                 TrayCommand::Exit => {
                     context.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
                     return;
                 }
             }
         }
+
+        while self.action_executor.try_completion().is_some() {}
 
         if let Some(event) = self.interaction.as_ref().and_then(InteractionRuntime::try_event) {
             self.handle_runtime_event(context, event);

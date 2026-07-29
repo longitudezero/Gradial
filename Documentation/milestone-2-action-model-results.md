@@ -113,3 +113,8 @@ Action selection is now deterministic and safely compiled, but no action can
 run. Target freshness/integrity validation, the single-plan executor,
 cancellation/timeout behavior, result reporting, tray activity, and every
 Win32 action backend remain future bounded slices.
+
+The single-plan coordinator and Delay-only backend were completed in the
+subsequent
+[`milestone-2-delay-executor-results.md`](milestone-2-delay-executor-results.md)
+slice.

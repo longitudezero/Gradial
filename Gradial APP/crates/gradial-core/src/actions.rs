@@ -539,6 +539,37 @@ pub enum ActionPlanError {
     StepLimitExceeded { maximum: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionErrorCode {
+    ActionBusy,
+    ActionTimeout,
+    ExecutorUnavailable,
+    StepLimitExceeded,
+    StepTimeout,
+    UnsupportedAction,
+}
+
+impl ActionErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ActionBusy => "action_busy",
+            Self::ActionTimeout => "action_timeout",
+            Self::ExecutorUnavailable => "executor_unavailable",
+            Self::StepLimitExceeded => "step_limit_exceeded",
+            Self::StepTimeout => "step_timeout",
+            Self::UnsupportedAction => "unsupported_action",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionResult {
+    Success,
+    Cancelled,
+    Failure { code: ActionErrorCode, safe_message: String },
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

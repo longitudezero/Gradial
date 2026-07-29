@@ -49,11 +49,14 @@ slices, and the first two bounded Milestone 2 slices establish:
 - Cycle-, depth-, step-, and delay-bounded sequence validation.
 - Immutable release-time execution-plan compilation tied to the invocation's
   frozen configuration revision.
+- One bounded action worker with immediate busy rejection, cancellable Delay
+  execution, timeouts, and a two-second shutdown wait.
 
 It intentionally does not expose configuration editing, perform release-time
-action-target validation, or execute plans. A release logs the chosen slice
-and either compiles its assigned plan or cancels an empty slice, but cannot
-launch or inject anything.
+action-target validation, or execute OS-affecting operations. A release logs
+the chosen slice, compiles its assigned plan, and submits it to the coordinator.
+Only Delay can succeed; the app cannot launch, inject, open, or manipulate a
+window.
 
 ## Workspace layout
 
@@ -120,13 +123,14 @@ selected files.
 
 ## Input and interaction architecture
 
-Gradial uses three execution contexts:
+Gradial uses four execution contexts:
 
 | Context | Responsibility | May block or allocate? |
 | --- | --- | --- |
 | Win32 input thread | Classify M4, raw deltas, movement, Escape, and cancellation input | No, inside callbacks |
 | Interaction thread | Snapshot invocation state and advance the pure gesture controller | Yes, outside callbacks |
 | eframe UI thread | Maintain the hidden controller and paint independent per-display viewports | Yes |
+| Action worker | Execute one admitted immutable plan and observe cancellation/timeouts | Yes |
 
 The input thread owns the low-level hooks, heartbeat timer, and a message-only
 window registered for raw mouse input. Both event sources execute serially on
@@ -160,7 +164,8 @@ hook-callback duration.
 The tray health state is `Recovering input` during startup, input replacement,
 and display rebuild; `Healthy` only after a new hook thread reports responsive;
 and `Input faulted` after queue overflow or a failed start. Its menu contains
-the non-interactive current state, **Retry input**, and **Exit Gradial**.
+the non-interactive current state, **Retry input**, **Cancel current action**,
+and **Exit Gradial**.
 Explorer's `TaskbarCreated` message restores the icon and re-registers input.
 Power-resume and current-session unlock notifications also re-register the
 complete runtime. These signals do not silently clear a queue-overflow fault.
@@ -254,14 +259,23 @@ configuration loads. On release, the selected action UUID comes from the
 invocation's frozen menu. The compiler requires the same frozen
 `config_revision`, recursively replaces reusable sequences with ordered leaf
 steps, and attaches the immutable plan to the invocation. Every plan records a
-5-second per-step timeout and 30-second overall ceiling for the future
-executor.
+5-second per-step timeout and 30-second overall ceiling for the worker.
 
-This slice has no executor and makes no OS action calls. Assigned slices record
-`action_plan_compiled` with safe metadata and `action_executed=false`.
-Unassigned slices record `EmptySlice`; a defensive compilation mismatch
-records `ActionPlanInvalid`. The overlay still begins its close animation
-immediately in all three cases.
+The single-worker executor accepts at most one pending or running plan. A
+second dispatch returns `action_busy` immediately and is never queued. Before
+its first step, the worker verifies that every operation is Delay; other or
+mixed plans fail as `unsupported_action` without partially running.
+
+Delay uses monotonic time and checks cancellation/shutdown in increments no
+larger than 10 ms. The worker defensively enforces the compiled 32-step,
+5-second per-step, and 30-second overall limits. The tray's **Cancel current
+action** command is enabled only while the admission gate is occupied.
+Shutdown requests cancellation and waits at most two seconds for the worker.
+
+Successful Delay plans record `action_executed=true`. Empty slices still record
+`EmptySlice`; a defensive compilation mismatch records `ActionPlanInvalid`.
+The overlay begins its close animation immediately and never waits for action
+completion.
 
 ## Edge behavior
 
@@ -434,8 +448,8 @@ Run the full display-event capture from an elevated PowerShell. Pass
    `hook_thread_responsive`, `invocation_started`, three
    `focus_checkpoint` records, `slice_selected` or `invocation_cancelled`, and
    `hook_thread_stopped`.
-10. Open the tray icon and confirm its status line, **Retry input**, and
-    **Exit Gradial** commands are present.
+10. Open the tray icon and confirm its status line, **Retry input**,
+    **Cancel current action**, and **Exit Gradial** commands are present.
 11. Repeat once with `--reduced-motion`; selection and close behavior should be
     identical without interpolated visuals.
 
@@ -461,6 +475,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint top-left -AllDirections
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint center -Direction SW -InvocationCount 20 -QuickFlick -InterInvocationDelayMilliseconds 10
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-delay-executor.ps1
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -484,6 +499,11 @@ without an animation wait, proving that rendering is not a prerequisite for
 selection. Every normal run also correlates the selected invocation with its
 animated hide and checks the observed close lifecycle against the 50 ms target
 with scheduler tolerance.
+`smoke-delay-executor.ps1` creates a temporary schema-two configuration with a
+50 ms Delay on every slice, runs the release executable through the same
+gesture checks, requires one successful executor completion per invocation,
+and removes the isolated data directory afterward. It never reads or writes
+the user's Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

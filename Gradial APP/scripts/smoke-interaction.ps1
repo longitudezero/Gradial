@@ -29,6 +29,8 @@ param(
 
     [switch]$QuickFlick,
 
+    [switch]$ExpectDelayExecution,
+
     [ValidateSet(
         "default",
         "center",
@@ -63,7 +65,6 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @"
 using System;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 public static class GradialSmokeNative
@@ -157,16 +158,30 @@ public static class GradialSmokeNative
         SendMouse(dx, dy, 0, 0x0001u);
     }
 
-    public static void CloseWindowsForProcess(uint processId)
+    public static bool CloseControllerWindowForProcess(uint processId)
     {
-        var windows = new List<IntPtr>();
+        var closed = false;
         EnumWindows((window, data) => {
             uint windowProcessId;
             GetWindowThreadProcessId(window, out windowProcessId);
-            if (windowProcessId == processId) windows.Add(window);
+            if (windowProcessId != processId) return true;
+            var identifier = new NotificationIconIdentifier {
+                Size = (uint)Marshal.SizeOf(typeof(NotificationIconIdentifier)),
+                Window = window,
+                Id = 1,
+                Item = Guid.Empty
+            };
+            Rect iconLocation;
+            if (
+                Shell_NotifyIconGetRect(ref identifier, out iconLocation) == 0 &&
+                PostMessage(window, 0x0010u, IntPtr.Zero, IntPtr.Zero)
+            ) {
+                closed = true;
+                return false;
+            }
             return true;
         }, IntPtr.Zero);
-        foreach (var window in windows) PostMessage(window, 0x0010u, IntPtr.Zero, IntPtr.Zero);
+        return closed;
     }
 
     public static int NotifyDisplayChangeForProcess(uint processId)
@@ -266,6 +281,9 @@ if (-not (Test-Path -LiteralPath $executable)) {
 }
 if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
     throw "Input fault simulation is available only in a debug build."
+}
+if ($ExpectDelayExecution -and ($Configuration -ne "release" -or $Slices -ne "8")) {
+    throw "Delay execution validation requires the release build and its configured eight-slice menu."
 }
 if ($Slices -eq "4" -and -not $AllDirections -and $Direction.Length -ne 1) {
     throw "Four-slice validation accepts only N, E, S, or W."
@@ -646,7 +664,12 @@ finally {
     }
     [GradialSmokeNative]::SetCursorPos($originalCursor.X, $originalCursor.Y) | Out-Null
     if ($gradial -and -not $gradial.HasExited) {
-        [GradialSmokeNative]::CloseWindowsForProcess([uint32]$gradial.Id)
+        $gracefulShutdownRequested =
+            [GradialSmokeNative]::CloseControllerWindowForProcess([uint32]$gradial.Id)
+        if (-not $gracefulShutdownRequested) {
+            Stop-Process -Id $gradial.Id -Force
+            throw "Could not request a graceful Gradial shutdown."
+        }
         if (-not $gradial.WaitForExit(5000)) {
             Stop-Process -Id $gradial.Id -Force
         }
@@ -670,6 +693,16 @@ if (-not $configurationRecord.Success) {
     throw "The live check did not load a validated schema-two configuration."
 }
 $activeConfigRevision = $configurationRecord.Groups["revision"].Value
+if (
+    $log -notmatch (
+        "event_code=action_executor_ready .*config_revision=$activeConfigRevision " +
+        ".*supported_operations=delay .*per_step_timeout_ms=5000 " +
+        ".*maximum_duration_ms=30000 .*maximum_steps=32 " +
+        ".*cancellation_poll_ms=10 .*shutdown_wait_ms=2000"
+    )
+) {
+    throw "The bounded Delay executor did not initialize with the required safety limits."
+}
 $expectedDebugOverride = if ($Configuration -eq "debug") { $Slices } else { "none" }
 if (
     $log -notmatch (
@@ -734,8 +767,31 @@ $selectionRecords = [regex]::Matches(
 if ($selectionRecords.Count -ne $expectedInvocations) {
     throw "Expected $expectedInvocations selected gestures; observed $($selectionRecords.Count)."
 }
-if ($log -match "action_executed=true") {
-    throw "The plan-only action milestone unexpectedly executed an action."
+if ($ExpectDelayExecution) {
+    $uncompiledSelections = @(
+        $selectionRecords |
+            Where-Object {
+                $_.Groups["assigned"].Value -ne "true" -or
+                $_.Groups["compiled"].Value -ne "true"
+            }
+    )
+    if ($uncompiledSelections.Count -ne 0) {
+        throw "At least one Delay fixture selection did not compile an assigned action."
+    }
+    $completedDelayRecords = [regex]::Matches(
+        $log,
+        "target=actions .*event_code=action_execution_completed .*result_code=ok " +
+        ".*action_executed=true"
+    )
+    if ($completedDelayRecords.Count -ne $expectedInvocations) {
+        throw (
+            "Expected $expectedInvocations completed Delay actions; " +
+            "observed $($completedDelayRecords.Count)."
+        )
+    }
+}
+elseif ($log -match "action_executed=true") {
+    throw "The action-free smoke configuration unexpectedly executed an action."
 }
 $actionOutcomeRecords = [regex]::Matches(
     $log,
@@ -747,6 +803,14 @@ if ($actionOutcomeRecords.Count -ne $expectedInvocations) {
         "Expected $expectedInvocations non-executing action outcomes; " +
         "observed $($actionOutcomeRecords.Count)."
     )
+}
+if (
+    $log -notmatch (
+        "event_code=action_executor_stopped .*result_code=ok " +
+        "config_revision=$activeConfigRevision"
+    )
+) {
+    throw "The action executor did not complete its bounded shutdown."
 }
 foreach ($expectedDirection in $directions) {
     $expectedSlice = $directionSlices[$expectedDirection]

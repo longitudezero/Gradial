@@ -1,6 +1,6 @@
 use std::{
     mem::size_of,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use anyhow::{Context, Result, bail};
@@ -27,10 +27,12 @@ use windows::{
 pub(crate) const CALLBACK_MESSAGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x246;
 const ICON_ID: u32 = 1;
 const RETRY_COMMAND_ID: usize = 1;
-const EXIT_COMMAND_ID: usize = 2;
+const CANCEL_ACTION_COMMAND_ID: usize = 2;
+const EXIT_COMMAND_ID: usize = 3;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 static PENDING_COMMAND: AtomicU8 = AtomicU8::new(0);
 static CURRENT_HEALTH: AtomicU8 = AtomicU8::new(TrayHealth::Recovering as u8);
+static ACTION_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
@@ -62,6 +64,7 @@ impl TrayHealth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrayCommand {
     RetryInput,
+    CancelCurrentAction,
     Exit,
 }
 
@@ -190,9 +193,14 @@ pub(crate) fn handle_callback(window: HWND, lparam: isize) -> bool {
 pub(crate) fn try_command() -> Option<TrayCommand> {
     match PENDING_COMMAND.swap(0, Ordering::AcqRel) {
         1 => Some(TrayCommand::RetryInput),
-        2 => Some(TrayCommand::Exit),
+        2 => Some(TrayCommand::CancelCurrentAction),
+        3 => Some(TrayCommand::Exit),
         _ => None,
     }
+}
+
+pub(crate) fn set_action_running(running: bool) {
+    ACTION_RUNNING.store(running, Ordering::Release);
 }
 
 #[cfg(debug_assertions)]
@@ -208,6 +216,7 @@ fn show_menu(window: HWND) -> Result<()> {
     let result = (|| {
         let status = wide(health.status_text());
         let retry = wide("Retry input");
+        let cancel_action = wide("Cancel current action");
         let exit = wide("Exit Gradial");
         // SAFETY: the menu is live and all strings remain null-terminated for
         // the duration of each call.
@@ -223,6 +232,18 @@ fn show_menu(window: HWND) -> Result<()> {
             };
             AppendMenuW(menu, retry_flags, RETRY_COMMAND_ID, PCWSTR(retry.as_ptr()))
                 .context("could not add Retry Input")?;
+            let cancel_flags = if ACTION_RUNNING.load(Ordering::Acquire) {
+                MF_STRING | MF_ENABLED
+            } else {
+                MF_STRING | MF_GRAYED
+            };
+            AppendMenuW(
+                menu,
+                cancel_flags,
+                CANCEL_ACTION_COMMAND_ID,
+                PCWSTR(cancel_action.as_ptr()),
+            )
+            .context("could not add Cancel current action")?;
             AppendMenuW(menu, MF_STRING, EXIT_COMMAND_ID, PCWSTR(exit.as_ptr()))
                 .context("could not add Exit")?;
         }
@@ -249,7 +270,8 @@ fn show_menu(window: HWND) -> Result<()> {
         .0;
         match usize::try_from(selected).unwrap_or_default() {
             RETRY_COMMAND_ID => PENDING_COMMAND.store(1, Ordering::Release),
-            EXIT_COMMAND_ID => PENDING_COMMAND.store(2, Ordering::Release),
+            CANCEL_ACTION_COMMAND_ID => PENDING_COMMAND.store(2, Ordering::Release),
+            EXIT_COMMAND_ID => PENDING_COMMAND.store(3, Ordering::Release),
             _ => {}
         }
         Ok(())

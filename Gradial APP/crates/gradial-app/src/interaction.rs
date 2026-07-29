@@ -13,14 +13,15 @@ use std::sync::atomic::AtomicU8;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
-    ActionPlanCompiler, CancelReason, ExecutionPlan, GestureConfig, InputEvent, InputEventKind,
-    InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
+    ActionPlanCompiler, ActionResult, CancelReason, ExecutionPlan, GestureConfig, InputEvent,
+    InputEventKind, InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
     InvocationSnapshot, ProfileResolver, ProfileTarget, ResolvedMenu, monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use crate::{
+    action_executor::{ActionDispatch, ActionExecutorHandle},
     diagnostics::TimingMarkers,
     input::{HookThread, HookThreadMetrics, InputConfiguration},
     overlay::OverlayRoute,
@@ -68,6 +69,7 @@ struct EffectDispatcher<'a> {
     timing_markers: &'a TimingMarkers,
     routes: &'a [OverlayRoute],
     action_plan_compiler: &'a ActionPlanCompiler,
+    action_executor: &'a ActionExecutorHandle,
     config_revision: u64,
 }
 
@@ -106,6 +108,7 @@ impl InteractionRuntime {
         routes: Vec<OverlayRoute>,
         profile_resolver: Arc<ProfileResolver>,
         action_plan_compiler: Arc<ActionPlanCompiler>,
+        action_executor: ActionExecutorHandle,
         debug_menu_override: Option<Arc<ResolvedMenu>>,
         config_revision: u64,
     ) -> Result<Self> {
@@ -141,6 +144,7 @@ impl InteractionRuntime {
                     &routes,
                     &profile_resolver,
                     &action_plan_compiler,
+                    &action_executor,
                     debug_menu_override.as_ref(),
                     config_revision,
                 );
@@ -245,6 +249,7 @@ fn run_interaction_thread(
     routes: &[OverlayRoute],
     profile_resolver: &ProfileResolver,
     action_plan_compiler: &ActionPlanCompiler,
+    action_executor: &ActionExecutorHandle,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
     config_revision: u64,
 ) {
@@ -256,6 +261,7 @@ fn run_interaction_thread(
         timing_markers,
         routes,
         action_plan_compiler,
+        action_executor,
         config_revision,
     };
     let qpc_frequency = query_qpc_frequency();
@@ -664,6 +670,7 @@ fn dispatch_effect(
                         invocation_id,
                         active_action_id,
                         active_execution_plan,
+                        dispatcher.action_executor,
                         active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
                             snapshot.context.config_revision
                         }),
@@ -690,6 +697,7 @@ fn log_selected_action_outcome(
     invocation_id: uuid::Uuid,
     action_id: Option<uuid::Uuid>,
     execution_plan: Option<&Arc<ExecutionPlan>>,
+    action_executor: &ActionExecutorHandle,
     config_revision: u64,
 ) {
     match (action_id, execution_plan) {
@@ -705,6 +713,26 @@ fn log_selected_action_outcome(
                 plan.per_step_timeout_ms(),
                 plan.maximum_duration_ms()
             );
+            match action_executor.try_dispatch(invocation_id, Arc::clone(plan)) {
+                ActionDispatch::Accepted => {
+                    log::info!(
+                        target: "actions",
+                        "component=actions event_code=action_dispatched result_code=ok \
+                         config_revision={} invocation_id={invocation_id} \
+                         action_id={action_id} step_count={} action_executed=false",
+                        plan.config_revision(),
+                        plan.steps().len()
+                    );
+                }
+                ActionDispatch::Rejected(result) => {
+                    log_dispatch_rejection(
+                        invocation_id,
+                        action_id,
+                        plan.config_revision(),
+                        &result,
+                    );
+                }
+            }
         }
         (Some(action_id), None) => {
             log::error!(
@@ -721,6 +749,41 @@ fn log_selected_action_outcome(
                 "component=actions event_code=invocation_cancelled result_code=cancelled \
                  config_revision={config_revision} invocation_id={invocation_id} \
                  reason=EmptySlice action_executed=false"
+            );
+        }
+    }
+}
+
+fn log_dispatch_rejection(
+    invocation_id: uuid::Uuid,
+    action_id: uuid::Uuid,
+    config_revision: u64,
+    result: &ActionResult,
+) {
+    match result {
+        ActionResult::Failure { code, .. } => {
+            log::error!(
+                target: "actions",
+                "component=actions event_code=action_dispatch_rejected result_code=failure \
+                 error_code={} config_revision={config_revision} \
+                 invocation_id={invocation_id} action_id={action_id} action_executed=false",
+                code.as_str()
+            );
+        }
+        ActionResult::Cancelled => {
+            log::info!(
+                target: "actions",
+                "component=actions event_code=action_dispatch_rejected result_code=cancelled \
+                 config_revision={config_revision} invocation_id={invocation_id} \
+                 action_id={action_id} action_executed=false"
+            );
+        }
+        ActionResult::Success => {
+            log::error!(
+                target: "actions",
+                "component=actions event_code=action_dispatch_rejected result_code=failure \
+                 error_code=invalid_executor_result config_revision={config_revision} \
+                 invocation_id={invocation_id} action_id={action_id} action_executed=false"
             );
         }
     }
@@ -841,16 +904,21 @@ const fn heartbeat_is_unresponsive(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, thread, time::Duration};
 
     use gradial_core::{
-        ActionDefinition, ActionKind, ActionPlanCompiler, Configuration, InteractionEffect,
-        InteractionOutcome, InvocationContext, InvocationGeometry, InvocationSnapshot,
-        ResolvedMenu, ScreenPoint, SliceCount,
+        ActionDefinition, ActionKind, ActionPlanCompiler, ActionResult, Configuration,
+        InteractionEffect, InteractionOutcome, InvocationContext, InvocationGeometry,
+        InvocationSnapshot, ResolvedMenu, ScreenPoint, SliceCount,
     };
     use uuid::Uuid;
 
-    use super::{ActiveInvocation, heartbeat_is_unresponsive, prepare_selected_action};
+    use crate::action_executor::ActionExecutor;
+
+    use super::{
+        ActiveInvocation, heartbeat_is_unresponsive, log_selected_action_outcome,
+        prepare_selected_action,
+    };
 
     #[test]
     fn heartbeat_faults_only_after_three_missed_intervals() {
@@ -867,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn release_compiles_the_frozen_slice_action_for_the_invocation_revision() {
+    fn release_compiles_and_dispatches_the_frozen_action_for_the_invocation_revision() {
         let action_id = Uuid::from_u128(41);
         let invocation_id = Uuid::from_u128(42);
         let configuration = Configuration {
@@ -913,9 +981,27 @@ mod tests {
         );
 
         assert_eq!(active.action_id, Some(action_id));
-        let plan = active.execution_plan.expect("immutable release plan");
+        let plan = Arc::clone(active.execution_plan.as_ref().expect("immutable release plan"));
         assert_eq!(plan.root_action_id(), action_id);
         assert_eq!(plan.config_revision(), 9);
         assert_eq!(plan.steps().len(), 1);
+
+        let executor = ActionExecutor::start(9).expect("executor");
+        log_selected_action_outcome(
+            invocation_id,
+            active.action_id,
+            Some(&plan),
+            &executor.handle(),
+            9,
+        );
+        for _ in 0..100 {
+            if let Some(completion) = executor.try_completion() {
+                assert_eq!(completion.invocation_id, invocation_id);
+                assert_eq!(completion.result, ActionResult::Success);
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("release-time action did not complete");
     }
 }

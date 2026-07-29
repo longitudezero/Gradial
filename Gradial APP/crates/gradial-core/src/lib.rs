@@ -8,8 +8,8 @@ pub mod paths;
 pub mod profiles;
 
 pub use actions::{
-    ActionDefinition, ActionKind, ActionPlanCompiler, ActionPlanError,
-    DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation, ExecutionPlan, ExecutionStep,
+    ActionDefinition, ActionErrorCode, ActionKind, ActionPlanCompiler, ActionPlanError,
+    ActionResult, DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation, ExecutionPlan, ExecutionStep,
     MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
     MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
 };
