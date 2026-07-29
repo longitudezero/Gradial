@@ -298,6 +298,11 @@ $standardErrorPath = Join-Path $temporaryRoot "gradial.stderr.log"
 $actionId = "67726164-6961-4c00-8000-000000000901"
 $shortcutActionId = "67726164-6961-4c00-8000-000000000902"
 $textActionId = "67726164-6961-4c00-8000-000000000903"
+$urlActionId = "67726164-6961-4c00-8000-000000000905"
+$pathActionId = "67726164-6961-4c00-8000-000000000906"
+$executableActionId = "67726164-6961-4c00-8000-000000000907"
+$delayActionId = "67726164-6961-4c00-8000-000000000908"
+$windowActionId = "67726164-6961-4c00-8000-000000000909"
 $profileId = "67726164-6961-4c00-8000-000000000001"
 $labels = @("North old", "NE old", "East old", "SE old", "South old", "SW old", "West old", "NW old")
 $gradial = $null
@@ -390,8 +395,8 @@ try {
     }
     Wait-LogPattern `
         -Path $logPath `
-        -Pattern "event_code=settings_debug_action_draft_edited .*action_count=3" `
-        -Failure "The action catalog did not accept the isolated shortcut and text actions." |
+        -Pattern "event_code=settings_debug_action_draft_edited .*action_count=8" `
+        -Failure "The action catalog did not accept all isolated leaf-action payloads." |
         Out-Null
 
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x79)) {
@@ -421,6 +426,52 @@ try {
             -Window $settingsWindow `
             -Path (Join-Path $workspace "captures\settings-actions-editor-smoke.png")
     }
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x75)) {
+        throw "Could not select the application editor in the settings window."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_leaf_editor_selected .*action_id=$executableActionId" `
+        -Failure "The application payload editor did not become active." | Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-leaf-action-editor-smoke.png")
+    }
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x7A)) {
+        throw "Could not open the native application chooser."
+    }
+    $pickerWindow = [IntPtr]::Zero
+    $pickerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 100
+        $pickerWindow = [GradialSettingsSmokeNative]::FindVisibleWindow(
+            [uint32]$gradial.Id,
+            "Gradial: choose an application"
+        )
+    } while (
+        $pickerWindow -eq [IntPtr]::Zero -and
+        [DateTime]::UtcNow -lt $pickerDeadline
+    )
+    if ($pickerWindow -eq [IntPtr]::Zero) {
+        throw "The native Windows application chooser was not visible."
+    }
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 500
+        Save-WindowScreenshot `
+            -Window $pickerWindow `
+            -Path (Join-Path $workspace "captures\settings-native-application-chooser-smoke.png")
+    }
+    if (-not [GradialSettingsSmokeNative]::CloseWindow($pickerWindow)) {
+        throw "Could not cancel the native application chooser."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_native_picker .*result_code=cancelled .*picker_kind=application" `
+        -Failure "The native application chooser did not report safe cancellation." | Out-Null
 
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x74)) {
         throw "Could not send the isolated edit command to the settings window."
@@ -494,8 +545,8 @@ try {
     ) {
         throw "The new shortcut and preserved cardinal action assignments are incorrect."
     }
-    if (@($saved.actions).Count -ne 3) {
-        throw "The settings save did not preserve all three catalog actions."
+    if (@($saved.actions).Count -ne 8) {
+        throw "The settings save did not preserve all eight catalog actions."
     }
     $shortcutAction = $saved.actions | Where-Object { $_.id -eq $shortcutActionId }
     if (
@@ -517,6 +568,55 @@ try {
         $textAction.kind.text -ne "Gradial editor text 🙂"
     ) {
         throw "The Unicode text action was not saved exactly."
+    }
+    $urlAction = $saved.actions | Where-Object { $_.id -eq $urlActionId }
+    if (
+        -not $urlAction -or
+        $urlAction.name -ne "Editor website" -or
+        $urlAction.kind.type -ne "open_url" -or
+        $urlAction.kind.url -ne "https://example.com/gradial-editor"
+    ) {
+        throw "The website action was not saved exactly."
+    }
+    $pathAction = $saved.actions | Where-Object { $_.id -eq $pathActionId }
+    if (
+        -not $pathAction -or
+        $pathAction.name -ne "Editor folder" -or
+        $pathAction.kind.type -ne "open_path" -or
+        $pathAction.kind.path -ne "C:\Windows"
+    ) {
+        throw "The file-or-folder action was not saved exactly."
+    }
+    $executableAction = $saved.actions | Where-Object { $_.id -eq $executableActionId }
+    $expectedArguments = @("--editor-smoke", "literal argument with spaces", "")
+    $savedArguments = @($executableAction.kind.arguments)
+    if (
+        -not $executableAction -or
+        $executableAction.name -ne "Editor application" -or
+        $executableAction.kind.type -ne "run_executable" -or
+        $executableAction.kind.executable -ne "C:\Windows\System32\notepad.exe" -or
+        $executableAction.kind.working_directory -ne "C:\Windows" -or
+        (Compare-Object $expectedArguments $savedArguments -SyncWindow 0).Count -ne 0
+    ) {
+        throw "The application path, working folder, or literal argument rows changed during save."
+    }
+    $delayAction = $saved.actions | Where-Object { $_.id -eq $delayActionId }
+    if (
+        -not $delayAction -or
+        $delayAction.name -ne "Editor delay" -or
+        $delayAction.kind.type -ne "delay" -or
+        $delayAction.kind.milliseconds -ne 275
+    ) {
+        throw "The Delay action was not saved exactly."
+    }
+    $windowAction = $saved.actions | Where-Object { $_.id -eq $windowActionId }
+    if (
+        -not $windowAction -or
+        $windowAction.name -ne "Editor window" -or
+        $windowAction.kind.type -ne "window" -or
+        $windowAction.kind.command -ne "restore"
+    ) {
+        throw "The invocation-window action was not saved exactly."
     }
     $backup = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
     if (
@@ -563,8 +663,8 @@ try {
         -Failure "The preserved cardinal action did not execute from the reloaded menu." | Out-Null
 
     Write-Host (
-        "Settings editor smoke check passed: action creation, exact Ctrl+F14 recording, " +
-        "Unicode text, guarded dirty close, atomic revision 2 save, and live reload."
+        "Settings editor smoke check passed: all leaf editors, exact Ctrl+F14 recording, " +
+        "literal arguments, guarded dirty close, atomic revision 2 save, and live reload."
     )
 }
 catch {

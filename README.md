@@ -36,9 +36,9 @@ The first settings-editor slice adds a normal single-instance window for the
 global radial menu, with four/eight-direction editing, existing-action
 assignment, a production-renderer preview, guarded unsaved changes, atomic
 saves, and immediate runtime reload. The action-catalog editor now creates and
-edits keyboard shortcuts and Unicode text actions, supports rename and
-duplication across every action type, and prevents deletion while an action is
-still referenced.
+edits every leaf action, supports rename and duplication across every action
+type, opens native Windows path choosers, and prevents deletion while an action
+is still referenced.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -154,16 +154,17 @@ restore for the invocation window.
 Choose **Open settings** from the notification-area menu to edit the global
 menu. The window can switch between four and eight directions, edit every
 visible label, assign or clear catalog actions, and select directions directly
-in the live radial preview. The **Actions** tab creates keyboard-shortcut and
-Unicode-text actions, records one non-modifier key with its exact left/right
-modifiers, edits names and text, and duplicates or safely deletes actions.
-Referenced actions must be unassigned before deletion. Closing a dirty draft
-requires **Discard changes** or **Keep editing**. A successful save validates
-and compiles the complete proposed configuration before atomic replacement,
-advances its revision, and reloads new M4 invocations without restarting
-Gradial. Editors for the remaining action payloads, application profiles,
-activation binding, import/export, icons, and onboarding remain future
-slices.
+in the live radial preview. The **Actions** tab creates and edits keyboard
+shortcuts, Unicode text, websites, files/folders, applications, Delay, and
+invocation-window commands. Application arguments are separate literal rows,
+and native Windows choosers select files, folders, applications, and working
+folders. The catalog can rename or duplicate every action and safely delete
+unreferenced actions. Closing a dirty draft requires **Discard changes** or
+**Keep editing**. A successful save validates and compiles the complete
+proposed configuration before atomic replacement, advances its revision, and
+reloads new M4 invocations without restarting Gradial. Sequence editing,
+application profiles, activation binding, import/export, icons, and onboarding
+remain future slices.
 
 Run all local checks with:
 
@@ -225,3 +226,5 @@ Global-menu settings-editor and live-reload results are recorded in
 [`Documentation/milestone-2-settings-menu-editor-results.md`](Documentation/milestone-2-settings-menu-editor-results.md).
 Action-catalog and shortcut-recorder results are recorded in
 [`Documentation/milestone-2-action-editor-results.md`](Documentation/milestone-2-action-editor-results.md).
+Remaining leaf-action editor and native-picker results are recorded in
+[`Documentation/milestone-2-leaf-action-editor-results.md`](Documentation/milestone-2-leaf-action-editor-results.md).

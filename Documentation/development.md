@@ -71,15 +71,18 @@ slices, and the current bounded Milestone 2 slices establish:
 - An action catalog that creates and edits keyboard shortcuts and Unicode text,
   records physical shortcut data, and supports rename, duplication, and
   reference-safe deletion.
+- Leaf-action editors for websites, files/folders, direct applications, Delay,
+  and invocation-window commands, with native Windows path choosers and
+  literal application-argument rows.
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
 
-Configuration editing currently covers the global menu plus keyboard-shortcut
-and Unicode-text action payloads. The remaining action payload editors,
-application-profile rules, activation binding, appearance, icons,
-import/export, and onboarding are not exposed yet. A release logs the chosen
-slice, compiles its assigned plan, and submits it to the coordinator. Every
-schema-two leaf action family can execute through its bounded backend.
+Configuration editing currently covers the global menu and every leaf-action
+payload. Sequence steps, application-profile rules, activation binding,
+appearance, icons, import/export, and onboarding are not exposed yet. A
+release logs the chosen slice, compiles its assigned plan, and submits it to
+the coordinator. Every schema-two leaf action family can execute through its
+bounded backend.
 
 ## Workspace layout
 
@@ -289,10 +292,11 @@ The clickable live preview uses `FoundationOverlayRenderer` and
 ordering, and selection rendering. It does not contain a second gesture or
 layout implementation.
 
-The **Actions** tab lists the complete catalog. It can create keyboard-shortcut
-and Unicode-text actions and can rename or duplicate every action type.
-Payloads belonging to action types whose dedicated editor has not shipped
-remain read-only. Creation and duplication generate new UUIDs and readable
+The **Actions** tab lists the complete catalog. Its **New action** menu creates
+every leaf type: keyboard shortcut, Unicode text, website, file/folder,
+application, Delay, and invocation-window command. It can rename or duplicate
+every action type. Sequence payloads remain read-only until the dedicated
+sequence slice. Creation and duplication generate new UUIDs and readable
 unique names.
 
 The shortcut recorder accepts one supported non-modifier physical key plus the
@@ -304,6 +308,27 @@ The first editor covers letters, top-row numbers, punctuation, Enter, Tab,
 Backspace, Space, navigation keys, and F1 through F24. Unicode text is edited
 directly without clipboard access and displays its UTF-8 byte count against
 the existing 8 KiB limit.
+
+Website fields accept only complete HTTP or HTTPS addresses. File/folder
+actions allow direct absolute-path editing plus separate native file and folder
+choosers. Application actions use an absolute `.exe` path, an optional absolute
+working folder, and one UI row per argument. Rows are preserved literally,
+including spaces and empty values; the editor never parses a shell command.
+The application and working-folder controls use the native Windows common item
+dialog from a dedicated STA thread and do not log selected paths. Delay is
+constrained to 10 through 10,000 ms. Window commands are limited to close,
+minimize, maximize, and restore for the invocation window.
+
+New leaf actions begin with a syntactically valid, visible default so creating
+one does not invalidate unrelated draft work: HTTPS example address, the
+current user folder, Notepad from the Windows directory, 250 ms Delay, or
+minimize as appropriate. The user must still assign the action to a menu before
+it can run.
+
+Draft validation translates invalid URLs, non-absolute paths, non-`.exe`
+applications, null-containing arguments, and out-of-range Delay values into
+field-specific messages. Complete configuration validation and plan
+compilation remain authoritative before save.
 
 Deletion first scans global and application-profile menu slices plus sequence
 steps. A referenced action is never removed; the editor reports the number and
@@ -740,17 +765,20 @@ the foreground application after notification submission, while the wrapper
 confirms that neither its private path sentinel nor its configured argument
 appears in the local log. The isolated configuration is always removed.
 `smoke-settings-editor.ps1` starts the debug executable with a private
-eight-slice configuration and opens its real settings viewport. It creates a
-shortcut and a Unicode-text action through the editor helpers, exercises
-duplication and unreferenced deletion, records an exact left-Ctrl+F14
-combination through native key messages, and assigns it to a menu slice. The
-harness then converts the draft to four slices, sends a normal window-close
-request, observes the unsaved confirmation, keeps editing, saves, and closes
-the clean editor. It requires revision 2 on disk with the exact shortcut and
-text payloads, the old eight-slice revision in `config.json.bak`, preserved
-cardinal assignments, and a fresh M4 action using the reloaded four-slice menu.
-Optional screenshots cover the menu, action editor, recorder, and confirmation.
-The fixture never reads or writes the user's Gradial configuration.
+eight-slice configuration and opens its real settings viewport. It creates and
+persists every leaf-action type, exercises duplication and unreferenced
+deletion, records an exact left-Ctrl+F14 combination through native key
+messages, and assigns it to a menu slice. The application fixture includes
+three exact argument rows—one containing spaces and one empty—plus a working
+folder. The harness opens the real native application chooser, observes its
+window, and cancels it without changing the draft. It then converts the draft
+to four slices, sends a normal window-close request, observes the unsaved
+confirmation, keeps editing, saves, and closes the clean editor. It requires
+revision 2 on disk with all exact leaf payloads, the old eight-slice revision
+in `config.json.bak`, preserved cardinal assignments, and a fresh M4 action
+using the reloaded four-slice menu. Optional screenshots cover the menu,
+payload editor, shortcut recorder, Windows chooser, and confirmation. The
+fixture never reads or writes the user's Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

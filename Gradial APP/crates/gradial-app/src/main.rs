@@ -8,6 +8,7 @@ mod diagnostics;
 mod focus;
 mod input;
 mod interaction;
+mod native_file_dialog;
 mod options;
 mod overlay;
 mod platform;

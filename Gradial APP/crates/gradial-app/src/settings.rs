@@ -1,21 +1,24 @@
 use std::{
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
 
 use eframe::egui::{
-    self, Align, Color32, ComboBox, Id, Layout, Modal, RichText, ScrollArea, Sense, TextEdit,
-    UiBuilder, Vec2, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
+    self, Align, Color32, ComboBox, DragValue, Id, Layout, Modal, RichText, ScrollArea, Sense,
+    TextEdit, UiBuilder, Vec2, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 #[cfg(debug_assertions)]
 use gradial_core::ShortcutModifier;
 use gradial_core::{
-    ActionDefinition, ActionKind, ActionPlanCompiler, Configuration, MAX_TYPED_TEXT_BYTES, Menu,
-    MenuSlice, ProfileResolver, ResolvedMenu, ShortcutKey, SliceCount,
+    ActionDefinition, ActionKind, ActionPlanCompiler, Configuration, ConfigurationError,
+    MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, ProfileResolver, ResolvedMenu, ShortcutKey, SliceCount,
+    WindowCommand,
 };
 use uuid::Uuid;
 
 use crate::{
+    native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
     overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
     shortcut_recorder::{CaptureOutcome, ShortcutRecorder, shortcut_display},
 };
@@ -30,6 +33,16 @@ const DEBUG_SHORTCUT_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_800
 const DEBUG_TEXT_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0903);
 #[cfg(debug_assertions)]
 const DEBUG_DUPLICATE_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0904);
+#[cfg(debug_assertions)]
+const DEBUG_URL_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0905);
+#[cfg(debug_assertions)]
+const DEBUG_PATH_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0906);
+#[cfg(debug_assertions)]
+const DEBUG_EXECUTABLE_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0907);
+#[cfg(debug_assertions)]
+const DEBUG_DELAY_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0908);
+#[cfg(debug_assertions)]
+const DEBUG_WINDOW_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0909);
 pub(crate) fn settings_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("gradial-settings")
 }
@@ -95,6 +108,72 @@ enum SettingsSection {
     Actions,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NewActionTemplate {
+    Shortcut,
+    Text,
+    Website,
+    FileOrFolder,
+    Application,
+    Delay,
+    Window,
+}
+
+impl NewActionTemplate {
+    const ALL: [Self; 7] = [
+        Self::Shortcut,
+        Self::Text,
+        Self::Website,
+        Self::FileOrFolder,
+        Self::Application,
+        Self::Delay,
+        Self::Window,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Shortcut => "Keyboard shortcut",
+            Self::Text => "Text",
+            Self::Website => "Website",
+            Self::FileOrFolder => "File or folder",
+            Self::Application => "Application",
+            Self::Delay => "Delay",
+            Self::Window => "Window command",
+        }
+    }
+
+    const fn preferred_name(self) -> &'static str {
+        match self {
+            Self::Shortcut => "Keyboard shortcut",
+            Self::Text => "Type text",
+            Self::Website => "Open website",
+            Self::FileOrFolder => "Open file or folder",
+            Self::Application => "Run application",
+            Self::Delay => "Delay",
+            Self::Window => "Window command",
+        }
+    }
+
+    fn action_kind(self) -> ActionKind {
+        match self {
+            Self::Shortcut => ActionKind::SendShortcut {
+                modifiers: Vec::new(),
+                key: ShortcutKey { scan_code: 0x64, extended: false },
+            },
+            Self::Text => ActionKind::TypeText { text: String::new() },
+            Self::Website => ActionKind::OpenUrl { url: "https://example.com".to_owned() },
+            Self::FileOrFolder => ActionKind::OpenPath { path: default_browse_path() },
+            Self::Application => ActionKind::RunExecutable {
+                executable: default_executable_path(),
+                arguments: Vec::new(),
+                working_directory: None,
+            },
+            Self::Delay => ActionKind::Delay { milliseconds: 250 },
+            Self::Window => ActionKind::Window { command: WindowCommand::Minimize },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum SaveFeedback {
     #[default]
@@ -108,6 +187,11 @@ enum DraftValidationError {
     EmptyLabel { index: usize, slice_count: SliceCount },
     EmptyActionName { index: usize },
     TypedTextTooLong { index: usize, bytes: usize },
+    InvalidUrl { index: usize },
+    InvalidPath { index: usize, field: &'static str },
+    InvalidExecutable { index: usize },
+    InvalidArgument { index: usize, argument: usize },
+    InvalidDelay { index: usize, milliseconds: u32 },
     InvalidConfiguration,
 }
 
@@ -123,6 +207,32 @@ impl DraftValidationError {
             Self::TypedTextTooLong { index, bytes } => {
                 format!(
                     "Action {} contains {bytes} bytes of text; the limit is {MAX_TYPED_TEXT_BYTES}.",
+                    index + 1
+                )
+            }
+            Self::InvalidUrl { index } => {
+                format!("Enter a complete http:// or https:// address for action {}.", index + 1)
+            }
+            Self::InvalidPath { index, field } => {
+                format!(
+                    "Choose or enter an absolute {} for action {}.",
+                    action_field_name(field),
+                    index + 1
+                )
+            }
+            Self::InvalidExecutable { index } => {
+                format!("Choose an .exe application for action {}.", index + 1)
+            }
+            Self::InvalidArgument { index, argument } => {
+                format!(
+                    "Remove the unsupported null character from argument {} of action {}.",
+                    argument + 1,
+                    index + 1
+                )
+            }
+            Self::InvalidDelay { index, milliseconds } => {
+                format!(
+                    "Set action {} to a delay from 10 through 10000 ms; it currently uses {milliseconds} ms.",
                     index + 1
                 )
             }
@@ -352,6 +462,41 @@ impl SettingsState {
                 ActionKind::TypeText { text: "Gradial editor text \u{1F642}".to_owned() },
             );
         }
+        for (action_id, name, kind) in [
+            (
+                DEBUG_URL_ACTION_ID,
+                "Editor website",
+                ActionKind::OpenUrl { url: "https://example.com/gradial-editor".to_owned() },
+            ),
+            (
+                DEBUG_PATH_ACTION_ID,
+                "Editor folder",
+                ActionKind::OpenPath { path: PathBuf::from(r"C:\Windows") },
+            ),
+            (
+                DEBUG_EXECUTABLE_ACTION_ID,
+                "Editor application",
+                ActionKind::RunExecutable {
+                    executable: PathBuf::from(r"C:\Windows\System32\notepad.exe"),
+                    arguments: vec![
+                        "--editor-smoke".to_owned(),
+                        "literal argument with spaces".to_owned(),
+                        String::new(),
+                    ],
+                    working_directory: Some(PathBuf::from(r"C:\Windows")),
+                },
+            ),
+            (DEBUG_DELAY_ACTION_ID, "Editor delay", ActionKind::Delay { milliseconds: 275 }),
+            (
+                DEBUG_WINDOW_ACTION_ID,
+                "Editor window",
+                ActionKind::Window { command: WindowCommand::Restore },
+            ),
+        ] {
+            if !draft.proposed.actions.iter().any(|action| action.id == action_id) {
+                let _created = create_action(&mut draft.proposed, action_id, name, kind);
+            }
+        }
         let _duplicated =
             duplicate_action(&mut draft.proposed, DEBUG_TEXT_ACTION_ID, DEBUG_DUPLICATE_ACTION_ID);
         let _deleted = delete_action(&mut draft.proposed, DEBUG_DUPLICATE_ACTION_ID);
@@ -393,6 +538,40 @@ impl SettingsState {
             self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
         );
         true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_select_leaf_action(&mut self) -> bool {
+        if !self.draft.as_ref().is_some_and(|draft| {
+            draft.proposed.actions.iter().any(|action| action.id == DEBUG_EXECUTABLE_ACTION_ID)
+        }) {
+            return false;
+        }
+        self.section = SettingsSection::Actions;
+        self.selected_action = Some(DEBUG_EXECUTABLE_ACTION_ID);
+        self.action_feedback = None;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_leaf_editor_selected result_code=ok \
+             config_revision={} action_id={DEBUG_EXECUTABLE_ACTION_ID}",
+            self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_open_native_application_picker(&mut self) {
+        let result_code = match choose_path(PathDialogKind::Executable) {
+            PathDialogOutcome::Selected(_) => "selected",
+            PathDialogOutcome::Cancelled => "cancelled",
+            PathDialogOutcome::Failed => "failed",
+        };
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_native_picker result_code={result_code} \
+             config_revision={} picker_kind=application",
+            self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -439,6 +618,18 @@ impl SettingsState {
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F10))
         {
             let _recording = self.debug_begin_shortcut_recording();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F6))
+        {
+            let _selected = self.debug_select_leaf_action();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F11))
+        {
+            self.debug_open_native_application_picker();
             None
         } else if ui
             .ctx()
@@ -695,33 +886,28 @@ impl SettingsState {
                 }
             });
             ui.separator();
-            if ui.button("+ Keyboard shortcut").clicked() {
+            let mut new_action = None;
+            ui.menu_button("+ New action", |ui| {
+                for template in NewActionTemplate::ALL {
+                    if ui.button(template.label()).clicked() {
+                        new_action = Some(template);
+                        ui.close();
+                    }
+                }
+            });
+            if let Some(template) = new_action {
                 let action_id = Uuid::new_v4();
                 create_action(
                     configuration,
                     action_id,
-                    "Keyboard shortcut",
-                    ActionKind::SendShortcut {
-                        modifiers: Vec::new(),
-                        key: ShortcutKey { scan_code: 0x64, extended: false },
-                    },
+                    template.preferred_name(),
+                    template.action_kind(),
                 );
                 self.selected_action = Some(action_id);
-                self.action_feedback =
-                    Some(ActionEditorFeedback::Info("Keyboard shortcut created.".to_owned()));
-                self.save_feedback = SaveFeedback::None;
-            }
-            if ui.button("+ Text action").clicked() {
-                let action_id = Uuid::new_v4();
-                create_action(
-                    configuration,
-                    action_id,
-                    "Type text",
-                    ActionKind::TypeText { text: String::new() },
-                );
-                self.selected_action = Some(action_id);
-                self.action_feedback =
-                    Some(ActionEditorFeedback::Info("Text action created.".to_owned()));
+                self.action_feedback = Some(ActionEditorFeedback::Info(format!(
+                    "{} action created.",
+                    template.label()
+                )));
                 self.save_feedback = SaveFeedback::None;
             }
             ui.add_space(8.0);
@@ -756,6 +942,7 @@ impl SettingsState {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_action_details(&mut self, ui: &mut egui::Ui, configuration: &mut Configuration) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(12.0);
@@ -781,6 +968,8 @@ impl SettingsState {
             ui.label(RichText::new(action_kind_name(&action.kind)).strong());
             ui.add_space(12.0);
 
+            let mut payload_changed = false;
+            let mut payload_feedback = None;
             match &mut action.kind {
                 ActionKind::SendShortcut { modifiers, key } => {
                     ui.label("Shortcut");
@@ -805,8 +994,7 @@ impl SettingsState {
                         )
                         .changed()
                     {
-                        self.action_feedback = None;
-                        self.save_feedback = SaveFeedback::None;
+                        payload_changed = true;
                     }
                     let bytes = text.len();
                     let count = format!("{bytes} / {MAX_TYPED_TEXT_BYTES} bytes");
@@ -817,13 +1005,41 @@ impl SettingsState {
                     }
                     ui.weak("Text is sent literally and is never copied to the clipboard.");
                 }
-                kind => {
-                    ui.label(format!(
-                        "{} fields will be editable in a later action-editor step.",
-                        action_kind_name(kind)
-                    ));
+                ActionKind::OpenUrl { url } => {
+                    payload_changed = render_url_editor(ui, url);
+                }
+                ActionKind::OpenPath { path } => {
+                    let outcome = render_open_path_editor(ui, path);
+                    payload_changed = outcome.changed;
+                    payload_feedback = outcome.feedback;
+                }
+                ActionKind::RunExecutable {
+                    executable,
+                    arguments,
+                    working_directory,
+                } => {
+                    let outcome =
+                        render_executable_editor(ui, executable, arguments, working_directory);
+                    payload_changed = outcome.changed;
+                    payload_feedback = outcome.feedback;
+                }
+                ActionKind::Window { command } => {
+                    payload_changed = render_window_editor(ui, command);
+                }
+                ActionKind::Delay { milliseconds } => {
+                    payload_changed = render_delay_editor(ui, milliseconds);
+                }
+                ActionKind::Sequence { .. } => {
+                    ui.label("Sequence steps will be editable in a later action-editor step.");
                     ui.weak("You can rename, duplicate, assign, or safely delete this action now.");
                 }
+            }
+            if payload_changed {
+                self.action_feedback = None;
+                self.save_feedback = SaveFeedback::None;
+            }
+            if let Some(feedback) = payload_feedback {
+                self.action_feedback = Some(feedback);
             }
 
             ui.add_space(14.0);
@@ -968,6 +1184,221 @@ impl SettingsState {
             );
             CloseOutcome::Closed
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PayloadEditOutcome {
+    changed: bool,
+    feedback: Option<ActionEditorFeedback>,
+}
+
+fn render_url_editor(ui: &mut egui::Ui, url: &mut String) -> bool {
+    ui.label("Website address");
+    let changed = ui.add(TextEdit::singleline(url).desired_width(f32::INFINITY)).changed();
+    ui.weak("Only complete http:// and https:// addresses are accepted.");
+    changed
+}
+
+fn render_open_path_editor(ui: &mut egui::Ui, path: &mut PathBuf) -> PayloadEditOutcome {
+    ui.label("File or folder path");
+    let mut outcome =
+        PayloadEditOutcome { changed: render_path_text_field(ui, path), feedback: None };
+    ui.horizontal(|ui| {
+        if ui.button("Choose file...").clicked() {
+            apply_dialog_outcome(
+                &mut outcome,
+                path,
+                choose_path(PathDialogKind::File),
+                "Gradial could not open the file chooser.",
+            );
+        }
+        if ui.button("Choose folder...").clicked() {
+            apply_dialog_outcome(
+                &mut outcome,
+                path,
+                choose_path(PathDialogKind::Folder),
+                "Gradial could not open the folder chooser.",
+            );
+        }
+    });
+    ui.weak("The path must be absolute. Gradial checks that it exists when the action runs.");
+    outcome
+}
+
+fn render_executable_editor(
+    ui: &mut egui::Ui,
+    executable: &mut PathBuf,
+    arguments: &mut Vec<String>,
+    working_directory: &mut Option<PathBuf>,
+) -> PayloadEditOutcome {
+    let mut outcome = PayloadEditOutcome::default();
+    ui.label("Application");
+    outcome.changed |= render_path_text_field(ui, executable);
+    if ui.button("Choose application...").clicked() {
+        apply_dialog_outcome(
+            &mut outcome,
+            executable,
+            choose_path(PathDialogKind::Executable),
+            "Gradial could not open the application chooser.",
+        );
+    }
+    ui.weak("Choose an absolute .exe path. Scripts and shell commands are not accepted.");
+
+    ui.add_space(12.0);
+    ui.label("Arguments");
+    let mut remove_argument = None;
+    ScrollArea::vertical()
+        .id_salt("application_arguments")
+        .max_height(130.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for (index, argument) in arguments.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}.", index + 1));
+                    outcome.changed |=
+                        ui.add(TextEdit::singleline(argument).desired_width(260.0)).changed();
+                    if ui.small_button("Remove").clicked() {
+                        remove_argument = Some(index);
+                    }
+                });
+            }
+        });
+    if let Some(index) = remove_argument {
+        outcome.changed |= remove_executable_argument(arguments, index);
+    }
+    if ui.button("+ Add argument").clicked() {
+        add_executable_argument(arguments);
+        outcome.changed = true;
+    }
+    ui.weak("Each row is one literal argument. Empty rows are preserved; no shell parsing occurs.");
+
+    ui.add_space(12.0);
+    let mut use_working_directory = working_directory.is_some();
+    if ui.checkbox(&mut use_working_directory, "Use a working folder").changed() {
+        if use_working_directory {
+            let initial = executable
+                .parent()
+                .filter(|parent| parent.is_absolute())
+                .map_or_else(default_browse_path, Path::to_path_buf);
+            *working_directory = Some(initial);
+        } else {
+            *working_directory = None;
+        }
+        outcome.changed = true;
+    }
+    if let Some(directory) = working_directory {
+        outcome.changed |= render_path_text_field(ui, directory);
+        if ui.button("Choose working folder...").clicked() {
+            apply_dialog_outcome(
+                &mut outcome,
+                directory,
+                choose_path(PathDialogKind::Folder),
+                "Gradial could not open the working-folder chooser.",
+            );
+        }
+        ui.weak("The working folder is passed directly to the application.");
+    }
+    outcome
+}
+
+fn render_window_editor(ui: &mut egui::Ui, command: &mut WindowCommand) -> bool {
+    ui.label("Command");
+    let previous = *command;
+    ComboBox::from_id_salt("window_action_command")
+        .selected_text(window_command_name(*command))
+        .show_ui(ui, |ui| {
+            for candidate in [
+                WindowCommand::Close,
+                WindowCommand::Minimize,
+                WindowCommand::Maximize,
+                WindowCommand::Restore,
+            ] {
+                ui.selectable_value(command, candidate, window_command_name(candidate));
+            }
+        });
+    ui.weak("The command applies only to the window captured when the M4 gesture begins.");
+    *command != previous
+}
+
+fn render_delay_editor(ui: &mut egui::Ui, milliseconds: &mut u32) -> bool {
+    ui.label("Duration");
+    let changed =
+        ui.add(DragValue::new(milliseconds).range(10..=10_000).speed(10).suffix(" ms")).changed();
+    ui.weak("Allowed range: 10 through 10000 milliseconds.");
+    changed
+}
+
+fn render_path_text_field(ui: &mut egui::Ui, path: &mut PathBuf) -> bool {
+    let mut text = path.to_string_lossy().into_owned();
+    let changed = ui.add(TextEdit::singleline(&mut text).desired_width(f32::INFINITY)).changed();
+    if changed {
+        *path = PathBuf::from(text);
+    }
+    changed
+}
+
+fn apply_dialog_outcome(
+    current: &mut PayloadEditOutcome,
+    path: &mut PathBuf,
+    dialog: PathDialogOutcome,
+    failure_message: &'static str,
+) {
+    match dialog {
+        PathDialogOutcome::Selected(selected) => {
+            *path = selected;
+            current.changed = true;
+            current.feedback = None;
+        }
+        PathDialogOutcome::Cancelled => {}
+        PathDialogOutcome::Failed => {
+            current.feedback = Some(ActionEditorFeedback::Error(failure_message.to_owned()));
+        }
+    }
+}
+
+fn add_executable_argument(arguments: &mut Vec<String>) {
+    arguments.push(String::new());
+}
+
+fn remove_executable_argument(arguments: &mut Vec<String>, index: usize) -> bool {
+    if index >= arguments.len() {
+        return false;
+    }
+    arguments.remove(index);
+    true
+}
+
+fn default_browse_path() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\"))
+}
+
+fn default_executable_path() -> PathBuf {
+    std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("notepad.exe")
+}
+
+const fn window_command_name(command: WindowCommand) -> &'static str {
+    match command {
+        WindowCommand::Close => "Close",
+        WindowCommand::Minimize => "Minimize",
+        WindowCommand::Maximize => "Maximize",
+        WindowCommand::Restore => "Restore",
+    }
+}
+
+fn action_field_name(field: &'static str) -> &'static str {
+    match field {
+        "executable" => "application path",
+        "working_directory" => "working-folder path",
+        _ => "file or folder path",
     }
 }
 
@@ -1273,7 +1704,7 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
     {
         return Err(DraftValidationError::TypedTextTooLong { index, bytes });
     }
-    configuration.validate().map_err(|_error| DraftValidationError::InvalidConfiguration)?;
+    configuration.validate().map_err(|error| draft_validation_error(configuration, &error))?;
     ProfileResolver::compile(configuration)
         .map_err(|_error| DraftValidationError::InvalidConfiguration)?;
     ActionPlanCompiler::from_configuration(configuration)
@@ -1281,20 +1712,59 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
     Ok(())
 }
 
+fn draft_validation_error(
+    configuration: &Configuration,
+    error: &ConfigurationError,
+) -> DraftValidationError {
+    let action_index = |action_id| {
+        configuration.actions.iter().position(|action| action.id == action_id).unwrap_or(0)
+    };
+    match error {
+        ConfigurationError::InvalidActionUrl { action_id } => {
+            DraftValidationError::InvalidUrl { index: action_index(*action_id) }
+        }
+        ConfigurationError::ActionPathNotAbsolute { action_id, field }
+        | ConfigurationError::ActionPathContainsNul { action_id, field } => {
+            DraftValidationError::InvalidPath { index: action_index(*action_id), field }
+        }
+        ConfigurationError::ExecutableExtensionNotAllowed { action_id } => {
+            DraftValidationError::InvalidExecutable { index: action_index(*action_id) }
+        }
+        ConfigurationError::ExecutableArgumentContainsNul { action_id, index } => {
+            DraftValidationError::InvalidArgument {
+                index: action_index(*action_id),
+                argument: *index,
+            }
+        }
+        ConfigurationError::InvalidDelay { action_id, milliseconds } => {
+            DraftValidationError::InvalidDelay {
+                index: action_index(*action_id),
+                milliseconds: *milliseconds,
+            }
+        }
+        _ => DraftValidationError::InvalidConfiguration,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use eframe::egui::Vec2;
     use gradial_core::{
         ActionDefinition, ActionKind, Configuration, MAX_TYPED_TEXT_BYTES, MenuSlice, ShortcutKey,
-        ShortcutModifier, SliceCount,
+        ShortcutModifier, SliceCount, WindowCommand,
     };
     use uuid::Uuid;
 
     use super::{
-        ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle, SettingsDraft,
-        SettingsState, action_references, create_action, delete_action, duplicate_action,
-        map_selected_slice, preview_slice_at, resize_menu, validate_draft,
+        ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
+        NewActionTemplate, PayloadEditOutcome, SettingsDraft, SettingsState, action_references,
+        add_executable_argument, apply_dialog_outcome, create_action, delete_action,
+        duplicate_action, map_selected_slice, preview_slice_at, remove_executable_argument,
+        resize_menu, validate_draft,
     };
+    use crate::native_file_dialog::PathDialogOutcome;
 
     #[test]
     fn switching_slice_counts_preserves_cardinals_and_restores_diagonals_within_the_draft() {
@@ -1534,6 +2004,112 @@ mod tests {
                 index: 0,
                 bytes: MAX_TYPED_TEXT_BYTES + 1,
             })
+        );
+    }
+
+    #[test]
+    fn every_leaf_action_template_creates_a_valid_payload() {
+        let mut configuration = Configuration::default();
+        for (index, template) in NewActionTemplate::ALL.into_iter().enumerate() {
+            assert!(create_action(
+                &mut configuration,
+                Uuid::from_u128(500 + index as u128),
+                template.preferred_name(),
+                template.action_kind(),
+            ));
+        }
+
+        assert_eq!(configuration.actions.len(), NewActionTemplate::ALL.len());
+        assert_eq!(validate_draft(&configuration), Ok(()));
+        assert!(matches!(configuration.actions[5].kind, ActionKind::Delay { milliseconds: 250 }));
+        assert!(matches!(
+            configuration.actions[6].kind,
+            ActionKind::Window { command: WindowCommand::Minimize }
+        ));
+    }
+
+    #[test]
+    fn executable_argument_rows_preserve_literal_boundaries_and_empty_values() {
+        let mut arguments = vec!["--first".to_owned(), "literal value with spaces".to_owned()];
+
+        add_executable_argument(&mut arguments);
+        assert_eq!(arguments, ["--first", "literal value with spaces", ""]);
+        assert!(remove_executable_argument(&mut arguments, 0));
+        assert_eq!(arguments, ["literal value with spaces", ""]);
+        assert!(!remove_executable_argument(&mut arguments, 9));
+    }
+
+    #[test]
+    fn native_dialog_selection_replaces_only_the_edited_path() {
+        let mut path = PathBuf::from(r"C:\before");
+        let mut outcome = PayloadEditOutcome::default();
+
+        apply_dialog_outcome(
+            &mut outcome,
+            &mut path,
+            PathDialogOutcome::Selected(PathBuf::from(r"D:\after")),
+            "fixed failure",
+        );
+        assert_eq!(path, PathBuf::from(r"D:\after"));
+        assert!(outcome.changed);
+        assert_eq!(outcome.feedback, None);
+
+        apply_dialog_outcome(
+            &mut outcome,
+            &mut path,
+            PathDialogOutcome::Cancelled,
+            "fixed failure",
+        );
+        assert_eq!(path, PathBuf::from(r"D:\after"));
+        assert_eq!(outcome.feedback, None);
+    }
+
+    #[test]
+    fn leaf_action_validation_reports_the_specific_editor_field() {
+        let action_id = Uuid::from_u128(601);
+        let mut configuration = Configuration {
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Edited action".to_owned(),
+                kind: ActionKind::OpenUrl { url: "file:///private".to_owned() },
+            }],
+            ..Configuration::default()
+        };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidUrl { index: 0 })
+        );
+
+        configuration.actions[0].kind = ActionKind::OpenPath { path: PathBuf::from("relative") };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidPath { index: 0, field: "path" })
+        );
+
+        configuration.actions[0].kind = ActionKind::RunExecutable {
+            executable: PathBuf::from(r"C:\tool.cmd"),
+            arguments: Vec::new(),
+            working_directory: None,
+        };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidExecutable { index: 0 })
+        );
+
+        configuration.actions[0].kind = ActionKind::RunExecutable {
+            executable: PathBuf::from(r"C:\tool.exe"),
+            arguments: vec!["bad\0argument".to_owned()],
+            working_directory: None,
+        };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidArgument { index: 0, argument: 0 })
+        );
+
+        configuration.actions[0].kind = ActionKind::Delay { milliseconds: 1 };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidDelay { index: 0, milliseconds: 1 })
         );
     }
 }
