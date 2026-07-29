@@ -15,6 +15,7 @@ mod process_launch;
 mod settings;
 mod shell_open;
 mod shortcut;
+mod shortcut_recorder;
 mod tray;
 mod unicode_text;
 mod window_action;

@@ -35,7 +35,10 @@ non-focus-stealing Windows notification; successful actions remain silent.
 The first settings-editor slice adds a normal single-instance window for the
 global radial menu, with four/eight-direction editing, existing-action
 assignment, a production-renderer preview, guarded unsaved changes, atomic
-saves, and immediate runtime reload.
+saves, and immediate runtime reload. The action-catalog editor now creates and
+edits keyboard shortcuts and Unicode text actions, supports rename and
+duplication across every action type, and prevents deletion while an action is
+still referenced.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -150,13 +153,17 @@ restore for the invocation window.
 
 Choose **Open settings** from the notification-area menu to edit the global
 menu. The window can switch between four and eight directions, edit every
-visible label, assign or clear an action already present in the catalog, and
-select directions directly in the live radial preview. Closing a dirty draft
+visible label, assign or clear catalog actions, and select directions directly
+in the live radial preview. The **Actions** tab creates keyboard-shortcut and
+Unicode-text actions, records one non-modifier key with its exact left/right
+modifiers, edits names and text, and duplicates or safely deletes actions.
+Referenced actions must be unassigned before deletion. Closing a dirty draft
 requires **Discard changes** or **Keep editing**. A successful save validates
 and compiles the complete proposed configuration before atomic replacement,
 advances its revision, and reloads new M4 invocations without restarting
-Gradial. Action creation, application-profile editing, activation binding,
-import/export, icons, and onboarding remain future editor slices.
+Gradial. Editors for the remaining action payloads, application profiles,
+activation binding, import/export, icons, and onboarding remain future
+slices.
 
 Run all local checks with:
 
@@ -216,3 +223,5 @@ Action activity and failure-notification results are recorded in
 [`Documentation/milestone-2-action-feedback-results.md`](Documentation/milestone-2-action-feedback-results.md).
 Global-menu settings-editor and live-reload results are recorded in
 [`Documentation/milestone-2-settings-menu-editor-results.md`](Documentation/milestone-2-settings-menu-editor-results.md).
+Action-catalog and shortcut-recorder results are recorded in
+[`Documentation/milestone-2-action-editor-results.md`](Documentation/milestone-2-action-editor-results.md).

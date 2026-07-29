@@ -4,23 +4,32 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Color32, ComboBox, Id, Layout, Modal, RichText, Sense, UiBuilder, Vec2,
-    ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
+    self, Align, Color32, ComboBox, Id, Layout, Modal, RichText, ScrollArea, Sense, TextEdit,
+    UiBuilder, Vec2, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
+#[cfg(debug_assertions)]
+use gradial_core::ShortcutModifier;
 use gradial_core::{
-    ActionKind, ActionPlanCompiler, Configuration, Menu, MenuSlice, ProfileResolver, ResolvedMenu,
-    SliceCount,
+    ActionDefinition, ActionKind, ActionPlanCompiler, Configuration, MAX_TYPED_TEXT_BYTES, Menu,
+    MenuSlice, ProfileResolver, ResolvedMenu, ShortcutKey, SliceCount,
 };
 use uuid::Uuid;
 
-use crate::overlay::{
-    AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer,
+use crate::{
+    overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
+    shortcut_recorder::{CaptureOutcome, ShortcutRecorder, shortcut_display},
 };
 
 const SETTINGS_SIZE: [f32; 2] = [820.0, 620.0];
 const SETTINGS_MIN_SIZE: [f32; 2] = [720.0, 540.0];
 const PREVIEW_SIZE: f32 = 288.0;
 const PREVIEW_INVOCATION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0901);
+#[cfg(debug_assertions)]
+const DEBUG_SHORTCUT_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0902);
+#[cfg(debug_assertions)]
+const DEBUG_TEXT_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0903);
+#[cfg(debug_assertions)]
+const DEBUG_DUPLICATE_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0904);
 pub(crate) fn settings_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("gradial-settings")
 }
@@ -79,6 +88,13 @@ enum EditorLifecycle {
     ConfirmingClose,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SettingsSection {
+    #[default]
+    Menu,
+    Actions,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum SaveFeedback {
     #[default]
@@ -90,6 +106,8 @@ enum SaveFeedback {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DraftValidationError {
     EmptyLabel { index: usize, slice_count: SliceCount },
+    EmptyActionName { index: usize },
+    TypedTextTooLong { index: usize, bytes: usize },
     InvalidConfiguration,
 }
 
@@ -99,9 +117,54 @@ impl DraftValidationError {
             Self::EmptyLabel { index, slice_count } => {
                 format!("Give {} a label before saving.", direction_name(*index, *slice_count))
             }
-            Self::InvalidConfiguration => {
-                "These settings cannot be saved yet. Review the menu fields.".to_owned()
+            Self::EmptyActionName { index } => {
+                format!("Give action {} a name before saving.", index + 1)
             }
+            Self::TypedTextTooLong { index, bytes } => {
+                format!(
+                    "Action {} contains {bytes} bytes of text; the limit is {MAX_TYPED_TEXT_BYTES}.",
+                    index + 1
+                )
+            }
+            Self::InvalidConfiguration => {
+                "These settings cannot be saved yet. Review the editor fields.".to_owned()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActionEditorFeedback {
+    Info(String),
+    Error(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ActionReferenceSummary {
+    menu_slices: usize,
+    sequences: usize,
+}
+
+impl ActionReferenceSummary {
+    const fn is_referenced(self) -> bool {
+        self.menu_slices > 0 || self.sequences > 0
+    }
+
+    fn message(self) -> String {
+        match (self.menu_slices, self.sequences) {
+            (menu_slices, 0) => format!(
+                "This action is assigned to {menu_slices} menu {}. Clear those assignments before deleting it.",
+                if menu_slices == 1 { "slice" } else { "slices" }
+            ),
+            (0, sequences) => format!(
+                "This action is used by {sequences} sequence {}. Remove those steps before deleting it.",
+                if sequences == 1 { "step" } else { "steps" }
+            ),
+            (menu_slices, sequences) => format!(
+                "This action is assigned to {menu_slices} menu {} and used by {sequences} sequence {}. Clear those references before deleting it.",
+                if menu_slices == 1 { "slice" } else { "slices" },
+                if sequences == 1 { "step" } else { "steps" }
+            ),
         }
     }
 }
@@ -173,7 +236,12 @@ impl SettingsEditor {
 struct SettingsState {
     lifecycle: EditorLifecycle,
     draft: Option<SettingsDraft>,
+    section: SettingsSection,
     selected_slice: usize,
+    selected_action: Option<Uuid>,
+    action_feedback: Option<ActionEditorFeedback>,
+    shortcut_recorder: ShortcutRecorder,
+    recording_action_id: Option<Uuid>,
     save_feedback: SaveFeedback,
     recovery_warning: bool,
     preview_renderer: FoundationOverlayRenderer,
@@ -185,7 +253,12 @@ impl SettingsState {
         Self {
             lifecycle: EditorLifecycle::Closed,
             draft: None,
+            section: SettingsSection::Menu,
             selected_slice: 0,
+            selected_action: None,
+            action_feedback: None,
+            shortcut_recorder: ShortcutRecorder::default(),
+            recording_action_id: None,
             save_feedback: SaveFeedback::None,
             recovery_warning,
             preview_renderer: FoundationOverlayRenderer::new(),
@@ -198,7 +271,12 @@ impl SettingsState {
         if newly_opened {
             self.lifecycle = EditorLifecycle::Editing;
             self.draft = Some(SettingsDraft::new(configuration));
+            self.section = SettingsSection::Menu;
             self.selected_slice = 0;
+            self.selected_action = configuration.actions.first().map(|action| action.id);
+            self.action_feedback = None;
+            self.shortcut_recorder.cancel();
+            self.recording_action_id = None;
             self.save_feedback = SaveFeedback::None;
             log::info!(
                 target: "settings",
@@ -215,6 +293,7 @@ impl SettingsState {
             draft.accept_saved(configuration);
         }
         self.save_feedback = SaveFeedback::Saved;
+        self.action_feedback = None;
         self.recovery_warning = false;
     }
 
@@ -245,6 +324,73 @@ impl SettingsState {
             "component=settings event_code=settings_debug_draft_edited result_code=ok \
              config_revision={} slice_count=4",
             draft.original.config_revision
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_apply_action_fixture_edit(&mut self) -> bool {
+        let Some(draft) = &mut self.draft else {
+            return false;
+        };
+        if !draft.proposed.actions.iter().any(|action| action.id == DEBUG_SHORTCUT_ACTION_ID) {
+            let _created = create_action(
+                &mut draft.proposed,
+                DEBUG_SHORTCUT_ACTION_ID,
+                "Editor shortcut",
+                ActionKind::SendShortcut {
+                    modifiers: vec![ShortcutModifier::LeftControl],
+                    key: ShortcutKey { scan_code: 0x64, extended: false },
+                },
+            );
+        }
+        if !draft.proposed.actions.iter().any(|action| action.id == DEBUG_TEXT_ACTION_ID) {
+            let _created = create_action(
+                &mut draft.proposed,
+                DEBUG_TEXT_ACTION_ID,
+                "Editor text",
+                ActionKind::TypeText { text: "Gradial editor text \u{1F642}".to_owned() },
+            );
+        }
+        let _duplicated =
+            duplicate_action(&mut draft.proposed, DEBUG_TEXT_ACTION_ID, DEBUG_DUPLICATE_ACTION_ID);
+        let _deleted = delete_action(&mut draft.proposed, DEBUG_DUPLICATE_ACTION_ID);
+        if let Some(north) = draft.proposed.global_profile.menu.slices.first_mut() {
+            north.action_id = Some(DEBUG_SHORTCUT_ACTION_ID);
+        }
+        self.section = SettingsSection::Actions;
+        self.selected_action = Some(DEBUG_SHORTCUT_ACTION_ID);
+        self.action_feedback = None;
+        self.save_feedback = SaveFeedback::None;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_action_draft_edited result_code=ok \
+             config_revision={} action_count={}",
+            draft.original.config_revision,
+            draft.proposed.actions.len()
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_begin_shortcut_recording(&mut self) -> bool {
+        let Some(action_id) = self.selected_action else {
+            return false;
+        };
+        if !self.draft.as_ref().is_some_and(|draft| {
+            draft.proposed.actions.iter().any(|action| {
+                action.id == action_id && matches!(action.kind, ActionKind::SendShortcut { .. })
+            })
+        }) {
+            return false;
+        }
+        self.recording_action_id = Some(action_id);
+        self.shortcut_recorder.begin();
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_shortcut_recording_started \
+             result_code=ok config_revision={} action_id={action_id}",
+            self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
         );
         true
     }
@@ -284,6 +430,18 @@ impl SettingsState {
             None
         } else if ui
             .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F9))
+        {
+            let _edited = self.debug_apply_action_fixture_edit();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F10))
+        {
+            let _recording = self.debug_begin_shortcut_recording();
+            None
+        } else if ui
+            .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F7))
         {
             let _kept = self.debug_keep_editing();
@@ -301,6 +459,8 @@ impl SettingsState {
 
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
         if close_requested {
+            self.shortcut_recorder.cancel();
+            self.recording_action_id = None;
             match self.request_close() {
                 CloseOutcome::Closed => return None,
                 CloseOutcome::ConfirmationShown => {
@@ -325,7 +485,10 @@ impl SettingsState {
                     ui.label(if dirty { "Unsaved changes" } else { "All changes saved" });
                 });
             });
-            ui.label("Global menu");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.section, SettingsSection::Menu, "Menu");
+                ui.selectable_value(&mut self.section, SettingsSection::Actions, "Actions");
+            });
             if self.recovery_warning {
                 ui.add_space(6.0);
                 ui.colored_label(
@@ -349,6 +512,10 @@ impl SettingsState {
                     self.selected_slice = self
                         .selected_slice
                         .min(draft.proposed.global_profile.menu.slices.len() - 1);
+                    self.selected_action = draft.proposed.actions.first().map(|action| action.id);
+                    self.action_feedback = None;
+                    self.shortcut_recorder.cancel();
+                    self.recording_action_id = None;
                     self.save_feedback = SaveFeedback::None;
                 }
                 if let Err(error) = &validation {
@@ -368,6 +535,58 @@ impl SettingsState {
             ui.add_space(8.0);
         });
 
+        match self.section {
+            SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
+            SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
+        }
+
+        if self.lifecycle == EditorLifecycle::ConfirmingClose {
+            let mut discard = false;
+            let mut keep_editing = false;
+            let frame = egui::Frame::popup(ui.style()).fill(Color32::from_rgb(28, 28, 28));
+            Modal::new(Id::new("discard_settings_confirmation"))
+                .frame(frame)
+                .backdrop_color(Color32::from_black_alpha(150))
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(340.0);
+                    ui.heading("Discard unsaved changes?");
+                    ui.label("Your settings edits have not been saved.");
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard changes").clicked() {
+                            discard = true;
+                        }
+                        if ui.button("Keep editing").clicked() {
+                            keep_editing = true;
+                        }
+                    });
+                });
+            if discard {
+                draft.discard();
+                self.lifecycle = EditorLifecycle::Closed;
+                ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                log::info!(
+                    target: "settings",
+                    "component=settings event_code=settings_closed result_code=ok \
+                     config_revision={} unsaved_changes_discarded=true",
+                    draft.original.config_revision
+                );
+            } else if keep_editing {
+                self.lifecycle = EditorLifecycle::Editing;
+                log::info!(
+                    target: "settings",
+                    "component=settings event_code=settings_close_cancelled result_code=ok \
+                     config_revision={}",
+                    draft.original.config_revision
+                );
+            }
+        }
+
+        self.draft = Some(draft);
+        event
+    }
+
+    fn render_menu_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
         egui::Panel::left("menu_editor").resizable(false).exact_size(350.0).show(ui, |ui| {
             ui.add_space(12.0);
             ui.heading("Menu");
@@ -426,7 +645,9 @@ impl SettingsState {
                     });
                 if action_catalog_empty {
                     ui.add_space(6.0);
-                    ui.weak("No actions exist yet. Action creation will be added in a later step.");
+                    if ui.link("Create an action first.").clicked() {
+                        self.section = SettingsSection::Actions;
+                    }
                 }
             }
         });
@@ -440,47 +661,257 @@ impl SettingsState {
                 self.render_preview(ui, &draft.proposed);
             });
         });
+    }
 
-        if self.lifecycle == EditorLifecycle::ConfirmingClose {
-            let mut discard = false;
-            let mut keep_editing = false;
-            Modal::new(Id::new("discard_settings_confirmation")).show(ui.ctx(), |ui| {
-                ui.set_min_width(340.0);
-                ui.heading("Discard unsaved changes?");
-                ui.label("Your menu edits have not been saved.");
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Discard changes").clicked() {
-                        discard = true;
-                    }
-                    if ui.button("Keep editing").clicked() {
-                        keep_editing = true;
-                    }
-                });
+    fn render_actions_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
+        if self.selected_action.is_some_and(|selected| {
+            !draft.proposed.actions.iter().any(|action| action.id == selected)
+        }) {
+            self.selected_action = draft.proposed.actions.first().map(|action| action.id);
+        }
+        self.render_action_catalog(ui, &mut draft.proposed);
+        self.render_action_details(ui, &mut draft.proposed);
+        self.render_shortcut_recorder(ui.ctx(), &mut draft.proposed);
+    }
+
+    fn render_action_catalog(&mut self, ui: &mut egui::Ui, configuration: &mut Configuration) {
+        let action_rows = configuration
+            .actions
+            .iter()
+            .map(|action| (action.id, action.name.clone(), action_kind_name(&action.kind)))
+            .collect::<Vec<_>>();
+        egui::Panel::left("action_catalog").resizable(false).exact_size(280.0).show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Actions");
+            ui.label("Create reusable actions, then assign them from the Menu tab.");
+            ui.add_space(10.0);
+            ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                if action_rows.is_empty() {
+                    ui.weak("No actions yet.");
+                }
+                for (action_id, name, kind) in &action_rows {
+                    let label = format!("{name}\n{kind}");
+                    ui.selectable_value(&mut self.selected_action, Some(*action_id), label);
+                }
             });
-            if discard {
-                draft.discard();
-                self.lifecycle = EditorLifecycle::Closed;
-                ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                log::info!(
-                    target: "settings",
-                    "component=settings event_code=settings_closed result_code=ok \
-                     config_revision={} unsaved_changes_discarded=true",
-                    draft.original.config_revision
+            ui.separator();
+            if ui.button("+ Keyboard shortcut").clicked() {
+                let action_id = Uuid::new_v4();
+                create_action(
+                    configuration,
+                    action_id,
+                    "Keyboard shortcut",
+                    ActionKind::SendShortcut {
+                        modifiers: Vec::new(),
+                        key: ShortcutKey { scan_code: 0x64, extended: false },
+                    },
                 );
-            } else if keep_editing {
-                self.lifecycle = EditorLifecycle::Editing;
-                log::info!(
-                    target: "settings",
-                    "component=settings event_code=settings_close_cancelled result_code=ok \
-                     config_revision={}",
-                    draft.original.config_revision
-                );
+                self.selected_action = Some(action_id);
+                self.action_feedback =
+                    Some(ActionEditorFeedback::Info("Keyboard shortcut created.".to_owned()));
+                self.save_feedback = SaveFeedback::None;
             }
+            if ui.button("+ Text action").clicked() {
+                let action_id = Uuid::new_v4();
+                create_action(
+                    configuration,
+                    action_id,
+                    "Type text",
+                    ActionKind::TypeText { text: String::new() },
+                );
+                self.selected_action = Some(action_id);
+                self.action_feedback =
+                    Some(ActionEditorFeedback::Info("Text action created.".to_owned()));
+                self.save_feedback = SaveFeedback::None;
+            }
+            ui.add_space(8.0);
+            let has_selection = self.selected_action.is_some();
+            if ui.add_enabled(has_selection, egui::Button::new("Duplicate selected")).clicked()
+                && let Some(source_id) = self.selected_action
+            {
+                let duplicate_id = Uuid::new_v4();
+                if duplicate_action(configuration, source_id, duplicate_id) {
+                    self.selected_action = Some(duplicate_id);
+                    self.action_feedback =
+                        Some(ActionEditorFeedback::Info("Action duplicated.".to_owned()));
+                    self.save_feedback = SaveFeedback::None;
+                }
+            }
+            if ui.add_enabled(has_selection, egui::Button::new("Delete selected")).clicked()
+                && let Some(action_id) = self.selected_action
+            {
+                match delete_action(configuration, action_id) {
+                    Ok(next_selection) => {
+                        self.selected_action = next_selection;
+                        self.action_feedback =
+                            Some(ActionEditorFeedback::Info("Action deleted.".to_owned()));
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    Err(references) => {
+                        self.action_feedback =
+                            Some(ActionEditorFeedback::Error(references.message()));
+                    }
+                }
+            }
+        });
+    }
+
+    fn render_action_details(&mut self, ui: &mut egui::Ui, configuration: &mut Configuration) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Action editor");
+            let Some(action_id) = self.selected_action else {
+                ui.label("Create or select an action to edit it.");
+                return;
+            };
+            let references = action_references(configuration, action_id);
+            let Some(action) = configuration.actions.iter_mut().find(|action| action.id == action_id)
+            else {
+                ui.label("Select an available action.");
+                return;
+            };
+
+            ui.label("Name");
+            if ui.text_edit_singleline(&mut action.name).changed() {
+                self.action_feedback = None;
+                self.save_feedback = SaveFeedback::None;
+            }
+            ui.add_space(10.0);
+            ui.label("Type");
+            ui.label(RichText::new(action_kind_name(&action.kind)).strong());
+            ui.add_space(12.0);
+
+            match &mut action.kind {
+                ActionKind::SendShortcut { modifiers, key } => {
+                    ui.label("Shortcut");
+                    ui.label(RichText::new(shortcut_display(modifiers, *key)).monospace().strong());
+                    ui.add_space(8.0);
+                    if ui.button("Record shortcut").clicked() {
+                        self.recording_action_id = Some(action_id);
+                        self.shortcut_recorder.begin();
+                        self.action_feedback = None;
+                    }
+                    ui.weak(
+                        "Press modifiers first, then one letter, number, navigation key, or F1–F24.",
+                    );
+                }
+                ActionKind::TypeText { text } => {
+                    ui.label("Text");
+                    if ui
+                        .add(
+                            TextEdit::multiline(text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(10),
+                        )
+                        .changed()
+                    {
+                        self.action_feedback = None;
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    let bytes = text.len();
+                    let count = format!("{bytes} / {MAX_TYPED_TEXT_BYTES} bytes");
+                    if bytes > MAX_TYPED_TEXT_BYTES {
+                        ui.colored_label(Color32::from_rgb(239, 113, 113), count);
+                    } else {
+                        ui.weak(count);
+                    }
+                    ui.weak("Text is sent literally and is never copied to the clipboard.");
+                }
+                kind => {
+                    ui.label(format!(
+                        "{} fields will be editable in a later action-editor step.",
+                        action_kind_name(kind)
+                    ));
+                    ui.weak("You can rename, duplicate, assign, or safely delete this action now.");
+                }
+            }
+
+            ui.add_space(14.0);
+            if references.is_referenced() {
+                ui.weak(references.message());
+            }
+            if let Some(feedback) = &self.action_feedback {
+                match feedback {
+                    ActionEditorFeedback::Info(message) => {
+                        ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+                    }
+                    ActionEditorFeedback::Error(message) => {
+                        ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+                    }
+                }
+            }
+        });
+    }
+
+    fn render_shortcut_recorder(
+        &mut self,
+        context: &egui::Context,
+        configuration: &mut Configuration,
+    ) {
+        if !self.shortcut_recorder.is_recording() {
+            return;
+        }
+        let outcome = self.shortcut_recorder.update(context);
+        let mut cancel = false;
+        let frame = egui::Frame::popup(&context.style_of(context.theme()))
+            .fill(Color32::from_rgb(28, 28, 28));
+        Modal::new(Id::new("shortcut_recorder"))
+            .frame(frame)
+            .backdrop_color(Color32::from_black_alpha(150))
+            .show(context, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading("Record shortcut");
+                ui.label("Press the shortcut now.");
+                ui.label("Press Escape or choose Cancel to stop recording.");
+                if let Some(error) = self.shortcut_recorder.error() {
+                    ui.add_space(8.0);
+                    ui.colored_label(Color32::from_rgb(239, 113, 113), error);
+                }
+                ui.add_space(12.0);
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        if cancel {
+            self.shortcut_recorder.cancel();
+            self.recording_action_id = None;
+            return;
         }
 
-        self.draft = Some(draft);
-        event
+        match outcome {
+            Some(CaptureOutcome::Captured(recorded)) => {
+                let Some(action_id) = self.recording_action_id.take() else {
+                    return;
+                };
+                let Some(action) =
+                    configuration.actions.iter_mut().find(|action| action.id == action_id)
+                else {
+                    return;
+                };
+                let ActionKind::SendShortcut { modifiers, key } = &mut action.kind else {
+                    return;
+                };
+                *modifiers = recorded.modifiers;
+                *key = recorded.key;
+                self.action_feedback =
+                    Some(ActionEditorFeedback::Info("Shortcut recorded.".to_owned()));
+                self.save_feedback = SaveFeedback::None;
+                log::info!(
+                    target: "settings",
+                    "component=settings event_code=settings_shortcut_recorded result_code=ok \
+                     config_revision={} action_id={} modifier_count={} scan_code={} extended={}",
+                    configuration.config_revision,
+                    action_id,
+                    modifiers.len(),
+                    key.scan_code,
+                    key.extended
+                );
+            }
+            Some(CaptureOutcome::Cancelled) => {
+                self.recording_action_id = None;
+            }
+            None => {}
+        }
     }
 
     fn render_preview(&mut self, ui: &mut egui::Ui, configuration: &Configuration) {
@@ -632,6 +1063,101 @@ fn direction_name(index: usize, slice_count: SliceCount) -> &'static str {
     }
 }
 
+fn create_action(
+    configuration: &mut Configuration,
+    action_id: Uuid,
+    preferred_name: &str,
+    kind: ActionKind,
+) -> bool {
+    if configuration.actions.iter().any(|action| action.id == action_id) {
+        return false;
+    }
+    let name = unique_action_name(configuration, preferred_name);
+    configuration.actions.push(ActionDefinition { id: action_id, name, kind });
+    true
+}
+
+fn duplicate_action(
+    configuration: &mut Configuration,
+    source_id: Uuid,
+    duplicate_id: Uuid,
+) -> bool {
+    if configuration.actions.iter().any(|action| action.id == duplicate_id) {
+        return false;
+    }
+    let Some(mut duplicate) =
+        configuration.actions.iter().find(|action| action.id == source_id).cloned()
+    else {
+        return false;
+    };
+    duplicate.id = duplicate_id;
+    duplicate.name = unique_action_name(configuration, &format!("{} copy", duplicate.name));
+    configuration.actions.push(duplicate);
+    true
+}
+
+fn unique_action_name(configuration: &Configuration, preferred_name: &str) -> String {
+    if !configuration.actions.iter().any(|action| action.name == preferred_name) {
+        return preferred_name.to_owned();
+    }
+    for suffix in 2_u32.. {
+        let candidate = format!("{preferred_name} {suffix}");
+        if !configuration.actions.iter().any(|action| action.name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the finite action catalog cannot exhaust every u32 name suffix")
+}
+
+fn action_references(configuration: &Configuration, action_id: Uuid) -> ActionReferenceSummary {
+    let global_references = configuration
+        .global_profile
+        .menu
+        .slices
+        .iter()
+        .filter(|slice| slice.action_id == Some(action_id))
+        .count();
+    let application_references = configuration
+        .application_profiles
+        .iter()
+        .flat_map(|application| &application.profile.menu.slices)
+        .filter(|slice| slice.action_id == Some(action_id))
+        .count();
+    let sequence_references = configuration
+        .actions
+        .iter()
+        .filter_map(|action| match &action.kind {
+            ActionKind::Sequence { actions } => Some(actions),
+            _ => None,
+        })
+        .flatten()
+        .filter(|child_id| **child_id == action_id)
+        .count();
+    ActionReferenceSummary {
+        menu_slices: global_references.saturating_add(application_references),
+        sequences: sequence_references,
+    }
+}
+
+fn delete_action(
+    configuration: &mut Configuration,
+    action_id: Uuid,
+) -> Result<Option<Uuid>, ActionReferenceSummary> {
+    let references = action_references(configuration, action_id);
+    if references.is_referenced() {
+        return Err(references);
+    }
+    let Some(index) = configuration.actions.iter().position(|action| action.id == action_id) else {
+        return Ok(configuration.actions.first().map(|action| action.id));
+    };
+    configuration.actions.remove(index);
+    Ok(configuration
+        .actions
+        .get(index)
+        .or_else(|| configuration.actions.last())
+        .map(|action| action.id))
+}
+
 fn action_options(configuration: &Configuration) -> Vec<(Uuid, String)> {
     configuration
         .actions
@@ -732,6 +1258,21 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
     {
         return Err(DraftValidationError::EmptyLabel { index, slice_count });
     }
+    if let Some((index, _)) =
+        configuration.actions.iter().enumerate().find(|(_, action)| action.name.trim().is_empty())
+    {
+        return Err(DraftValidationError::EmptyActionName { index });
+    }
+    if let Some((index, bytes)) =
+        configuration.actions.iter().enumerate().find_map(|(index, action)| {
+            let ActionKind::TypeText { text } = &action.kind else {
+                return None;
+            };
+            (text.len() > MAX_TYPED_TEXT_BYTES).then_some((index, text.len()))
+        })
+    {
+        return Err(DraftValidationError::TypedTextTooLong { index, bytes });
+    }
     configuration.validate().map_err(|_error| DraftValidationError::InvalidConfiguration)?;
     ProfileResolver::compile(configuration)
         .map_err(|_error| DraftValidationError::InvalidConfiguration)?;
@@ -743,11 +1284,15 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
 #[cfg(test)]
 mod tests {
     use eframe::egui::Vec2;
-    use gradial_core::{ActionDefinition, ActionKind, Configuration, MenuSlice, SliceCount};
+    use gradial_core::{
+        ActionDefinition, ActionKind, Configuration, MAX_TYPED_TEXT_BYTES, MenuSlice, ShortcutKey,
+        ShortcutModifier, SliceCount,
+    };
     use uuid::Uuid;
 
     use super::{
-        CloseOutcome, DraftValidationError, EditorLifecycle, SettingsDraft, SettingsState,
+        ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle, SettingsDraft,
+        SettingsState, action_references, create_action, delete_action, duplicate_action,
         map_selected_slice, preview_slice_at, resize_menu, validate_draft,
     };
 
@@ -877,5 +1422,118 @@ mod tests {
     fn selection_mapping_keeps_the_same_cardinal_direction() {
         assert_eq!(map_selected_slice(2, SliceCount::Eight, SliceCount::Four), 1);
         assert_eq!(map_selected_slice(1, SliceCount::Four, SliceCount::Eight), 2);
+    }
+
+    #[test]
+    fn action_creation_and_duplication_assign_fresh_ids_and_readable_names() {
+        let mut configuration = Configuration::default();
+        let source_id = Uuid::from_u128(101);
+        let duplicate_id = Uuid::from_u128(102);
+        assert!(create_action(
+            &mut configuration,
+            source_id,
+            "Keyboard shortcut",
+            ActionKind::SendShortcut {
+                modifiers: vec![ShortcutModifier::LeftControl],
+                key: ShortcutKey { scan_code: 0x64, extended: false },
+            }
+        ));
+        assert!(create_action(
+            &mut configuration,
+            Uuid::from_u128(103),
+            "Keyboard shortcut",
+            ActionKind::TypeText { text: "literal".to_owned() }
+        ));
+        assert!(duplicate_action(&mut configuration, source_id, duplicate_id));
+
+        assert_eq!(
+            configuration.actions.iter().map(|action| action.name.as_str()).collect::<Vec<_>>(),
+            ["Keyboard shortcut", "Keyboard shortcut 2", "Keyboard shortcut copy"]
+        );
+        let duplicate = configuration
+            .actions
+            .iter()
+            .find(|action| action.id == duplicate_id)
+            .expect("duplicate");
+        assert_eq!(duplicate.kind, configuration.actions[0].kind);
+        assert_eq!(validate_draft(&configuration), Ok(()));
+    }
+
+    #[test]
+    fn referenced_action_deletion_is_blocked_without_clearing_any_reference() {
+        let target_id = Uuid::from_u128(201);
+        let sequence_id = Uuid::from_u128(202);
+        let mut configuration = Configuration {
+            actions: vec![
+                ActionDefinition {
+                    id: target_id,
+                    name: "Target".to_owned(),
+                    kind: ActionKind::TypeText { text: "private".to_owned() },
+                },
+                ActionDefinition {
+                    id: sequence_id,
+                    name: "Sequence".to_owned(),
+                    kind: ActionKind::Sequence { actions: vec![target_id] },
+                },
+            ],
+            ..Configuration::default()
+        };
+        configuration.global_profile.menu.slices[0].action_id = Some(target_id);
+
+        assert_eq!(
+            action_references(&configuration, target_id),
+            ActionReferenceSummary { menu_slices: 1, sequences: 1 }
+        );
+        assert_eq!(
+            delete_action(&mut configuration, target_id),
+            Err(ActionReferenceSummary { menu_slices: 1, sequences: 1 })
+        );
+        assert!(configuration.actions.iter().any(|action| action.id == target_id));
+        assert_eq!(configuration.global_profile.menu.slices[0].action_id, Some(target_id));
+    }
+
+    #[test]
+    fn unreferenced_action_deletion_selects_the_next_available_action() {
+        let first_id = Uuid::from_u128(301);
+        let second_id = Uuid::from_u128(302);
+        let mut configuration = Configuration {
+            actions: [first_id, second_id]
+                .map(|id| ActionDefinition {
+                    id,
+                    name: format!("Action {id}"),
+                    kind: ActionKind::TypeText { text: String::new() },
+                })
+                .into(),
+            ..Configuration::default()
+        };
+
+        assert_eq!(delete_action(&mut configuration, first_id), Ok(Some(second_id)));
+        assert_eq!(configuration.actions.len(), 1);
+        assert_eq!(configuration.actions[0].id, second_id);
+    }
+
+    #[test]
+    fn action_validation_reports_empty_names_and_oversized_text_fields() {
+        let mut configuration = Configuration::default();
+        configuration.actions.push(ActionDefinition {
+            id: Uuid::from_u128(401),
+            name: " ".to_owned(),
+            kind: ActionKind::TypeText { text: String::new() },
+        });
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::EmptyActionName { index: 0 })
+        );
+
+        configuration.actions[0].name = "Large text".to_owned();
+        configuration.actions[0].kind =
+            ActionKind::TypeText { text: "x".repeat(MAX_TYPED_TEXT_BYTES + 1) };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::TypedTextTooLong {
+                index: 0,
+                bytes: MAX_TYPED_TEXT_BYTES + 1,
+            })
+        );
     }
 }

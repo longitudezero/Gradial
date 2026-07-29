@@ -105,6 +105,30 @@ public static class GradialSettingsSmokeNative
             PostMessage(window, 0x0101u, new IntPtr(virtualKey), IntPtr.Zero);
     }
 
+    public static bool SendRecordedShortcut(IntPtr window)
+    {
+        return
+            PostKey(window, 0x0100u, 0xA2u, 0x001D0001u) &&
+            PostKey(window, 0x0100u, 0x7Du, 0x00650001u) &&
+            PostKey(window, 0x0101u, 0x7Du, 0xC0650001u) &&
+            PostKey(window, 0x0101u, 0xA2u, 0xC01D0001u);
+    }
+
+    private static bool PostKey(
+        IntPtr window,
+        uint message,
+        uint virtualKey,
+        uint keyData
+    )
+    {
+        return PostMessage(
+            window,
+            message,
+            new IntPtr(virtualKey),
+            new IntPtr(unchecked((int)keyData))
+        );
+    }
+
     public static bool CloseWindow(IntPtr window)
     {
         return PostMessage(window, 0x0010u, IntPtr.Zero, IntPtr.Zero);
@@ -272,6 +296,8 @@ $logPath = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
 $standardOutputPath = Join-Path $temporaryRoot "gradial.stdout.log"
 $standardErrorPath = Join-Path $temporaryRoot "gradial.stderr.log"
 $actionId = "67726164-6961-4c00-8000-000000000901"
+$shortcutActionId = "67726164-6961-4c00-8000-000000000902"
+$textActionId = "67726164-6961-4c00-8000-000000000903"
 $profileId = "67726164-6961-4c00-8000-000000000001"
 $labels = @("North old", "NE old", "East old", "SE old", "South old", "SW old", "West old", "NW old")
 $gradial = $null
@@ -359,6 +385,43 @@ try {
             -Path (Join-Path $captureDirectory "settings-editor-smoke.png")
     }
 
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x78)) {
+        throw "Could not send the action-catalog edit command to the settings window."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_action_draft_edited .*action_count=3" `
+        -Failure "The action catalog did not accept the isolated shortcut and text actions." |
+        Out-Null
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x79)) {
+        throw "Could not start shortcut recording in the settings window."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_shortcut_recording_started .*action_id=$shortcutActionId" `
+        -Failure "The shortcut recorder did not start." | Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-shortcut-recorder-smoke.png")
+    }
+    if (-not [GradialSettingsSmokeNative]::SendRecordedShortcut($settingsWindow)) {
+        throw "Could not send Ctrl+F14 to the shortcut recorder."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_shortcut_recorded .*action_id=$shortcutActionId .*modifier_count=1 .*scan_code=101 .*extended=false" `
+        -Failure "The shortcut recorder did not capture exact Ctrl+F14 scan-code data." |
+        Out-Null
+
+    if ($CaptureScreenshot) {
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-actions-editor-smoke.png")
+    }
+
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x74)) {
         throw "Could not send the isolated edit command to the settings window."
     }
@@ -384,6 +447,7 @@ try {
     }
 
     if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
         Save-WindowScreenshot `
             -Window $settingsWindow `
             -Path (Join-Path $workspace "captures\settings-close-confirmation-smoke.png")
@@ -423,16 +487,43 @@ try {
     if ((Compare-Object $expectedEditedLabels $savedLabels -SyncWindow 0).Count -ne 0) {
         throw "The saved four-slice labels do not match the editor draft."
     }
+    $savedActionIds = @($saved.global_profile.menu.slices | ForEach-Object { $_.action_id })
     if (
-        @(
-            $saved.global_profile.menu.slices |
-                Where-Object { $_.action_id -ne $actionId }
-        ).Count -ne 0
+        $savedActionIds[0] -ne $shortcutActionId -or
+        @($savedActionIds[1..3] | Where-Object { $_ -ne $actionId }).Count -ne 0
     ) {
-        throw "The four cardinal action assignments were not preserved."
+        throw "The new shortcut and preserved cardinal action assignments are incorrect."
+    }
+    if (@($saved.actions).Count -ne 3) {
+        throw "The settings save did not preserve all three catalog actions."
+    }
+    $shortcutAction = $saved.actions | Where-Object { $_.id -eq $shortcutActionId }
+    if (
+        -not $shortcutAction -or
+        $shortcutAction.name -ne "Editor shortcut" -or
+        $shortcutAction.kind.type -ne "send_shortcut" -or
+        $shortcutAction.kind.key.scan_code -ne 101 -or
+        $shortcutAction.kind.key.extended -ne $false -or
+        @($shortcutAction.kind.modifiers).Count -ne 1 -or
+        $shortcutAction.kind.modifiers[0] -ne "left_control"
+    ) {
+        throw "The recorded Ctrl+F14 action was not saved exactly."
+    }
+    $textAction = $saved.actions | Where-Object { $_.id -eq $textActionId }
+    if (
+        -not $textAction -or
+        $textAction.name -ne "Editor text" -or
+        $textAction.kind.type -ne "type_text" -or
+        $textAction.kind.text -ne "Gradial editor text 🙂"
+    ) {
+        throw "The Unicode text action was not saved exactly."
     }
     $backup = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
-    if ($backup.config_revision -ne 1 -or $backup.global_profile.menu.slice_count -ne 8) {
+    if (
+        $backup.config_revision -ne 1 -or
+        $backup.global_profile.menu.slice_count -ne 8 -or
+        @($backup.actions).Count -ne 1
+    ) {
         throw "The atomic save did not preserve the previous eight-slice configuration."
     }
 
@@ -472,8 +563,8 @@ try {
         -Failure "The preserved cardinal action did not execute from the reloaded menu." | Out-Null
 
     Write-Host (
-        "Settings editor smoke check passed: one native window, guarded dirty close, " +
-        "atomic revision 2 save, preserved cardinal actions, and live four-slice reload."
+        "Settings editor smoke check passed: action creation, exact Ctrl+F14 recording, " +
+        "Unicode text, guarded dirty close, atomic revision 2 save, and live reload."
     )
 }
 catch {

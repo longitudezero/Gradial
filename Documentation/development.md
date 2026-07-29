@@ -3,7 +3,7 @@
 ## Current milestone scope
 
 The foundation, Milestone 0 interaction spike, completed bounded Milestone 1
-slices, and the first two bounded Milestone 2 slices establish:
+slices, and the current bounded Milestone 2 slices establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -68,15 +68,18 @@ slices, and the first two bounded Milestone 2 slices establish:
   actions and cancellations do not notify.
 - A single-instance native settings window for global-menu four/eight geometry,
   labels, existing-action assignments, and a production-renderer preview.
+- An action catalog that creates and edits keyboard shortcuts and Unicode text,
+  records physical shortcut data, and supports rename, duplication, and
+  reference-safe deletion.
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
 
-Configuration editing is intentionally bounded to the global menu in this
-slice. Action creation, application-profile rules, activation binding,
-appearance, icons, import/export, and onboarding are not exposed yet. A
-release logs the chosen slice, compiles its assigned plan, and submits it to
-the coordinator. Every schema-two leaf action family can execute through its
-bounded backend.
+Configuration editing currently covers the global menu plus keyboard-shortcut
+and Unicode-text action payloads. The remaining action payload editors,
+application-profile rules, activation binding, appearance, icons,
+import/export, and onboarding are not exposed yet. A release logs the chosen
+slice, compiles its assigned plan, and submits it to the coordinator. Every
+schema-two leaf action family can execute through its bounded backend.
 
 ## Workspace layout
 
@@ -273,18 +276,39 @@ window and preserves its draft. The editor begins from the running
 configuration and modifies a private full-configuration copy; an unfinished
 edit cannot affect an open gesture or a later invocation.
 
-This first editor slice covers the global menu. It can switch between four and
-eight clockwise directions, edit each label, and assign or clear any action
-already present in the validated catalog. Eight-to-four conversion retains the
-four cardinal slices. Diagonal slices are stashed while the draft remains open
-and restored if the user switches back; expanding a configuration that was
-already saved with four slices creates the standard diagonal defaults. The
-selected direction follows its cardinal equivalent across conversions.
+The **Menu** tab can switch between four and eight clockwise directions, edit
+each label, and assign or clear any action in the validated catalog.
+Eight-to-four conversion retains the four cardinal slices. Diagonal slices are
+stashed while the draft remains open and restored if the user switches back;
+expanding a configuration that was already saved with four slices creates the
+standard diagonal defaults. The selected direction follows its cardinal
+equivalent across conversions.
 
 The clickable live preview uses `FoundationOverlayRenderer` and
 `ResolvedMenu`, so it shares production geometry, label placement, slice
 ordering, and selection rendering. It does not contain a second gesture or
 layout implementation.
+
+The **Actions** tab lists the complete catalog. It can create keyboard-shortcut
+and Unicode-text actions and can rename or duplicate every action type.
+Payloads belonging to action types whose dedicated editor has not shipped
+remain read-only. Creation and duplication generate new UUIDs and readable
+unique names.
+
+The shortcut recorder accepts one supported non-modifier physical key plus the
+exact left/right Ctrl, Alt, Shift, and Windows modifiers held for it. It stores
+the Windows scan code and extended-key flag shown before save; Escape cancels
+recording. If a modifier was already down before recording began and no
+left/right key transition is visible, it safely falls back to the left variant.
+The first editor covers letters, top-row numbers, punctuation, Enter, Tab,
+Backspace, Space, navigation keys, and F1 through F24. Unicode text is edited
+directly without clipboard access and displays its UTF-8 byte count against
+the existing 8 KiB limit.
+
+Deletion first scans global and application-profile menu slices plus sequence
+steps. A referenced action is never removed; the editor reports the number and
+kind of references so the user can clear them. An unreferenced action can be
+deleted without rewriting any other configuration data.
 
 **Save changes** is enabled only for a dirty draft whose required labels,
 configuration references, profile rules, action catalog, and bounded action
@@ -716,14 +740,17 @@ the foreground application after notification submission, while the wrapper
 confirms that neither its private path sentinel nor its configured argument
 appears in the local log. The isolated configuration is always removed.
 `smoke-settings-editor.ps1` starts the debug executable with a private
-eight-slice configuration and opens its real settings viewport. It verifies
-one visible native window, converts the draft to four slices, sends a normal
-window-close request, observes the unsaved confirmation, keeps editing, saves,
-and then closes the clean editor. It requires revision 2 on disk, the old
-eight-slice revision in `config.json.bak`, preserved cardinal action
-assignments, and a fresh M4 action using the reloaded four-slice menu. Optional
-screenshots cover both the editor and confirmation. The fixture never reads or
-writes the user's Gradial configuration.
+eight-slice configuration and opens its real settings viewport. It creates a
+shortcut and a Unicode-text action through the editor helpers, exercises
+duplication and unreferenced deletion, records an exact left-Ctrl+F14
+combination through native key messages, and assigns it to a menu slice. The
+harness then converts the draft to four slices, sends a normal window-close
+request, observes the unsaved confirmation, keeps editing, saves, and closes
+the clean editor. It requires revision 2 on disk with the exact shortcut and
+text payloads, the old eight-slice revision in `config.json.bak`, preserved
+cardinal assignments, and a fresh M4 action using the reloaded four-slice menu.
+Optional screenshots cover the menu, action editor, recorder, and confirmation.
+The fixture never reads or writes the user's Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:
