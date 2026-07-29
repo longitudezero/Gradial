@@ -657,6 +657,15 @@ finally {
 
 $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
 $log = Get-Content -LiteralPath $logPath -Raw
+$configurationRecord = [regex]::Match(
+    $log,
+    "event_code=config_loaded .*config_revision=(?<revision>[1-9][0-9]*) " +
+    "schema_version=1 source=(?<source>[a-z_]+)"
+)
+if (-not $configurationRecord.Success) {
+    throw "The live check did not load a validated schema-one configuration."
+}
+$activeConfigRevision = $configurationRecord.Groups["revision"].Value
 if ($log -notmatch "event_code=input_geometry_ready .*geometry_mode=$Geometry .*slice_count=$Slices") {
     throw "The log does not confirm geometry mode '$Geometry' with $Slices slices."
 }
@@ -671,6 +680,22 @@ if (
     throw "The renderer cache and animation contract was not initialized as requested."
 }
 $expectedInvocations = $directions.Count * $InvocationCount
+$snapshotRecords = [regex]::Matches(
+    $log,
+    "event_code=invocation_snapshot_captured .*" +
+    "config_revision=$activeConfigRevision .*activation_binding=MouseButton4"
+)
+if ($snapshotRecords.Count -lt $expectedInvocations) {
+    throw "Expected $expectedInvocations complete invocation snapshots; observed $($snapshotRecords.Count)."
+}
+$profileRecords = [regex]::Matches(
+    $log,
+    "event_code=profile_resolved .*config_revision=$activeConfigRevision .*" +
+    "profile_id=[0-9a-f-]+ .*decision=[a-z_]+"
+)
+if ($profileRecords.Count -lt $expectedInvocations) {
+    throw "Expected $expectedInvocations profile resolutions; observed $($profileRecords.Count)."
+}
 $invocationRecords = [regex]::Matches(
     $log,
     "event_code=invocation_started .*geometry=$expectedBehavior"

@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     CancelReason, GestureConfig, InputEvent, InputEventKind, InteractionController,
-    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, SliceCount,
-    monitor_index_for_point,
+    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, ProfileResolver,
+    ProfileTarget, SliceCount, monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -41,12 +41,28 @@ struct EventCounters {
     cancel: u64,
 }
 
+#[derive(Debug, Default)]
+struct ActiveInvocation {
+    snapshot: Option<InvocationSnapshot>,
+    profile_id: Option<uuid::Uuid>,
+    route: Option<usize>,
+}
+
+impl ActiveInvocation {
+    fn clear(&mut self) {
+        self.snapshot = None;
+        self.profile_id = None;
+        self.route = None;
+    }
+}
+
 #[derive(Debug)]
 struct EffectDispatcher<'a> {
     egui_context: &'a eframe::egui::Context,
     timing_markers: &'a TimingMarkers,
     routes: &'a [OverlayRoute],
     slice_count: SliceCount,
+    config_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +86,7 @@ pub(crate) struct InteractionRuntime {
     join_handle: Option<JoinHandle<()>>,
     control_sender: Sender<RuntimeControl>,
     events: Receiver<RuntimeEvent>,
+    config_revision: u64,
     #[cfg(debug_assertions)]
     debug_failure: Arc<AtomicU8>,
 }
@@ -81,6 +98,8 @@ impl InteractionRuntime {
         timing_markers: Arc<TimingMarkers>,
         routes: Vec<OverlayRoute>,
         slice_count: SliceCount,
+        profile_resolver: Arc<ProfileResolver>,
+        config_revision: u64,
     ) -> Result<Self> {
         let (producer, consumer) = RingBuffer::new(INPUT_QUEUE_CAPACITY);
         let accepting_input = Arc::new(AtomicBool::new(true));
@@ -113,6 +132,8 @@ impl InteractionRuntime {
                     &timing_markers,
                     &routes,
                     slice_count,
+                    &profile_resolver,
+                    config_revision,
                 );
             })
             .context("could not spawn the interaction thread")?;
@@ -124,6 +145,7 @@ impl InteractionRuntime {
             join_handle: Some(join_handle),
             control_sender,
             events,
+            config_revision,
             #[cfg(debug_assertions)]
             debug_failure,
         })
@@ -172,7 +194,8 @@ impl Drop for InteractionRuntime {
             log::error!(
                 target: "interaction",
                 "component=interaction event_code=interaction_thread_panicked \
-                 result_code=failure config_revision=0"
+                 result_code=failure config_revision={}",
+                self.config_revision
             );
         }
 
@@ -183,21 +206,23 @@ impl Drop for InteractionRuntime {
         #[cfg(debug_assertions)]
         log::info!(
             target: "input",
-            "component=input event_code=hook_debug_summary result_code=ok config_revision=0 \
+            "component=input event_code=hook_debug_summary result_code=ok config_revision={} \
              mouse_callback_count={} last_mouse_message={} last_mouse_data={}",
+            self.config_revision,
             self.hook_thread.metrics.debug.mouse_callback_count.load(Ordering::Acquire),
             self.hook_thread.metrics.debug.last_mouse_message.load(Ordering::Acquire),
             self.hook_thread.metrics.debug.last_mouse_data.load(Ordering::Acquire),
         );
         log::info!(
             target: "input",
-            "component=input event_code=hook_thread_stopped result_code=ok config_revision=0 \
-             maximum_callback_us={maximum_microseconds}"
+            "component=input event_code=hook_thread_stopped result_code=ok config_revision={} \
+             maximum_callback_us={maximum_microseconds}",
+            self.config_revision
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_interaction_thread(
     mut consumer: Consumer<InputEvent>,
     controls: &Receiver<RuntimeControl>,
@@ -210,13 +235,15 @@ fn run_interaction_thread(
     timing_markers: &TimingMarkers,
     routes: &[OverlayRoute],
     slice_count: SliceCount,
+    profile_resolver: &ProfileResolver,
+    config_revision: u64,
 ) {
     let gesture_config = GestureConfig { slice_count, ..GestureConfig::default() };
     let mut controller = InteractionController::new(gesture_config);
-    let mut active_snapshot = None;
-    let mut active_route = None;
+    let mut active = ActiveInvocation::default();
     let mut counters = EventCounters::default();
-    let dispatcher = EffectDispatcher { egui_context, timing_markers, routes, slice_count };
+    let dispatcher =
+        EffectDispatcher { egui_context, timing_markers, routes, slice_count, config_revision };
     let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut runtime_stop_pending = false;
@@ -231,8 +258,7 @@ fn run_interaction_thread(
             handle_runtime_control(
                 control,
                 &mut controller,
-                &mut active_snapshot,
-                &mut active_route,
+                &mut active,
                 event_sender,
                 &dispatcher,
             );
@@ -247,18 +273,24 @@ fn run_interaction_thread(
         if simulated_failure == 2 || metrics.queue_overflow.swap(false, Ordering::AcqRel) {
             accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::InputQueueOverflow) {
-                dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
+                dispatch_effect(
+                    effect,
+                    query_qpc(),
+                    active.snapshot.as_ref(),
+                    active.profile_id,
+                    active.route,
+                    &dispatcher,
+                );
             }
-            active_snapshot = None;
-            active_route = None;
+            active.clear();
             runtime_stop_pending = true;
             log::error!(
                 target: "input",
                 "component=input event_code=input_queue_overflow result_code=failure \
-                 config_revision=0 capacity={INPUT_QUEUE_CAPACITY}"
+                 config_revision={config_revision} capacity={INPUT_QUEUE_CAPACITY}"
             );
             if let Err(error) = event_sender.try_send(RuntimeEvent::InputFaulted) {
-                log_runtime_event_error(error);
+                log_runtime_event_error(error, config_revision);
             }
             platform::request_controller_repaint();
             continue;
@@ -271,18 +303,24 @@ fn run_interaction_thread(
         {
             accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::HookUnresponsive) {
-                dispatch_effect(effect, now, active_snapshot, active_route, &dispatcher);
+                dispatch_effect(
+                    effect,
+                    now,
+                    active.snapshot.as_ref(),
+                    active.profile_id,
+                    active.route,
+                    &dispatcher,
+                );
             }
-            active_snapshot = None;
-            active_route = None;
+            active.clear();
             runtime_stop_pending = true;
             log::error!(
                 target: "input",
                 "component=input event_code=hook_thread_unresponsive result_code=failure \
-                 config_revision=0 timeout_ms={HOOK_UNRESPONSIVE_AFTER_MS}"
+                 config_revision={config_revision} timeout_ms={HOOK_UNRESPONSIVE_AFTER_MS}"
             );
             if let Err(error) = event_sender.try_send(RuntimeEvent::InputRecoveryReady) {
-                log_runtime_event_error(error);
+                log_runtime_event_error(error, config_revision);
             }
             platform::request_controller_repaint();
             continue;
@@ -294,10 +332,10 @@ fn run_interaction_thread(
             handle_input_event(
                 event,
                 &mut controller,
-                &mut active_snapshot,
-                &mut active_route,
+                &mut active,
                 &mut counters,
                 &dispatcher,
+                profile_resolver,
             );
         }
 
@@ -307,16 +345,23 @@ fn run_interaction_thread(
     }
 
     if let Some(effect) = controller.fault(CancelReason::Shutdown) {
-        dispatch_effect(effect, query_qpc(), active_snapshot, active_route, &dispatcher);
+        dispatch_effect(
+            effect,
+            query_qpc(),
+            active.snapshot.as_ref(),
+            active.profile_id,
+            active.route,
+            &dispatcher,
+        );
     }
-    log_interaction_stopped(&counters);
+    log_interaction_stopped(&counters, config_revision);
 }
 
-fn log_interaction_stopped(counters: &EventCounters) {
+fn log_interaction_stopped(counters: &EventCounters, config_revision: u64) {
     log::info!(
         target: "interaction",
         "component=interaction event_code=interaction_thread_stopped result_code=ok \
-         config_revision=0 activation_down_events={} pointer_moved_events={} \
+         config_revision={config_revision} activation_down_events={} pointer_moved_events={} \
          activation_up_events={} raw_pointer_delta_events={} cancel_events={}",
         counters.activation_down,
         counters.pointer_moved,
@@ -329,8 +374,7 @@ fn log_interaction_stopped(counters: &EventCounters) {
 fn handle_runtime_control(
     control: RuntimeControl,
     controller: &mut InteractionController,
-    active_snapshot: &mut Option<InvocationSnapshot>,
-    active_route: &mut Option<usize>,
+    active: &mut ActiveInvocation,
     event_sender: &Sender<RuntimeEvent>,
     dispatcher: &EffectDispatcher<'_>,
 ) {
@@ -347,16 +391,23 @@ fn handle_runtime_control(
         ),
     };
     if let Some(effect) = controller.fault(reason) {
-        dispatch_effect(effect, query_qpc(), *active_snapshot, *active_route, dispatcher);
+        dispatch_effect(
+            effect,
+            query_qpc(),
+            active.snapshot.as_ref(),
+            active.profile_id,
+            active.route,
+            dispatcher,
+        );
     }
-    *active_snapshot = None;
-    *active_route = None;
+    active.clear();
     log::info!(
         target: "interaction",
-        "component=interaction event_code={event_code} result_code=ok config_revision=0"
+        "component=interaction event_code={event_code} result_code=ok config_revision={}",
+        dispatcher.config_revision
     );
     if let Err(error) = event_sender.try_send(event) {
-        log_runtime_event_error(error);
+        log_runtime_event_error(error, dispatcher.config_revision);
     }
     platform::request_controller_repaint();
 }
@@ -364,25 +415,67 @@ fn handle_runtime_control(
 fn handle_input_event(
     event: InputEvent,
     controller: &mut InteractionController,
-    active_snapshot: &mut Option<InvocationSnapshot>,
-    active_route: &mut Option<usize>,
+    active: &mut ActiveInvocation,
     counters: &mut EventCounters,
     dispatcher: &EffectDispatcher<'_>,
+    profile_resolver: &ProfileResolver,
 ) {
     let source_qpc = event.qpc_timestamp;
     let effect = match event.kind {
-        InputEventKind::ActivationDown(geometry) => {
+        InputEventKind::ActivationDown { geometry, physical_modifiers } => {
             counters.activation_down = counters.activation_down.saturating_add(1);
-            let snapshot = capture_snapshot(event, geometry);
-            *active_snapshot = Some(snapshot);
-            *active_route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
+            let snapshot =
+                capture_snapshot(event, geometry, physical_modifiers, dispatcher.config_revision);
+            log::info!(
+                target: "interaction",
+                "component=interaction event_code=invocation_snapshot_captured result_code=ok \
+                 config_revision={} invocation_id={} foreground_pid={} \
+                 process_start_time_available={} executable_path_available={} \
+                 window_class_available={} window_title_available={} \
+                 monitor_device_available={} modifier_control={} modifier_alt={} \
+                 modifier_shift={} activation_binding={:?}",
+                snapshot.context.config_revision,
+                snapshot.invocation_id,
+                snapshot.context.foreground_pid,
+                snapshot.context.process_start_time != 0,
+                snapshot.context.executable_path.is_some(),
+                !snapshot.context.window_class.is_empty(),
+                !snapshot.context.window_title.is_empty(),
+                !snapshot.context.monitor_device_name.is_empty(),
+                snapshot.context.physical_modifiers.control,
+                snapshot.context.physical_modifiers.alt,
+                snapshot.context.physical_modifiers.shift,
+                snapshot.context.activation_binding
+            );
+            let resolution = profile_resolver.resolve(ProfileTarget {
+                executable_path: snapshot.context.executable_path.as_deref(),
+                window_class: &snapshot.context.window_class,
+                window_title: &snapshot.context.window_title,
+            });
+            log::info!(
+                target: "profiles",
+                "component=profiles event_code=profile_resolved result_code=ok \
+                 config_revision={} invocation_id={} profile_id={} used_global={} \
+                 decision={} matching_profile_count={} menu_slice_count={}",
+                snapshot.context.config_revision,
+                snapshot.invocation_id,
+                resolution.profile_id,
+                resolution.used_global_profile,
+                resolution.decision.as_str(),
+                resolution.matching_profiles.len(),
+                resolution.slice_count.as_str()
+            );
+            active.profile_id = Some(resolution.profile_id);
+            active.route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
             dispatcher.timing_markers.emit(
                 "activation_dequeued",
                 Some(snapshot.invocation_id),
                 source_qpc,
                 &format!("geometry={}", geometry.behavior.as_str()),
             );
-            controller.activation_down(snapshot)
+            let effect = controller.activation_down(snapshot.clone());
+            active.snapshot = Some(snapshot);
+            effect
         }
         InputEventKind::PointerMoved => {
             counters.pointer_moved = counters.pointer_moved.saturating_add(1);
@@ -396,7 +489,7 @@ fn handle_input_event(
             counters.activation_up = counters.activation_up.saturating_add(1);
             dispatcher.timing_markers.emit(
                 "release_dequeued",
-                active_snapshot.map(|snapshot| snapshot.invocation_id),
+                active.snapshot.as_ref().map(|snapshot| snapshot.invocation_id),
                 source_qpc,
                 "",
             );
@@ -409,27 +502,37 @@ fn handle_input_event(
     };
 
     if let Some(effect) = effect {
-        dispatch_effect(effect, source_qpc, *active_snapshot, *active_route, dispatcher);
+        dispatch_effect(
+            effect,
+            source_qpc,
+            active.snapshot.as_ref(),
+            active.profile_id,
+            active.route,
+            dispatcher,
+        );
     }
     if matches!(controller.state(), InteractionState::Idle | InteractionState::Faulted) {
-        *active_snapshot = None;
-        *active_route = None;
+        active.clear();
     }
 }
 
 fn capture_snapshot(
     event: InputEvent,
     geometry: gradial_core::InvocationGeometry,
+    physical_modifiers: gradial_core::PhysicalModifiers,
+    config_revision: u64,
 ) -> InvocationSnapshot {
-    let foreground = platform::foreground_window_identity();
     InvocationSnapshot {
         invocation_id: uuid::Uuid::new_v4(),
         qpc_timestamp: event.qpc_timestamp,
-        foreground_window: foreground.window,
-        foreground_pid: foreground.process_id,
         cursor_physical_px: event.point,
         monitor_dpi: geometry.monitor_dpi,
         geometry,
+        context: Arc::new(platform::capture_invocation_context(
+            event.point,
+            physical_modifiers,
+            config_revision,
+        )),
     }
 }
 
@@ -441,11 +544,14 @@ fn route_for_point(point: gradial_core::ScreenPoint, routes: &[OverlayRoute]) ->
 fn dispatch_effect(
     effect: InteractionEffect,
     source_qpc: i64,
-    active_snapshot: Option<InvocationSnapshot>,
+    active_snapshot: Option<&InvocationSnapshot>,
+    active_profile_id: Option<uuid::Uuid>,
     active_route: Option<usize>,
     dispatcher: &EffectDispatcher<'_>,
 ) {
-    let Some((route_index, route)) = active_overlay_route(active_route, dispatcher.routes) else {
+    let Some((route_index, route)) =
+        active_overlay_route(active_route, dispatcher.routes, dispatcher.config_revision)
+    else {
         return;
     };
 
@@ -457,15 +563,18 @@ fn dispatch_effect(
                 log::error!(
                     target: "interaction",
                     "component=interaction event_code=invocation_snapshot_missing \
-                     result_code=failure config_revision=0 invocation_id={invocation_id}"
+                     result_code=failure config_revision={} invocation_id={invocation_id}",
+                    dispatcher.config_revision
                 );
                 return;
             };
             log::info!(
                 target: "interaction",
                 "component=interaction event_code=invocation_started result_code=ok \
-                 config_revision=0 invocation_id={invocation_id} monitor_index={route_index} \
-                 geometry={} slice_count={}",
+                 config_revision={} invocation_id={invocation_id} profile_id={} \
+                 monitor_index={route_index} geometry={} slice_count={}",
+                snapshot.context.config_revision,
+                active_profile_id.unwrap_or_default(),
                 snapshot.geometry.behavior.as_str(),
                 dispatcher.slice_count.as_str()
             );
@@ -481,8 +590,9 @@ fn dispatch_effect(
                 log::error!(
                     target: "renderer",
                     "component=renderer event_code=overlay_wake_request_failed \
-                     result_code=failure config_revision=0 invocation_id={invocation_id} \
-                     error={error}"
+                     result_code=failure config_revision={} invocation_id={invocation_id} \
+                     error={error}",
+                    snapshot.context.config_revision
                 );
             }
         }
@@ -490,8 +600,11 @@ fn dispatch_effect(
             log::debug!(
                 target: "interaction",
                 "component=interaction event_code=selection_changed result_code=ok \
-                 config_revision=0 invocation_id={invocation_id} \
-                 selected_slice={selected_slice:?}"
+                 config_revision={} invocation_id={invocation_id} \
+                 selected_slice={selected_slice:?}",
+                active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
+                    snapshot.context.config_revision
+                })
             );
             dispatcher.timing_markers.emit(
                 "highlight_requested",
@@ -507,15 +620,22 @@ fn dispatch_effect(
                     log::info!(
                         target: "interaction",
                         "component=interaction event_code=slice_selected result_code=ok \
-                         config_revision=0 invocation_id={invocation_id} \
-                         slice_index={slice_index} action_executed=false"
+                         config_revision={} invocation_id={invocation_id} profile_id={} \
+                         slice_index={slice_index} action_executed=false",
+                        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
+                            snapshot.context.config_revision
+                        }),
+                        active_profile_id.unwrap_or_default()
                     );
                 }
                 InteractionOutcome::Cancelled { reason } => {
                     log::info!(
                         target: "interaction",
                         "component=interaction event_code=invocation_cancelled result_code=ok \
-                         config_revision=0 invocation_id={invocation_id} reason={reason:?}"
+                         config_revision={} invocation_id={invocation_id} reason={reason:?}",
+                        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
+                            snapshot.context.config_revision
+                        })
                     );
                 }
             }
@@ -528,12 +648,13 @@ fn dispatch_effect(
 fn active_overlay_route(
     route_index: Option<usize>,
     routes: &[OverlayRoute],
+    config_revision: u64,
 ) -> Option<(usize, &OverlayRoute)> {
     let Some(route_index) = route_index else {
         log::error!(
             target: "renderer",
             "component=renderer event_code=overlay_route_missing result_code=failure \
-             config_revision=0"
+             config_revision={config_revision}"
         );
         return None;
     };
@@ -542,18 +663,18 @@ fn active_overlay_route(
         log::error!(
             target: "renderer",
             "component=renderer event_code=overlay_route_missing result_code=failure \
-             config_revision=0 monitor_index={route_index}"
+             config_revision={config_revision} monitor_index={route_index}"
         );
     }
     route.map(|route| (route_index, route))
 }
 
-fn log_runtime_event_error(error: TrySendError<RuntimeEvent>) {
+fn log_runtime_event_error(error: TrySendError<RuntimeEvent>, config_revision: u64) {
     let reason = if matches!(error, TrySendError::Full(_)) { "queue_full" } else { "queue_closed" };
     log::error!(
         target: "interaction",
         "component=interaction event_code=runtime_signal_failed result_code=failure \
-         config_revision=0 reason={reason}"
+         config_revision={config_revision} reason={reason}"
     );
 }
 

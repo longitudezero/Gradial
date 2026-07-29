@@ -2,8 +2,8 @@
 
 ## Current milestone scope
 
-The foundation, Milestone 0 interaction spike, and current bounded Milestone 1
-slices establish:
+The foundation, Milestone 0 interaction spike, completed bounded Milestone 1
+slices, and first bounded Milestone 2 slice establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -36,9 +36,14 @@ slices establish:
   Explorer restart.
 - Persistent per-monitor geometry caches and bounded 60/35/50 ms
   open/selection/close animation state.
+- A validated schema-one configuration with atomic primary/backup replacement.
+- Complete immutable target/display/modifier identity for every invocation.
+- A compiled, deterministic application-profile resolver with explanation
+  data.
 
-It intentionally does not save configuration, validate targets, or execute
-actions. A release logs the chosen slice but cannot launch anything.
+It intentionally does not expose configuration editing, perform release-time
+action-target validation, or execute actions. A release logs the chosen slice
+and resolved profile but cannot launch anything.
 
 ## Workspace layout
 
@@ -47,7 +52,7 @@ Gradial APP\
     Cargo.toml
     crates\
         gradial-core\    Pure geometry, gesture state, and application paths
-        gradial-app\     Windows input, executable, and overlay renderer
+        gradial-app\     Windows input, persistence, executable, and renderer
     scripts\
         check.ps1          Complete local code verification
         check-focus.ps1    Validate the latest completed focus trace
@@ -70,13 +75,23 @@ On first run, Gradial creates:
 
 ```text
 %LOCALAPPDATA%\Gradial\
+    config.json
     icons\
     logs\
 ```
 
-The application does not create `config.json` yet. Configuration persistence
-will be introduced with atomic replacement and backup recovery as required by
-the v0.2 plan.
+`config.json` starts at schema 1 and revision 1 with the stable global profile
+and an eight-slice label-only menu. A successful later replacement preserves
+the previous valid primary as `config.json.bak`; `config.json.tmp` exists only
+during a save. The current bounded schema deliberately has no action
+definitions or references.
+
+Configuration is parsed and completely validated before input starts. Profile
+regular expressions are compiled into the retained resolver at load rather
+than during invocation. An invalid primary loads the backup without rewriting
+either file. If neither file is usable, Gradial runs the built-in default in
+memory, retains the broken files, and writes a `config_recovery_warning`. The
+settings editor will surface that same warning visually when it is introduced.
 
 Logs are local and rotate at 1 MiB. At most five log files are retained.
 Gradial uses its own filter so a host-level `RUST_LOG` setting cannot silence
@@ -154,11 +169,42 @@ the invocation monitor's effective DPI:
 - release in the center/no-selection zone cancels;
 - Escape closes once, then waits for M4 release before returning to idle.
 
-Each invocation captures a UUID, QPC timestamp, foreground window handle and
-process ID, cursor origin, effective monitor DPI, resolved geometry behavior,
-and visual ring origin. These immutable fields are the beginning of the full
-v0.2 invocation snapshot; target identity and profile resolution belong to a
-later milestone.
+Each invocation captures a UUID and source QPC timestamp plus immutable target,
+display, input, and configuration identity. The target fields are foreground
+window handle/PID, process creation time, optional full executable path, window
+class, and window title. Display fields are signed cursor coordinate, monitor
+device name, monitor rectangle, work area, effective DPI, resolved geometry,
+and visual origin. Ctrl/Alt/Shift state is captured in the low-level
+button-down event along with the fixed development binding ID. The
+configuration revision is frozen before profile selection.
+
+Only the fixed-size modifier bits are added by the hook callback. Process,
+window, monitor, configuration, and profile work remains on the interaction
+thread. Executable paths, classes, and titles are held for matching but never
+written to routine logs.
+
+## Configuration and profile resolution
+
+The current action-free configuration model contains one global profile and
+zero or more application profiles. Every profile has an immutable UUID, name,
+and complete four- or eight-slice label menu. Application rules require an
+executable path and may add window-class and title-regex predicates with an
+explicit priority from 0 through 100.
+
+Executable separators and case are normalized without expanding environment
+variables. Class matching is case-insensitive exact; title regex matching uses
+Rust's non-backtracking regex engine and is opt-in. Eligible profiles are
+ordered by highest priority, then most predicates, then lexicographically
+smallest UUID. If the process path is unavailable or no rule matches, the
+global profile wins.
+
+The compiled resolver returns the winner, all matching profile IDs, their
+priority/specificity, and the exact tie-break step. The interaction log records
+that explanation without target path, class, or title data. In this bounded
+slice, profile selection is diagnostic: the temporary `--slices=4|8`
+development option still controls the gesture controller and renderer. A
+subsequent slice will route an immutable resolved menu into caches for both
+supported geometries.
 
 ## Edge behavior
 

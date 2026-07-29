@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gradial_core::{GeometryMode, SliceCount};
+use gradial_core::{GeometryMode, ProfileResolver, SliceCount};
 
 use crate::{
     diagnostics::TimingMarkers,
@@ -25,6 +25,8 @@ pub(crate) struct GradialApp {
     input_recovery_in_progress: bool,
     manual_input_fault: bool,
     timing_markers: Arc<TimingMarkers>,
+    profile_resolver: Arc<ProfileResolver>,
+    config_revision: u64,
     tray_icon: TrayIcon,
 }
 
@@ -35,6 +37,8 @@ impl GradialApp {
         creation_context: &eframe::CreationContext<'_>,
         startup_options: StartupOptions,
         timing_markers: Arc<TimingMarkers>,
+        profile_resolver: Arc<ProfileResolver>,
+        config_revision: u64,
     ) -> Result<Self> {
         platform::set_display_topology_monitoring(false);
         platform::configure_overlay_window(creation_context)?;
@@ -43,7 +47,8 @@ impl GradialApp {
             platform::monitor_work_areas().context("could not read the display work areas")?;
         log::info!(
             target: "startup",
-            "component=app event_code=input_geometry_ready result_code=ok config_revision=0 \
+            "component=app event_code=input_geometry_ready result_code=ok \
+             config_revision={config_revision} \
              geometry_mode={} slice_count={} reduced_motion={} monitor_count={}",
             startup_options.geometry_mode.as_str(),
             startup_options.slice_count.as_str(),
@@ -60,6 +65,7 @@ impl GradialApp {
             monitors,
             startup_options.slice_count,
             animation_mode,
+            config_revision,
             Arc::clone(&timing_markers),
         );
         creation_context.egui_ctx.request_repaint();
@@ -76,15 +82,22 @@ impl GradialApp {
             input_recovery_in_progress: false,
             manual_input_fault: false,
             timing_markers,
+            profile_resolver,
+            config_revision,
             tray_icon,
         })
     }
 
-    fn fail(context: &eframe::egui::Context, event_code: &str, error: &anyhow::Error) {
+    fn fail(
+        context: &eframe::egui::Context,
+        event_code: &str,
+        error: &anyhow::Error,
+        config_revision: u64,
+    ) {
         log::error!(
             target: "renderer",
             "component=renderer event_code={event_code} result_code=failure \
-             config_revision=0 error={error}"
+             config_revision={config_revision} error={error}"
         );
         context.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
     }
@@ -97,7 +110,7 @@ impl GradialApp {
         self.set_tray_health(TrayHealth::Recovering);
         let interaction = self.interaction.as_ref().expect("interaction checked above");
         if let Err(error) = interaction.begin_display_rebuild() {
-            Self::fail(context, "display_rebuild_request_failed", &error);
+            Self::fail(context, "display_rebuild_request_failed", &error, self.config_revision);
             return;
         }
         self.rebuild_in_progress = true;
@@ -108,7 +121,7 @@ impl GradialApp {
         let monitors = match platform::monitor_work_areas() {
             Ok(monitors) => monitors,
             Err(error) => {
-                Self::fail(context, "display_enumeration_failed", &error);
+                Self::fail(context, "display_enumeration_failed", &error, self.config_revision);
                 return;
             }
         };
@@ -118,13 +131,15 @@ impl GradialApp {
             monitors,
             self.slice_count,
             self.animation_mode,
+            self.config_revision,
             Arc::clone(&self.timing_markers),
         );
         self.rebuild_in_progress = false;
         log::info!(
             target: "renderer",
             "component=renderer event_code=overlay_pool_rebuild_started result_code=ok \
-             config_revision=0 generation={} monitor_count={}",
+             config_revision={} generation={} monitor_count={}",
+            self.config_revision,
             self.pool_generation,
             self.overlay_pool.monitors().len()
         );
@@ -139,7 +154,8 @@ impl GradialApp {
             log::error!(
                 target: "tray",
                 "component=tray event_code=tray_health_update_failed result_code=failure \
-                 config_revision=0 health={health:?} error={error}"
+                 config_revision={} health={health:?} error={error}",
+                self.config_revision
             );
         }
     }
@@ -158,7 +174,8 @@ impl GradialApp {
             log::error!(
                 target: "input",
                 "component=input event_code=input_reregistration_signal_failed \
-                 result_code=failure config_revision=0 source={source} error={error}"
+                 result_code=failure config_revision={} source={source} error={error}",
+                self.config_revision
             );
             self.interaction = None;
             return;
@@ -167,7 +184,8 @@ impl GradialApp {
         log::info!(
             target: "input",
             "component=input event_code=input_recovery_started result_code=ok \
-             config_revision=0 source={source}"
+             config_revision={} source={source}",
+            self.config_revision
         );
     }
 
@@ -184,7 +202,8 @@ impl GradialApp {
                 log::info!(
                     target: "input",
                     "component=input event_code=input_recovery_restart_ready result_code=ok \
-                     config_revision=0"
+                     config_revision={}",
+                    self.config_revision
                 );
             }
             RuntimeEvent::InputFaulted => {
@@ -195,14 +214,16 @@ impl GradialApp {
                 log::error!(
                     target: "input",
                     "component=input event_code=input_fault_requires_retry result_code=failure \
-                     config_revision=0 reason=queue_overflow"
+                     config_revision={} reason=queue_overflow",
+                    self.config_revision
                 );
             }
             RuntimeEvent::DisplayRebuildReady => {
                 log::warn!(
                     target: "renderer",
                     "component=renderer event_code=unexpected_display_rebuild_ready \
-                     result_code=failure config_revision=0"
+                     result_code=failure config_revision={}",
+                    self.config_revision
                 );
             }
         }
@@ -217,7 +238,8 @@ impl GradialApp {
             log::info!(
                 target: "input",
                 "component=input event_code=input_retry_requested result_code=ok \
-                 config_revision=0 source=tray"
+                 config_revision={} source=tray",
+                self.config_revision
             );
         }
     }
@@ -238,7 +260,7 @@ impl GradialApp {
         let current_monitors = match platform::monitor_work_areas() {
             Ok(monitors) => monitors,
             Err(error) => {
-                Self::fail(context, "display_enumeration_failed", &error);
+                Self::fail(context, "display_enumeration_failed", &error, self.config_revision);
                 return;
             }
         };
@@ -249,6 +271,7 @@ impl GradialApp {
                 current_monitors,
                 self.slice_count,
                 self.animation_mode,
+                self.config_revision,
                 Arc::clone(&self.timing_markers),
             );
             context.request_repaint();
@@ -263,6 +286,8 @@ impl GradialApp {
             Arc::clone(&self.timing_markers),
             routes,
             self.slice_count,
+            Arc::clone(&self.profile_resolver),
+            self.config_revision,
         ) {
             Ok(interaction) => interaction,
             Err(error) => {
@@ -271,7 +296,8 @@ impl GradialApp {
                 log::error!(
                     target: "input",
                     "component=input event_code=interaction_start_failed result_code=failure \
-                     config_revision=0 error={error}"
+                     config_revision={} error={error}",
+                    self.config_revision
                 );
                 return;
             }
@@ -284,7 +310,8 @@ impl GradialApp {
         log::info!(
             target: "renderer",
             "component=renderer event_code=overlay_pool_ready result_code=ok \
-             config_revision=0 generation={} monitor_count={}",
+             config_revision={} generation={} monitor_count={}",
+            self.config_revision,
             self.pool_generation,
             self.overlay_pool.monitors().len()
         );
@@ -299,7 +326,7 @@ impl eframe::App for GradialApp {
     fn logic(&mut self, context: &eframe::egui::Context, frame: &mut eframe::Frame) {
         if self.native_style_passes < Self::REQUIRED_NATIVE_STYLE_PASSES {
             if let Err(error) = platform::enforce_overlay_window_styles(frame) {
-                Self::fail(context, "renderer_unavailable", &error);
+                Self::fail(context, "renderer_unavailable", &error, self.config_revision);
                 return;
             }
 
@@ -307,7 +334,7 @@ impl eframe::App for GradialApp {
             if self.native_style_passes < Self::REQUIRED_NATIVE_STYLE_PASSES {
                 context.request_repaint();
             } else if let Err(error) = platform::hide_overlay(frame) {
-                Self::fail(context, "initial_overlay_hide_failed", &error);
+                Self::fail(context, "initial_overlay_hide_failed", &error, self.config_revision);
                 return;
             }
         }
@@ -318,7 +345,8 @@ impl eframe::App for GradialApp {
             log::error!(
                 target: "tray",
                 "component=tray event_code=tray_icon_restore_failed result_code=failure \
-                 config_revision=0 error={error}"
+                 config_revision={} error={error}",
+                self.config_revision
             );
         }
 

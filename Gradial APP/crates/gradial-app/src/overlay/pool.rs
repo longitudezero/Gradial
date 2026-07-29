@@ -80,6 +80,7 @@ pub(crate) struct OverlayPool {
     monitors: Vec<MonitorGeometry>,
     slots: Vec<OverlaySlot>,
     animation_mode: AnimationMode,
+    config_revision: u64,
     timing_markers: Arc<TimingMarkers>,
     close_coordinator: CloseCoordinator,
 }
@@ -90,6 +91,7 @@ impl OverlayPool {
         monitors: Vec<MonitorGeometry>,
         slice_count: SliceCount,
         animation_mode: AnimationMode,
+        config_revision: u64,
         timing_markers: Arc<TimingMarkers>,
     ) -> Self {
         let process_id = std::process::id();
@@ -109,14 +111,15 @@ impl OverlayPool {
         log::info!(
             target: "renderer",
             "component=renderer event_code=renderer_geometry_cache_ready result_code=ok \
-             config_revision=0 generation={generation} monitor_count={} slice_count={} \
+             config_revision={config_revision} generation={generation} monitor_count={} \
+             slice_count={} \
              reduced_motion={} open_ms=60 selection_ms=35 close_ms=50",
             slots.len(),
             slice_count.as_str(),
             animation_mode.is_reduced()
         );
 
-        Self { monitors, slots, animation_mode, timing_markers, close_coordinator }
+        Self { monitors, slots, animation_mode, config_revision, timing_markers, close_coordinator }
     }
 
     pub(crate) fn monitors(&self) -> &[MonitorGeometry] {
@@ -132,6 +135,7 @@ impl OverlayPool {
             let renderer = Arc::clone(&slot.renderer);
             let timing_markers = Arc::clone(&self.timing_markers);
             let animation_mode = self.animation_mode;
+            let config_revision = self.config_revision;
             let builder = viewport_builder(&title);
 
             context.show_viewport_deferred(viewport_id, builder, move |ui, viewport_class| {
@@ -139,12 +143,21 @@ impl OverlayPool {
                     log::error!(
                         target: "renderer",
                         "component=renderer event_code=overlay_viewport_embedded \
-                         result_code=failure config_revision=0 monitor_index={index}"
+                         result_code=failure config_revision={config_revision} \
+                         monitor_index={index}"
                     );
                     return;
                 }
 
-                prewarm_viewport(ui.ctx(), viewport_id, &title, monitor, index, &state);
+                prewarm_viewport(
+                    ui.ctx(),
+                    viewport_id,
+                    &title,
+                    monitor,
+                    index,
+                    config_revision,
+                    &state,
+                );
                 let prepared = prepare_overlay_frame(
                     ui.ctx(),
                     viewport_id,
@@ -181,6 +194,7 @@ impl OverlayPool {
                     monitor: slot.monitor,
                     native_handle,
                     animation_mode: self.animation_mode,
+                    config_revision: self.config_revision,
                     close_sender: self.close_coordinator.sender.clone(),
                     state: Arc::clone(&slot.state),
                 })
@@ -219,6 +233,7 @@ pub(crate) struct OverlayRoute {
     monitor: MonitorGeometry,
     native_handle: OverlayWakeHandle,
     animation_mode: AnimationMode,
+    config_revision: u64,
     close_sender: Sender<CloseCommand>,
     state: Arc<Mutex<OverlayViewportState>>,
 }
@@ -232,14 +247,20 @@ impl OverlayRoute {
         &self,
         context: &Context,
         timing_markers: &TimingMarkers,
-        snapshot: InvocationSnapshot,
+        snapshot: &InvocationSnapshot,
     ) -> Result<()> {
         let started_at = Instant::now();
+        let invocation_id = snapshot.invocation_id;
+        let qpc_timestamp = snapshot.qpc_timestamp;
+        let overlay_origin = snapshot.geometry.overlay_origin_physical_px;
         let interrupted_snapshot = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let interrupted =
-                state.snapshot.filter(|active| active.invocation_id != snapshot.invocation_id);
-            state.snapshot = Some(snapshot);
+            let interrupted = state
+                .snapshot
+                .as_ref()
+                .filter(|active| active.invocation_id != invocation_id)
+                .cloned();
+            state.snapshot = Some(snapshot.clone());
             state.selected_slice = None;
             state.selection_changed_at = Some(started_at);
             state.phase = VisualPhase::Opening { started_at };
@@ -260,31 +281,24 @@ impl OverlayRoute {
             );
         }
         focus::activation(snapshot);
-        platform::request_overlay_wake(
-            self.native_handle,
-            snapshot.geometry.overlay_origin_physical_px,
-        )
-        .inspect_err(|_| {
-            self.clear_immediately(snapshot.invocation_id);
-        })
-        .context("could not wake the routed display overlay")?;
-        timing_markers.emit(
-            "overlay_wake_requested",
-            Some(snapshot.invocation_id),
-            snapshot.qpc_timestamp,
-            "",
-        );
+        platform::request_overlay_wake(self.native_handle, overlay_origin)
+            .inspect_err(|_| {
+                self.clear_immediately(invocation_id);
+            })
+            .context("could not wake the routed display overlay")?;
+        timing_markers.emit("overlay_wake_requested", Some(invocation_id), qpc_timestamp, "");
         timing_markers.emit(
             "open_animation_started",
-            Some(snapshot.invocation_id),
-            snapshot.qpc_timestamp,
+            Some(invocation_id),
+            qpc_timestamp,
             &format!("duration_ms=60 reduced_motion={}", self.animation_mode.is_reduced()),
         );
         log::debug!(
             target: "renderer",
             "component=renderer event_code=open_animation_started result_code=ok \
-             config_revision=0 invocation_id={} duration_ms=60 reduced_motion={}",
-            snapshot.invocation_id,
+             config_revision={} invocation_id={} duration_ms=60 reduced_motion={}",
+            snapshot.context.config_revision,
+            invocation_id,
             self.animation_mode.is_reduced()
         );
         context.request_repaint_of(self.viewport_id);
@@ -299,7 +313,11 @@ impl OverlayRoute {
     ) {
         let applied = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.snapshot.is_some_and(|snapshot| snapshot.invocation_id == invocation_id) {
+            if state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.invocation_id == invocation_id)
+            {
                 state.selected_slice = selected_slice;
                 state.selection_changed_at = Some(Instant::now());
                 state.pending_highlight_marker = Some((invocation_id, selected_slice));
@@ -322,7 +340,11 @@ impl OverlayRoute {
         let started_at = Instant::now();
         let scheduled = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.snapshot.is_some_and(|snapshot| snapshot.invocation_id == invocation_id) {
+            if state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.invocation_id == invocation_id)
+            {
                 state.phase = VisualPhase::Closing { started_at };
                 true
             } else {
@@ -339,8 +361,9 @@ impl OverlayRoute {
                 log::error!(
                     target: "renderer",
                     "component=renderer event_code=close_watchdog_schedule_failed \
-                     result_code=failure config_revision=0 invocation_id={invocation_id} \
-                     error={error}"
+                     result_code=failure config_revision={} invocation_id={invocation_id} \
+                     error={error}",
+                    self.config_revision
                 );
             }
             timing_markers.emit(
@@ -352,8 +375,9 @@ impl OverlayRoute {
             log::debug!(
                 target: "renderer",
                 "component=renderer event_code=close_animation_started result_code=ok \
-                 config_revision=0 invocation_id={invocation_id} duration_ms=50 \
+                 config_revision={} invocation_id={invocation_id} duration_ms=50 \
                  reduced_motion={}",
+                self.config_revision,
                 self.animation_mode.is_reduced()
             );
             context.request_repaint_of(self.viewport_id);
@@ -361,8 +385,9 @@ impl OverlayRoute {
                 log::error!(
                     target: "renderer",
                     "component=renderer event_code=close_repaint_wake_failed \
-                     result_code=failure config_revision=0 invocation_id={invocation_id} \
-                     error={error}"
+                     result_code=failure config_revision={} invocation_id={invocation_id} \
+                     error={error}",
+                    self.config_revision
                 );
             }
         }
@@ -370,7 +395,7 @@ impl OverlayRoute {
 
     fn clear_immediately(&self, invocation_id: Uuid) -> Option<InvocationSnapshot> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.snapshot.is_some_and(|snapshot| snapshot.invocation_id == invocation_id) {
+        if state.snapshot.as_ref().is_some_and(|snapshot| snapshot.invocation_id == invocation_id) {
             state.reset_visuals()
         } else {
             None
@@ -487,6 +512,7 @@ fn complete_scheduled_close(scheduled: &ScheduledClose, timing_markers: &TimingM
         let mut state = scheduled.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let matching = state
             .snapshot
+            .as_ref()
             .is_some_and(|snapshot| snapshot.invocation_id == scheduled.invocation_id)
             && matches!(state.phase, VisualPhase::Closing { .. });
         if !matching {
@@ -512,14 +538,14 @@ fn complete_scheduled_close(scheduled: &ScheduledClose, timing_markers: &TimingM
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PreparedOverlayFrame {
     render: OverlayRenderFrame,
     repaint_after: Option<std::time::Duration>,
     completed_close: Option<CompletedClose>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct CompletedClose {
     native_handle: OverlayWakeHandle,
     snapshot: Option<InvocationSnapshot>,
@@ -542,7 +568,7 @@ fn prepare_overlay_frame(
             let frame = opening_frame(now.saturating_duration_since(started_at), animation_mode);
             if frame.complete {
                 state.phase = VisualPhase::Visible;
-                if let Some(snapshot) = state.snapshot {
+                if let Some(snapshot) = state.snapshot.as_ref() {
                     timing_markers.emit(
                         "open_animation_completed",
                         Some(snapshot.invocation_id),
@@ -578,7 +604,7 @@ fn prepare_overlay_frame(
 
     PreparedOverlayFrame {
         render: OverlayRenderFrame {
-            invocation_id: state.snapshot.map(|snapshot| snapshot.invocation_id),
+            invocation_id: state.snapshot.as_ref().map(|snapshot| snapshot.invocation_id),
             selected_slice: state.selected_slice,
             selection_changed_at: state.selection_changed_at,
             opacity: presence.opacity,
@@ -598,7 +624,7 @@ fn process_pending_markers(
     timing_markers: &TimingMarkers,
 ) {
     if let Some(snapshot) = state.pending_first_frame.take()
-        && state.snapshot == Some(snapshot)
+        && state.snapshot.as_ref() == Some(&snapshot)
     {
         timing_markers.emit(
             "first_frame_checkpoint",
@@ -606,18 +632,18 @@ fn process_pending_markers(
             0,
             "correlate_with_presentmon=true",
         );
-        focus::checkpoint(snapshot, "after_first_frame");
+        focus::checkpoint(&snapshot, "after_first_frame");
     }
     if state.pending_open_marker {
         state.pending_open_marker = false;
-        if let Some(snapshot) = state.snapshot {
+        if let Some(snapshot) = state.snapshot.as_ref() {
             timing_markers.emit(
                 "overlay_shown",
                 Some(snapshot.invocation_id),
                 snapshot.qpc_timestamp,
                 &format!("geometry={}", snapshot.geometry.behavior.as_str()),
             );
-            state.pending_first_frame = Some(snapshot);
+            state.pending_first_frame = Some(snapshot.clone());
             context.request_repaint_of(viewport_id);
         }
     }
@@ -674,7 +700,7 @@ fn record_finished_close(completed: CompletedClose, hidden: bool, timing_markers
                 completed.forced
             );
         }
-        focus::checkpoint(snapshot, "after_close");
+        focus::checkpoint(&snapshot, "after_close");
     }
 }
 
@@ -700,6 +726,7 @@ fn prewarm_viewport(
     title: &str,
     monitor: MonitorGeometry,
     monitor_index: usize,
+    config_revision: u64,
     state: &Mutex<OverlayViewportState>,
 ) {
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -721,7 +748,7 @@ fn prewarm_viewport(
         log::error!(
             target: "renderer",
             "component=renderer event_code=overlay_prewarm_failed result_code=failure \
-             config_revision=0 monitor_index={monitor_index} error={error}"
+             config_revision={config_revision} monitor_index={monitor_index} error={error}"
         );
         context.request_repaint_of(viewport_id);
         return;
@@ -734,7 +761,7 @@ fn prewarm_viewport(
         log::info!(
             target: "renderer",
             "component=renderer event_code=overlay_pool_slot_ready result_code=ok \
-             config_revision=0 monitor_index={monitor_index} dpi={actual_dpi}"
+             config_revision={config_revision} monitor_index={monitor_index} dpi={actual_dpi}"
         );
         context.request_repaint_of(ViewportId::ROOT);
     } else {

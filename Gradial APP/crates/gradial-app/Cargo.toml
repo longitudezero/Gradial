@@ -19,11 +19,16 @@ gradial-core = { path = "../gradial-core" }
 log.workspace = true
 raw-window-handle.workspace = true
 rtrb.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 windows.workspace = true
 
 [build-dependencies]
 embed-resource = "3.0"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -9,7 +9,9 @@ assist; display/DPI rebuild handling; input-hook recovery; a native health tray
 icon; cached overlay geometry; bounded animations; and focus/timing
 instrumentation. A versioned interaction-matrix harness now covers repeatable
 direction, corner/edge, rapid-use, focus, display-routing, topology, and
-recovery scenarios.
+recovery scenarios. The first Milestone 2 foundation adds schema-versioned
+configuration, atomic backup recovery, complete invocation target identity,
+and deterministic application-profile resolution.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -56,9 +58,9 @@ the four-slice N/E/S/W geometry end to end:
 cargo run --package gradial-app -- --slices=4
 ```
 
-`--slices 4` and `--slices 8` are also accepted. This startup-only switch is
-temporary; persisted per-profile selection remains part of the profiles
-milestone.
+`--slices 4` and `--slices 8` are also accepted. This startup-only switch
+continues to control visible development geometry while profile-menu rendering
+is introduced in the next bounded slice.
 
 The overlay opens from 96% scale and 85% opacity over 60 ms, changes selection
 color over 35 ms, and fades out over 50 ms. Gesture recognition and release do
@@ -85,6 +87,13 @@ input heartbeat triggers automatic recovery after 750 ms. Queue overflow and
 startup failures remain faulted with M4 passed through until **Retry input** is
 chosen. The same menu provides **Exit Gradial**. Input is also re-registered
 after resume, session unlock, or an Explorer restart.
+
+First startup now creates `%LOCALAPPDATA%\Gradial\config.json` with schema 1,
+revision 1, and a global eight-slice profile. Configuration replacement is
+validated and atomic, preserves the previous valid primary as
+`config.json.bak`, and recovers from that backup without overwriting a broken
+primary. Application-profile rules are resolved at every activation, but
+actions and the settings editor are not present yet.
 
 Run all local checks with:
 
@@ -115,3 +124,5 @@ Renderer cache and animation results are recorded in
 [`Documentation/milestone-1-renderer-animation-results.md`](Documentation/milestone-1-renderer-animation-results.md).
 The repeatable interaction-matrix contract and current coverage are recorded in
 [`Documentation/milestone-1-interaction-matrix-results.md`](Documentation/milestone-1-interaction-matrix-results.md).
+Configuration, snapshot, persistence, and resolver results are recorded in
+[`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).

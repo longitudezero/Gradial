@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod application;
+mod configuration;
 mod diagnostics;
 mod focus;
 mod input;
@@ -13,7 +14,7 @@ mod tray;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use gradial_core::AppPaths;
+use gradial_core::{AppPaths, ProfileResolver};
 
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -33,6 +34,30 @@ fn main() -> Result<()> {
         target: "startup",
         "component=app event_code=startup_begin result_code=ok config_revision=0"
     );
+    let loaded_configuration = configuration::ConfigStore::new(paths.clone())
+        .load_or_initialize()
+        .context("could not load Gradial configuration")?;
+    let config_revision = loaded_configuration.configuration.config_revision;
+    let profile_resolver = Arc::new(
+        ProfileResolver::compile(&loaded_configuration.configuration)
+            .context("could not compile Gradial profiles")?,
+    );
+    log::info!(
+        target: "config",
+        "component=config event_code=config_loaded result_code=ok \
+         config_revision={config_revision} schema_version={} source={}",
+        loaded_configuration.configuration.schema_version,
+        loaded_configuration.source.as_str()
+    );
+    if let Some(warning) = &loaded_configuration.warning {
+        log::error!(
+            target: "config",
+            "component=config event_code=config_recovery_warning result_code=failure \
+             config_revision={config_revision} primary_error={} backup_error={}",
+            warning.primary_error,
+            warning.backup_error.as_deref().unwrap_or("none")
+        );
+    }
     let timing_markers = Arc::new(
         diagnostics::TimingMarkers::register()
             .context("could not initialize ETW-compatible timing markers")?,
@@ -40,6 +65,7 @@ fn main() -> Result<()> {
 
     let options = overlay::native_options();
     let app_timing_markers = Arc::clone(&timing_markers);
+    let app_profile_resolver = Arc::clone(&profile_resolver);
     let run_result = eframe::run_native(
         "Gradial",
         options,
@@ -48,6 +74,8 @@ fn main() -> Result<()> {
                 creation_context,
                 startup_options,
                 app_timing_markers,
+                app_profile_resolver,
+                config_revision,
             )?;
             Ok(Box::new(app))
         }),
@@ -57,14 +85,16 @@ fn main() -> Result<()> {
         Ok(()) => {
             log::info!(
                 target: "startup",
-                "component=app event_code=shutdown_complete result_code=ok config_revision=0"
+                "component=app event_code=shutdown_complete result_code=ok \
+                 config_revision={config_revision}"
             );
             Ok(())
         }
         Err(error) => {
             log::error!(
                 target: "renderer",
-                "component=renderer event_code=renderer_unavailable result_code=failure config_revision=0"
+                "component=renderer event_code=renderer_unavailable result_code=failure \
+                 config_revision={config_revision}"
             );
             Err(anyhow!("Gradial's window loop failed: {error}"))
         }

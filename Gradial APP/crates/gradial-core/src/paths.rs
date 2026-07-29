@@ -15,6 +15,7 @@ pub struct AppPaths {
     pub root: PathBuf,
     pub config: PathBuf,
     pub config_backup: PathBuf,
+    pub config_temporary: PathBuf,
     pub icons: PathBuf,
     pub logs: PathBuf,
 }
@@ -39,6 +40,7 @@ impl AppPaths {
         Self {
             config: root.join("config.json"),
             config_backup: root.join("config.json.bak"),
+            config_temporary: root.join("config.json.tmp"),
             icons: root.join("icons"),
             logs: root.join("logs"),
             root,
@@ -89,6 +91,7 @@ mod tests {
         assert_eq!(paths.root, std::path::PathBuf::from(r"C:\Users\Test\AppData\Local\Gradial"));
         assert_eq!(paths.config, paths.root.join("config.json"));
         assert_eq!(paths.config_backup, paths.root.join("config.json.bak"));
+        assert_eq!(paths.config_temporary, paths.root.join("config.json.tmp"));
         assert_eq!(paths.icons, paths.root.join("icons"));
         assert_eq!(paths.logs, paths.root.join("logs"));
     }

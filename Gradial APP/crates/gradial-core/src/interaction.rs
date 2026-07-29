@@ -1,4 +1,8 @@
-use std::f64::consts::{PI, TAU};
+use std::{
+    f64::consts::{PI, TAU},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use uuid::Uuid;
 
@@ -167,7 +171,7 @@ impl InputEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEventKind {
-    ActivationDown(InvocationGeometry),
+    ActivationDown { geometry: InvocationGeometry, physical_modifiers: PhysicalModifiers },
     PointerMoved,
     RawPointerDelta { dx: i32, dy: i32 },
     ActivationUp,
@@ -186,19 +190,46 @@ pub enum CancelReason {
     Shutdown,
 }
 
-/// Immutable information captured when M4 is pressed.
-///
-/// Milestone 0 captures the fields required by the gesture and focus checks.
-/// Process identity and profile fields will be added with target validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Immutable information captured when the activation button is pressed.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationSnapshot {
     pub invocation_id: Uuid,
     pub qpc_timestamp: i64,
-    pub foreground_window: usize,
-    pub foreground_pid: u32,
     pub cursor_physical_px: ScreenPoint,
     pub monitor_dpi: u32,
     pub geometry: InvocationGeometry,
+    pub context: Arc<InvocationContext>,
+}
+
+/// Target, display, binding, and configuration identity frozen at activation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InvocationContext {
+    pub foreground_window: usize,
+    pub foreground_pid: u32,
+    pub process_start_time: u64,
+    pub executable_path: Option<PathBuf>,
+    pub window_class: String,
+    pub window_title: String,
+    pub monitor_device_name: String,
+    pub monitor_rect_physical_px: ScreenRect,
+    pub work_area_physical_px: ScreenRect,
+    pub physical_modifiers: PhysicalModifiers,
+    pub activation_binding: ActivationBindingId,
+    pub config_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalModifiers {
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActivationBindingId {
+    #[default]
+    MouseButton4,
+    MouseButton5,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,8 +306,8 @@ impl InteractionController {
     }
 
     #[must_use]
-    pub const fn snapshot(&self) -> Option<InvocationSnapshot> {
-        self.snapshot
+    pub fn snapshot(&self) -> Option<&InvocationSnapshot> {
+        self.snapshot.as_ref()
     }
 
     pub fn activation_down(&mut self, snapshot: InvocationSnapshot) -> Option<InteractionEffect> {
@@ -287,15 +318,14 @@ impl InteractionController {
         self.state = InteractionState::Opening;
         self.selected_slice = None;
         self.virtual_pointer = snapshot.cursor_physical_px;
+        let invocation_id = snapshot.invocation_id;
+        let origin = snapshot.geometry.overlay_origin_physical_px;
         self.snapshot = Some(snapshot);
-        Some(InteractionEffect::Open {
-            invocation_id: snapshot.invocation_id,
-            origin: snapshot.geometry.overlay_origin_physical_px,
-        })
+        Some(InteractionEffect::Open { invocation_id, origin })
     }
 
     pub fn raw_pointer_delta(&mut self, dx: i32, dy: i32) -> Option<InteractionEffect> {
-        if self.snapshot.map(|snapshot| snapshot.geometry.behavior)
+        if self.snapshot.as_ref().map(|snapshot| snapshot.geometry.behavior)
             != Some(ResolvedGeometry::EdgeAssist)
         {
             return None;
@@ -313,7 +343,7 @@ impl InteractionController {
             return None;
         }
 
-        let Some(snapshot) = self.snapshot else {
+        let Some(snapshot) = self.snapshot.as_ref() else {
             self.state = InteractionState::Faulted;
             return None;
         };
@@ -336,7 +366,7 @@ impl InteractionController {
     pub fn activation_up(&mut self) -> Option<InteractionEffect> {
         match self.state {
             InteractionState::Opening | InteractionState::Tracking => {
-                let Some(snapshot) = self.snapshot else {
+                let Some(snapshot) = self.snapshot.as_ref() else {
                     self.state = InteractionState::Faulted;
                     return None;
                 };
@@ -364,7 +394,7 @@ impl InteractionController {
             return None;
         }
 
-        let Some(snapshot) = self.snapshot else {
+        let Some(snapshot) = self.snapshot.as_ref() else {
             self.state = InteractionState::Faulted;
             return None;
         };
@@ -377,7 +407,7 @@ impl InteractionController {
     }
 
     pub fn fault(&mut self, reason: CancelReason) -> Option<InteractionEffect> {
-        let effect = self.snapshot.map(|snapshot| InteractionEffect::Close {
+        let effect = self.snapshot.as_ref().map(|snapshot| InteractionEffect::Close {
             invocation_id: snapshot.invocation_id,
             outcome: InteractionOutcome::Cancelled { reason },
         });
@@ -389,7 +419,7 @@ impl InteractionController {
 
     fn selection_for_point(
         &self,
-        snapshot: InvocationSnapshot,
+        snapshot: &InvocationSnapshot,
         point: ScreenPoint,
     ) -> Option<usize> {
         let dx = point.x - snapshot.cursor_physical_px.x;
@@ -571,11 +601,14 @@ mod tests {
         InvocationSnapshot {
             invocation_id: Uuid::nil(),
             qpc_timestamp: 100,
-            foreground_window: 42,
-            foreground_pid: 7,
             cursor_physical_px: origin,
             monitor_dpi: 96,
             geometry: InvocationGeometry::fixed(origin, 96),
+            context: std::sync::Arc::new(super::InvocationContext {
+                foreground_window: 42,
+                foreground_pid: 7,
+                ..super::InvocationContext::default()
+            }),
         }
     }
 
@@ -815,7 +848,7 @@ mod tests {
         for ((dx, dy), expected_slice) in deltas {
             let mut controller = InteractionController::new(GestureConfig::default());
             assert_eq!(
-                controller.activation_down(edge_snapshot),
+                controller.activation_down(edge_snapshot.clone()),
                 Some(InteractionEffect::Open {
                     invocation_id: Uuid::nil(),
                     origin: ScreenPoint::new(144, 144),
@@ -828,7 +861,7 @@ mod tests {
                     selected_slice: Some(expected_slice),
                 })
             );
-            assert_eq!(controller.snapshot(), Some(edge_snapshot));
+            assert_eq!(controller.snapshot(), Some(&edge_snapshot));
         }
     }
 

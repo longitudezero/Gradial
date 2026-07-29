@@ -1,5 +1,8 @@
 use std::{
+    ffi::OsString,
     mem::size_of,
+    os::windows::ffi::OsStringExt,
+    path::PathBuf,
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -10,33 +13,45 @@ use std::{
 use std::sync::atomic::AtomicU8;
 
 use anyhow::{Context, Result, bail};
-use gradial_core::{MonitorGeometry, ScreenPoint, ScreenRect};
+use gradial_core::{
+    ActivationBindingId, InvocationContext, MonitorGeometry, PhysicalModifiers, ScreenPoint,
+    ScreenRect,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM},
+    Foundation::{
+        CloseHandle, FILETIME, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError,
+        WIN32_ERROR, WPARAM,
+    },
     Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, InvalidateRect, MONITORINFO,
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, InvalidateRect,
+        MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
     },
     System::RemoteDesktop::{
         NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+    },
+    System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     },
     UI::{
         HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            FindWindowW, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
-            GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE,
-            PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY,
-            PBT_APMRESUMESUSPEND, PostMessageW, RegisterWindowMessageW, SET_WINDOW_POS_FLAGS,
-            SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-            WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST,
-            WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW, WTS_SESSION_UNLOCK,
+            FindWindowW, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
+            GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, PBT_APMRESUMEAUTOMATIC,
+            PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY, PBT_APMRESUMESUSPEND, PostMessageW,
+            RegisterWindowMessageW, SET_WINDOW_POS_FLAGS, SPI_SETWORKAREA, SW_HIDE,
+            SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_DISPLAYCHANGE,
+            WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST,
+            WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WTS_SESSION_UNLOCK,
         },
     },
 };
-use windows::core::{BOOL, PCWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 
 const OVERLAY_SUBCLASS_ID: usize = 0x4752_444C;
 const WM_GRADIAL_SHOW_OVERLAY: u32 = WM_APP + 0x244;
@@ -83,6 +98,161 @@ pub(crate) fn foreground_window_identity() -> ForegroundWindowIdentity {
         GetWindowThreadProcessId(window, Some(&raw mut process_id));
     }
     ForegroundWindowIdentity { window: window.0.addr(), process_id }
+}
+
+pub(crate) fn capture_invocation_context(
+    point: ScreenPoint,
+    physical_modifiers: PhysicalModifiers,
+    config_revision: u64,
+) -> InvocationContext {
+    let foreground = foreground_window_identity();
+    let window = HWND(std::ptr::with_exposed_provenance_mut(foreground.window));
+    let (process_start_time, executable_path) =
+        process_identity(foreground.process_id, config_revision);
+    let (monitor_device_name, monitor_rect_physical_px, work_area_physical_px) =
+        monitor_identity(point);
+
+    InvocationContext {
+        foreground_window: foreground.window,
+        foreground_pid: foreground.process_id,
+        process_start_time,
+        executable_path,
+        window_class: window_class(window),
+        window_title: window_title(window),
+        monitor_device_name,
+        monitor_rect_physical_px,
+        work_area_physical_px,
+        physical_modifiers,
+        activation_binding: ActivationBindingId::MouseButton4,
+        config_revision,
+    }
+}
+
+fn process_identity(process_id: u32, config_revision: u64) -> (u64, Option<PathBuf>) {
+    if process_id == 0 {
+        return (0, None);
+    }
+    // SAFETY: the requested handle is read-only and `process_id` was returned
+    // for the foreground window. A racing process exit is handled as missing
+    // target metadata.
+    let Ok(process) =
+        (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) })
+    else {
+        return (0, None);
+    };
+
+    let process_start_time = process_start_time(process).unwrap_or_default();
+    let executable_path = process_executable_path(process);
+    // SAFETY: `process` was opened by this function and is no longer used.
+    if let Err(error) = unsafe { CloseHandle(process) } {
+        log::warn!(
+            target: "interaction",
+            "component=interaction event_code=target_process_handle_cleanup_failed \
+             result_code=failure config_revision={config_revision} error={error}"
+        );
+    }
+    (process_start_time, executable_path)
+}
+
+fn process_start_time(process: windows::Win32::Foundation::HANDLE) -> Option<u64> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the process handle has query rights and all outputs are live.
+    unsafe {
+        GetProcessTimes(process, &raw mut creation, &raw mut exit, &raw mut kernel, &raw mut user)
+            .ok()?;
+    }
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
+fn process_executable_path(process: windows::Win32::Foundation::HANDLE) -> Option<PathBuf> {
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = u32::try_from(buffer.len()).ok()?;
+    // SAFETY: the process handle has query rights and the output buffer remains
+    // writable for the reported capacity.
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR::from_raw(buffer.as_mut_ptr()),
+            &raw mut length,
+        )
+        .ok()?;
+    }
+    let length = usize::try_from(length).ok()?;
+    buffer.truncate(length);
+    Some(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+fn window_class(window: HWND) -> String {
+    if window.is_invalid() {
+        return String::new();
+    }
+    let mut buffer = [0_u16; 256];
+    // SAFETY: `window` is the activation foreground HWND and `buffer` is live.
+    let length = unsafe { GetClassNameW(window, &mut buffer) };
+    if length <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..usize::try_from(length).unwrap_or_default()])
+}
+
+fn window_title(window: HWND) -> String {
+    if window.is_invalid() {
+        return String::new();
+    }
+    // SAFETY: `window` is the activation foreground HWND.
+    let length = unsafe { GetWindowTextLengthW(window) };
+    if length <= 0 {
+        return String::new();
+    }
+    let Ok(capacity) = usize::try_from(length.saturating_add(1)) else {
+        return String::new();
+    };
+    let mut buffer = vec![0_u16; capacity];
+    // SAFETY: `buffer` has room for the measured title and terminator.
+    let copied = unsafe { GetWindowTextW(window, &mut buffer) };
+    if copied <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..usize::try_from(copied).unwrap_or_default()])
+}
+
+fn monitor_identity(point: ScreenPoint) -> (String, ScreenRect, ScreenRect) {
+    let win32_point = POINT { x: point.x, y: point.y };
+    // SAFETY: the point is a signed virtual-screen coordinate.
+    let monitor = unsafe { MonitorFromPoint(win32_point, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return (String::new(), ScreenRect::default(), ScreenRect::default());
+    }
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = u32::try_from(size_of::<MONITORINFOEXW>()).unwrap_or(u32::MAX);
+    // SAFETY: MONITORINFOEXW begins with MONITORINFO as required by
+    // GetMonitorInfoW and remains live for the output.
+    let succeeded =
+        unsafe { GetMonitorInfoW(monitor, std::ptr::from_mut(&mut info).cast::<MONITORINFO>()) };
+    if !succeeded.as_bool() {
+        return (String::new(), ScreenRect::default(), ScreenRect::default());
+    }
+    let device_length =
+        info.szDevice.iter().position(|character| *character == 0).unwrap_or(info.szDevice.len());
+    (
+        String::from_utf16_lossy(&info.szDevice[..device_length]),
+        ScreenRect::new(
+            info.monitorInfo.rcMonitor.left,
+            info.monitorInfo.rcMonitor.top,
+            info.monitorInfo.rcMonitor.right,
+            info.monitorInfo.rcMonitor.bottom,
+        ),
+        ScreenRect::new(
+            info.monitorInfo.rcWork.left,
+            info.monitorInfo.rcWork.top,
+            info.monitorInfo.rcWork.right,
+            info.monitorInfo.rcWork.bottom,
+        ),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

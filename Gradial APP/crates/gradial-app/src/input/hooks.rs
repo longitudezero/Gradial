@@ -11,15 +11,15 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::bounded;
 use gradial_core::{
-    CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, InputEvent, InputEventKind, ResolvedGeometry,
-    ScreenPoint, resolve_invocation_geometry,
+    CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, InputEvent, InputEventKind, PhysicalModifiers,
+    ResolvedGeometry, ScreenPoint, resolve_invocation_geometry,
 };
 use rtrb::Producer;
 use windows::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
     System::{Performance::QueryPerformanceCounter, Threading::GetCurrentThreadId},
     UI::{
-        Input::KeyboardAndMouse::VK_ESCAPE,
+        Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT},
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
             KillTimer, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetTimer, SetWindowsHookExW,
@@ -458,7 +458,10 @@ impl HookCallbackState {
                     self.push(InputEvent::new(
                         timestamp,
                         point,
-                        InputEventKind::ActivationDown(geometry),
+                        InputEventKind::ActivationDown {
+                            geometry,
+                            physical_modifiers: capture_physical_modifiers(),
+                        },
                     ));
                 }
                 true
@@ -570,6 +573,18 @@ impl HookCallbackState {
     }
 }
 
+fn capture_physical_modifiers() -> PhysicalModifiers {
+    // SAFETY: GetAsyncKeyState has no memory-safety preconditions and performs
+    // no allocation or blocking work in the hook callback.
+    unsafe {
+        PhysicalModifiers {
+            control: GetAsyncKeyState(i32::from(VK_CONTROL.0)) < 0,
+            alt: GetAsyncKeyState(i32::from(VK_MENU.0)) < 0,
+            shift: GetAsyncKeyState(i32::from(VK_SHIFT.0)) < 0,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct SuppressionState {
     geometry: Option<ResolvedGeometry>,
@@ -606,7 +621,7 @@ mod tests {
 
     use gradial_core::{
         CancelReason, GeometryMode, InputEvent, InputEventKind, InvocationGeometry,
-        MonitorGeometry, ResolvedGeometry, ScreenPoint, ScreenRect,
+        MonitorGeometry, PhysicalModifiers, ResolvedGeometry, ScreenPoint, ScreenRect,
     };
     use rtrb::{Consumer, RingBuffer};
     use windows::Win32::{
@@ -670,7 +685,10 @@ mod tests {
             Ok(InputEvent::new(
                 10,
                 origin,
-                InputEventKind::ActivationDown(InvocationGeometry::fixed(origin, 96)),
+                InputEventKind::ActivationDown {
+                    geometry: InvocationGeometry::fixed(origin, 96),
+                    physical_modifiers: PhysicalModifiers::default(),
+                },
             ))
         );
 
@@ -704,11 +722,14 @@ mod tests {
             Ok(InputEvent::new(
                 10,
                 origin,
-                InputEventKind::ActivationDown(InvocationGeometry {
-                    behavior: ResolvedGeometry::EdgeAssist,
-                    overlay_origin_physical_px: origin,
-                    monitor_dpi: 96,
-                }),
+                InputEventKind::ActivationDown {
+                    geometry: InvocationGeometry {
+                        behavior: ResolvedGeometry::EdgeAssist,
+                        overlay_origin_physical_px: origin,
+                        monitor_dpi: 96,
+                    },
+                    physical_modifiers: PhysicalModifiers::default(),
+                },
             ))
         );
 
