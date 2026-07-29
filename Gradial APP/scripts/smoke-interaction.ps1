@@ -31,6 +31,8 @@ param(
 
     [switch]$ExpectDelayExecution,
 
+    [switch]$ExpectShortcutExecution,
+
     [ValidateSet(
         "default",
         "center",
@@ -282,8 +284,14 @@ if (-not (Test-Path -LiteralPath $executable)) {
 if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
     throw "Input fault simulation is available only in a debug build."
 }
-if ($ExpectDelayExecution -and ($Configuration -ne "release" -or $Slices -ne "8")) {
-    throw "Delay execution validation requires the release build and its configured eight-slice menu."
+if ($ExpectDelayExecution -and $ExpectShortcutExecution) {
+    throw "Choose only one expected action execution mode."
+}
+if (
+    ($ExpectDelayExecution -or $ExpectShortcutExecution) -and
+    ($Configuration -ne "release" -or $Slices -ne "8")
+) {
+    throw "Action execution validation requires the release build and its configured eight-slice menu."
 }
 if ($Slices -eq "4" -and -not $AllDirections -and $Direction.Length -ne 1) {
     throw "Four-slice validation accepts only N, E, S, or W."
@@ -696,7 +704,7 @@ $activeConfigRevision = $configurationRecord.Groups["revision"].Value
 if (
     $log -notmatch (
         "event_code=action_executor_ready .*config_revision=$activeConfigRevision " +
-        ".*supported_operations=delay .*per_step_timeout_ms=5000 " +
+        ".*supported_operations=delay,send_shortcut .*per_step_timeout_ms=5000 " +
         ".*maximum_duration_ms=30000 .*maximum_steps=32 " +
         ".*cancellation_poll_ms=10 .*shutdown_wait_ms=2000"
     )
@@ -767,7 +775,7 @@ $selectionRecords = [regex]::Matches(
 if ($selectionRecords.Count -ne $expectedInvocations) {
     throw "Expected $expectedInvocations selected gestures; observed $($selectionRecords.Count)."
 }
-if ($ExpectDelayExecution) {
+if ($ExpectDelayExecution -or $ExpectShortcutExecution) {
     $uncompiledSelections = @(
         $selectionRecords |
             Where-Object {
@@ -776,17 +784,17 @@ if ($ExpectDelayExecution) {
             }
     )
     if ($uncompiledSelections.Count -ne 0) {
-        throw "At least one Delay fixture selection did not compile an assigned action."
+        throw "At least one action fixture selection did not compile its assigned action."
     }
-    $completedDelayRecords = [regex]::Matches(
+    $completedActionRecords = [regex]::Matches(
         $log,
         "target=actions .*event_code=action_execution_completed .*result_code=ok " +
         ".*action_executed=true"
     )
-    if ($completedDelayRecords.Count -ne $expectedInvocations) {
+    if ($completedActionRecords.Count -ne $expectedInvocations) {
         throw (
-            "Expected $expectedInvocations completed Delay actions; " +
-            "observed $($completedDelayRecords.Count)."
+            "Expected $expectedInvocations completed actions; " +
+            "observed $($completedActionRecords.Count)."
         )
     }
 }

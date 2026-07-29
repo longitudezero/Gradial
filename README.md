@@ -17,7 +17,9 @@ Milestone 2 slice adds schema-two built-in action definitions, validated menu
 references and reusable sequences, safe schema-one migration, and immutable
 release-time action-plan compilation. The first executor slice adds a
 single-worker coordinator and cancellable Delay execution with bounded
-timeouts and shutdown.
+timeouts and shutdown. The next executor slice adds stale/elevated target
+validation and scan-code keyboard shortcuts with strict synthesized-key
+cleanup.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -79,10 +81,12 @@ cargo run --package gradial-app -- --reduced-motion
 
 **M4 is dedicated to Gradial while the app runs.** Its normal browser
 back/navigation behavior is suppressed. An assigned slice is compiled into an
-immutable, bounded plan at release. Delay-only plans execute on one worker;
-another dispatch while it is busy fails immediately instead of queuing.
-Unassigned slices cancel as `EmptySlice`, and plans containing any other
-action family fail safely as `unsupported_action`.
+immutable, bounded plan at release. Delay and keyboard-shortcut steps execute
+on one worker; another dispatch while it is busy fails immediately instead of
+queuing. Before a shortcut, Gradial verifies that the captured window still
+has the same process/start time, remains foreground, and is not at higher
+integrity. Unassigned slices cancel as `EmptySlice`, and plans containing any
+other action family fail safely as `unsupported_action`.
 
 The display under the M4-down cursor selects the prewarmed overlay window.
 Display, work-area, or DPI changes cancel an active gesture and rebuild the
@@ -93,7 +97,7 @@ Gradial keeps a notification-area icon visible while it runs. Its icon and
 first menu line show `Healthy`, `Recovering input`, or `Input faulted`. A missed
 input heartbeat triggers automatic recovery after 750 ms. Queue overflow and
 startup failures remain faulted with M4 passed through until **Retry input** is
-chosen. The same menu provides **Cancel current action** while a Delay is
+chosen. The same menu provides **Cancel current action** while a plan is
 running and **Exit Gradial**. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
@@ -106,9 +110,9 @@ replacement is validated and atomic, preserves the previous valid primary as
 primary. Application-profile rules are resolved at every activation. The
 selected profile's complete menu—including optional action UUIDs—is frozen for
 the invocation, so title or configuration changes cannot switch geometry,
-labels, or the selected action while a gesture is open. Delay execution is
-enabled; OS-affecting action backends and the settings editor are not present
-yet.
+labels, or the selected action while a gesture is open. Delay and keyboard
+shortcut execution are enabled; text, URL/path, executable, window-action, and
+settings-editor support are not present yet.
 
 Run all local checks with:
 
@@ -147,3 +151,5 @@ Schema-two action validation and plan-compilation results are recorded in
 [`Documentation/milestone-2-action-model-results.md`](Documentation/milestone-2-action-model-results.md).
 Single-plan coordination and Delay execution results are recorded in
 [`Documentation/milestone-2-delay-executor-results.md`](Documentation/milestone-2-delay-executor-results.md).
+Target validation and keyboard-shortcut results are recorded in
+[`Documentation/milestone-2-keyboard-shortcut-results.md`](Documentation/milestone-2-keyboard-shortcut-results.md).

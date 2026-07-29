@@ -670,6 +670,7 @@ fn dispatch_effect(
                         invocation_id,
                         active_action_id,
                         active_execution_plan,
+                        active_snapshot.map(|snapshot| &snapshot.context),
                         dispatcher.action_executor,
                         active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
                             snapshot.context.config_revision
@@ -697,11 +698,12 @@ fn log_selected_action_outcome(
     invocation_id: uuid::Uuid,
     action_id: Option<uuid::Uuid>,
     execution_plan: Option<&Arc<ExecutionPlan>>,
+    target: Option<&Arc<gradial_core::InvocationContext>>,
     action_executor: &ActionExecutorHandle,
     config_revision: u64,
 ) {
-    match (action_id, execution_plan) {
-        (Some(action_id), Some(plan)) => {
+    match (action_id, execution_plan, target) {
+        (Some(action_id), Some(plan), Some(target)) => {
             log::info!(
                 target: "actions",
                 "component=actions event_code=action_plan_compiled result_code=ok \
@@ -713,7 +715,8 @@ fn log_selected_action_outcome(
                 plan.per_step_timeout_ms(),
                 plan.maximum_duration_ms()
             );
-            match action_executor.try_dispatch(invocation_id, Arc::clone(plan)) {
+            match action_executor.try_dispatch(invocation_id, Arc::clone(plan), Arc::clone(target))
+            {
                 ActionDispatch::Accepted => {
                     log::info!(
                         target: "actions",
@@ -734,7 +737,7 @@ fn log_selected_action_outcome(
                 }
             }
         }
-        (Some(action_id), None) => {
+        (Some(action_id), _, _) => {
             log::error!(
                 target: "actions",
                 "component=actions event_code=invocation_cancelled result_code=cancelled \
@@ -743,7 +746,7 @@ fn log_selected_action_outcome(
                  reason=ActionPlanInvalid action_executed=false"
             );
         }
-        (None, _) => {
+        (None, _, _) => {
             log::info!(
                 target: "actions",
                 "component=actions event_code=invocation_cancelled result_code=cancelled \
@@ -987,10 +990,12 @@ mod tests {
         assert_eq!(plan.steps().len(), 1);
 
         let executor = ActionExecutor::start(9).expect("executor");
+        let target = active.snapshot.as_ref().map(|snapshot| &snapshot.context);
         log_selected_action_outcome(
             invocation_id,
             active.action_id,
             Some(&plan),
+            target,
             &executor.handle(),
             9,
         );

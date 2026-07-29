@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     ActionErrorCode, ActionResult, DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation,
-    ExecutionPlan, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
+    ExecutionPlan, InvocationContext, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
 };
 use uuid::Uuid;
 
@@ -36,6 +36,7 @@ impl ActionExecutorHandle {
         &self,
         invocation_id: Uuid,
         plan: Arc<ExecutionPlan>,
+        target: Arc<InvocationContext>,
     ) -> ActionDispatch {
         if self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return ActionDispatch::Rejected(failure(
@@ -53,7 +54,7 @@ impl ActionExecutorHandle {
 
         self.cancellation_requested.store(false, Ordering::Release);
         tray::set_action_running(true);
-        let request = ExecutionRequest { invocation_id, plan };
+        let request = ExecutionRequest { invocation_id, plan, target };
         match self.commands.try_send(WorkerCommand::Execute(request)) {
             Ok(()) => {
                 self.worker_thread.unpark();
@@ -152,7 +153,7 @@ impl ActionExecutor {
         log::info!(
             target: "actions",
             "component=actions event_code=action_executor_ready result_code=ok \
-             config_revision={config_revision} supported_operations=delay \
+             config_revision={config_revision} supported_operations=delay,send_shortcut \
              per_step_timeout_ms={DEFAULT_ACTION_STEP_TIMEOUT_MS} \
              maximum_duration_ms={MAX_ACTION_SEQUENCE_DURATION_MS} \
              maximum_steps={MAX_ACTION_SEQUENCE_STEPS} cancellation_poll_ms={} \
@@ -251,6 +252,7 @@ enum WorkerCommand {
 struct ExecutionRequest {
     invocation_id: Uuid,
     plan: Arc<ExecutionPlan>,
+    target: Arc<InvocationContext>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -293,8 +295,13 @@ fn run_worker(
                     request.plan.root_action_id(),
                     request.plan.steps().len()
                 );
-                let result =
-                    execute_plan(&request.plan, cancellation_requested, shutdown_requested, policy);
+                let result = execute_plan(
+                    &request.plan,
+                    &request.target,
+                    cancellation_requested,
+                    shutdown_requested,
+                    policy,
+                );
                 let completion = ActionCompletion {
                     invocation_id: request.invocation_id,
                     root_action_id: request.plan.root_action_id(),
@@ -337,6 +344,7 @@ fn run_worker(
 
 fn execute_plan(
     plan: &ExecutionPlan,
+    target: &InvocationContext,
     cancellation_requested: &AtomicBool,
     shutdown_requested: &AtomicBool,
     policy: ExecutionPolicy,
@@ -347,8 +355,12 @@ fn execute_plan(
             "the action exceeds the executor step limit",
         );
     }
-    if plan.steps().iter().any(|step| !matches!(step.operation(), ExecutionOperation::Delay { .. }))
-    {
+    if plan.steps().iter().any(|step| {
+        !matches!(
+            step.operation(),
+            ExecutionOperation::Delay { .. } | ExecutionOperation::SendShortcut { .. }
+        )
+    }) {
         return failure(ActionErrorCode::UnsupportedAction, "this action type is not enabled yet");
     }
 
@@ -362,23 +374,44 @@ fn execute_plan(
         {
             return ActionResult::Cancelled;
         }
-        let ExecutionOperation::Delay { milliseconds } = step.operation() else {
-            unreachable!("the complete plan was preflighted before execution");
-        };
         let per_step_timeout = policy
             .per_step_timeout_override
             .unwrap_or_else(|| Duration::from_millis(u64::from(plan.per_step_timeout_ms())));
-        let result = execute_delay(
-            Duration::from_millis(u64::from(*milliseconds)),
-            plan_started,
-            maximum_duration,
-            per_step_timeout,
-            cancellation_requested,
-            shutdown_requested,
-            policy.cancellation_poll_interval,
-        );
-        if let Some(result) = result {
+        let step_started = Instant::now();
+        let check_deadline_after_step =
+            matches!(step.operation(), ExecutionOperation::SendShortcut { .. });
+        let result = match step.operation() {
+            ExecutionOperation::Delay { milliseconds } => execute_delay(
+                Duration::from_millis(u64::from(*milliseconds)),
+                plan_started,
+                maximum_duration,
+                per_step_timeout,
+                cancellation_requested,
+                shutdown_requested,
+                policy.cancellation_poll_interval,
+            ),
+            ExecutionOperation::SendShortcut { modifiers, key } => Some(crate::shortcut::execute(
+                target,
+                modifiers,
+                *key,
+                cancellation_requested,
+                shutdown_requested,
+            )),
+            _ => unreachable!("the complete plan was preflighted before execution"),
+        };
+        if let Some(result) = result
+            && result != ActionResult::Success
+        {
             return result;
+        }
+        if check_deadline_after_step && step_started.elapsed() >= per_step_timeout {
+            return failure(ActionErrorCode::StepTimeout, "an action step timed out");
+        }
+        if check_deadline_after_step && plan_started.elapsed() >= maximum_duration {
+            return failure(
+                ActionErrorCode::ActionTimeout,
+                "the action exceeded its maximum duration",
+            );
         }
     }
     ActionResult::Success
@@ -483,7 +516,7 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use super::{ActionDispatch, ActionExecutor, ExecutionPolicy};
+    use super::{ActionDispatch, ActionExecutor, ActionExecutorHandle, ExecutionPolicy};
 
     fn delay_plan(milliseconds: u32, revision: u64) -> Arc<gradial_core::ExecutionPlan> {
         let configuration = Configuration {
@@ -492,6 +525,23 @@ mod tests {
                 id: Uuid::from_u128(1),
                 name: "Delay".to_owned(),
                 kind: ActionKind::Delay { milliseconds },
+            }],
+            ..Configuration::default()
+        };
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        Arc::new(compiler.compile_plan(Uuid::from_u128(1), revision).expect("plan"))
+    }
+
+    fn shortcut_plan(revision: u64) -> Arc<gradial_core::ExecutionPlan> {
+        let configuration = Configuration {
+            config_revision: revision,
+            actions: vec![ActionDefinition {
+                id: Uuid::from_u128(1),
+                name: "Shortcut".to_owned(),
+                kind: ActionKind::SendShortcut {
+                    modifiers: vec![gradial_core::ShortcutModifier::LeftControl],
+                    key: gradial_core::ShortcutKey { scan_code: 0x64, extended: false },
+                },
             }],
             ..Configuration::default()
         };
@@ -509,6 +559,18 @@ mod tests {
         panic!("action did not complete");
     }
 
+    fn dispatch(
+        handle: &ActionExecutorHandle,
+        invocation_id: Uuid,
+        plan: Arc<gradial_core::ExecutionPlan>,
+    ) -> ActionDispatch {
+        handle.try_dispatch(
+            invocation_id,
+            plan,
+            Arc::new(gradial_core::InvocationContext::default()),
+        )
+    }
+
     #[test]
     fn only_one_plan_is_admitted_and_delay_completes() {
         let executor = ActionExecutor::start(1).expect("executor");
@@ -516,10 +578,10 @@ mod tests {
         let plan = delay_plan(20, 1);
 
         assert_eq!(
-            handle.try_dispatch(Uuid::from_u128(11), Arc::clone(&plan)),
+            dispatch(&handle, Uuid::from_u128(11), Arc::clone(&plan)),
             ActionDispatch::Accepted
         );
-        let rejected = handle.try_dispatch(Uuid::from_u128(12), Arc::clone(&plan));
+        let rejected = dispatch(&handle, Uuid::from_u128(12), Arc::clone(&plan));
         assert!(matches!(
             rejected,
             ActionDispatch::Rejected(ActionResult::Failure {
@@ -533,7 +595,7 @@ mod tests {
         assert_eq!(completion.result, ActionResult::Success);
         assert!(!handle.is_busy());
 
-        assert_eq!(handle.try_dispatch(Uuid::from_u128(13), plan), ActionDispatch::Accepted);
+        assert_eq!(dispatch(&handle, Uuid::from_u128(13), plan), ActionDispatch::Accepted);
         assert_eq!(wait_for_completion(&executor).result, ActionResult::Success);
     }
 
@@ -543,7 +605,7 @@ mod tests {
         let handle = executor.handle();
         let plan = delay_plan(500, 1);
 
-        assert_eq!(handle.try_dispatch(Uuid::from_u128(21), plan), ActionDispatch::Accepted);
+        assert_eq!(dispatch(&handle, Uuid::from_u128(21), plan), ActionDispatch::Accepted);
         thread::sleep(Duration::from_millis(20));
         assert!(handle.cancel_current());
 
@@ -552,7 +614,7 @@ mod tests {
         assert!(completion.elapsed_ms < 250);
 
         assert_eq!(
-            handle.try_dispatch(Uuid::from_u128(22), delay_plan(20, 1)),
+            dispatch(&handle, Uuid::from_u128(22), delay_plan(20, 1)),
             ActionDispatch::Accepted
         );
         assert_eq!(wait_for_completion(&executor).result, ActionResult::Success);
@@ -566,7 +628,7 @@ mod tests {
         };
         let step_executor = ActionExecutor::start_with_policy(1, step_policy).expect("executor");
         assert_eq!(
-            step_executor.handle().try_dispatch(Uuid::from_u128(31), delay_plan(100, 1)),
+            dispatch(&step_executor.handle(), Uuid::from_u128(31), delay_plan(100, 1)),
             ActionDispatch::Accepted
         );
         assert!(matches!(
@@ -582,12 +644,25 @@ mod tests {
         let overall_executor =
             ActionExecutor::start_with_policy(1, overall_policy).expect("executor");
         assert_eq!(
-            overall_executor.handle().try_dispatch(Uuid::from_u128(32), delay_plan(100, 1)),
+            dispatch(&overall_executor.handle(), Uuid::from_u128(32), delay_plan(100, 1)),
             ActionDispatch::Accepted
         );
         assert!(matches!(
             wait_for_completion(&overall_executor).result,
             ActionResult::Failure { code: ActionErrorCode::ActionTimeout, .. }
+        ));
+    }
+
+    #[test]
+    fn shortcut_reaches_target_validation_before_any_input_is_sent() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        assert_eq!(
+            dispatch(&executor.handle(), Uuid::from_u128(35), shortcut_plan(1)),
+            ActionDispatch::Accepted
+        );
+        assert!(matches!(
+            wait_for_completion(&executor).result,
+            ActionResult::Failure { code: ActionErrorCode::StaleTarget, .. }
         ));
     }
 
@@ -622,7 +697,7 @@ mod tests {
         let executor = ActionExecutor::start(1).expect("executor");
 
         assert_eq!(
-            executor.handle().try_dispatch(Uuid::from_u128(41), plan),
+            dispatch(&executor.handle(), Uuid::from_u128(41), plan),
             ActionDispatch::Accepted
         );
         let completion = wait_for_completion(&executor);
@@ -639,7 +714,7 @@ mod tests {
         let started = std::time::Instant::now();
         let mut executor = ActionExecutor::start(1).expect("executor");
         assert_eq!(
-            executor.handle().try_dispatch(Uuid::from_u128(51), delay_plan(1_000, 1)),
+            dispatch(&executor.handle(), Uuid::from_u128(51), delay_plan(1_000, 1)),
             ActionDispatch::Accepted
         );
         thread::sleep(Duration::from_millis(20));

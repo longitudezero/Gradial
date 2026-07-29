@@ -109,3 +109,8 @@ Only Delay can succeed. Target freshness/integrity validation and Win32
 backends for shortcut, Unicode text, URL/path opening, executable launch, and
 invocation-window commands are not present. The tray exposes cancellation but
 does not yet retain activity history or show failure toasts.
+
+Target freshness/integrity validation and the first input backend were
+completed in the subsequent
+[`milestone-2-keyboard-shortcut-results.md`](milestone-2-keyboard-shortcut-results.md)
+slice.

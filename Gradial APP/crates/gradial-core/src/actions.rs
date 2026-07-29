@@ -122,7 +122,7 @@ fn validate_action_fields(definition: &ActionDefinition) -> Result<(), Configura
     }
     match &definition.kind {
         ActionKind::SendShortcut { modifiers, key } => {
-            if key.scan_code == 0 {
+            if key.scan_code == 0 || is_modifier_shortcut_key(*key) {
                 return Err(ConfigurationError::InvalidShortcutScanCode {
                     action_id: definition.id,
                 });
@@ -187,6 +187,13 @@ fn validate_action_fields(definition: &ActionDefinition) -> Result<(), Configura
         }
     }
     Ok(())
+}
+
+const fn is_modifier_shortcut_key(key: ShortcutKey) -> bool {
+    matches!(
+        (key.scan_code, key.extended),
+        (0x1D | 0x38 | 0x2A | 0x36, false) | (0x1D | 0x38 | 0x5B | 0x5C, true)
+    )
 }
 
 fn validate_absolute_path(
@@ -543,7 +550,10 @@ pub enum ActionPlanError {
 pub enum ActionErrorCode {
     ActionBusy,
     ActionTimeout,
+    ElevatedTarget,
     ExecutorUnavailable,
+    InputInjectionFailed,
+    StaleTarget,
     StepLimitExceeded,
     StepTimeout,
     UnsupportedAction,
@@ -555,7 +565,10 @@ impl ActionErrorCode {
         match self {
             Self::ActionBusy => "action_busy",
             Self::ActionTimeout => "action_timeout",
+            Self::ElevatedTarget => "elevated_target",
             Self::ExecutorUnavailable => "executor_unavailable",
+            Self::InputInjectionFailed => "input_injection_failed",
+            Self::StaleTarget => "stale_target",
             Self::StepLimitExceeded => "step_limit_exceeded",
             Self::StepTimeout => "step_timeout",
             Self::UnsupportedAction => "unsupported_action",
@@ -692,6 +705,13 @@ mod tests {
                 ActionKind::SendShortcut {
                     modifiers: Vec::new(),
                     key: ShortcutKey { scan_code: 0, extended: false },
+                },
+                "scan code",
+            ),
+            (
+                ActionKind::SendShortcut {
+                    modifiers: Vec::new(),
+                    key: ShortcutKey { scan_code: 0x1D, extended: false },
                 },
                 "scan code",
             ),

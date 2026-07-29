@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod action_executor;
+mod action_target;
 mod application;
 mod configuration;
 mod diagnostics;
@@ -10,6 +11,7 @@ mod interaction;
 mod options;
 mod overlay;
 mod platform;
+mod shortcut;
 mod tray;
 
 use std::sync::Arc;
