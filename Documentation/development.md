@@ -60,12 +60,13 @@ slices, and the first two bounded Milestone 2 slices establish:
 - Direct launch of existing absolute `.exe` files through `CreateProcessW`,
   with exact argument-array preservation, validated working directories,
   inherited environment, immediate handle cleanup, and redacted diagnostics.
+- Close, minimize, maximize, and restore for the frozen invocation window,
+  with full target revalidation and one asynchronous message dispatch.
 
-It intentionally does not expose configuration editing or perform invocation
-window manipulation. A release logs the chosen slice, compiles its assigned
-plan, and submits it to the coordinator. Delay, keyboard shortcuts, Unicode
-text, URL open, file/folder open, and direct executable launch can succeed;
-window actions fail before any prefix runs.
+It intentionally does not expose configuration editing. A release logs the
+chosen slice, compiles its assigned plan, and submits it to the coordinator.
+Every schema-two leaf action family can now execute through its bounded
+backend.
 
 ## Workspace layout
 
@@ -88,6 +89,8 @@ Gradial APP\
         smoke-open-executor.ps1 Verify an isolated Windows file association
         open-smoke-receiver.ps1 Capture the exact associated file path
         smoke-process-executor.ps1 Verify direct process launch in isolation
+        smoke-window-executor.ps1 Verify all invocation-window commands
+        window-smoke-target.ps1 Observe isolated window messages and states
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
@@ -280,10 +283,9 @@ steps, and attaches the immutable plan to the invocation. Every plan records a
 5-second per-step timeout and 30-second overall ceiling for the worker.
 
 The single-worker executor accepts at most one pending or running plan. A
-second dispatch returns `action_busy` immediately and is never queued. Before
-its first step, the worker verifies that every operation is Delay,
-SendShortcut, TypeText, OpenUrl, OpenPath, or RunExecutable; window or mixed
-plans fail as `unsupported_action` without partially running.
+second dispatch returns `action_busy` immediately and is never queued. Every
+compiled leaf operation is supported: Delay, SendShortcut, TypeText, OpenUrl,
+OpenPath, RunExecutable, and Window.
 
 Delay uses monotonic time and checks cancellation/shutdown in increments no
 larger than 10 ms. The worker defensively enforces the compiled 32-step,
@@ -352,7 +354,22 @@ Successful plans record `action_executed=true`. Empty slices still record
 The overlay begins its close animation immediately and never waits for action
 completion. Logs record Unicode scalar counts and open-request kinds but never
 text, URLs, paths, executable names, working directories, or argument values.
-Window commands remain disabled.
+
+Window actions use the exact HWND captured at M4-down. Immediately before
+dispatch, the worker checks that the HWND still exists, still belongs to the
+captured PID, and still represents the same process start time. It also
+requires that window to remain foreground and checks target integrity against
+Gradial's normal integrity. Stale identity returns `stale_target`, a higher
+integrity target returns `elevated_target`, and inspection or dispatch failure
+returns `window_command_failed`.
+
+Close posts one `WM_CLOSE` request. Minimize, maximize, and restore each post
+one matching `WM_SYSCOMMAND`. These are asynchronous queue operations: success
+means Windows accepted the message, not that the application obeyed or
+finished the transition. Gradial never enumerates windows, substitutes a
+current HWND, activates a target, retries, waits for acknowledgement, or
+terminates a process. Window titles and target identity values are omitted
+from action logs; only the fixed command name is recorded.
 
 ## Edge behavior
 
@@ -470,10 +487,13 @@ before the first rendered frame and still select its slice.
 ## Focus and timing diagnostics
 
 Focus diagnostics compare the foreground window at activation, after the next
-child-viewport frame checkpoint, and immediately after hiding the overlay. A checkpoint passes
-when the same window remains foreground or when the target process itself
-changed its foreground window. Gradial never calls an API that activates or
-restores the foreground window.
+child-viewport frame checkpoint, and immediately after hiding the overlay. A
+checkpoint passes when the same window remains foreground or when the target
+process itself changed its foreground window. A successfully queued window
+action marks its invocation as an expected target change, so a deliberate
+minimize or close is not mislabeled as overlay focus theft at the final
+checkpoint. Gradial never calls an API that activates or restores the
+foreground window.
 
 After completing an M4 gesture that was held long enough to render a frame,
 validate the latest invocation with:
@@ -557,6 +577,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-shortcut-execu
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-text-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-open-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-process-executor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-window-executor.ps1
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -611,6 +632,12 @@ inherited environment. It remains alive after Gradial reports completion,
 proving that the worker closed its handles without waiting for child exit. The
 harness checks redacted metadata, stops only the exact receiver path, and
 removes its isolated data.
+`smoke-window-executor.ps1` starts four separate normal-integrity WinForms
+targets and an isolated release configuration for each command. It observes
+the exact `WM_CLOSE` or `WM_SYSCOMMAND`, verifies minimized/maximized/restored
+state or normal close, and checks that a private target title is absent from
+Gradial's log. Cleanup closes only the receiver processes it started and
+removes the isolated configurations.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

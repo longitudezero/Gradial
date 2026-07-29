@@ -16,6 +16,7 @@ mod shell_open;
 mod shortcut;
 mod tray;
 mod unicode_text;
+mod window_action;
 
 use std::sync::Arc;
 

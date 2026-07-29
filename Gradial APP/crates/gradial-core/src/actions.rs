@@ -85,6 +85,18 @@ pub enum WindowCommand {
     Restore,
 }
 
+impl WindowCommand {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::Minimize => "minimize",
+            Self::Maximize => "maximize",
+            Self::Restore => "restore",
+        }
+    }
+}
+
 pub(crate) fn validate_actions(configuration: &Configuration) -> Result<(), ConfigurationError> {
     let mut definitions = BTreeMap::new();
     for definition in &configuration.actions {
@@ -568,6 +580,7 @@ pub enum ActionErrorCode {
     StepLimitExceeded,
     StepTimeout,
     UnsupportedAction,
+    WindowCommandFailed,
 }
 
 impl ActionErrorCode {
@@ -585,6 +598,7 @@ impl ActionErrorCode {
             Self::StepLimitExceeded => "step_limit_exceeded",
             Self::StepTimeout => "step_timeout",
             Self::UnsupportedAction => "unsupported_action",
+            Self::WindowCommandFailed => "window_command_failed",
         }
     }
 }
@@ -961,8 +975,9 @@ mod tests {
     }
 
     #[test]
-    fn shell_open_failures_have_stable_public_codes() {
+    fn operating_system_failures_have_stable_public_codes() {
         assert_eq!(ActionErrorCode::PathNotFound.as_str(), "path_not_found");
         assert_eq!(ActionErrorCode::ProcessLaunchFailed.as_str(), "process_launch_failed");
+        assert_eq!(ActionErrorCode::WindowCommandFailed.as_str(), "window_command_failed");
     }
 }

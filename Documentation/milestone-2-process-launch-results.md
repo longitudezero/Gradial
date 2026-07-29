@@ -5,8 +5,8 @@ Date: 2026-07-29
 This record covers the eighth bounded Milestone 2 action slice: direct launch
 of an existing Windows executable with argument-array preservation and an
 optional working directory. Delay, keyboard shortcuts, Unicode text, and
-URL/file/folder open remain enabled. Invocation-window commands remain
-disabled.
+URL/file/folder open remain enabled. At this slice, invocation-window commands
+remained disabled.
 
 ## Configuration and runtime boundary
 
@@ -85,8 +85,8 @@ Unit and executor tests prove:
 - cancellation and expired deadlines stop before process creation;
 - the production single-worker executor admits RunExecutable and reaches its
   missing-path boundary;
-- plans containing the remaining disabled window action fail preflight before
-  any enabled prefix runs.
+- RunExecutable remains compatible with the executor's complete current leaf
+  catalog.
 
 ## Isolated Windows evidence
 
@@ -125,4 +125,5 @@ The completed implementation passed:
 There is no settings editor, executable picker, custom environment editor,
 child-process lifecycle management, activity history, or failure toast yet.
 Arbitrary shell execution remains deliberately out of scope. Invocation-window
-commands remain the only disabled schema-two leaf action family.
+commands were enabled in the next bounded slice; see
+[`milestone-2-window-action-results.md`](milestone-2-window-action-results.md).

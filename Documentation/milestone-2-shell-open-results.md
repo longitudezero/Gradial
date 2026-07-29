@@ -5,7 +5,8 @@ Date: 2026-07-29
 This record covers the seventh bounded Milestone 2 slice: opening HTTP/HTTPS
 URLs and existing absolute files or folders through Windows shell
 associations. Delay, keyboard shortcuts, and Unicode text remain enabled.
-Executable launch and invocation-window commands remain disabled.
+At this slice, executable launch and invocation-window commands remained
+disabled.
 
 ## Shell association boundary
 
@@ -58,8 +59,8 @@ Unit and executor tests prove:
 - missing-path behavior is reached through the production single-worker
   executor;
 - open actions may participate in validated linear sequences;
-- a sequence containing a still-disabled window action fails preflight before
-  any enabled prefix runs.
+- open actions remain compatible with the executor's complete current leaf
+  catalog.
 
 ## Isolated Windows evidence
 
@@ -107,4 +108,5 @@ application-exit acknowledgement after Windows accepts the association.
 Direct `.exe` launch was enabled in the next bounded slice; its boundary and
 evidence are in
 [`milestone-2-process-launch-results.md`](milestone-2-process-launch-results.md).
-Invocation-window commands remain disabled.
+Invocation-window commands were enabled in the later bounded slice recorded in
+[`milestone-2-window-action-results.md`](milestone-2-window-action-results.md).

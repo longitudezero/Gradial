@@ -26,7 +26,10 @@ action slice opens HTTP/HTTPS URLs and existing absolute files or folders
 through Windows shell associations without command-shell interpolation or
 payload logging. Direct executable actions now launch existing absolute
 `.exe` files with exact argument-array preservation, an optional validated
-working directory, no shell, and no wait for child exit.
+working directory, no shell, and no wait for child exit. Invocation-window
+actions now send one asynchronous minimize, maximize, restore, or polite close
+request only to the window frozen at M4-down after revalidating its identity
+and integrity.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -89,8 +92,9 @@ cargo run --package gradial-app -- --reduced-motion
 **M4 is dedicated to Gradial while the app runs.** Its normal browser
 back/navigation behavior is suppressed. An assigned slice is compiled into an
 immutable, bounded plan at release. Delay, keyboard-shortcut, Unicode-text,
-URL-open, path-open, and direct executable steps execute on one worker; another
-dispatch while it is busy fails immediately instead of queuing. Before input,
+URL-open, path-open, direct executable, and invocation-window steps execute on
+one worker; another dispatch while it is busy fails immediately instead of
+queuing. Before input,
 Gradial verifies that the captured window still has the same process/start
 time, remains foreground, and is not at higher integrity. Text is sent as
 literal Unicode without clipboard access or environment expansion, and the
@@ -102,8 +106,11 @@ as an array until the Windows process-creation boundary, validate an optional
 absolute working directory, inherit the normal process environment, and omit
 all paths and argument values from logs. They never invoke a command shell and
 do not wait for the child process to exit.
-Unassigned slices cancel as `EmptySlice`, and plans containing any other
-action family fail safely as `unsupported_action`.
+Window actions revalidate the frozen HWND, PID, process start time, foreground
+identity, and integrity immediately before posting one asynchronous command.
+Close sends a normal close request and never terminates the target process.
+Unassigned slices cancel as `EmptySlice`; reusable sequences stop on the first
+failure or cancellation.
 
 The display under the M4-down cursor selects the prewarmed overlay window.
 Display, work-area, or DPI changes cancel an active gesture and rebuild the
@@ -129,8 +136,8 @@ selected profile's complete menu—including optional action UUIDs—is frozen f
 the invocation, so title or configuration changes cannot switch geometry,
 labels, or the selected action while a gesture is open. Delay, keyboard
 shortcut, Unicode text, HTTP/HTTPS URL, existing absolute file/folder open, and
-direct `.exe` launch are enabled; window-action and settings-editor support are
-not present yet.
+direct `.exe` launch are enabled together with close, minimize, maximize, and
+restore for the invocation window. Settings-editor support is not present yet.
 
 Run all local checks with:
 
@@ -177,3 +184,5 @@ URL/file/folder association results are recorded in
 [`Documentation/milestone-2-shell-open-results.md`](Documentation/milestone-2-shell-open-results.md).
 Direct executable-launch results are recorded in
 [`Documentation/milestone-2-process-launch-results.md`](Documentation/milestone-2-process-launch-results.md).
+Invocation-window action results are recorded in
+[`Documentation/milestone-2-window-action-results.md`](Documentation/milestone-2-window-action-results.md).

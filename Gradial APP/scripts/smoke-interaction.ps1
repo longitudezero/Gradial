@@ -39,6 +39,8 @@ param(
 
     [switch]$ExpectProcessExecution,
 
+    [switch]$ExpectWindowExecution,
+
     [ValidateSet(
         "default",
         "center",
@@ -295,7 +297,8 @@ $expectedActionModes = @(
     $ExpectShortcutExecution,
     $ExpectTextExecution,
     $ExpectOpenExecution,
-    $ExpectProcessExecution
+    $ExpectProcessExecution,
+    $ExpectWindowExecution
 ) | Where-Object { $_ }
 if ($expectedActionModes.Count -gt 1) {
     throw "Choose only one expected action execution mode."
@@ -657,7 +660,11 @@ try {
 
     $foregroundAfter = [GradialSmokeNative]::GetForegroundWindow()
     $foregroundProcessAfter = [GradialSmokeNative]::ForegroundProcessId()
-    if ($foregroundAfter -ne $foregroundWindow -and $foregroundProcessAfter -ne $foregroundProcess) {
+    if (
+        -not $ExpectWindowExecution -and
+        $foregroundAfter -ne $foregroundWindow -and
+        $foregroundProcessAfter -ne $foregroundProcess
+    ) {
         throw "The foreground application changed during the Gradial invocation."
     }
     $expectedBehavior = if ($Geometry -eq "fixed-origin") {
@@ -717,7 +724,7 @@ $activeConfigRevision = $configurationRecord.Groups["revision"].Value
 if (
     $log -notmatch (
         "event_code=action_executor_ready .*config_revision=$activeConfigRevision " +
-        ".*supported_operations=delay,send_shortcut,type_text,open_url,open_path,run_executable " +
+        ".*supported_operations=delay,send_shortcut,type_text,open_url,open_path,run_executable,window " +
         ".*per_step_timeout_ms=5000 " +
         ".*maximum_duration_ms=30000 .*maximum_steps=32 " +
         ".*cancellation_poll_ms=10 .*shutdown_wait_ms=2000"
