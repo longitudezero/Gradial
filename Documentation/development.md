@@ -57,12 +57,15 @@ slices, and the first two bounded Milestone 2 slices establish:
   in-flight code-unit cleanup.
 - HTTP/HTTPS URL and existing absolute file/folder opening through Windows
   shell associations, with literal payloads and redacted diagnostics.
+- Direct launch of existing absolute `.exe` files through `CreateProcessW`,
+  with exact argument-array preservation, validated working directories,
+  inherited environment, immediate handle cleanup, and redacted diagnostics.
 
-It intentionally does not expose configuration editing, perform release-time
-executable launch, or window manipulation. A release logs the chosen slice,
-compiles its assigned plan, and submits it to the coordinator. Delay, keyboard
-shortcuts, Unicode text, URL open, and file/folder open can succeed; all
-remaining action families fail before any prefix runs.
+It intentionally does not expose configuration editing or perform invocation
+window manipulation. A release logs the chosen slice, compiles its assigned
+plan, and submits it to the coordinator. Delay, keyboard shortcuts, Unicode
+text, URL open, file/folder open, and direct executable launch can succeed;
+window actions fail before any prefix runs.
 
 ## Workspace layout
 
@@ -84,6 +87,7 @@ Gradial APP\
         input-smoke-target.ps1 Capture key and Unicode messages safely
         smoke-open-executor.ps1 Verify an isolated Windows file association
         open-smoke-receiver.ps1 Capture the exact associated file path
+        smoke-process-executor.ps1 Verify direct process launch in isolation
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
@@ -262,10 +266,11 @@ Schema two supports the complete v1 action family:
 - reusable linear sequence of action UUIDs.
 
 The model rejects empty action names, duplicate action UUIDs, malformed
-shortcuts, text above 8 KiB UTF-8, disallowed URLs, relative paths, embedded
-nulls, missing menu/sequence references, empty or oversized sequences, direct
-or indirect cycles, nesting beyond four sequence levels, expansion beyond 32
-leaf steps, and a statically known delay total above 30 seconds.
+shortcuts, text above 8 KiB UTF-8, disallowed URLs, relative paths, executable
+paths without an `.exe` extension, embedded nulls, missing menu/sequence
+references, empty or oversized sequences, direct or indirect cycles, nesting
+beyond four sequence levels, expansion beyond 32 leaf steps, and a statically
+known delay total above 30 seconds.
 
 The validated catalog is cloned into an immutable `ActionPlanCompiler` when
 configuration loads. On release, the selected action UUID comes from the
@@ -277,8 +282,8 @@ steps, and attaches the immutable plan to the invocation. Every plan records a
 The single-worker executor accepts at most one pending or running plan. A
 second dispatch returns `action_busy` immediately and is never queued. Before
 its first step, the worker verifies that every operation is Delay,
-SendShortcut, TypeText, OpenUrl, or OpenPath; other or mixed plans fail as
-`unsupported_action` without partially running.
+SendShortcut, TypeText, OpenUrl, OpenPath, or RunExecutable; window or mixed
+plans fail as `unsupported_action` without partially running.
 
 Delay uses monotonic time and checks cancellation/shutdown in increments no
 larger than 10 ms. The worker defensively enforces the compiled 32-step,
@@ -323,11 +328,31 @@ call returns without waiting for the opened application's lifetime.
 accepted the association request. Other rejection returns
 `process_launch_failed`.
 
+RunExecutable accepts only a validated absolute `.exe` path. Immediately
+before creation, the worker requires that path to resolve to an existing
+regular file and requires an optional working directory to resolve to an
+existing directory. A confirmed missing executable or working directory
+returns `path_not_found`; invalid path kinds, inspection errors, an oversized
+Windows command line, or process-creation rejection return
+`process_launch_failed`.
+
+Arguments remain separate strings in the immutable plan. At the Windows
+boundary, each value, including empty strings, quotes, spaces, and trailing
+backslashes, is encoded and escaped into the one mutable UTF-16 command line
+required by `CreateProcessW`. The validated executable is also supplied
+separately as the application name. Gradial invokes no shell, performs no
+environment interpolation, supplies no custom environment, disables handle
+inheritance, and therefore gives the child the action worker's normal
+environment and integrity. Once Windows creates the child, Gradial closes the
+returned process/thread handles immediately and records success without
+waiting for application readiness or exit.
+
 Successful plans record `action_executed=true`. Empty slices still record
 `EmptySlice`; a defensive compilation mismatch records `ActionPlanInvalid`.
 The overlay begins its close animation immediately and never waits for action
 completion. Logs record Unicode scalar counts and open-request kinds but never
-text, URLs, or paths. Executable launch and window commands remain disabled.
+text, URLs, paths, executable names, working directories, or argument values.
+Window commands remain disabled.
 
 ## Edge behavior
 
@@ -531,6 +556,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-delay-executor
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-shortcut-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-text-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-open-executor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-process-executor.ps1
 ```
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
@@ -577,6 +603,14 @@ checks that the private path sentinel is absent from Gradial's isolated log.
 Its `finally` block removes the association, receiver data, and isolated
 configuration; it never changes a normal file association or opens one of the
 user's applications.
+`smoke-process-executor.ps1` compiles a private temporary `.exe`, assigns it
+through an isolated configuration, and checks empty, spaced, quoted,
+trailing-backslash, shell-character, environment-like, and Unicode arguments.
+The receiver also confirms the exact configured working directory and
+inherited environment. It remains alive after Gradial reports completion,
+proving that the worker closed its handles without waiting for child exit. The
+harness checks redacted metadata, stops only the exact receiver path, and
+removes its isolated data.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

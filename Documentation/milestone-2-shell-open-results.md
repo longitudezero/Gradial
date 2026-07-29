@@ -58,8 +58,8 @@ Unit and executor tests prove:
 - missing-path behavior is reached through the production single-worker
   executor;
 - open actions may participate in validated linear sequences;
-- a sequence containing a still-disabled executable or window action fails
-  preflight before any enabled prefix runs.
+- a sequence containing a still-disabled window action fails preflight before
+  any enabled prefix runs.
 
 ## Isolated Windows evidence
 
@@ -104,5 +104,7 @@ The successful matrix artifacts are under
 There is no settings editor, URL/path picker, activity history, or failure
 toast yet. Open actions deliberately provide no application-ready or
 application-exit acknowledgement after Windows accepts the association.
-Executable launch with an argument array and invocation-window commands remain
-separate, disabled action families.
+Direct `.exe` launch was enabled in the next bounded slice; its boundary and
+evidence are in
+[`milestone-2-process-launch-results.md`](milestone-2-process-launch-results.md).
+Invocation-window commands remain disabled.

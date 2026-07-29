@@ -37,6 +37,8 @@ param(
 
     [switch]$ExpectOpenExecution,
 
+    [switch]$ExpectProcessExecution,
+
     [ValidateSet(
         "default",
         "center",
@@ -292,7 +294,8 @@ $expectedActionModes = @(
     $ExpectDelayExecution,
     $ExpectShortcutExecution,
     $ExpectTextExecution,
-    $ExpectOpenExecution
+    $ExpectOpenExecution,
+    $ExpectProcessExecution
 ) | Where-Object { $_ }
 if ($expectedActionModes.Count -gt 1) {
     throw "Choose only one expected action execution mode."
@@ -714,7 +717,7 @@ $activeConfigRevision = $configurationRecord.Groups["revision"].Value
 if (
     $log -notmatch (
         "event_code=action_executor_ready .*config_revision=$activeConfigRevision " +
-        ".*supported_operations=delay,send_shortcut,type_text,open_url,open_path " +
+        ".*supported_operations=delay,send_shortcut,type_text,open_url,open_path,run_executable " +
         ".*per_step_timeout_ms=5000 " +
         ".*maximum_duration_ms=30000 .*maximum_steps=32 " +
         ".*cancellation_poll_ms=10 .*shutdown_wait_ms=2000"

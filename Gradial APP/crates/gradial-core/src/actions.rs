@@ -155,6 +155,15 @@ fn validate_action_fields(definition: &ActionDefinition) -> Result<(), Configura
         }
         ActionKind::RunExecutable { executable, arguments, working_directory } => {
             validate_absolute_path(definition.id, "executable", executable)?;
+            if !executable
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            {
+                return Err(ConfigurationError::ExecutableExtensionNotAllowed {
+                    action_id: definition.id,
+                });
+            }
             if let Some(working_directory) = working_directory {
                 validate_absolute_path(definition.id, "working_directory", working_directory)?;
             }
@@ -736,6 +745,14 @@ mod tests {
                     working_directory: None,
                 },
                 "argument 0",
+            ),
+            (
+                ActionKind::RunExecutable {
+                    executable: PathBuf::from(r"C:\Example\example.cmd"),
+                    arguments: Vec::new(),
+                    working_directory: None,
+                },
+                ".exe extension",
             ),
             (ActionKind::Delay { milliseconds: 9 }, "expected 10 through 10000"),
         ];

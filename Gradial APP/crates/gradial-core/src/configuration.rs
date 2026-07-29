@@ -241,6 +241,9 @@ pub enum ConfigurationError {
     #[error("run action {action_id} argument {index} contains a null character")]
     ExecutableArgumentContainsNul { action_id: Uuid, index: usize },
 
+    #[error("run action {action_id} must reference a file with an .exe extension")]
+    ExecutableExtensionNotAllowed { action_id: Uuid },
+
     #[error("delay action {action_id} uses {milliseconds} ms; expected 10 through 10000")]
     InvalidDelay { action_id: Uuid, milliseconds: u32 },
 

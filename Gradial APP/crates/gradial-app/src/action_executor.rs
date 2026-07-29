@@ -155,7 +155,7 @@ impl ActionExecutor {
             target: "actions",
             "component=actions event_code=action_executor_ready result_code=ok \
              config_revision={config_revision} \
-             supported_operations=delay,send_shortcut,type_text,open_url,open_path \
+             supported_operations=delay,send_shortcut,type_text,open_url,open_path,run_executable \
              per_step_timeout_ms={DEFAULT_ACTION_STEP_TIMEOUT_MS} \
              maximum_duration_ms={MAX_ACTION_SEQUENCE_DURATION_MS} \
              maximum_steps={MAX_ACTION_SEQUENCE_STEPS} cancellation_poll_ms={} \
@@ -367,6 +367,7 @@ fn execute_plan(
                 | ExecutionOperation::TypeText { .. }
                 | ExecutionOperation::OpenUrl { .. }
                 | ExecutionOperation::OpenPath { .. }
+                | ExecutionOperation::RunExecutable { .. }
         )
     }) {
         return failure(ActionErrorCode::UnsupportedAction, "this action type is not enabled yet");
@@ -392,6 +393,7 @@ fn execute_plan(
                 | ExecutionOperation::TypeText { .. }
                 | ExecutionOperation::OpenUrl { .. }
                 | ExecutionOperation::OpenPath { .. }
+                | ExecutionOperation::RunExecutable { .. }
         );
         let result = execute_step(
             step,
@@ -496,6 +498,26 @@ fn execute_step(step: &ExecutionStep, runtime: StepRuntime<'_>) -> Option<Action
                     runtime.per_step_timeout,
                     runtime.plan_started,
                     runtime.maximum_duration,
+                ),
+            ))
+        }
+        ExecutionOperation::RunExecutable { executable, arguments, working_directory } => {
+            Some(crate::process_launch::execute(
+                executable,
+                arguments,
+                working_directory.as_deref(),
+                runtime.cancellation_requested,
+                runtime.shutdown_requested,
+                crate::process_launch::LaunchDeadlines::new(
+                    runtime.step_started,
+                    runtime.per_step_timeout,
+                    runtime.plan_started,
+                    runtime.maximum_duration,
+                ),
+                crate::process_launch::LaunchLogContext::new(
+                    runtime.config_revision,
+                    runtime.invocation_id,
+                    step.source_action_id(),
                 ),
             ))
         }
@@ -703,6 +725,24 @@ mod tests {
         Arc::new(compiler.compile_plan(Uuid::from_u128(3), revision).expect("plan"))
     }
 
+    fn executable_plan(executable: PathBuf, revision: u64) -> Arc<gradial_core::ExecutionPlan> {
+        let configuration = Configuration {
+            config_revision: revision,
+            actions: vec![ActionDefinition {
+                id: Uuid::from_u128(1),
+                name: "Executable".to_owned(),
+                kind: ActionKind::RunExecutable {
+                    executable,
+                    arguments: vec!["private argument".to_owned()],
+                    working_directory: None,
+                },
+            }],
+            ..Configuration::default()
+        };
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        Arc::new(compiler.compile_plan(Uuid::from_u128(1), revision).expect("plan"))
+    }
+
     fn wait_for_completion(executor: &ActionExecutor) -> super::ActionCompletion {
         for _ in 0..200 {
             if let Some(completion) = executor.try_completion() {
@@ -856,6 +896,26 @@ mod tests {
     }
 
     #[test]
+    fn executable_plan_reaches_missing_path_without_process_creation() {
+        let missing_executable =
+            std::env::temp_dir().join(format!("gradial-missing-{}.exe", Uuid::new_v4()));
+        assert!(!missing_executable.exists());
+        let executor = ActionExecutor::start(1).expect("executor");
+        assert_eq!(
+            dispatch(
+                &executor.handle(),
+                Uuid::from_u128(38),
+                executable_plan(missing_executable, 1),
+            ),
+            ActionDispatch::Accepted
+        );
+        assert!(matches!(
+            wait_for_completion(&executor).result,
+            ActionResult::Failure { code: ActionErrorCode::PathNotFound, .. }
+        ));
+    }
+
+    #[test]
     fn unsupported_plans_fail_before_any_step_runs() {
         let configuration = Configuration {
             config_revision: 1,
@@ -867,12 +927,8 @@ mod tests {
                 },
                 ActionDefinition {
                     id: Uuid::from_u128(2),
-                    name: "Executable".to_owned(),
-                    kind: ActionKind::RunExecutable {
-                        executable: PathBuf::from(r"C:\Example\example.exe"),
-                        arguments: Vec::new(),
-                        working_directory: None,
-                    },
+                    name: "Window".to_owned(),
+                    kind: ActionKind::Window { command: gradial_core::WindowCommand::Restore },
                 },
                 ActionDefinition {
                     id: Uuid::from_u128(3),
