@@ -364,7 +364,10 @@ try {
         throw "Could not read the positioned cursor."
     }
 
-    $startupArguments = @("--geometry=$Geometry", "--slices=$Slices")
+    $startupArguments = @("--geometry=$Geometry")
+    if ($Configuration -eq "debug") {
+        $startupArguments += "--slices=$Slices"
+    }
     if ($ReducedMotion) {
         $startupArguments += "--reduced-motion"
     }
@@ -666,13 +669,19 @@ if (-not $configurationRecord.Success) {
     throw "The live check did not load a validated schema-one configuration."
 }
 $activeConfigRevision = $configurationRecord.Groups["revision"].Value
-if ($log -notmatch "event_code=input_geometry_ready .*geometry_mode=$Geometry .*slice_count=$Slices") {
-    throw "The log does not confirm geometry mode '$Geometry' with $Slices slices."
+$expectedDebugOverride = if ($Configuration -eq "debug") { $Slices } else { "none" }
+if (
+    $log -notmatch (
+        "event_code=input_geometry_ready .*geometry_mode=$Geometry " +
+        ".*debug_slice_override=$expectedDebugOverride"
+    )
+) {
+    throw "The log does not confirm geometry mode '$Geometry' and the expected menu authority."
 }
 $expectedReducedMotion = if ($ReducedMotion) { "true" } else { "false" }
 if (
     $log -notmatch (
-        "event_code=renderer_geometry_cache_ready .*slice_count=$Slices " +
+        "event_code=renderer_geometry_cache_ready .*slice_counts=4,8 " +
         ".*reduced_motion=$expectedReducedMotion .*open_ms=60 " +
         ".*selection_ms=35 .*close_ms=50"
     )
@@ -691,17 +700,28 @@ if ($snapshotRecords.Count -lt $expectedInvocations) {
 $profileRecords = [regex]::Matches(
     $log,
     "event_code=profile_resolved .*config_revision=$activeConfigRevision .*" +
-    "profile_id=[0-9a-f-]+ .*decision=[a-z_]+"
+    "profile_id=[0-9a-f-]+ .*decision=[a-z_]+ .*" +
+    "menu_slice_count=$Slices .*menu_label_count=$Slices " +
+    ".*menu_source=" + $(if ($Configuration -eq "debug") { "debug_override" } else { "configuration" })
 )
 if ($profileRecords.Count -lt $expectedInvocations) {
     throw "Expected $expectedInvocations profile resolutions; observed $($profileRecords.Count)."
 }
 $invocationRecords = [regex]::Matches(
     $log,
-    "event_code=invocation_started .*geometry=$expectedBehavior"
+    "event_code=invocation_started .*geometry=$expectedBehavior .*slice_count=$Slices"
 )
 if ($invocationRecords.Count -lt $expectedInvocations) {
     throw "Expected $expectedInvocations '$expectedBehavior' invocations; observed $($invocationRecords.Count)."
+}
+$menuFrameRecords = [regex]::Matches(
+    $log,
+    "event_code=profile_menu_frame_ready .*config_revision=$activeConfigRevision .*" +
+    "slice_count=$Slices .*label_count=$Slices"
+)
+$minimumMenuFrames = if ($QuickFlick) { 0 } else { $expectedInvocations }
+if ($menuFrameRecords.Count -lt $minimumMenuFrames) {
+    throw "Expected $minimumMenuFrames complete profile-menu frames; observed $($menuFrameRecords.Count)."
 }
 $selectionRecords = [regex]::Matches(
     $log,

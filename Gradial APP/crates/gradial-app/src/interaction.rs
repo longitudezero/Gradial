@@ -15,7 +15,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     CancelReason, GestureConfig, InputEvent, InputEventKind, InteractionController,
     InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, ProfileResolver,
-    ProfileTarget, SliceCount, monitor_index_for_point,
+    ProfileTarget, ResolvedMenu, monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -45,6 +45,7 @@ struct EventCounters {
 struct ActiveInvocation {
     snapshot: Option<InvocationSnapshot>,
     profile_id: Option<uuid::Uuid>,
+    menu: Option<Arc<ResolvedMenu>>,
     route: Option<usize>,
 }
 
@@ -52,6 +53,7 @@ impl ActiveInvocation {
     fn clear(&mut self) {
         self.snapshot = None;
         self.profile_id = None;
+        self.menu = None;
         self.route = None;
     }
 }
@@ -61,7 +63,6 @@ struct EffectDispatcher<'a> {
     egui_context: &'a eframe::egui::Context,
     timing_markers: &'a TimingMarkers,
     routes: &'a [OverlayRoute],
-    slice_count: SliceCount,
     config_revision: u64,
 }
 
@@ -97,8 +98,8 @@ impl InteractionRuntime {
         input_configuration: InputConfiguration,
         timing_markers: Arc<TimingMarkers>,
         routes: Vec<OverlayRoute>,
-        slice_count: SliceCount,
         profile_resolver: Arc<ProfileResolver>,
+        debug_menu_override: Option<Arc<ResolvedMenu>>,
         config_revision: u64,
     ) -> Result<Self> {
         let (producer, consumer) = RingBuffer::new(INPUT_QUEUE_CAPACITY);
@@ -131,8 +132,8 @@ impl InteractionRuntime {
                     &thread_shutdown,
                     &timing_markers,
                     &routes,
-                    slice_count,
                     &profile_resolver,
+                    debug_menu_override.as_ref(),
                     config_revision,
                 );
             })
@@ -234,16 +235,14 @@ fn run_interaction_thread(
     shutdown: &Arc<AtomicBool>,
     timing_markers: &TimingMarkers,
     routes: &[OverlayRoute],
-    slice_count: SliceCount,
     profile_resolver: &ProfileResolver,
+    debug_menu_override: Option<&Arc<ResolvedMenu>>,
     config_revision: u64,
 ) {
-    let gesture_config = GestureConfig { slice_count, ..GestureConfig::default() };
-    let mut controller = InteractionController::new(gesture_config);
+    let mut controller = InteractionController::new(GestureConfig::default());
     let mut active = ActiveInvocation::default();
     let mut counters = EventCounters::default();
-    let dispatcher =
-        EffectDispatcher { egui_context, timing_markers, routes, slice_count, config_revision };
+    let dispatcher = EffectDispatcher { egui_context, timing_markers, routes, config_revision };
     let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut runtime_stop_pending = false;
@@ -278,6 +277,7 @@ fn run_interaction_thread(
                     query_qpc(),
                     active.snapshot.as_ref(),
                     active.profile_id,
+                    active.menu.as_ref(),
                     active.route,
                     &dispatcher,
                 );
@@ -308,6 +308,7 @@ fn run_interaction_thread(
                     now,
                     active.snapshot.as_ref(),
                     active.profile_id,
+                    active.menu.as_ref(),
                     active.route,
                     &dispatcher,
                 );
@@ -336,6 +337,7 @@ fn run_interaction_thread(
                 &mut counters,
                 &dispatcher,
                 profile_resolver,
+                debug_menu_override,
             );
         }
 
@@ -350,6 +352,7 @@ fn run_interaction_thread(
             query_qpc(),
             active.snapshot.as_ref(),
             active.profile_id,
+            active.menu.as_ref(),
             active.route,
             &dispatcher,
         );
@@ -396,6 +399,7 @@ fn handle_runtime_control(
             query_qpc(),
             active.snapshot.as_ref(),
             active.profile_id,
+            active.menu.as_ref(),
             active.route,
             dispatcher,
         );
@@ -419,63 +423,22 @@ fn handle_input_event(
     counters: &mut EventCounters,
     dispatcher: &EffectDispatcher<'_>,
     profile_resolver: &ProfileResolver,
+    debug_menu_override: Option<&Arc<ResolvedMenu>>,
 ) {
     let source_qpc = event.qpc_timestamp;
     let effect = match event.kind {
         InputEventKind::ActivationDown { geometry, physical_modifiers } => {
             counters.activation_down = counters.activation_down.saturating_add(1);
-            let snapshot =
-                capture_snapshot(event, geometry, physical_modifiers, dispatcher.config_revision);
-            log::info!(
-                target: "interaction",
-                "component=interaction event_code=invocation_snapshot_captured result_code=ok \
-                 config_revision={} invocation_id={} foreground_pid={} \
-                 process_start_time_available={} executable_path_available={} \
-                 window_class_available={} window_title_available={} \
-                 monitor_device_available={} modifier_control={} modifier_alt={} \
-                 modifier_shift={} activation_binding={:?}",
-                snapshot.context.config_revision,
-                snapshot.invocation_id,
-                snapshot.context.foreground_pid,
-                snapshot.context.process_start_time != 0,
-                snapshot.context.executable_path.is_some(),
-                !snapshot.context.window_class.is_empty(),
-                !snapshot.context.window_title.is_empty(),
-                !snapshot.context.monitor_device_name.is_empty(),
-                snapshot.context.physical_modifiers.control,
-                snapshot.context.physical_modifiers.alt,
-                snapshot.context.physical_modifiers.shift,
-                snapshot.context.activation_binding
-            );
-            let resolution = profile_resolver.resolve(ProfileTarget {
-                executable_path: snapshot.context.executable_path.as_deref(),
-                window_class: &snapshot.context.window_class,
-                window_title: &snapshot.context.window_title,
-            });
-            log::info!(
-                target: "profiles",
-                "component=profiles event_code=profile_resolved result_code=ok \
-                 config_revision={} invocation_id={} profile_id={} used_global={} \
-                 decision={} matching_profile_count={} menu_slice_count={}",
-                snapshot.context.config_revision,
-                snapshot.invocation_id,
-                resolution.profile_id,
-                resolution.used_global_profile,
-                resolution.decision.as_str(),
-                resolution.matching_profiles.len(),
-                resolution.slice_count.as_str()
-            );
-            active.profile_id = Some(resolution.profile_id);
-            active.route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
-            dispatcher.timing_markers.emit(
-                "activation_dequeued",
-                Some(snapshot.invocation_id),
-                source_qpc,
-                &format!("geometry={}", geometry.behavior.as_str()),
-            );
-            let effect = controller.activation_down(snapshot.clone());
-            active.snapshot = Some(snapshot);
-            effect
+            begin_invocation(
+                event,
+                geometry,
+                physical_modifiers,
+                controller,
+                active,
+                dispatcher,
+                profile_resolver,
+                debug_menu_override,
+            )
         }
         InputEventKind::PointerMoved => {
             counters.pointer_moved = counters.pointer_moved.saturating_add(1);
@@ -507,6 +470,7 @@ fn handle_input_event(
             source_qpc,
             active.snapshot.as_ref(),
             active.profile_id,
+            active.menu.as_ref(),
             active.route,
             dispatcher,
         );
@@ -514,6 +478,81 @@ fn handle_input_event(
     if matches!(controller.state(), InteractionState::Idle | InteractionState::Faulted) {
         active.clear();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn begin_invocation(
+    event: InputEvent,
+    geometry: gradial_core::InvocationGeometry,
+    physical_modifiers: gradial_core::PhysicalModifiers,
+    controller: &mut InteractionController,
+    active: &mut ActiveInvocation,
+    dispatcher: &EffectDispatcher<'_>,
+    profile_resolver: &ProfileResolver,
+    debug_menu_override: Option<&Arc<ResolvedMenu>>,
+) -> Option<InteractionEffect> {
+    let snapshot =
+        capture_snapshot(event, geometry, physical_modifiers, dispatcher.config_revision);
+    log::info!(
+        target: "interaction",
+        "component=interaction event_code=invocation_snapshot_captured result_code=ok \
+         config_revision={} invocation_id={} foreground_pid={} \
+         process_start_time_available={} executable_path_available={} \
+         window_class_available={} window_title_available={} \
+         monitor_device_available={} modifier_control={} modifier_alt={} \
+         modifier_shift={} activation_binding={:?}",
+        snapshot.context.config_revision,
+        snapshot.invocation_id,
+        snapshot.context.foreground_pid,
+        snapshot.context.process_start_time != 0,
+        snapshot.context.executable_path.is_some(),
+        !snapshot.context.window_class.is_empty(),
+        !snapshot.context.window_title.is_empty(),
+        !snapshot.context.monitor_device_name.is_empty(),
+        snapshot.context.physical_modifiers.control,
+        snapshot.context.physical_modifiers.alt,
+        snapshot.context.physical_modifiers.shift,
+        snapshot.context.activation_binding
+    );
+    let resolution = profile_resolver.resolve(ProfileTarget {
+        executable_path: snapshot.context.executable_path.as_deref(),
+        window_class: &snapshot.context.window_class,
+        window_title: &snapshot.context.window_title,
+    });
+    let (menu, menu_source) = debug_menu_override.map_or_else(
+        || (Arc::clone(&resolution.menu), "configuration"),
+        |menu| (Arc::clone(menu), "debug_override"),
+    );
+    log::info!(
+        target: "profiles",
+        "component=profiles event_code=profile_resolved result_code=ok \
+         config_revision={} invocation_id={} profile_id={} used_global={} \
+         decision={} matching_profile_count={} configured_slice_count={} \
+         menu_slice_count={} menu_label_count={} menu_source={menu_source}",
+        snapshot.context.config_revision,
+        snapshot.invocation_id,
+        resolution.profile_id,
+        resolution.used_global_profile,
+        resolution.decision.as_str(),
+        resolution.matching_profiles.len(),
+        resolution.menu.slice_count().as_str(),
+        menu.slice_count().as_str(),
+        menu.labels().len()
+    );
+    dispatcher.timing_markers.emit(
+        "activation_dequeued",
+        Some(snapshot.invocation_id),
+        event.qpc_timestamp,
+        &format!("geometry={}", geometry.behavior.as_str()),
+    );
+    let effect = controller.activation_down_with_slice_count(snapshot.clone(), menu.slice_count());
+    if effect.is_some() {
+        active.profile_id = Some(resolution.profile_id);
+        active.route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
+        active.snapshot = Some(snapshot);
+        active.menu = Some(menu);
+    }
+    effect
 }
 
 fn capture_snapshot(
@@ -546,6 +585,7 @@ fn dispatch_effect(
     source_qpc: i64,
     active_snapshot: Option<&InvocationSnapshot>,
     active_profile_id: Option<uuid::Uuid>,
+    active_menu: Option<&Arc<ResolvedMenu>>,
     active_route: Option<usize>,
     dispatcher: &EffectDispatcher<'_>,
 ) {
@@ -557,44 +597,16 @@ fn dispatch_effect(
 
     match effect {
         InteractionEffect::Open { invocation_id, .. } => {
-            let Some(snapshot) =
-                active_snapshot.filter(|snapshot| snapshot.invocation_id == invocation_id)
-            else {
-                log::error!(
-                    target: "interaction",
-                    "component=interaction event_code=invocation_snapshot_missing \
-                     result_code=failure config_revision={} invocation_id={invocation_id}",
-                    dispatcher.config_revision
-                );
-                return;
-            };
-            log::info!(
-                target: "interaction",
-                "component=interaction event_code=invocation_started result_code=ok \
-                 config_revision={} invocation_id={invocation_id} profile_id={} \
-                 monitor_index={route_index} geometry={} slice_count={}",
-                snapshot.context.config_revision,
-                active_profile_id.unwrap_or_default(),
-                snapshot.geometry.behavior.as_str(),
-                dispatcher.slice_count.as_str()
-            );
-            dispatcher.timing_markers.emit(
-                "open_requested",
-                Some(invocation_id),
+            dispatch_open(
+                invocation_id,
                 source_qpc,
-                &format!("geometry={}", snapshot.geometry.behavior.as_str()),
+                active_snapshot,
+                active_profile_id,
+                active_menu,
+                route_index,
+                route,
+                dispatcher,
             );
-            if let Err(error) =
-                route.open(dispatcher.egui_context, dispatcher.timing_markers, snapshot)
-            {
-                log::error!(
-                    target: "renderer",
-                    "component=renderer event_code=overlay_wake_request_failed \
-                     result_code=failure config_revision={} invocation_id={invocation_id} \
-                     error={error}",
-                    snapshot.context.config_revision
-                );
-            }
         }
         InteractionEffect::SelectionChanged { invocation_id, selected_slice } => {
             log::debug!(
@@ -642,6 +654,65 @@ fn dispatch_effect(
             dispatcher.timing_markers.emit("close_requested", Some(invocation_id), source_qpc, "");
             route.close(dispatcher.egui_context, dispatcher.timing_markers, invocation_id);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_open(
+    invocation_id: uuid::Uuid,
+    source_qpc: i64,
+    active_snapshot: Option<&InvocationSnapshot>,
+    active_profile_id: Option<uuid::Uuid>,
+    active_menu: Option<&Arc<ResolvedMenu>>,
+    route_index: usize,
+    route: &OverlayRoute,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    let Some(snapshot) = active_snapshot.filter(|snapshot| snapshot.invocation_id == invocation_id)
+    else {
+        log::error!(
+            target: "interaction",
+            "component=interaction event_code=invocation_snapshot_missing \
+             result_code=failure config_revision={} invocation_id={invocation_id}",
+            dispatcher.config_revision
+        );
+        return;
+    };
+    let Some(menu) = active_menu else {
+        log::error!(
+            target: "interaction",
+            "component=interaction event_code=invocation_menu_missing \
+             result_code=failure config_revision={} invocation_id={invocation_id}",
+            dispatcher.config_revision
+        );
+        return;
+    };
+    log::info!(
+        target: "interaction",
+        "component=interaction event_code=invocation_started result_code=ok \
+         config_revision={} invocation_id={invocation_id} profile_id={} \
+         monitor_index={route_index} geometry={} slice_count={}",
+        snapshot.context.config_revision,
+        active_profile_id.unwrap_or_default(),
+        snapshot.geometry.behavior.as_str(),
+        menu.slice_count().as_str()
+    );
+    dispatcher.timing_markers.emit(
+        "open_requested",
+        Some(invocation_id),
+        source_qpc,
+        &format!("geometry={}", snapshot.geometry.behavior.as_str()),
+    );
+    if let Err(error) =
+        route.open(dispatcher.egui_context, dispatcher.timing_markers, snapshot, Arc::clone(menu))
+    {
+        log::error!(
+            target: "renderer",
+            "component=renderer event_code=overlay_wake_request_failed \
+             result_code=failure config_revision={} invocation_id={invocation_id} \
+             error={error}",
+            snapshot.context.config_revision
+        );
     }
 }
 

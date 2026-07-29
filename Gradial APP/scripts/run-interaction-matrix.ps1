@@ -202,7 +202,7 @@ Invoke-MatrixScenario `
     -ExpectedInvocations 8 `
     -MonitorIndex 0
 
-if ($Suite -ne "quick") {
+if ($Suite -ne "quick" -and $Configuration -eq "debug") {
     Invoke-MatrixScenario `
         -Id "center-four-directions" `
         -Category "gesture" `

@@ -1,7 +1,8 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Stroke, Vec2, epaint::CircleShape};
-use gradial_core::SliceCount;
+use gradial_core::{ResolvedMenu, SliceCount};
 use uuid::Uuid;
 
 use super::animation::{AnimationMode, selection_progress};
@@ -15,9 +16,10 @@ const SELECTED_ARC_STEPS: u8 = 24;
 const SELECTED_ARC_INSET_RADIANS: f32 = 0.035;
 const MAX_SLICE_COUNT: usize = 8;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct OverlayRenderFrame {
     pub(crate) invocation_id: Option<Uuid>,
+    pub(crate) menu: Option<Arc<ResolvedMenu>>,
     pub(crate) selected_slice: Option<usize>,
     pub(crate) selection_changed_at: Option<Instant>,
     pub(crate) opacity: f32,
@@ -34,33 +36,30 @@ pub(crate) trait OverlayRenderer {
 
 #[derive(Debug)]
 pub(crate) struct FoundationOverlayRenderer {
-    geometry: RendererGeometryCache,
+    geometry: RendererGeometryCaches,
     active_invocation: Option<Uuid>,
     selection: SelectionTransition,
 }
 
 impl Default for FoundationOverlayRenderer {
     fn default() -> Self {
-        Self::new(SliceCount::Eight)
+        Self::new()
     }
 }
 
 impl FoundationOverlayRenderer {
-    pub(crate) fn new(slice_count: SliceCount) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            geometry: RendererGeometryCache::new(slice_count),
+            geometry: RendererGeometryCaches::new(),
             active_invocation: None,
             selection: SelectionTransition::default(),
         }
     }
 
     #[cfg(test)]
-    fn cached_geometry_counts(&self) -> (usize, usize, usize) {
-        (
-            self.geometry.boundaries.len(),
-            self.geometry.labels.len(),
-            self.geometry.selected_arcs.len(),
-        )
+    fn cached_geometry_counts(&self, slice_count: SliceCount) -> (usize, usize, usize) {
+        let geometry = self.geometry.for_slice_count(slice_count);
+        (geometry.boundaries.len(), geometry.label_offsets.len(), geometry.selected_arcs.len())
     }
 }
 
@@ -76,6 +75,10 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             frame.now,
             frame.animation_mode,
         );
+        let Some(menu) = frame.menu.as_deref() else {
+            return selection_animating;
+        };
+        let geometry = self.geometry.for_slice_count(menu.slice_count());
 
         let center = ui.max_rect().center();
         let painter = ui.painter();
@@ -92,7 +95,7 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             ),
         });
 
-        draw_selected_slices(painter, center, &self.geometry, selection_levels, opacity, scale);
+        draw_selected_slices(painter, center, geometry, selection_levels, opacity, scale);
 
         painter.circle_stroke(
             center,
@@ -108,8 +111,8 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             Stroke::new(scale, faded(Color32::from_rgba_unmultiplied(124, 154, 255, 125), opacity)),
         );
 
-        draw_slice_boundaries(painter, center, &self.geometry, opacity, scale);
-        draw_slice_labels(painter, center, &self.geometry, opacity, scale);
+        draw_slice_boundaries(painter, center, geometry, opacity, scale);
+        draw_slice_labels(painter, center, geometry, menu.labels(), opacity, scale);
 
         painter.circle_filled(
             center,
@@ -129,9 +132,31 @@ impl OverlayRenderer for FoundationOverlayRenderer {
 }
 
 #[derive(Debug)]
+struct RendererGeometryCaches {
+    four: RendererGeometryCache,
+    eight: RendererGeometryCache,
+}
+
+impl RendererGeometryCaches {
+    fn new() -> Self {
+        Self {
+            four: RendererGeometryCache::new(SliceCount::Four),
+            eight: RendererGeometryCache::new(SliceCount::Eight),
+        }
+    }
+
+    fn for_slice_count(&self, slice_count: SliceCount) -> &RendererGeometryCache {
+        match slice_count {
+            SliceCount::Four => &self.four,
+            SliceCount::Eight => &self.eight,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct RendererGeometryCache {
     boundaries: Vec<[Vec2; 2]>,
-    labels: Vec<LabelGeometry>,
+    label_offsets: Vec<Vec2>,
     selected_arcs: Vec<Vec<[Vec2; 2]>>,
 }
 
@@ -139,7 +164,7 @@ impl RendererGeometryCache {
     fn new(slice_count: SliceCount) -> Self {
         let half_slice_angle = half_slice_angle(slice_count);
         let mut boundaries = Vec::with_capacity(slice_count.get());
-        let mut labels = Vec::with_capacity(slice_count.get());
+        let mut label_offsets = Vec::with_capacity(slice_count.get());
         let mut selected_arcs = Vec::with_capacity(slice_count.get());
 
         for index in 0..slice_count.get() {
@@ -152,22 +177,13 @@ impl RendererGeometryCache {
             ]);
 
             let label_direction = slice_count.unit_vector(index).expect("valid cached slice");
-            labels.push(LabelGeometry {
-                text: slice_label(slice_count, index).expect("valid cached label"),
-                offset: Vec2::new(label_direction.x, label_direction.y) * LABEL_RADIUS_DIP,
-            });
+            label_offsets.push(Vec2::new(label_direction.x, label_direction.y) * LABEL_RADIUS_DIP);
 
             selected_arcs.push(selected_arc_segments(center_angle, half_slice_angle));
         }
 
-        Self { boundaries, labels, selected_arcs }
+        Self { boundaries, label_offsets, selected_arcs }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LabelGeometry {
-    text: &'static str,
-    offset: Vec2,
 }
 
 #[derive(Debug)]
@@ -302,19 +318,27 @@ fn draw_slice_labels(
     painter: &egui::Painter,
     center: Pos2,
     geometry: &RendererGeometryCache,
+    labels: &[String],
     opacity: f32,
     scale: f32,
 ) {
     let color = faded(Color32::from_rgba_unmultiplied(225, 232, 255, 230), opacity);
-    for label in &geometry.labels {
+    for (offset, label) in menu_label_layout(geometry, labels) {
         painter.text(
-            center + label.offset * scale,
+            center + offset * scale,
             Align2::CENTER_CENTER,
-            label.text,
+            label,
             FontId::monospace(12.0 * scale),
             color,
         );
     }
+}
+
+fn menu_label_layout<'a>(
+    geometry: &'a RendererGeometryCache,
+    labels: &'a [String],
+) -> impl Iterator<Item = (Vec2, &'a str)> + 'a {
+    geometry.label_offsets.iter().copied().zip(labels.iter().map(String::as_str))
 }
 
 fn faded(color: Color32, opacity: f32) -> Color32 {
@@ -328,20 +352,17 @@ const fn half_slice_angle(slice_count: SliceCount) -> f32 {
     }
 }
 
-fn slice_label(slice_count: SliceCount, index: usize) -> Option<&'static str> {
-    match slice_count {
-        SliceCount::Four => ["N", "E", "S", "W"].get(index).copied(),
-        SliceCount::Eight => ["N", "NE", "E", "SE", "S", "SW", "W", "NW"].get(index).copied(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use gradial_core::SliceCount;
+    use std::sync::Arc;
 
-    use super::{FoundationOverlayRenderer, SelectionTransition, half_slice_angle, slice_label};
+    use gradial_core::{ResolvedMenu, SliceCount};
+
+    use super::{
+        FoundationOverlayRenderer, SelectionTransition, half_slice_angle, menu_label_layout,
+    };
     use crate::overlay::AnimationMode;
 
     fn assert_close(actual: f32, expected: f32) {
@@ -349,50 +370,45 @@ mod tests {
     }
 
     #[test]
-    fn four_slice_renderer_uses_cardinal_labels_and_quadrants() {
-        let labels: Vec<_> =
-            (0..SliceCount::Four.get()).map(|index| slice_label(SliceCount::Four, index)).collect();
-        assert_eq!(labels, [Some("N"), Some("E"), Some("S"), Some("W")]);
+    fn four_slice_renderer_uses_cardinal_quadrants() {
         assert!(
             (half_slice_angle(SliceCount::Four) - std::f32::consts::FRAC_PI_4).abs() < f32::EPSILON
         );
     }
 
     #[test]
-    fn renderer_rejects_labels_outside_the_selected_geometry() {
-        assert_eq!(slice_label(SliceCount::Four, 4), None);
-        assert_eq!(slice_label(SliceCount::Eight, 8), None);
-    }
-
-    #[test]
-    fn default_renderer_preserves_the_eight_direction_contract() {
+    fn default_renderer_prewarms_both_supported_geometries() {
         let _renderer = FoundationOverlayRenderer::default();
-        let labels: Vec<_> = (0..SliceCount::Eight.get())
-            .map(|index| slice_label(SliceCount::Eight, index))
-            .collect();
-        assert_eq!(
-            labels,
-            [
-                Some("N"),
-                Some("NE"),
-                Some("E"),
-                Some("SE"),
-                Some("S"),
-                Some("SW"),
-                Some("W"),
-                Some("NW"),
-            ]
-        );
     }
 
     #[test]
-    fn renderer_caches_every_geometry_once_per_slice_count() {
-        let four = FoundationOverlayRenderer::new(SliceCount::Four);
-        let eight = FoundationOverlayRenderer::new(SliceCount::Eight);
-        assert_eq!(four.cached_geometry_counts(), (4, 4, 4));
-        assert_eq!(eight.cached_geometry_counts(), (8, 8, 8));
-        assert!(four.geometry.selected_arcs.iter().all(|arc| arc.len() == 24));
-        assert!(eight.geometry.selected_arcs.iter().all(|arc| arc.len() == 24));
+    fn renderer_caches_every_geometry_once_per_display() {
+        let renderer = FoundationOverlayRenderer::new();
+        assert_eq!(renderer.cached_geometry_counts(SliceCount::Four), (4, 4, 4));
+        assert_eq!(renderer.cached_geometry_counts(SliceCount::Eight), (8, 8, 8));
+        assert!(renderer.geometry.four.selected_arcs.iter().all(|arc| arc.len() == 24));
+        assert!(renderer.geometry.eight.selected_arcs.iter().all(|arc| arc.len() == 24));
+    }
+
+    #[test]
+    fn renderer_layout_uses_the_resolved_profile_labels() {
+        let renderer = FoundationOverlayRenderer::new();
+        let menu = ResolvedMenu::new(
+            SliceCount::Four,
+            Arc::from([
+                "Build".to_owned(),
+                "Search".to_owned(),
+                "Tests".to_owned(),
+                "Terminal".to_owned(),
+            ]),
+        )
+        .expect("complete custom menu");
+        let labels: Vec<_> =
+            menu_label_layout(renderer.geometry.for_slice_count(menu.slice_count()), menu.labels())
+                .map(|(_, label)| label)
+                .collect();
+
+        assert_eq!(labels, ["Build", "Search", "Tests", "Terminal"]);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
-use gradial_core::{InvocationSnapshot, MonitorGeometry, ScreenPoint, SliceCount};
+use gradial_core::{InvocationSnapshot, MonitorGeometry, ResolvedMenu, ScreenPoint};
 use uuid::Uuid;
 
 use crate::{
@@ -44,6 +44,7 @@ struct OverlayViewportState {
     native_passes: u8,
     ready: bool,
     snapshot: Option<InvocationSnapshot>,
+    menu: Option<Arc<ResolvedMenu>>,
     selected_slice: Option<usize>,
     selection_changed_at: Option<Instant>,
     phase: VisualPhase,
@@ -55,6 +56,7 @@ struct OverlayViewportState {
 impl OverlayViewportState {
     fn reset_visuals(&mut self) -> Option<InvocationSnapshot> {
         let snapshot = self.snapshot.take();
+        self.menu = None;
         self.selected_slice = None;
         self.selection_changed_at = None;
         self.phase = VisualPhase::Hidden;
@@ -89,7 +91,6 @@ impl OverlayPool {
     pub(crate) fn new(
         generation: u64,
         monitors: Vec<MonitorGeometry>,
-        slice_count: SliceCount,
         animation_mode: AnimationMode,
         config_revision: u64,
         timing_markers: Arc<TimingMarkers>,
@@ -105,17 +106,16 @@ impl OverlayPool {
                 title: format!("Gradial Overlay {process_id}-{generation}-{index}"),
                 monitor,
                 state: Arc::new(Mutex::new(OverlayViewportState::default())),
-                renderer: Arc::new(Mutex::new(FoundationOverlayRenderer::new(slice_count))),
+                renderer: Arc::new(Mutex::new(FoundationOverlayRenderer::new())),
             })
             .collect();
         log::info!(
             target: "renderer",
             "component=renderer event_code=renderer_geometry_cache_ready result_code=ok \
              config_revision={config_revision} generation={generation} monitor_count={} \
-             slice_count={} \
+             slice_counts=4,8 \
              reduced_motion={} open_ms=60 selection_ms=35 close_ms=50",
             slots.len(),
-            slice_count.as_str(),
             animation_mode.is_reduced()
         );
 
@@ -248,6 +248,7 @@ impl OverlayRoute {
         context: &Context,
         timing_markers: &TimingMarkers,
         snapshot: &InvocationSnapshot,
+        menu: Arc<ResolvedMenu>,
     ) -> Result<()> {
         let started_at = Instant::now();
         let invocation_id = snapshot.invocation_id;
@@ -261,6 +262,7 @@ impl OverlayRoute {
                 .filter(|active| active.invocation_id != invocation_id)
                 .cloned();
             state.snapshot = Some(snapshot.clone());
+            state.menu = Some(menu);
             state.selected_slice = None;
             state.selection_changed_at = Some(started_at);
             state.phase = VisualPhase::Opening { started_at };
@@ -605,6 +607,7 @@ fn prepare_overlay_frame(
     PreparedOverlayFrame {
         render: OverlayRenderFrame {
             invocation_id: state.snapshot.as_ref().map(|snapshot| snapshot.invocation_id),
+            menu: state.menu.clone(),
             selected_slice: state.selected_slice,
             selection_changed_at: state.selection_changed_at,
             opacity: presence.opacity,
@@ -636,12 +639,26 @@ fn process_pending_markers(
     }
     if state.pending_open_marker {
         state.pending_open_marker = false;
-        if let Some(snapshot) = state.snapshot.as_ref() {
+        if let (Some(snapshot), Some(menu)) = (state.snapshot.as_ref(), state.menu.as_ref()) {
             timing_markers.emit(
                 "overlay_shown",
                 Some(snapshot.invocation_id),
                 snapshot.qpc_timestamp,
-                &format!("geometry={}", snapshot.geometry.behavior.as_str()),
+                &format!(
+                    "geometry={} slice_count={} label_count={}",
+                    snapshot.geometry.behavior.as_str(),
+                    menu.slice_count().as_str(),
+                    menu.labels().len()
+                ),
+            );
+            log::info!(
+                target: "renderer",
+                "component=renderer event_code=profile_menu_frame_ready result_code=ok \
+                 config_revision={} invocation_id={} slice_count={} label_count={}",
+                snapshot.context.config_revision,
+                snapshot.invocation_id,
+                menu.slice_count().as_str(),
+                menu.labels().len()
             );
             state.pending_first_frame = Some(snapshot.clone());
             context.request_repaint_of(viewport_id);

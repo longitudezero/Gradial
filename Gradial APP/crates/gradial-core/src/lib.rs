@@ -21,4 +21,5 @@ pub use interaction::{
 pub use paths::{AppPaths, AppPathsError};
 pub use profiles::{
     ProfileMatch, ProfileResolution, ProfileResolver, ProfileTarget, ResolutionDecision,
+    ResolvedMenu,
 };

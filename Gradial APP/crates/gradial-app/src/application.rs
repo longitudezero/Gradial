@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gradial_core::{GeometryMode, ProfileResolver, SliceCount};
+use gradial_core::{GeometryMode, ProfileResolver, ResolvedMenu};
 
 use crate::{
     diagnostics::TimingMarkers,
@@ -15,7 +15,7 @@ use crate::{
 
 pub(crate) struct GradialApp {
     geometry_mode: GeometryMode,
-    slice_count: SliceCount,
+    debug_menu_override: Option<Arc<ResolvedMenu>>,
     animation_mode: AnimationMode,
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
@@ -45,13 +45,23 @@ impl GradialApp {
         let tray_icon = TrayIcon::install(platform::controller_window_address())?;
         let monitors =
             platform::monitor_work_areas().context("could not read the display work areas")?;
+        #[cfg(debug_assertions)]
+        let debug_menu_override =
+            startup_options.debug_slice_override.map(ResolvedMenu::directional).map(Arc::new);
+        #[cfg(not(debug_assertions))]
+        let debug_menu_override = None;
+        #[cfg(debug_assertions)]
+        let debug_slice_override =
+            startup_options.debug_slice_override.map_or("none", gradial_core::SliceCount::as_str);
+        #[cfg(not(debug_assertions))]
+        let debug_slice_override = "none";
         log::info!(
             target: "startup",
             "component=app event_code=input_geometry_ready result_code=ok \
              config_revision={config_revision} \
-             geometry_mode={} slice_count={} reduced_motion={} monitor_count={}",
+             geometry_mode={} debug_slice_override={} reduced_motion={} monitor_count={}",
             startup_options.geometry_mode.as_str(),
-            startup_options.slice_count.as_str(),
+            debug_slice_override,
             startup_options.reduced_motion,
             monitors.len()
         );
@@ -63,7 +73,6 @@ impl GradialApp {
         let overlay_pool = OverlayPool::new(
             0,
             monitors,
-            startup_options.slice_count,
             animation_mode,
             config_revision,
             Arc::clone(&timing_markers),
@@ -72,7 +81,7 @@ impl GradialApp {
 
         Ok(Self {
             geometry_mode: startup_options.geometry_mode,
-            slice_count: startup_options.slice_count,
+            debug_menu_override,
             animation_mode,
             overlay_pool,
             interaction: None,
@@ -129,7 +138,6 @@ impl GradialApp {
         self.overlay_pool = OverlayPool::new(
             self.pool_generation,
             monitors,
-            self.slice_count,
             self.animation_mode,
             self.config_revision,
             Arc::clone(&self.timing_markers),
@@ -269,7 +277,6 @@ impl GradialApp {
             self.overlay_pool = OverlayPool::new(
                 self.pool_generation,
                 current_monitors,
-                self.slice_count,
                 self.animation_mode,
                 self.config_revision,
                 Arc::clone(&self.timing_markers),
@@ -285,8 +292,8 @@ impl GradialApp {
             input_configuration,
             Arc::clone(&self.timing_markers),
             routes,
-            self.slice_count,
             Arc::clone(&self.profile_resolver),
+            self.debug_menu_override.clone(),
             self.config_revision,
         ) {
             Ok(interaction) => interaction,

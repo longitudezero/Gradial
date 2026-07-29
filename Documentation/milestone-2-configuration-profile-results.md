@@ -125,3 +125,7 @@ bounded and prevents configuration from driving only half of the renderer.
 The next profile-facing slice must make the resolved complete menu immutable
 for the invocation and teach each prewarmed viewport to cache/render both
 four- and eight-slice profile menus. Actions and the editor remain separate.
+
+That boundary was completed in the subsequent
+[`milestone-2-profile-menu-results.md`](milestone-2-profile-menu-results.md)
+slice.

@@ -1,6 +1,9 @@
 use anyhow::{Result, bail};
-use gradial_core::{GeometryMode, SliceCount};
+use gradial_core::GeometryMode;
+#[cfg(debug_assertions)]
+use gradial_core::SliceCount;
 
+#[cfg(debug_assertions)]
 pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
@@ -20,17 +23,38 @@ Animation:
   --reduced-motion  Remove visual interpolation without changing gesture timing.
 ";
 
+#[cfg(not(debug_assertions))]
+pub(crate) const HELP: &str = "\
+Gradial
+
+Usage:
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--reduced-motion]
+
+Geometry modes:
+  auto          Use edge assist only when the complete ring would clip.
+  fixed-origin  Keep the ring and gesture origin at the activation button-down.
+  edge-assist   Always inset the ring and use raw deltas as a virtual pointer.
+
+Animation:
+  --reduced-motion  Remove visual interpolation without changing gesture timing.
+
+Menu geometry and labels are selected from the resolved profile configuration.
+";
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StartupOptions {
     pub(crate) geometry_mode: GeometryMode,
-    pub(crate) slice_count: SliceCount,
+    pub(crate) debug_slice_override: Option<gradial_core::SliceCount>,
     pub(crate) reduced_motion: bool,
 }
 
 impl StartupOptions {
     pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut geometry_mode = GeometryMode::Auto;
-        let mut slice_count = SliceCount::Eight;
+        #[cfg(debug_assertions)]
+        let mut debug_slice_override = None;
+        #[cfg(not(debug_assertions))]
+        let debug_slice_override = None;
         let mut reduced_motion = false;
         let mut arguments = arguments.into_iter();
 
@@ -42,23 +66,32 @@ impl StartupOptions {
                     anyhow::anyhow!("--geometry requires auto, fixed-origin, or edge-assist")
                 })?;
                 geometry_mode = parse_geometry_mode(&value)?;
-            } else if let Some(value) = argument.strip_prefix("--slices=") {
-                slice_count = parse_slice_count(value)?;
-            } else if argument == "--slices" {
-                let value =
-                    arguments.next().ok_or_else(|| anyhow::anyhow!("--slices requires 4 or 8"))?;
-                slice_count = parse_slice_count(&value)?;
             } else if argument == "--reduced-motion" {
                 reduced_motion = true;
             } else {
+                #[cfg(debug_assertions)]
+                {
+                    if let Some(value) = argument.strip_prefix("--slices=") {
+                        debug_slice_override = Some(parse_slice_count(value)?);
+                        continue;
+                    }
+                    if argument == "--slices" {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("--slices requires 4 or 8"))?;
+                        debug_slice_override = Some(parse_slice_count(&value)?);
+                        continue;
+                    }
+                }
                 bail!("unknown Gradial argument: {argument}");
             }
         }
 
-        Ok(Self { geometry_mode, slice_count, reduced_motion })
+        Ok(Self { geometry_mode, debug_slice_override, reduced_motion })
     }
 }
 
+#[cfg(debug_assertions)]
 fn parse_slice_count(value: &str) -> Result<SliceCount> {
     match value {
         "4" => Ok(SliceCount::Four),
@@ -78,7 +111,9 @@ fn parse_geometry_mode(value: &str) -> Result<GeometryMode> {
 
 #[cfg(test)]
 mod tests {
-    use gradial_core::{GeometryMode, SliceCount};
+    use gradial_core::GeometryMode;
+    #[cfg(debug_assertions)]
+    use gradial_core::SliceCount;
 
     use super::StartupOptions;
 
@@ -86,7 +121,7 @@ mod tests {
     fn geometry_defaults_to_automatic() {
         let options = StartupOptions::parse(Vec::new()).expect("default options");
         assert_eq!(options.geometry_mode, GeometryMode::Auto);
-        assert_eq!(options.slice_count, SliceCount::Eight);
+        assert_eq!(options.debug_slice_override, None);
         assert!(!options.reduced_motion);
     }
 
@@ -114,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn slice_count_accepts_both_argument_forms_and_combines_with_geometry() {
         let four = StartupOptions::parse([
             "--slices=4".to_owned(),
@@ -121,15 +157,16 @@ mod tests {
             "edge-assist".to_owned(),
         ])
         .expect("four-slice options");
-        assert_eq!(four.slice_count, SliceCount::Four);
+        assert_eq!(four.debug_slice_override, Some(SliceCount::Four));
         assert_eq!(four.geometry_mode, GeometryMode::EdgeAssist);
 
         let eight =
             StartupOptions::parse(["--slices".to_owned(), "8".to_owned()]).expect("separate form");
-        assert_eq!(eight.slice_count, SliceCount::Eight);
+        assert_eq!(eight.debug_slice_override, Some(SliceCount::Eight));
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn invalid_slice_count_is_rejected() {
         let error =
             StartupOptions::parse(["--slices=6".to_owned()]).expect_err("unsupported count");
@@ -137,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn reduced_motion_combines_with_other_development_options() {
         let options = StartupOptions::parse([
             "--geometry=edge-assist".to_owned(),
@@ -145,7 +183,15 @@ mod tests {
         ])
         .expect("reduced-motion options");
         assert_eq!(options.geometry_mode, GeometryMode::EdgeAssist);
-        assert_eq!(options.slice_count, SliceCount::Four);
+        assert_eq!(options.debug_slice_override, Some(SliceCount::Four));
         assert!(options.reduced_motion);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_build_rejects_the_debug_slice_override() {
+        let error =
+            StartupOptions::parse(["--slices=4".to_owned()]).expect_err("debug-only override");
+        assert!(error.to_string().contains("unknown Gradial argument"));
     }
 }

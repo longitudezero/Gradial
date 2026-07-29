@@ -3,7 +3,7 @@
 ## Current milestone scope
 
 The foundation, Milestone 0 interaction spike, completed bounded Milestone 1
-slices, and first bounded Milestone 2 slice establish:
+slices, and the first two bounded Milestone 2 slices establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -40,6 +40,10 @@ slices, and first bounded Milestone 2 slice establish:
 - Complete immutable target/display/modifier identity for every invocation.
 - A compiled, deterministic application-profile resolver with explanation
   data.
+- One immutable resolved menu per invocation, shared by gesture recognition
+  and rendering.
+- Prewarmed four/eight geometry caches on every display and rendering of
+  configured profile labels.
 
 It intentionally does not expose configuration editing, perform release-time
 action-target validation, or execute actions. A release logs the chosen slice
@@ -199,12 +203,14 @@ smallest UUID. If the process path is unavailable or no rule matches, the
 global profile wins.
 
 The compiled resolver returns the winner, all matching profile IDs, their
-priority/specificity, and the exact tie-break step. The interaction log records
-that explanation without target path, class, or title data. In this bounded
-slice, profile selection is diagnostic: the temporary `--slices=4|8`
-development option still controls the gesture controller and renderer. A
-subsequent slice will route an immutable resolved menu into caches for both
-supported geometries.
+priority/specificity, the exact tie-break step, and a reference-counted
+immutable copy of that profile's complete menu. The interaction log records
+the explanation without target path, class, title, or menu-label content.
+
+The selected menu is frozen with the active invocation. Its slice count drives
+gesture recognition and chooses the matching renderer cache; its label list is
+passed to the same frame. A title change after activation therefore cannot
+switch profiles or produce a gesture/render mismatch.
 
 ## Edge behavior
 
@@ -226,11 +232,14 @@ movement. Raw input is used only during an active edge-assisted invocation.
 The four/eight-direction mappings, forced modes, corner insets at 200% DPI, and
 absolute-motion suppression are unit tested.
 
-Eight slices are the default. `--slices=4` selects a cardinal N/E/S/W ring, and
-`--slices=8` selects N/NE/E/SE/S/SW/W/NW. Both counts use the same radii and
-five-degree boundary hysteresis; only the angular width, labels, selection
-indices, and highlight arc change. This is a development override rather than
-persistent configuration:
+The resolved profile is authoritative for both four/eight geometry and labels.
+Both counts use the same radii and five-degree boundary hysteresis; their
+angular width, selection indices, highlight arc, and configured labels differ.
+
+Debug builds retain `--slices=4|8` solely for repeatable interaction tests. The
+override substitutes a complete direction-labelled test menu and is recorded
+as `menu_source=debug_override`. Release builds reject the option and always
+record `menu_source=configuration`:
 
 ```powershell
 cargo run --package gradial-app -- --slices=4
@@ -269,10 +278,12 @@ message handled by that child's native subclass positions and shows it with
 no-activation flags. The matching child repaint is independent of the invisible
 root-controller repaint cycle.
 
-Each child owns a persistent renderer. During pool construction it caches that
-slice count's boundary segments, label offsets, and 24-segment highlight arcs.
-Rendering reuses those structures; display/DPI pool replacement constructs one
-new cache for each replacement child. Selection animation uses fixed-size
+Each child owns a persistent renderer. During pool construction it caches both
+four- and eight-slice boundary segments, label offsets, and 24-segment
+highlight arcs. Rendering selects one cache from the frozen menu and pairs its
+offsets with the configured labels; no geometry or profile matching occurs on
+activation's UI path. Display/DPI pool replacement constructs one complete
+cache pair for each replacement child. Selection animation uses fixed-size
 eight-entry state and can retarget from its current color without rebuilding
 geometry.
 

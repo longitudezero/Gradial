@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, path::Path};
+use std::{cmp::Ordering, path::Path, sync::Arc};
 
 use regex::Regex;
 use uuid::Uuid;
@@ -8,7 +8,7 @@ use crate::{Configuration, ConfigurationError, SliceCount};
 #[derive(Debug)]
 pub struct ProfileResolver {
     global_profile_id: Uuid,
-    global_slice_count: SliceCount,
+    global_menu: Arc<ResolvedMenu>,
     application_profiles: Vec<CompiledApplicationProfile>,
 }
 
@@ -44,7 +44,25 @@ impl ProfileResolver {
                     .transpose()?;
                 Ok(CompiledApplicationProfile {
                     profile_id,
-                    slice_count,
+                    menu: Arc::new(
+                        ResolvedMenu::new(
+                            slice_count,
+                            application_profile
+                                .profile
+                                .menu
+                                .slices
+                                .iter()
+                                .map(|slice| slice.label.clone())
+                                .collect::<Arc<[_]>>(),
+                        )
+                        .ok_or(
+                            ConfigurationError::IncorrectMenuLength {
+                                profile_id,
+                                slice_count: application_profile.profile.menu.slice_count,
+                                found: application_profile.profile.menu.slices.len(),
+                            },
+                        )?,
+                    ),
                     executable_path: normalize_windows_path(
                         &application_profile.rule.executable_path,
                     ),
@@ -66,7 +84,23 @@ impl ProfileResolver {
         )?;
         Ok(Self {
             global_profile_id: configuration.global_profile.id,
-            global_slice_count,
+            global_menu: Arc::new(
+                ResolvedMenu::new(
+                    global_slice_count,
+                    configuration
+                        .global_profile
+                        .menu
+                        .slices
+                        .iter()
+                        .map(|slice| slice.label.clone())
+                        .collect::<Arc<[_]>>(),
+                )
+                .ok_or(ConfigurationError::IncorrectMenuLength {
+                    profile_id: configuration.global_profile.id,
+                    slice_count: configuration.global_profile.menu.slice_count,
+                    found: configuration.global_profile.menu.slices.len(),
+                })?,
+            ),
             application_profiles,
         })
     }
@@ -76,7 +110,7 @@ impl ProfileResolver {
         let Some(executable_path) = target.executable_path else {
             return ProfileResolution::global(
                 self.global_profile_id,
-                self.global_slice_count,
+                Arc::clone(&self.global_menu),
                 ResolutionDecision::ExecutablePathUnavailable,
             );
         };
@@ -109,14 +143,14 @@ impl ProfileResolver {
         let Some(winner) = matching_profiles.first() else {
             return ProfileResolution::global(
                 self.global_profile_id,
-                self.global_slice_count,
+                Arc::clone(&self.global_menu),
                 ResolutionDecision::NoApplicationProfileMatched,
             );
         };
         let decision = decision_for_winner(&matching_profiles);
         ProfileResolution {
             profile_id: winner.profile_id,
-            slice_count: winner.slice_count,
+            menu: Arc::clone(&winner.menu),
             used_global_profile: false,
             decision,
             matching_profiles: matching_profiles
@@ -141,21 +175,56 @@ pub struct ProfileTarget<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileResolution {
     pub profile_id: Uuid,
-    pub slice_count: SliceCount,
+    pub menu: Arc<ResolvedMenu>,
     pub used_global_profile: bool,
     pub decision: ResolutionDecision,
     pub matching_profiles: Vec<ProfileMatch>,
 }
 
 impl ProfileResolution {
-    fn global(profile_id: Uuid, slice_count: SliceCount, decision: ResolutionDecision) -> Self {
+    fn global(profile_id: Uuid, menu: Arc<ResolvedMenu>, decision: ResolutionDecision) -> Self {
         Self {
             profile_id,
-            slice_count,
+            menu,
             used_global_profile: true,
             decision,
             matching_profiles: Vec::new(),
         }
+    }
+}
+
+/// A complete immutable menu selected for one invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedMenu {
+    slice_count: SliceCount,
+    labels: Arc<[String]>,
+}
+
+impl ResolvedMenu {
+    /// Creates a menu only when every supported slice has exactly one label.
+    #[must_use]
+    pub fn new(slice_count: SliceCount, labels: Arc<[String]>) -> Option<Self> {
+        (labels.len() == slice_count.get()).then_some(Self { slice_count, labels })
+    }
+
+    #[must_use]
+    pub const fn slice_count(&self) -> SliceCount {
+        self.slice_count
+    }
+
+    #[must_use]
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Creates the direction-labelled menu used by debug interaction checks.
+    #[must_use]
+    pub fn directional(slice_count: SliceCount) -> Self {
+        let labels: &[&str] = match slice_count {
+            SliceCount::Four => &["N", "E", "S", "W"],
+            SliceCount::Eight => &["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+        };
+        Self { slice_count, labels: labels.iter().map(|label| (*label).to_owned()).collect() }
     }
 }
 
@@ -193,7 +262,7 @@ impl ResolutionDecision {
 #[derive(Debug)]
 struct CompiledApplicationProfile {
     profile_id: Uuid,
-    slice_count: SliceCount,
+    menu: Arc<ResolvedMenu>,
     executable_path: String,
     window_class: Option<String>,
     title_regex: Option<Regex>,
@@ -237,13 +306,16 @@ fn normalize_case_insensitive(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use uuid::Uuid;
 
     use super::{ProfileResolver, ProfileTarget, ResolutionDecision};
     use crate::{
-        ApplicationProfile, Configuration, Menu, Profile, ProfileRule,
+        ApplicationProfile, Configuration, Menu, MenuSlice, Profile, ProfileRule, SliceCount,
         configuration::DEFAULT_GLOBAL_PROFILE_ID,
     };
 
@@ -371,6 +443,41 @@ mod tests {
                 .resolve(target(Some(Path::new(r"C:\Apps\Editor.exe")), "", "Document one",))
                 .profile_id,
             Uuid::from_u128(2)
+        );
+    }
+
+    #[test]
+    fn resolved_profile_freezes_its_complete_custom_menu() {
+        let mut application_profile = profile(2, 10, None, None);
+        application_profile.profile.menu = Menu {
+            slice_count: 4,
+            slices: ["Build", "Search", "Tests", "Terminal"]
+                .map(|label| MenuSlice { label: label.to_owned() })
+                .into(),
+        };
+        let mut configuration = Configuration {
+            application_profiles: vec![application_profile],
+            ..Configuration::default()
+        };
+        let resolver = ProfileResolver::compile(&configuration).expect("resolver");
+        configuration.application_profiles[0].profile.menu.slices[0].label = "Changed".to_owned();
+
+        let first =
+            resolver.resolve(target(Some(Path::new(r"C:\Apps\Editor.exe")), "", "Document"));
+        let second =
+            resolver.resolve(target(Some(Path::new(r"C:\Apps\Editor.exe")), "", "Document"));
+
+        assert_eq!(first.menu.slice_count(), SliceCount::Four);
+        assert_eq!(first.menu.labels(), ["Build", "Search", "Tests", "Terminal"]);
+        assert!(std::sync::Arc::ptr_eq(&first.menu, &second.menu));
+    }
+
+    #[test]
+    fn resolved_menu_rejects_incomplete_label_sets() {
+        assert!(super::ResolvedMenu::new(SliceCount::Four, Arc::from([])).is_none());
+        assert!(
+            super::ResolvedMenu::new(SliceCount::Eight, Arc::from(["only one".to_owned()]))
+                .is_none()
         );
     }
 }

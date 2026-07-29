@@ -278,6 +278,7 @@ impl Default for GestureConfig {
 pub struct InteractionController {
     state: InteractionState,
     config: GestureConfig,
+    active_slice_count: SliceCount,
     snapshot: Option<InvocationSnapshot>,
     selected_slice: Option<usize>,
     virtual_pointer: ScreenPoint,
@@ -288,6 +289,7 @@ impl InteractionController {
     pub const fn new(config: GestureConfig) -> Self {
         Self {
             state: InteractionState::Idle,
+            active_slice_count: config.slice_count,
             config,
             snapshot: None,
             selected_slice: None,
@@ -311,11 +313,20 @@ impl InteractionController {
     }
 
     pub fn activation_down(&mut self, snapshot: InvocationSnapshot) -> Option<InteractionEffect> {
+        self.activation_down_with_slice_count(snapshot, self.config.slice_count)
+    }
+
+    pub fn activation_down_with_slice_count(
+        &mut self,
+        snapshot: InvocationSnapshot,
+        slice_count: SliceCount,
+    ) -> Option<InteractionEffect> {
         if self.state != InteractionState::Idle {
             return None;
         }
 
         self.state = InteractionState::Opening;
+        self.active_slice_count = slice_count;
         self.selected_slice = None;
         self.virtual_pointer = snapshot.cursor_physical_px;
         let invocation_id = snapshot.invocation_id;
@@ -436,7 +447,7 @@ impl InteractionController {
             return None;
         }
 
-        let candidate = slice_for_delta(dx, dy, self.config.slice_count);
+        let candidate = slice_for_delta(dx, dy, self.active_slice_count);
         let Some(current) = self.selected_slice else {
             return Some(candidate);
         };
@@ -445,9 +456,9 @@ impl InteractionController {
         }
 
         let angle = clockwise_angle_from_north(dx, dy);
-        let current_center = slice_center_angle(current, self.config.slice_count);
+        let current_center = slice_center_angle(current, self.active_slice_count);
         let distance_from_current_center = shortest_angular_distance(angle, current_center).abs();
-        let half_slice = half_slice_width(self.config.slice_count);
+        let half_slice = half_slice_width(self.active_slice_count);
         let hysteresis = self.config.boundary_hysteresis_degrees.to_radians();
 
         if distance_from_current_center <= half_slice + hysteresis {
@@ -459,6 +470,7 @@ impl InteractionController {
 
     fn reset_to_idle(&mut self) {
         self.state = InteractionState::Idle;
+        self.active_slice_count = self.config.slice_count;
         self.selected_slice = None;
         self.snapshot = None;
         self.virtual_pointer = ScreenPoint::new(0, 0);
@@ -660,11 +672,12 @@ mod tests {
     }
 
     #[test]
-    fn four_slice_controller_selects_east_as_slice_one() {
+    fn resolved_slice_count_is_frozen_per_invocation() {
         let origin = ScreenPoint::new(200, 300);
-        let config = GestureConfig { slice_count: SliceCount::Four, ..GestureConfig::default() };
-        let mut controller = InteractionController::new(config);
-        controller.activation_down(snapshot(origin)).expect("open");
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_slice_count(snapshot(origin), SliceCount::Four)
+            .expect("four-slice open");
 
         assert_eq!(
             controller.pointer_moved(ScreenPoint::new(260, 300)),
@@ -678,6 +691,17 @@ mod tests {
             Some(InteractionEffect::Close {
                 invocation_id: Uuid::nil(),
                 outcome: InteractionOutcome::Selected { slice_index: 1 },
+            })
+        );
+
+        controller
+            .activation_down_with_slice_count(snapshot(origin), SliceCount::Eight)
+            .expect("eight-slice open");
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(260, 300)),
+            Some(InteractionEffect::SelectionChanged {
+                invocation_id: Uuid::nil(),
+                selected_slice: Some(2),
             })
         );
     }
