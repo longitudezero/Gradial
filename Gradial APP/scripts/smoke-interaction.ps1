@@ -43,6 +43,11 @@ param(
 
     [switch]$ReducedMotion,
 
+    [switch]$ContinuousMeter,
+
+    [ValidateRange(0, 100)]
+    [int]$ContinuousPercent = 75,
+
     [switch]$QuickFlick,
 
     [switch]$ExpectDelayExecution,
@@ -155,6 +160,17 @@ public static class GradialSmokeNative
     public static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(Point point, uint flags);
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(
+        IntPtr monitor,
+        int dpiType,
+        out uint dpiX,
+        out uint dpiY
+    );
+
+    [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
     [DllImport("user32.dll")]
@@ -174,6 +190,17 @@ public static class GradialSmokeNative
         uint processId;
         GetWindowThreadProcessId(GetForegroundWindow(), out processId);
         return processId;
+    }
+
+    public static uint EffectiveDpiAt(int x, int y)
+    {
+        var monitor = MonitorFromPoint(new Point { X = x, Y = y }, 2u);
+        uint dpiX;
+        uint dpiY;
+        if (monitor == IntPtr.Zero || GetDpiForMonitor(monitor, 0, out dpiX, out dpiY) != 0) {
+            return 96u;
+        }
+        return dpiX;
     }
 
     public static void SendM4(bool down)
@@ -310,6 +337,9 @@ if (-not (Test-Path -LiteralPath $executable)) {
 if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
     throw "Input fault simulation is available only in a debug build."
 }
+if ($ContinuousMeter -and $Configuration -ne "debug") {
+    throw "The inert continuous meter is available only in a debug build."
+}
 $expectedActionModes = @(
     $ExpectDelayExecution,
     $ExpectShortcutExecution,
@@ -321,6 +351,9 @@ $expectedActionModes = @(
 ) | Where-Object { $_ }
 if ($expectedActionModes.Count -gt 1) {
     throw "Choose only one expected action execution mode."
+}
+if ($ContinuousMeter -and $expectedActionModes.Count -ne 0) {
+    throw "The inert continuous meter cannot execute an action fixture."
 }
 if (
     $expectedActionModes.Count -eq 1 -and
@@ -404,15 +437,41 @@ try {
             $testY = $workArea.Bottom - 3
         }
     }
+    $effectiveDpi = [GradialSmokeNative]::EffectiveDpiAt($testX, $testY)
+    $gestureDistanceDip = if ($ContinuousMeter) {
+        48.0 + (160.0 - 48.0) * ($ContinuousPercent / 100.0)
+    } else {
+        80.0
+    }
+    $gestureDistancePx = $gestureDistanceDip * $effectiveDpi / 96.0
+    $diagonalDistancePx = $gestureDistancePx / [Math]::Sqrt(2.0)
+    # A one-pixel cardinal bias keeps the 0% target on the armed side of the
+    # inclusive threshold after DPI conversion and integer cursor quantization.
+    # Diagonal rounding is already outward because each component is ceiled.
+    $continuousBoundaryBias = if ($ContinuousMeter -and $ContinuousPercent -eq 0) {
+        1
+    } else {
+        0
+    }
+    $cardinal = if ($ContinuousMeter) {
+        [int][Math]::Ceiling($gestureDistancePx) + $continuousBoundaryBias
+    } else {
+        [int][Math]::Round($gestureDistancePx)
+    }
+    $diagonal = if ($ContinuousMeter) {
+        [int][Math]::Ceiling($diagonalDistancePx)
+    } else {
+        [int][Math]::Round($diagonalDistancePx)
+    }
     $directionVectors = @{
-        N  = @(0, -80)
-        NE = @(57, -57)
-        E  = @(80, 0)
-        SE = @(57, 57)
-        S  = @(0, 80)
-        SW = @(-57, 57)
-        W  = @(-80, 0)
-        NW = @(-57, -57)
+        N  = @(0, -$cardinal)
+        NE = @($diagonal, -$diagonal)
+        E  = @($cardinal, 0)
+        SE = @($diagonal, $diagonal)
+        S  = @(0, $cardinal)
+        SW = @(-$diagonal, $diagonal)
+        W  = @(-$cardinal, 0)
+        NW = @(-$diagonal, -$diagonal)
     }
     $directionSlices = if ($Slices -eq "4") {
         @{ N = 0; E = 1; S = 2; W = 3 }
@@ -437,6 +496,9 @@ try {
     if ($Configuration -eq "debug") {
         $startupArguments += "--slices=$Slices"
         $startupArguments += "--skip-onboarding"
+        if ($ContinuousMeter) {
+            $startupArguments += "--continuous-meter"
+        }
     }
     if ($ReducedMotion) {
         $startupArguments += "--reduced-motion"
@@ -666,6 +728,13 @@ try {
             -Encoding ascii
     }
     $gestureDelay = if ($QuickFlick) { 0 } else { $GestureDelayMilliseconds }
+    $continuousUsesFixedOrigin = (
+        $ContinuousMeter -and
+        (
+            $Geometry -eq "fixed-origin" -or
+            ($Geometry -eq "auto" -and $resolvedActivationPoint -eq "center")
+        )
+    )
     $maxCursorDistance = 0.0
     $completedInvocations = 0
     foreach ($gestureDirection in $directions) {
@@ -683,6 +752,25 @@ try {
                 Start-Sleep -Milliseconds $gestureDelay
             }
             [GradialSmokeNative]::SendRelativeMove($vector[0], $vector[1])
+            if ($continuousUsesFixedOrigin) {
+                $desiredX = $testX + $vector[0]
+                $desiredY = $testY + $vector[1]
+                $correctionTolerance = if ($ContinuousMeter) { 0 } else { 1 }
+                for ($correction = 0; $correction -lt 8; $correction++) {
+                    Start-Sleep -Milliseconds 10
+                    $correctedCursor = New-Object GradialSmokeNative+Point
+                    [GradialSmokeNative]::GetCursorPos([ref]$correctedCursor) | Out-Null
+                    $errorX = $desiredX - $correctedCursor.X
+                    $errorY = $desiredY - $correctedCursor.Y
+                    if (
+                        [Math]::Abs($errorX) -le $correctionTolerance -and
+                        [Math]::Abs($errorY) -le $correctionTolerance
+                    ) {
+                        break
+                    }
+                    [GradialSmokeNative]::SendRelativeMove($errorX, $errorY)
+                }
+            }
             if ($gestureDelay -gt 0) {
                 Start-Sleep -Milliseconds $gestureDelay
             }
@@ -787,10 +875,14 @@ if (
     throw "The bounded action executor did not initialize with the required safety limits."
 }
 $expectedDebugOverride = if ($Configuration -eq "debug") { $Slices } else { "none" }
+$expectedContinuousMeter = if ($ContinuousMeter) { "true" } else { "false" }
+$expectedOverlayHalfExtent = if ($ContinuousMeter) { "200" } else { "144" }
 if (
     $log -notmatch (
         "event_code=input_geometry_ready .*geometry_mode=$Geometry " +
-        ".*debug_slice_override=$expectedDebugOverride"
+        ".*debug_slice_override=$expectedDebugOverride " +
+        ".*debug_continuous_meter=$expectedContinuousMeter " +
+        ".*overlay_half_extent_dip=$expectedOverlayHalfExtent"
     )
 ) {
     throw "The log does not confirm geometry mode '$Geometry' and the expected menu authority."
@@ -800,7 +892,9 @@ if (
     $log -notmatch (
         "event_code=renderer_geometry_cache_ready .*slice_counts=4,8 " +
         ".*reduced_motion=$expectedReducedMotion .*open_ms=60 " +
-        ".*selection_ms=35 .*close_ms=50"
+        ".*selection_ms=35 .*close_ms=50 " +
+        ".*continuous_arm_radius_dip=48 " +
+        ".*continuous_full_scale_radius_dip=160 .*overlay_size_dip=400"
     )
 ) {
     throw "The renderer cache and animation contract was not initialized as requested."
@@ -840,15 +934,45 @@ $minimumMenuFrames = if ($QuickFlick) { 0 } else { $expectedInvocations }
 if ($menuFrameRecords.Count -lt $minimumMenuFrames) {
     throw "Expected $minimumMenuFrames complete profile-menu frames; observed $($menuFrameRecords.Count)."
 }
-$selectionRecords = [regex]::Matches(
-    $log,
-    "(?m)^(?<time>\S+) .*event_code=slice_selected .*" +
-    "invocation_id=(?<invocation>[0-9a-f-]+) .*slice_index=(?<slice>[0-7]) " +
-    "action_assigned=(?<assigned>true|false) plan_compiled=(?<compiled>true|false) " +
-    "action_executed=false"
-)
+$selectionRecords = if ($ContinuousMeter) {
+    [regex]::Matches(
+        $log,
+        "(?m)^(?<time>\S+) .*event_code=continuous_meter_committed .*" +
+        "invocation_id=(?<invocation>[0-9a-f-]+) .*slice_index=(?<slice>[0-7]) " +
+        "normalized_value=(?<value>[0-9]+\.[0-9]+) " +
+        "continuous_meter=true action_executed=false"
+    )
+} else {
+    [regex]::Matches(
+        $log,
+        "(?m)^(?<time>\S+) .*event_code=slice_selected .*" +
+        "invocation_id=(?<invocation>[0-9a-f-]+) .*slice_index=(?<slice>[0-7]) " +
+        "action_assigned=(?<assigned>true|false) plan_compiled=(?<compiled>true|false) " +
+        "action_executed=false"
+    )
+}
 if ($selectionRecords.Count -ne $expectedInvocations) {
-    throw "Expected $expectedInvocations selected gestures; observed $($selectionRecords.Count)."
+    $outcomeName = if ($ContinuousMeter) { "continuous commits" } else { "selected gestures" }
+    throw "Expected $expectedInvocations $outcomeName; observed $($selectionRecords.Count)."
+}
+if ($ContinuousMeter) {
+    $unexpectedDiscreteSelections = [regex]::Matches($log, "event_code=slice_selected")
+    if ($unexpectedDiscreteSelections.Count -ne 0) {
+        throw "The continuous meter unexpectedly produced a discrete slice selection."
+    }
+    $expectedValue = $ContinuousPercent / 100.0
+    foreach ($record in $selectionRecords) {
+        $observedValue = [double]::Parse(
+            $record.Groups["value"].Value,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        if ([Math]::Abs($observedValue - $expectedValue) -gt 0.02) {
+            throw (
+                "Continuous target $expectedValue produced $observedValue; " +
+                "the tolerance is 0.02."
+            )
+        }
+    }
 }
 if ($expectedActionModes.Count -eq 1) {
     $uncompiledSelections = @(
@@ -931,16 +1055,27 @@ if ($expectedActionModes.Count -eq 1) {
 elseif ($log -match "action_executed=true") {
     throw "The action-free smoke configuration unexpectedly executed an action."
 }
-$actionOutcomeRecords = [regex]::Matches(
-    $log,
-    "target=actions .*event_code=(?:action_plan_compiled|invocation_cancelled) .*" +
-    "invocation_id=[0-9a-f-]+ .*action_executed=false"
-)
-if ($actionOutcomeRecords.Count -ne $expectedInvocations) {
-    throw (
-        "Expected $expectedInvocations non-executing action outcomes; " +
-        "observed $($actionOutcomeRecords.Count)."
+if ($ContinuousMeter) {
+    if (
+        $log -match (
+            "target=actions .*event_code=(?:action_plan_compiled|action_dispatched) .*" +
+            "action_executed="
+        )
+    ) {
+        throw "The continuous meter reached the saved-action compilation or dispatch path."
+    }
+} else {
+    $actionOutcomeRecords = [regex]::Matches(
+        $log,
+        "target=actions .*event_code=(?:action_plan_compiled|invocation_cancelled) .*" +
+        "invocation_id=[0-9a-f-]+ .*action_executed=false"
     )
+    if ($actionOutcomeRecords.Count -ne $expectedInvocations) {
+        throw (
+            "Expected $expectedInvocations non-executing action outcomes; " +
+            "observed $($actionOutcomeRecords.Count)."
+        )
+    }
 }
 if (
     $log -notmatch (
@@ -1021,6 +1156,7 @@ Write-Host (
     "Live $Configuration $Geometry $Slices-slice smoke check passed: " +
     "$expectedInvocations invocation(s), point $resolvedActivationPoint, " +
     "monitor $MonitorIndex, reduced motion $expectedReducedMotion, " +
+    "continuous meter $expectedContinuousMeter at $ContinuousPercent%, " +
     "maximum retained-cursor movement $maxCursorDistance px, " +
     "observed close $observedCloseMs ms."
 )

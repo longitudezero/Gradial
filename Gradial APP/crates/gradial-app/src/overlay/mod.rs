@@ -6,7 +6,7 @@ pub(crate) use animation::AnimationMode;
 pub(crate) use pool::{OverlayPool, OverlayRoute};
 pub(crate) use renderer::{FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer};
 
-pub(super) const OVERLAY_SIZE_DIP: f32 = 288.0;
+pub(super) const OVERLAY_SIZE_DIP: f32 = 400.0;
 
 pub(crate) fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {

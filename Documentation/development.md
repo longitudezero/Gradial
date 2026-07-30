@@ -110,6 +110,13 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
 - A versioned performance-report harness with QPC hook/dispatch timing,
   PresentMon displayed-frame correlation, phased resource sampling, and
   explicit evidence-status reporting.
+- The first v0.3 continuous-input prototype: pure 48–160 DIP normalization,
+  per-invocation continuous-slice masks, direction locking, center-stop
+  behavior, a production-overlay scalar track, and a debug-only meter that
+  cannot compile or dispatch configured actions.
+- A dedicated continuous interaction matrix that checks four/eight directions,
+  normalized target values, focus, edge assist, inert execution, and
+  machine-readable coverage without fabricating the pending human study.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -131,6 +138,7 @@ Gradial APP\
         check-focus.ps1    Validate the latest completed focus trace
         capture-timing.ps1 Capture ETW markers and presented-frame timings
         run-performance-report.ps1 Run development or release performance protocol
+        run-continuous-matrix.ps1 Run the continuous direction/distance matrix
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
         smoke-delay-executor.ps1 Run an isolated Delay action fixture
         smoke-input-executor.ps1 Shared isolated input-action fixture
@@ -426,6 +434,33 @@ Only the fixed-size modifier bits are added by the hook callback. Process,
 window, monitor, configuration, and profile work remains on the interaction
 thread. Executable paths, classes, and titles are held for matching but never
 written to routine logs.
+
+### Continuous prototype
+
+The debug-only `--continuous-meter` marks all resolved directions as
+continuous for that invocation. It does not modify schema-five configuration
+or saved action definitions. The pure controller:
+
+- selects by the existing angle and 36 DIP entry threshold;
+- arms at 48 DIP;
+- locks that slice for the rest of the invocation;
+- maps 48–160 DIP linearly to an unsigned `0.0..=1.0` scalar;
+- clamps greater distance to `1.0`;
+- commits the final scalar on activation release;
+- cancels without a commit when released before arming; and
+- stops an armed gesture when it returns inside 24 DIP.
+
+The render thread receives only the locked slice and scalar. It draws a radial
+track and percentage through `FoundationOverlayRenderer`; it performs no
+callback or configured action work. The interaction outcome is
+`ContinuousCommitted`, which the debug meter logs and closes without entering
+action-plan compilation. This makes the meter a no-side-effect sample sink,
+including when the selected configured slice normally has an action.
+
+The normalized value uses the invocation DPI. Edge assist accumulates raw
+physical deltas into the same virtual pointer and divides by that DPI before
+normalization, so equivalent DIP travel produces the same value on every
+monitor.
 
 ## Configuration and profile resolution
 
@@ -777,11 +812,14 @@ from action logs; only the fixed command name is recorded.
 
 ## Edge behavior
 
-The default `--geometry=auto` mode uses fixed origin whenever a 288 DIP square
-centered at activation-down fits in the monitor work area. Otherwise it selects edge
-assist and clamps the visual origin far enough inward for the complete overlay
-to fit. Work-area coordinates remain signed, so monitors above or left of the
-primary display are handled without unsigned conversion.
+The default `--geometry=auto` mode uses fixed origin whenever the required
+extent centered at activation-down fits in the monitor work area. Discrete
+invocations retain their 288 DIP square. The continuous meter requests a 400
+DIP square so its 160 DIP track, large appearance scale, and marker remain
+visible. Otherwise Gradial selects edge assist and clamps the visual origin far
+enough inward for the complete overlay to fit. Work-area coordinates remain
+signed, so monitors above or left of the primary display are handled without
+unsigned conversion.
 
 Comparison overrides are available without changing code:
 
@@ -1024,6 +1062,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault heartbeat
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault queue-overflow
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ReducedMotion
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 75
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint top-left -AllDirections
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint center -Direction SW -InvocationCount 20 -QuickFlick -InterInvocationDelayMilliseconds 10
@@ -1035,6 +1074,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-process-execut
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-window-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-settings-editor.ps1 -CaptureScreenshot
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-onboarding.ps1 -CaptureScreenshot
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-continuous-matrix.ps1 -Suite standard
 ```
 
 Debug `smoke-interaction.ps1` runs append the development-only

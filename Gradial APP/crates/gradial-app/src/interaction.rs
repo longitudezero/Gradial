@@ -13,9 +13,10 @@ use std::sync::atomic::AtomicU8;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
-    ActionPlanCompiler, ActionResult, CancelReason, ExecutionPlan, GestureConfig, InputEvent,
-    InputEventKind, InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
-    InvocationSnapshot, ProfileResolver, ProfileTarget, ResolvedMenu, monitor_index_for_point,
+    ActionPlanCompiler, ActionResult, CancelReason, ContinuousSelection, ContinuousSliceMask,
+    ExecutionPlan, GestureConfig, InputEvent, InputEventKind, InteractionController,
+    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, ProfileResolver,
+    ProfileTarget, ResolvedMenu, monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -52,6 +53,13 @@ struct ActiveInvocation {
     execution_plan: Option<Arc<ExecutionPlan>>,
     route: Option<usize>,
     practice: bool,
+    continuous_meter: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DebugInteractionOptions<'a> {
+    menu_override: Option<&'a Arc<ResolvedMenu>>,
+    continuous_meter: bool,
 }
 
 impl ActiveInvocation {
@@ -63,6 +71,7 @@ impl ActiveInvocation {
         self.execution_plan = None;
         self.route = None;
         self.practice = false;
+        self.continuous_meter = false;
     }
 }
 
@@ -115,6 +124,7 @@ impl InteractionRuntime {
         action_executor: ActionExecutorHandle,
         onboarding_practice: OnboardingPractice,
         debug_menu_override: Option<Arc<ResolvedMenu>>,
+        debug_continuous_meter: bool,
         config_revision: u64,
     ) -> Result<Self> {
         let (producer, consumer) = RingBuffer::new(INPUT_QUEUE_CAPACITY);
@@ -152,6 +162,7 @@ impl InteractionRuntime {
                     &action_executor,
                     &onboarding_practice,
                     debug_menu_override.as_ref(),
+                    debug_continuous_meter,
                     config_revision,
                 );
             })
@@ -264,6 +275,7 @@ fn run_interaction_thread(
     action_executor: &ActionExecutorHandle,
     onboarding_practice: &OnboardingPractice,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
+    debug_continuous_meter: bool,
     config_revision: u64,
 ) {
     let mut controller = InteractionController::new(GestureConfig::default());
@@ -277,6 +289,10 @@ fn run_interaction_thread(
         action_executor,
         onboarding_practice,
         config_revision,
+    };
+    let debug_options = DebugInteractionOptions {
+        menu_override: debug_menu_override,
+        continuous_meter: debug_continuous_meter,
     };
     let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
@@ -356,7 +372,7 @@ fn run_interaction_thread(
                 &mut counters,
                 &dispatcher,
                 profile_resolver,
-                debug_menu_override,
+                debug_options,
             );
         }
 
@@ -426,7 +442,7 @@ fn handle_input_event(
     counters: &mut EventCounters,
     dispatcher: &EffectDispatcher<'_>,
     profile_resolver: &ProfileResolver,
-    debug_menu_override: Option<&Arc<ResolvedMenu>>,
+    debug_options: DebugInteractionOptions<'_>,
 ) {
     let source_qpc = event.qpc_timestamp;
     let effect = match event.kind {
@@ -441,7 +457,8 @@ fn handle_input_event(
                 active,
                 dispatcher,
                 profile_resolver,
-                debug_menu_override,
+                debug_options.menu_override,
+                debug_options.continuous_meter,
             )
         }
         InputEventKind::PointerMoved => {
@@ -531,6 +548,7 @@ fn begin_invocation(
     dispatcher: &EffectDispatcher<'_>,
     profile_resolver: &ProfileResolver,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
+    debug_continuous_meter: bool,
 ) -> Option<InteractionEffect> {
     let snapshot = capture_snapshot(
         event,
@@ -576,13 +594,14 @@ fn begin_invocation(
         },
         |menu| (menu, "onboarding_practice"),
     );
+    let continuous_meter = debug_continuous_meter && !practice_active;
     log::info!(
         target: "profiles",
         "component=profiles event_code=profile_resolved result_code=ok \
          config_revision={} invocation_id={} profile_id={} used_global={} \
          decision={} matching_profile_count={} configured_slice_count={} \
          menu_slice_count={} menu_label_count={} menu_source={menu_source} \
-         onboarding_practice={practice_active}",
+         onboarding_practice={practice_active} continuous_meter={continuous_meter}",
         snapshot.context.config_revision,
         snapshot.invocation_id,
         resolution.profile_id,
@@ -599,13 +618,23 @@ fn begin_invocation(
         event.qpc_timestamp,
         &format!("geometry={}", geometry.behavior.as_str()),
     );
-    let effect = controller.activation_down_with_slice_count(snapshot.clone(), menu.slice_count());
+    let continuous_slices = if continuous_meter {
+        ContinuousSliceMask::all(menu.slice_count())
+    } else {
+        ContinuousSliceMask::none()
+    };
+    let effect = controller.activation_down_with_behavior(
+        snapshot.clone(),
+        menu.slice_count(),
+        continuous_slices,
+    );
     if effect.is_some() {
         active.profile_id = Some(resolution.profile_id);
         active.route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
         active.snapshot = Some(snapshot);
         active.menu = Some(menu);
         active.practice = practice_active;
+        active.continuous_meter = continuous_meter;
     }
     effect
 }
@@ -646,8 +675,7 @@ fn dispatch_effect(
     let active_snapshot = active.snapshot.as_ref();
     let active_profile_id = active.profile_id;
     let active_menu = active.menu.as_ref();
-    let active_action_id = active.action_id;
-    let active_execution_plan = active.execution_plan.as_ref();
+    let continuous_meter = active.continuous_meter;
     let Some((route_index, route)) =
         active_overlay_route(active.route, dispatcher.routes, dispatcher.config_revision)
     else {
@@ -662,6 +690,7 @@ fn dispatch_effect(
                 active_snapshot,
                 active_profile_id,
                 active_menu,
+                continuous_meter,
                 route_index,
                 route,
                 dispatcher,
@@ -672,78 +701,151 @@ fn dispatch_effect(
             }
         }
         InteractionEffect::SelectionChanged { invocation_id, selected_slice } => {
-            log::debug!(
-                target: "interaction",
-                "component=interaction event_code=selection_changed result_code=ok \
-                 config_revision={} invocation_id={invocation_id} \
-                 selected_slice={selected_slice:?}",
-                active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
-                    snapshot.context.config_revision
-                })
-            );
-            dispatcher.timing_markers.emit(
-                "highlight_requested",
-                Some(invocation_id),
+            dispatch_selection_changed(
+                invocation_id,
+                selected_slice,
                 source_qpc,
-                &format!("selected_slice={selected_slice:?}"),
+                active_snapshot,
+                route,
+                dispatcher,
             );
-            route.set_selection(dispatcher.egui_context, invocation_id, selected_slice);
+        }
+        InteractionEffect::ContinuousChanged { invocation_id, selection } => {
+            dispatch_continuous_changed(
+                invocation_id,
+                selection,
+                source_qpc,
+                active_snapshot,
+                route,
+                dispatcher,
+            );
         }
         InteractionEffect::Close { invocation_id, outcome } => {
-            match outcome {
-                InteractionOutcome::Selected { slice_index } => {
-                    let action_assigned = active_action_id.is_some();
-                    let plan_compiled = active_execution_plan.is_some();
-                    log::info!(
-                        target: "interaction",
-                        "component=interaction event_code=slice_selected result_code=ok \
-                         config_revision={} invocation_id={invocation_id} profile_id={} \
-                         slice_index={slice_index} action_assigned={action_assigned} \
-                         plan_compiled={plan_compiled} action_executed=false",
-                        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
-                            snapshot.context.config_revision
-                        }),
-                        active_profile_id.unwrap_or_default()
-                    );
-                    if active.practice {
-                        dispatcher.onboarding_practice.selected(slice_index);
-                        platform::request_controller_repaint();
-                    } else {
-                        log_selected_action_outcome(
-                            invocation_id,
-                            active_action_id,
-                            active_execution_plan,
-                            active_snapshot.map(|snapshot| &snapshot.context),
-                            dispatcher.action_executor,
-                            ActionDispatchTrace {
-                                timing_markers: dispatcher.timing_markers,
-                                release_qpc: source_qpc,
-                            },
-                            active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
-                                snapshot.context.config_revision
-                            }),
-                        );
-                    }
-                }
-                InteractionOutcome::Cancelled { reason } => {
-                    log::info!(
-                        target: "interaction",
-                        "component=interaction event_code=invocation_cancelled result_code=ok \
-                         config_revision={} invocation_id={invocation_id} reason={reason:?}",
-                        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
-                            snapshot.context.config_revision
-                        })
-                    );
-                    if active.practice {
-                        dispatcher.onboarding_practice.cancelled(reason);
-                        platform::request_controller_repaint();
-                    }
-                }
-            }
-            dispatcher.timing_markers.emit("close_requested", Some(invocation_id), source_qpc, "");
-            route.close(dispatcher.egui_context, dispatcher.timing_markers, invocation_id);
+            dispatch_close(invocation_id, outcome, source_qpc, active, route, dispatcher);
         }
     }
+}
+
+fn dispatch_close(
+    invocation_id: uuid::Uuid,
+    outcome: InteractionOutcome,
+    source_qpc: i64,
+    active: &ActiveInvocation,
+    route: &OverlayRoute,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    let active_snapshot = active.snapshot.as_ref();
+    let config_revision = active_snapshot
+        .map_or(dispatcher.config_revision, |snapshot| snapshot.context.config_revision);
+    match outcome {
+        InteractionOutcome::Selected { slice_index } => {
+            let action_assigned = active.action_id.is_some();
+            let plan_compiled = active.execution_plan.is_some();
+            log::info!(
+                target: "interaction",
+                "component=interaction event_code=slice_selected result_code=ok \
+                 config_revision={config_revision} invocation_id={invocation_id} profile_id={} \
+                 slice_index={slice_index} action_assigned={action_assigned} \
+                 plan_compiled={plan_compiled} action_executed=false",
+                active.profile_id.unwrap_or_default()
+            );
+            if active.practice {
+                dispatcher.onboarding_practice.selected(slice_index);
+                platform::request_controller_repaint();
+            } else {
+                log_selected_action_outcome(
+                    invocation_id,
+                    active.action_id,
+                    active.execution_plan.as_ref(),
+                    active_snapshot.map(|snapshot| &snapshot.context),
+                    dispatcher.action_executor,
+                    ActionDispatchTrace {
+                        timing_markers: dispatcher.timing_markers,
+                        release_qpc: source_qpc,
+                    },
+                    config_revision,
+                );
+            }
+        }
+        InteractionOutcome::ContinuousCommitted { slice_index, value } => {
+            log::info!(
+                target: "interaction",
+                "component=interaction event_code=continuous_meter_committed \
+                 result_code=ok config_revision={config_revision} invocation_id={invocation_id} \
+                 profile_id={} slice_index={slice_index} normalized_value={value:.6} \
+                 continuous_meter={} action_executed=false",
+                active.profile_id.unwrap_or_default(),
+                active.continuous_meter
+            );
+        }
+        InteractionOutcome::Cancelled { reason } => {
+            log::info!(
+                target: "interaction",
+                "component=interaction event_code=invocation_cancelled result_code=ok \
+                 config_revision={config_revision} invocation_id={invocation_id} reason={reason:?}"
+            );
+            if active.practice {
+                dispatcher.onboarding_practice.cancelled(reason);
+                platform::request_controller_repaint();
+            }
+        }
+    }
+    dispatcher.timing_markers.emit("close_requested", Some(invocation_id), source_qpc, "");
+    route.close(dispatcher.egui_context, dispatcher.timing_markers, invocation_id);
+}
+
+fn dispatch_selection_changed(
+    invocation_id: uuid::Uuid,
+    selected_slice: Option<usize>,
+    source_qpc: i64,
+    active_snapshot: Option<&InvocationSnapshot>,
+    route: &OverlayRoute,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    log::debug!(
+        target: "interaction",
+        "component=interaction event_code=selection_changed result_code=ok \
+         config_revision={} invocation_id={invocation_id} \
+         selected_slice={selected_slice:?}",
+        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
+            snapshot.context.config_revision
+        })
+    );
+    dispatcher.timing_markers.emit(
+        "highlight_requested",
+        Some(invocation_id),
+        source_qpc,
+        &format!("selected_slice={selected_slice:?}"),
+    );
+    route.set_selection(dispatcher.egui_context, invocation_id, selected_slice);
+}
+
+fn dispatch_continuous_changed(
+    invocation_id: uuid::Uuid,
+    selection: ContinuousSelection,
+    source_qpc: i64,
+    active_snapshot: Option<&InvocationSnapshot>,
+    route: &OverlayRoute,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    log::info!(
+        target: "interaction",
+        "component=interaction event_code=continuous_meter_updated result_code=ok \
+         config_revision={} invocation_id={invocation_id} \
+         slice_index={} normalized_value={:.6} action_executed=false",
+        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
+            snapshot.context.config_revision
+        }),
+        selection.slice_index,
+        selection.value
+    );
+    dispatcher.timing_markers.emit(
+        "continuous_value_requested",
+        Some(invocation_id),
+        source_qpc,
+        &format!("slice_index={} normalized_value={:.6}", selection.slice_index, selection.value),
+    );
+    route.set_continuous(dispatcher.egui_context, invocation_id, selection);
 }
 
 #[derive(Clone, Copy)]
@@ -865,6 +967,7 @@ fn dispatch_open(
     active_snapshot: Option<&InvocationSnapshot>,
     active_profile_id: Option<uuid::Uuid>,
     active_menu: Option<&Arc<ResolvedMenu>>,
+    continuous_meter: bool,
     route_index: usize,
     route: &OverlayRoute,
     dispatcher: &EffectDispatcher<'_>,
@@ -892,7 +995,8 @@ fn dispatch_open(
         target: "interaction",
         "component=interaction event_code=invocation_started result_code=ok \
          config_revision={} invocation_id={invocation_id} profile_id={} \
-         monitor_index={route_index} geometry={} slice_count={}",
+         monitor_index={route_index} geometry={} slice_count={} \
+         continuous_meter={continuous_meter}",
         snapshot.context.config_revision,
         active_profile_id.unwrap_or_default(),
         snapshot.geometry.behavior.as_str(),
@@ -1077,5 +1181,45 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         panic!("release-time action did not complete");
+    }
+
+    #[test]
+    fn continuous_meter_commit_never_compiles_a_saved_action() {
+        let action_id = Uuid::from_u128(51);
+        let invocation_id = Uuid::from_u128(52);
+        let configuration = Configuration {
+            config_revision: 10,
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Must stay inert".to_owned(),
+                kind: ActionKind::Delay { milliseconds: 10 },
+            }],
+            ..Configuration::default()
+        };
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        let menu = ResolvedMenu::new(
+            SliceCount::Four,
+            ["North", "East", "South", "West"].map(str::to_owned).into(),
+            vec![Some(action_id), None, None, None].into(),
+        )
+        .expect("menu");
+        let mut active = ActiveInvocation {
+            menu: Some(Arc::new(menu)),
+            continuous_meter: true,
+            ..ActiveInvocation::default()
+        };
+
+        prepare_selected_action(
+            Some(InteractionEffect::Close {
+                invocation_id,
+                outcome: InteractionOutcome::ContinuousCommitted { slice_index: 0, value: 0.75 },
+            }),
+            &mut active,
+            &compiler,
+            10,
+        );
+
+        assert_eq!(active.action_id, None);
+        assert!(active.execution_plan.is_none());
     }
 }

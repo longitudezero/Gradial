@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::bounded;
 use gradial_core::{
-    ActivationBindingId, CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, InputEvent, InputEventKind,
-    PhysicalModifiers, ResolvedGeometry, ScreenPoint, resolve_invocation_geometry,
+    ActivationBindingId, CancelReason, InputEvent, InputEventKind, PhysicalModifiers,
+    ResolvedGeometry, ScreenPoint, resolve_invocation_geometry,
 };
 use rtrb::Producer;
 use windows::Win32::{
@@ -571,7 +571,7 @@ impl HookCallbackState {
                     self.configuration.geometry_mode,
                     point,
                     &self.configuration.monitors,
-                    DEFAULT_OVERLAY_HALF_EXTENT_DIP,
+                    self.configuration.overlay_half_extent_dip,
                 );
                 self.suppression.geometry = Some(geometry.behavior);
                 self.suppression.cancel_sent = false;
@@ -801,6 +801,13 @@ mod tests {
     fn callback_state_for(
         geometry_mode: GeometryMode,
     ) -> (HookCallbackState, Consumer<InputEvent>) {
+        callback_state_for_extent(geometry_mode, gradial_core::DEFAULT_OVERLAY_HALF_EXTENT_DIP)
+    }
+
+    fn callback_state_for_extent(
+        geometry_mode: GeometryMode,
+        overlay_half_extent_dip: u32,
+    ) -> (HookCallbackState, Consumer<InputEvent>) {
         let (producer, consumer) = RingBuffer::new(16);
         let virtual_screen = ScreenRect::new(-2_000, -2_000, 2_000, 2_000);
         let configuration = InputConfiguration {
@@ -811,6 +818,7 @@ mod tests {
                 dpi: 96,
             }],
             activation_binding: ActivationBinding::default(),
+            overlay_half_extent_dip,
         };
         (
             HookCallbackState::new(
@@ -821,6 +829,39 @@ mod tests {
             ),
             consumer,
         )
+    }
+
+    #[test]
+    fn continuous_overlay_extent_enters_edge_assist_before_the_discrete_ring() {
+        let origin = ScreenPoint::new(-1_801, 0);
+        let m4 = mouse(origin, XBUTTON1);
+        let (mut discrete, mut discrete_events) =
+            callback_state_for_extent(GeometryMode::Auto, 144);
+        let (mut continuous, mut continuous_events) =
+            callback_state_for_extent(GeometryMode::Auto, 200);
+
+        assert!(discrete.handle_mouse(WM_XBUTTONDOWN, &m4, 10));
+        assert!(continuous.handle_mouse(WM_XBUTTONDOWN, &m4, 11));
+        assert!(matches!(
+            discrete_events.pop(),
+            Ok(InputEvent {
+                kind: InputEventKind::ActivationDown {
+                    geometry: InvocationGeometry { behavior: ResolvedGeometry::FixedOrigin, .. },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            continuous_events.pop(),
+            Ok(InputEvent {
+                kind: InputEventKind::ActivationDown {
+                    geometry: InvocationGeometry { behavior: ResolvedGeometry::EdgeAssist, .. },
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     fn mouse(point: ScreenPoint, xbutton: u16) -> MSLLHOOKSTRUCT {

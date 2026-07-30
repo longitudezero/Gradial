@@ -7,7 +7,9 @@ use std::{
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
-use gradial_core::{Appearance, InvocationSnapshot, MonitorGeometry, ResolvedMenu, ScreenPoint};
+use gradial_core::{
+    Appearance, ContinuousSelection, InvocationSnapshot, MonitorGeometry, ResolvedMenu, ScreenPoint,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -47,11 +49,13 @@ struct OverlayViewportState {
     snapshot: Option<InvocationSnapshot>,
     menu: Option<Arc<ResolvedMenu>>,
     selected_slice: Option<usize>,
+    continuous_selection: Option<ContinuousSelection>,
     selection_changed_at: Option<Instant>,
     phase: VisualPhase,
     pending_open_marker: bool,
     pending_first_frame: Option<InvocationSnapshot>,
     pending_highlight_marker: Option<(Uuid, Option<usize>)>,
+    pending_continuous_marker: Option<(Uuid, ContinuousSelection)>,
 }
 
 impl OverlayViewportState {
@@ -59,11 +63,13 @@ impl OverlayViewportState {
         let snapshot = self.snapshot.take();
         self.menu = None;
         self.selected_slice = None;
+        self.continuous_selection = None;
         self.selection_changed_at = None;
         self.phase = VisualPhase::Hidden;
         self.pending_open_marker = false;
         self.pending_first_frame = None;
         self.pending_highlight_marker = None;
+        self.pending_continuous_marker = None;
         snapshot
     }
 }
@@ -123,7 +129,9 @@ impl OverlayPool {
              slice_counts=4,8 \
              reduced_motion={} accent_red={} accent_green={} accent_blue={} \
              label_theme={} size_preset={} cached_icon_count={} \
-             open_ms=60 selection_ms=35 close_ms=50",
+             open_ms=60 selection_ms=35 close_ms=50 \
+             continuous_arm_radius_dip=48 continuous_full_scale_radius_dip=160 \
+             overlay_size_dip=400",
             slots.len(),
             animation_mode.is_reduced(),
             appearance.accent_color.red,
@@ -305,11 +313,13 @@ impl OverlayRoute {
             state.snapshot = Some(snapshot.clone());
             state.menu = Some(menu);
             state.selected_slice = None;
+            state.continuous_selection = None;
             state.selection_changed_at = Some(started_at);
             state.phase = VisualPhase::Opening { started_at };
             state.pending_open_marker = true;
             state.pending_first_frame = None;
             state.pending_highlight_marker = None;
+            state.pending_continuous_marker = None;
             interrupted
         };
         if let Some(interrupted_snapshot) = interrupted_snapshot {
@@ -362,8 +372,38 @@ impl OverlayRoute {
                 .is_some_and(|snapshot| snapshot.invocation_id == invocation_id)
             {
                 state.selected_slice = selected_slice;
+                state.continuous_selection = None;
                 state.selection_changed_at = Some(Instant::now());
                 state.pending_highlight_marker = Some((invocation_id, selected_slice));
+                true
+            } else {
+                false
+            }
+        };
+        if applied {
+            context.request_repaint_of(self.viewport_id);
+        }
+    }
+
+    pub(crate) fn set_continuous(
+        &self,
+        context: &Context,
+        invocation_id: Uuid,
+        selection: ContinuousSelection,
+    ) {
+        let applied = {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.invocation_id == invocation_id)
+            {
+                if state.selected_slice != Some(selection.slice_index) {
+                    state.selection_changed_at = Some(Instant::now());
+                }
+                state.selected_slice = Some(selection.slice_index);
+                state.continuous_selection = Some(selection);
+                state.pending_continuous_marker = Some((invocation_id, selection));
                 true
             } else {
                 false
@@ -658,6 +698,7 @@ fn prepare_overlay_frame(
                 }),
             appearance,
             selected_slice: state.selected_slice,
+            continuous_selection: state.continuous_selection,
             selection_changed_at: state.selection_changed_at,
             opacity: presence.opacity,
             scale: presence.scale,
@@ -719,6 +760,17 @@ fn process_pending_markers(
             Some(invocation_id),
             0,
             &format!("selected_slice={selected_slice:?} transition_ms=35"),
+        );
+    }
+    if let Some((invocation_id, selection)) = state.pending_continuous_marker.take() {
+        timing_markers.emit(
+            "continuous_value_applied",
+            Some(invocation_id),
+            0,
+            &format!(
+                "slice_index={} normalized_value={:.6}",
+                selection.slice_index, selection.value
+            ),
         );
     }
 }

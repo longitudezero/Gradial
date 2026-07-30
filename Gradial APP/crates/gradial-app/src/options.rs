@@ -8,7 +8,7 @@ pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
 Usage:
-  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--reduced-motion] [--open-settings] [--skip-onboarding]
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--continuous-meter] [--reduced-motion] [--open-settings] [--skip-onboarding]
 
 Geometry modes:
   auto          Use edge assist only when the complete ring would clip.
@@ -18,6 +18,9 @@ Geometry modes:
 Slice counts:
   4             Use the cardinal N/E/S/W menu.
   8             Use the eight-direction menu (default).
+
+Continuous input:
+  --continuous-meter  Make every direction an inert 0-100% distance meter.
 
 Animation:
   --reduced-motion  Remove visual interpolation without changing gesture timing.
@@ -48,11 +51,30 @@ Menu geometry and labels are selected from the resolved profile configuration.
 ";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ContinuousMeterMode {
+    #[default]
+    Disabled,
+    #[cfg(debug_assertions)]
+    Enabled,
+}
+
+impl ContinuousMeterMode {
+    pub(crate) const fn is_enabled(self) -> bool {
+        match self {
+            Self::Disabled => false,
+            #[cfg(debug_assertions)]
+            Self::Enabled => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StartupOptions {
     pub(crate) geometry_mode: GeometryMode,
     pub(crate) debug_slice_override: Option<gradial_core::SliceCount>,
     pub(crate) debug_open_settings: bool,
     pub(crate) debug_skip_onboarding: bool,
+    pub(crate) debug_continuous_meter: ContinuousMeterMode,
     pub(crate) reduced_motion: bool,
 }
 
@@ -72,6 +94,10 @@ impl StartupOptions {
         let mut debug_skip_onboarding = false;
         #[cfg(not(debug_assertions))]
         let debug_skip_onboarding = false;
+        #[cfg(debug_assertions)]
+        let mut debug_continuous_meter = ContinuousMeterMode::Disabled;
+        #[cfg(not(debug_assertions))]
+        let debug_continuous_meter = ContinuousMeterMode::Disabled;
         let mut arguments = arguments.into_iter();
 
         while let Some(argument) = arguments.next() {
@@ -106,6 +132,10 @@ impl StartupOptions {
                         debug_skip_onboarding = true;
                         continue;
                     }
+                    if argument == "--continuous-meter" {
+                        debug_continuous_meter = ContinuousMeterMode::Enabled;
+                        continue;
+                    }
                 }
                 bail!("unknown Gradial argument: {argument}");
             }
@@ -116,6 +146,7 @@ impl StartupOptions {
             debug_slice_override,
             debug_open_settings,
             debug_skip_onboarding,
+            debug_continuous_meter,
             reduced_motion,
         })
     }
@@ -145,7 +176,7 @@ mod tests {
     #[cfg(debug_assertions)]
     use gradial_core::SliceCount;
 
-    use super::StartupOptions;
+    use super::{ContinuousMeterMode, StartupOptions};
 
     #[test]
     fn geometry_defaults_to_automatic() {
@@ -154,6 +185,7 @@ mod tests {
         assert_eq!(options.debug_slice_override, None);
         assert!(!options.debug_open_settings);
         assert!(!options.debug_skip_onboarding);
+        assert_eq!(options.debug_continuous_meter, ContinuousMeterMode::Disabled);
         assert!(!options.reduced_motion);
     }
 
@@ -214,19 +246,22 @@ mod tests {
             "--reduced-motion".to_owned(),
             "--open-settings".to_owned(),
             "--skip-onboarding".to_owned(),
+            "--continuous-meter".to_owned(),
         ])
         .expect("reduced-motion options");
         assert_eq!(options.geometry_mode, GeometryMode::EdgeAssist);
         assert_eq!(options.debug_slice_override, Some(SliceCount::Four));
         assert!(options.debug_open_settings);
         assert!(options.debug_skip_onboarding);
+        assert_eq!(options.debug_continuous_meter, ContinuousMeterMode::Enabled);
         assert!(options.reduced_motion);
     }
 
     #[test]
     #[cfg(not(debug_assertions))]
     fn release_build_rejects_development_only_options() {
-        for argument in ["--slices=4", "--open-settings", "--skip-onboarding"] {
+        for argument in ["--slices=4", "--open-settings", "--skip-onboarding", "--continuous-meter"]
+        {
             let error =
                 StartupOptions::parse([argument.to_owned()]).expect_err("debug-only option");
             assert!(error.to_string().contains("unknown Gradial argument"));

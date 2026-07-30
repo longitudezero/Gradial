@@ -2,7 +2,8 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use gradial_core::{
-    ActionPlanCompiler, Configuration, GeometryMode, ProfileResolver, ResolvedMenu,
+    ActionPlanCompiler, CONTINUOUS_OVERLAY_HALF_EXTENT_DIP, Configuration,
+    DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, ProfileResolver, ResolvedMenu,
 };
 
 use crate::{
@@ -17,7 +18,7 @@ use crate::{
         OnboardingEditor, OnboardingEvent, OnboardingStartError, OnboardingStartup,
         OnboardingStore, onboarding_viewport_id,
     },
-    options::StartupOptions,
+    options::{ContinuousMeterMode, StartupOptions},
     overlay::{AnimationMode, OverlayPool},
     platform,
     settings::{SettingsEditor, SettingsEvent, settings_viewport_id},
@@ -45,9 +46,28 @@ impl ApplicationServices {
     }
 }
 
+fn resolve_debug_menu_options(
+    startup_options: StartupOptions,
+) -> (Option<Arc<ResolvedMenu>>, &'static str) {
+    #[cfg(debug_assertions)]
+    {
+        let description =
+            startup_options.debug_slice_override.map_or("none", gradial_core::SliceCount::as_str);
+        let menu =
+            startup_options.debug_slice_override.map(ResolvedMenu::directional).map(Arc::new);
+        (menu, description)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = startup_options;
+        (None, "none")
+    }
+}
+
 pub(crate) struct GradialApp {
     geometry_mode: GeometryMode,
     debug_menu_override: Option<Arc<ResolvedMenu>>,
+    debug_continuous_meter: ContinuousMeterMode,
     animation_mode: AnimationMode,
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
@@ -108,26 +128,26 @@ impl GradialApp {
         let action_executor = ActionExecutor::start(config_revision)?;
         let monitors =
             platform::monitor_work_areas().context("could not read the display work areas")?;
-        #[cfg(debug_assertions)]
-        let debug_menu_override =
-            startup_options.debug_slice_override.map(ResolvedMenu::directional).map(Arc::new);
-        #[cfg(not(debug_assertions))]
-        let debug_menu_override = None;
-        #[cfg(debug_assertions)]
-        let debug_slice_override =
-            startup_options.debug_slice_override.map_or("none", gradial_core::SliceCount::as_str);
-        #[cfg(not(debug_assertions))]
-        let debug_slice_override = "none";
+        let (debug_menu_override, debug_slice_override) =
+            resolve_debug_menu_options(startup_options);
+        let overlay_half_extent_dip = if startup_options.debug_continuous_meter.is_enabled() {
+            CONTINUOUS_OVERLAY_HALF_EXTENT_DIP
+        } else {
+            DEFAULT_OVERLAY_HALF_EXTENT_DIP
+        };
         log::info!(
             target: "startup",
             "component=app event_code=input_geometry_ready result_code=ok \
              config_revision={config_revision} \
-             geometry_mode={} debug_slice_override={} debug_open_settings={} \
-             reduced_motion={} monitor_count={}",
+             geometry_mode={} debug_slice_override={} debug_continuous_meter={} \
+             debug_open_settings={} reduced_motion={} overlay_half_extent_dip={} \
+             monitor_count={}",
             startup_options.geometry_mode.as_str(),
             debug_slice_override,
+            startup_options.debug_continuous_meter.is_enabled(),
             startup_options.debug_open_settings,
             startup_options.reduced_motion,
+            overlay_half_extent_dip,
             monitors.len()
         );
         let animation_mode = if startup_options.reduced_motion {
@@ -156,6 +176,7 @@ impl GradialApp {
         Ok(Self {
             geometry_mode: startup_options.geometry_mode,
             debug_menu_override,
+            debug_continuous_meter: startup_options.debug_continuous_meter,
             animation_mode,
             overlay_pool,
             interaction: None,
@@ -834,6 +855,11 @@ impl GradialApp {
             geometry_mode: self.geometry_mode,
             monitors: current_monitors,
             activation_binding: self.configuration.activation_binding,
+            overlay_half_extent_dip: if self.debug_continuous_meter.is_enabled() {
+                CONTINUOUS_OVERLAY_HALF_EXTENT_DIP
+            } else {
+                DEFAULT_OVERLAY_HALF_EXTENT_DIP
+            },
         };
         let interaction = match InteractionRuntime::start(
             context.clone(),
@@ -845,6 +871,7 @@ impl GradialApp {
             self.action_executor.handle(),
             self.onboarding.practice(),
             self.debug_menu_override.clone(),
+            self.debug_continuous_meter.is_enabled(),
             self.config_revision,
         ) {
             Ok(interaction) => interaction,

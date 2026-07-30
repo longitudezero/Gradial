@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2, epaint::CircleShape};
 use gradial_core::{
-    AccentColor, ActivationBindingId, Appearance, LabelTheme, ResolvedMenu, SliceCount,
+    AccentColor, ActivationBindingId, Appearance, ContinuousSelection, LabelTheme, ResolvedMenu,
+    SliceCount,
 };
 use uuid::Uuid;
 
@@ -21,6 +22,8 @@ const ICON_LABEL_RADIUS_DIP: f32 = 106.0;
 const ICON_SIZE_DIP: f32 = 30.0;
 const SELECTED_ARC_STEPS: u8 = 24;
 const SELECTED_ARC_INSET_RADIANS: f32 = 0.035;
+const CONTINUOUS_ARM_RADIUS_DIP: f32 = 48.0;
+const CONTINUOUS_FULL_SCALE_RADIUS_DIP: f32 = 160.0;
 const MAX_SLICE_COUNT: usize = 8;
 
 #[derive(Clone, Debug)]
@@ -30,6 +33,7 @@ pub(crate) struct OverlayRenderFrame {
     pub(crate) activation_button: ActivationBindingId,
     pub(crate) appearance: Appearance,
     pub(crate) selected_slice: Option<usize>,
+    pub(crate) continuous_selection: Option<ContinuousSelection>,
     pub(crate) selection_changed_at: Option<Instant>,
     pub(crate) opacity: f32,
     pub(crate) scale: f32,
@@ -106,6 +110,18 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         });
 
         draw_selected_slices(painter, center, geometry, selection_levels, opacity, scale, accent);
+        if let Some(selection) = frame.continuous_selection {
+            draw_continuous_track(
+                painter,
+                center,
+                menu.slice_count(),
+                selection,
+                opacity,
+                scale,
+                accent,
+                theme,
+            );
+        }
 
         painter.circle_stroke(
             center,
@@ -129,16 +145,76 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         );
 
         painter.circle_filled(center, 28.0 * scale, faded(theme.center, opacity));
+        let center_label = frame.continuous_selection.map_or_else(
+            || frame.activation_button.short_label().to_owned(),
+            |selection| format!("{:.0}%", selection.value.clamp(0.0, 1.0) * 100.0),
+        );
         painter.text(
             center,
             Align2::CENTER_CENTER,
-            frame.activation_button.short_label(),
+            center_label,
             FontId::proportional(11.0 * scale),
             faded(theme.center_label, opacity),
         );
 
         selection_animating
     }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn continuous_value_f32(value: f64) -> f32 {
+    value.clamp(0.0, 1.0) as f32
+}
+
+fn continuous_track_offsets(
+    slice_count: SliceCount,
+    selection: ContinuousSelection,
+) -> Option<[Vec2; 3]> {
+    let direction = slice_count.unit_vector(selection.slice_index)?;
+    let direction = Vec2::new(direction.x, direction.y);
+    let value = continuous_value_f32(selection.value);
+    let current_radius = CONTINUOUS_ARM_RADIUS_DIP
+        + (CONTINUOUS_FULL_SCALE_RADIUS_DIP - CONTINUOUS_ARM_RADIUS_DIP) * value;
+    Some([
+        direction * CONTINUOUS_ARM_RADIUS_DIP,
+        direction * current_radius,
+        direction * CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_continuous_track(
+    painter: &egui::Painter,
+    center: Pos2,
+    slice_count: SliceCount,
+    selection: ContinuousSelection,
+    opacity: f32,
+    scale: f32,
+    accent: AccentColor,
+    theme: ThemeColors,
+) {
+    let Some([start, current, end]) = continuous_track_offsets(slice_count, selection) else {
+        return;
+    };
+    let start = center + start * scale;
+    let current = center + current * scale;
+    let end = center + end * scale;
+    painter
+        .line_segment([start, end], Stroke::new(6.0 * scale, faded(theme.center, opacity * 0.82)));
+    painter.line_segment(
+        [start, end],
+        Stroke::new(2.0 * scale, faded(accent_color(accent, 105), opacity)),
+    );
+    painter.line_segment(
+        [start, current],
+        Stroke::new(4.0 * scale, faded(selected_accent_color(accent, 250), opacity)),
+    );
+    painter.circle_filled(current, 6.0 * scale, faded(selected_accent_color(accent, 255), opacity));
+    painter.circle_stroke(
+        current,
+        7.5 * scale,
+        Stroke::new(1.5 * scale, faded(theme.center_label, opacity)),
+    );
 }
 
 #[derive(Debug)]
@@ -513,17 +589,21 @@ mod tests {
 
     use std::sync::Arc;
 
-    use gradial_core::{AccentColor, Appearance, LabelTheme, ResolvedMenu, SizePreset, SliceCount};
+    use gradial_core::{
+        AccentColor, Appearance, ContinuousSelection, LabelTheme, ResolvedMenu, SizePreset,
+        SliceCount,
+    };
 
     use super::{
-        FoundationOverlayRenderer, SelectionTransition, fitted_icon_rect, half_slice_angle,
-        icon_and_label_offsets, menu_label_layout, selected_accent_color, theme_colors,
+        FoundationOverlayRenderer, SelectionTransition, continuous_track_offsets, fitted_icon_rect,
+        half_slice_angle, icon_and_label_offsets, menu_label_layout, selected_accent_color,
+        theme_colors,
     };
     use crate::icons::IconVisual;
     use crate::overlay::AnimationMode;
 
     fn assert_close(actual: f32, expected: f32) {
-        assert!((actual - expected).abs() < f32::EPSILON);
+        assert!((actual - expected).abs() < 0.0001);
     }
 
     #[test]
@@ -586,6 +666,29 @@ mod tests {
         );
         assert_close(rect.width(), 30.0);
         assert_close(rect.height(), 15.0);
+    }
+
+    #[test]
+    fn continuous_track_uses_arm_value_and_full_scale_radii() {
+        let [start, current, end] = continuous_track_offsets(
+            SliceCount::Eight,
+            ContinuousSelection { slice_index: 2, value: 0.5 },
+        )
+        .expect("east continuous track");
+
+        assert_close(start.x, 48.0);
+        assert_close(start.y, 0.0);
+        assert_close(current.x, 104.0);
+        assert_close(current.y, 0.0);
+        assert_close(end.x, 160.0);
+        assert_close(end.y, 0.0);
+        assert!(
+            continuous_track_offsets(
+                SliceCount::Four,
+                ContinuousSelection { slice_index: 7, value: 0.5 }
+            )
+            .is_none()
+        );
     }
 
     #[test]

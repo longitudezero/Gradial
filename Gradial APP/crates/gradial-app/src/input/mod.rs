@@ -21,4 +21,5 @@ pub(crate) struct InputConfiguration {
     pub(crate) geometry_mode: GeometryMode,
     pub(crate) monitors: Vec<MonitorGeometry>,
     pub(crate) activation_binding: ActivationBinding,
+    pub(crate) overlay_half_extent_dip: u32,
 }

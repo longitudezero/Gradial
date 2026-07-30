@@ -61,12 +61,17 @@ control that detects and repairs stale Windows registration, and a versioned
 performance-report harness with QPC hook/dispatch timing, PresentMon
 correlation, resource sampling, and explicit unavailable/not-run evidence.
 Configured application paths remain excluded from diagnostics unless the user
-explicitly includes them.
+explicitly includes them. The first bounded v0.3 slice adds pure,
+DPI-independent continuous distance, direction locking after arming, a
+production-overlay progress track, and a debug-only inert meter. The meter
+exercises the real input, edge-assist, interaction, rendering, focus, and close
+paths while remaining unable to compile or dispatch a saved action.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
 The broader v0.1 document is retained for historical context, but v0.2 controls
-the MVP.
+the MVP. [`gradial-v0.3-implementation-plan.md`](gradial-v0.3-implementation-plan.md)
+controls the continuous-input and plugin extension work.
 
 ## Build and run
 
@@ -111,6 +116,19 @@ cargo run --package gradial-app -- --slices=4
 
 `--slices 4` and `--slices 8` are also accepted by debug builds. Release builds
 reject this override and always use the resolved profile configuration.
+
+The debug-only continuous meter makes every direction inert and maps 48–160
+DIP of radial travel to `0–100%`. It locks the chosen direction after arming,
+uses the wider edge-assist extent, and never compiles or dispatches the saved
+slice action:
+
+```powershell
+cargo run --package gradial-app -- --continuous-meter --skip-onboarding
+```
+
+Releasing before 48 DIP cancels. Returning inside the existing 24 DIP center
+radius after arming stops the meter; cancellation does not imply rollback for
+future application plugins.
 
 The overlay opens from 96% scale and 85% opacity over 60 ms, changes selection
 color over 35 ms, and fades out over 50 ms. Gesture recognition and release do
@@ -285,6 +303,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interaction-matr
 It writes ignored, versioned JSON and CSV results under
 `Gradial APP\captures\interaction-matrix`.
 
+Run the continuous-input matrix separately:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-continuous-matrix.ps1 -Suite standard
+```
+
+It writes ignored JSON and CSV evidence under
+`Gradial APP\captures\continuous-matrix`. Automated results deliberately leave
+the eight-participant usability study as `not_run`.
+
 Run a short, non-qualifying local performance baseline after building the
 release executable:
 
@@ -300,7 +328,9 @@ See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
 [`Documentation/milestone-0-smoke-results.md`](Documentation/milestone-0-smoke-results.md),
-and the per-display pool evidence is in
+and continuous-input prototype evidence is recorded in
+[`Documentation/milestone-0-continuous-input-results.md`](Documentation/milestone-0-continuous-input-results.md).
+The per-display pool evidence is in
 [`Documentation/milestone-1-overlay-pool-results.md`](Documentation/milestone-1-overlay-pool-results.md).
 Four/eight geometry results are recorded in
 [`Documentation/milestone-1-slice-geometry-results.md`](Documentation/milestone-1-slice-geometry-results.md).

@@ -10,6 +10,9 @@ use uuid::Uuid;
 use crate::SliceCount;
 
 pub const DEFAULT_OVERLAY_HALF_EXTENT_DIP: u32 = 144;
+pub const CONTINUOUS_OVERLAY_HALF_EXTENT_DIP: u32 = 200;
+pub const DEFAULT_CONTINUOUS_ARM_RADIUS_DIP: f64 = 48.0;
+pub const DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP: f64 = 160.0;
 
 /// A signed physical-pixel coordinate in the Windows virtual screen.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -191,6 +194,7 @@ pub enum CancelReason {
     Escape,
     OtherMouseButton,
     NoSelection,
+    ReturnedToCenter,
     InputQueueOverflow,
     HookUnresponsive,
     InputReregistration,
@@ -279,28 +283,66 @@ pub enum InteractionState {
     Idle,
     Opening,
     Tracking,
+    Continuous,
     Cancelling,
     Closing,
     Faulted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InteractionOutcome {
     Selected { slice_index: usize },
+    ContinuousCommitted { slice_index: usize, value: f64 },
     Cancelled { reason: CancelReason },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InteractionEffect {
     Open { invocation_id: Uuid, origin: ScreenPoint },
     SelectionChanged { invocation_id: Uuid, selected_slice: Option<usize> },
+    ContinuousChanged { invocation_id: Uuid, selection: ContinuousSelection },
     Close { invocation_id: Uuid, outcome: InteractionOutcome },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContinuousSelection {
+    pub slice_index: usize,
+    pub value: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousSliceMask(u8);
+
+impl ContinuousSliceMask {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    #[must_use]
+    pub const fn all(slice_count: SliceCount) -> Self {
+        let bits = match slice_count {
+            SliceCount::Four => 0b0000_1111,
+            SliceCount::Eight => 0b1111_1111,
+        };
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn contains(self, slice_index: usize) -> bool {
+        if slice_index >= u8::BITS as usize {
+            return false;
+        }
+        self.0 & (1_u8 << slice_index) != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GestureConfig {
     pub center_cancel_radius_dip: f64,
     pub selection_entry_radius_dip: f64,
+    pub continuous_arm_radius_dip: f64,
+    pub continuous_full_scale_radius_dip: f64,
     pub boundary_hysteresis_degrees: f64,
     pub slice_count: SliceCount,
 }
@@ -310,6 +352,8 @@ impl Default for GestureConfig {
         Self {
             center_cancel_radius_dip: 24.0,
             selection_entry_radius_dip: 36.0,
+            continuous_arm_radius_dip: DEFAULT_CONTINUOUS_ARM_RADIUS_DIP,
+            continuous_full_scale_radius_dip: DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
             boundary_hysteresis_degrees: 5.0,
             slice_count: SliceCount::Eight,
         }
@@ -321,6 +365,8 @@ pub struct InteractionController {
     state: InteractionState,
     config: GestureConfig,
     active_slice_count: SliceCount,
+    continuous_slices: ContinuousSliceMask,
+    continuous_selection: Option<ContinuousSelection>,
     snapshot: Option<InvocationSnapshot>,
     selected_slice: Option<usize>,
     virtual_pointer: ScreenPoint,
@@ -332,6 +378,8 @@ impl InteractionController {
         Self {
             state: InteractionState::Idle,
             active_slice_count: config.slice_count,
+            continuous_slices: ContinuousSliceMask::none(),
+            continuous_selection: None,
             config,
             snapshot: None,
             selected_slice: None,
@@ -350,6 +398,11 @@ impl InteractionController {
     }
 
     #[must_use]
+    pub const fn continuous_selection(&self) -> Option<ContinuousSelection> {
+        self.continuous_selection
+    }
+
+    #[must_use]
     pub fn snapshot(&self) -> Option<&InvocationSnapshot> {
         self.snapshot.as_ref()
     }
@@ -363,12 +416,23 @@ impl InteractionController {
         snapshot: InvocationSnapshot,
         slice_count: SliceCount,
     ) -> Option<InteractionEffect> {
+        self.activation_down_with_behavior(snapshot, slice_count, ContinuousSliceMask::none())
+    }
+
+    pub fn activation_down_with_behavior(
+        &mut self,
+        snapshot: InvocationSnapshot,
+        slice_count: SliceCount,
+        continuous_slices: ContinuousSliceMask,
+    ) -> Option<InteractionEffect> {
         if self.state != InteractionState::Idle {
             return None;
         }
 
         self.state = InteractionState::Opening;
         self.active_slice_count = slice_count;
+        self.continuous_slices = continuous_slices;
+        self.continuous_selection = None;
         self.selected_slice = None;
         self.virtual_pointer = snapshot.cursor_physical_px;
         let invocation_id = snapshot.invocation_id;
@@ -392,7 +456,10 @@ impl InteractionController {
     }
 
     pub fn pointer_moved(&mut self, point: ScreenPoint) -> Option<InteractionEffect> {
-        if !matches!(self.state, InteractionState::Opening | InteractionState::Tracking) {
+        if !matches!(
+            self.state,
+            InteractionState::Opening | InteractionState::Tracking | InteractionState::Continuous
+        ) {
             return None;
         }
 
@@ -400,14 +467,66 @@ impl InteractionController {
             self.state = InteractionState::Faulted;
             return None;
         };
-        let new_selection = self.selection_for_point(snapshot, point);
-        if new_selection == self.selected_slice {
-            return None;
+
+        let distance_dip = distance_dip(snapshot.cursor_physical_px, point, snapshot.monitor_dpi);
+        if let Some(mut continuous) = self.continuous_selection {
+            if distance_dip <= self.config.center_cancel_radius_dip {
+                self.state = InteractionState::Cancelling;
+                self.selected_slice = None;
+                self.continuous_selection = None;
+                return Some(InteractionEffect::Close {
+                    invocation_id: snapshot.invocation_id,
+                    outcome: InteractionOutcome::Cancelled {
+                        reason: CancelReason::ReturnedToCenter,
+                    },
+                });
+            }
+
+            let value = normalize_continuous_distance(
+                distance_dip,
+                self.config.continuous_arm_radius_dip,
+                self.config.continuous_full_scale_radius_dip,
+            );
+            if (continuous.value - value).abs() <= f64::EPSILON {
+                return None;
+            }
+            continuous.value = value;
+            self.continuous_selection = Some(continuous);
+            return Some(InteractionEffect::ContinuousChanged {
+                invocation_id: snapshot.invocation_id,
+                selection: continuous,
+            });
         }
 
+        let new_selection = self.selection_for_point(snapshot, point);
+        let selection_changed = new_selection != self.selected_slice;
         self.selected_slice = new_selection;
         if new_selection.is_some() {
             self.state = InteractionState::Tracking;
+        }
+
+        if let Some(slice_index) = new_selection
+            && self.continuous_slices.contains(slice_index)
+            && distance_dip >= self.config.continuous_arm_radius_dip
+        {
+            let selection = ContinuousSelection {
+                slice_index,
+                value: normalize_continuous_distance(
+                    distance_dip,
+                    self.config.continuous_arm_radius_dip,
+                    self.config.continuous_full_scale_radius_dip,
+                ),
+            };
+            self.continuous_selection = Some(selection);
+            self.state = InteractionState::Continuous;
+            return Some(InteractionEffect::ContinuousChanged {
+                invocation_id: snapshot.invocation_id,
+                selection,
+            });
+        }
+
+        if !selection_changed {
+            return None;
         }
 
         Some(InteractionEffect::SelectionChanged {
@@ -418,14 +537,32 @@ impl InteractionController {
 
     pub fn activation_up(&mut self) -> Option<InteractionEffect> {
         match self.state {
-            InteractionState::Opening | InteractionState::Tracking => {
+            InteractionState::Opening
+            | InteractionState::Tracking
+            | InteractionState::Continuous => {
                 let Some(snapshot) = self.snapshot.as_ref() else {
                     self.state = InteractionState::Faulted;
                     return None;
                 };
-                let outcome = self.selected_slice.map_or(
-                    InteractionOutcome::Cancelled { reason: CancelReason::NoSelection },
-                    |slice_index| InteractionOutcome::Selected { slice_index },
+                let outcome = self.continuous_selection.map_or_else(
+                    || {
+                        self.selected_slice.map_or(
+                            InteractionOutcome::Cancelled { reason: CancelReason::NoSelection },
+                            |slice_index| {
+                                if self.continuous_slices.contains(slice_index) {
+                                    InteractionOutcome::Cancelled {
+                                        reason: CancelReason::NoSelection,
+                                    }
+                                } else {
+                                    InteractionOutcome::Selected { slice_index }
+                                }
+                            },
+                        )
+                    },
+                    |selection| InteractionOutcome::ContinuousCommitted {
+                        slice_index: selection.slice_index,
+                        value: selection.value,
+                    },
                 );
 
                 self.state = InteractionState::Closing;
@@ -443,7 +580,10 @@ impl InteractionController {
     }
 
     pub fn cancel(&mut self, reason: CancelReason) -> Option<InteractionEffect> {
-        if !matches!(self.state, InteractionState::Opening | InteractionState::Tracking) {
+        if !matches!(
+            self.state,
+            InteractionState::Opening | InteractionState::Tracking | InteractionState::Continuous
+        ) {
             return None;
         }
 
@@ -453,6 +593,7 @@ impl InteractionController {
         };
         self.state = InteractionState::Cancelling;
         self.selected_slice = None;
+        self.continuous_selection = None;
         Some(InteractionEffect::Close {
             invocation_id: snapshot.invocation_id,
             outcome: InteractionOutcome::Cancelled { reason },
@@ -466,6 +607,7 @@ impl InteractionController {
         });
         self.state = InteractionState::Faulted;
         self.selected_slice = None;
+        self.continuous_selection = None;
         self.snapshot = None;
         effect
     }
@@ -513,10 +655,43 @@ impl InteractionController {
     fn reset_to_idle(&mut self) {
         self.state = InteractionState::Idle;
         self.active_slice_count = self.config.slice_count;
+        self.continuous_slices = ContinuousSliceMask::none();
+        self.continuous_selection = None;
         self.selected_slice = None;
         self.snapshot = None;
         self.virtual_pointer = ScreenPoint::new(0, 0);
     }
+}
+
+fn distance_dip(origin: ScreenPoint, point: ScreenPoint, monitor_dpi: u32) -> f64 {
+    let dx = f64::from(point.x) - f64::from(origin.x);
+    let dy = f64::from(point.y) - f64::from(origin.y);
+    let dpi_scale = f64::from(monitor_dpi.max(96)) / 96.0;
+    dx.hypot(dy) / dpi_scale
+}
+
+/// Maps radial distance to the runtime-neutral continuous scalar.
+#[must_use]
+pub fn normalize_continuous_distance(
+    distance_dip: f64,
+    arm_radius_dip: f64,
+    full_scale_radius_dip: f64,
+) -> f64 {
+    if distance_dip.is_nan()
+        || !arm_radius_dip.is_finite()
+        || !full_scale_radius_dip.is_finite()
+        || arm_radius_dip < 0.0
+        || full_scale_radius_dip <= arm_radius_dip
+    {
+        return 0.0;
+    }
+    if distance_dip <= arm_radius_dip {
+        return 0.0;
+    }
+    if distance_dip >= full_scale_radius_dip {
+        return 1.0;
+    }
+    (distance_dip - arm_radius_dip) / (full_scale_radius_dip - arm_radius_dip)
 }
 
 const fn clamp_or_midpoint(value: i32, minimum: i32, maximum: i32) -> i32 {
@@ -643,11 +818,12 @@ fn shortest_angular_distance(left: f64, right: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivationBinding, ActivationBindingId, CancelReason, GeometryMode, GestureConfig,
-        InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
-        InvocationGeometry, InvocationSnapshot, MonitorGeometry, PhysicalModifiers,
-        ResolvedGeometry, ScreenPoint, ScreenRect, monitor_index_for_point,
-        resolve_invocation_geometry, slice_for_angle, slice_for_delta,
+        ActivationBinding, ActivationBindingId, CancelReason, ContinuousSelection,
+        ContinuousSliceMask, GeometryMode, GestureConfig, InteractionController, InteractionEffect,
+        InteractionOutcome, InteractionState, InvocationGeometry, InvocationSnapshot,
+        MonitorGeometry, PhysicalModifiers, ResolvedGeometry, ScreenPoint, ScreenRect,
+        monitor_index_for_point, normalize_continuous_distance, resolve_invocation_geometry,
+        slice_for_angle, slice_for_delta,
     };
     use crate::SliceCount;
     use uuid::Uuid;
@@ -766,6 +942,135 @@ mod tests {
             Some(InteractionEffect::SelectionChanged {
                 invocation_id: Uuid::nil(),
                 selected_slice: Some(2),
+            })
+        );
+    }
+
+    #[test]
+    fn continuous_distance_normalizes_and_clamps() {
+        let assert_scalar = |actual: f64, expected: f64| {
+            assert!((actual - expected).abs() <= f64::EPSILON, "expected {expected}, got {actual}");
+        };
+        assert_scalar(normalize_continuous_distance(0.0, 48.0, 160.0), 0.0);
+        assert_scalar(normalize_continuous_distance(48.0, 48.0, 160.0), 0.0);
+        assert_scalar(normalize_continuous_distance(104.0, 48.0, 160.0), 0.5);
+        assert_scalar(normalize_continuous_distance(160.0, 48.0, 160.0), 1.0);
+        assert_scalar(normalize_continuous_distance(10_000.0, 48.0, 160.0), 1.0);
+        assert_scalar(normalize_continuous_distance(f64::INFINITY, 48.0, 160.0), 1.0);
+        assert_scalar(normalize_continuous_distance(f64::NAN, 48.0, 160.0), 0.0);
+        assert_scalar(normalize_continuous_distance(104.0, 160.0, 48.0), 0.0);
+    }
+
+    #[test]
+    fn continuous_slice_arms_locks_direction_and_commits_final_value() {
+        let origin = ScreenPoint::new(100, 100);
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_behavior(
+                snapshot(origin),
+                SliceCount::Eight,
+                ContinuousSliceMask::all(SliceCount::Eight),
+            )
+            .expect("continuous open");
+
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(204, 100)),
+            Some(InteractionEffect::ContinuousChanged {
+                invocation_id: Uuid::nil(),
+                selection: ContinuousSelection { slice_index: 2, value: 0.5 },
+            })
+        );
+        assert_eq!(controller.state(), InteractionState::Continuous);
+        assert_eq!(controller.selected_slice(), Some(2));
+
+        assert_eq!(controller.pointer_moved(ScreenPoint::new(100, -4)), None);
+        assert_eq!(controller.selected_slice(), Some(2));
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(-60, 100)),
+            Some(InteractionEffect::ContinuousChanged {
+                invocation_id: Uuid::nil(),
+                selection: ContinuousSelection { slice_index: 2, value: 1.0 },
+            })
+        );
+        assert_eq!(
+            controller.activation_up(),
+            Some(InteractionEffect::Close {
+                invocation_id: Uuid::nil(),
+                outcome: InteractionOutcome::ContinuousCommitted { slice_index: 2, value: 1.0 },
+            })
+        );
+    }
+
+    #[test]
+    fn continuous_slice_release_before_arm_is_inert() {
+        let origin = ScreenPoint::new(100, 100);
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_behavior(
+                snapshot(origin),
+                SliceCount::Eight,
+                ContinuousSliceMask::all(SliceCount::Eight),
+            )
+            .expect("continuous open");
+        assert!(matches!(
+            controller.pointer_moved(ScreenPoint::new(147, 100)),
+            Some(InteractionEffect::SelectionChanged { selected_slice: Some(2), .. })
+        ));
+
+        assert_eq!(
+            controller.activation_up(),
+            Some(InteractionEffect::Close {
+                invocation_id: Uuid::nil(),
+                outcome: InteractionOutcome::Cancelled { reason: CancelReason::NoSelection },
+            })
+        );
+    }
+
+    #[test]
+    fn returning_to_center_cancels_an_armed_continuous_slice() {
+        let origin = ScreenPoint::new(100, 100);
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_behavior(
+                snapshot(origin),
+                SliceCount::Eight,
+                ContinuousSliceMask::all(SliceCount::Eight),
+            )
+            .expect("continuous open");
+        controller.pointer_moved(ScreenPoint::new(204, 100)).expect("armed");
+
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(110, 100)),
+            Some(InteractionEffect::Close {
+                invocation_id: Uuid::nil(),
+                outcome: InteractionOutcome::Cancelled { reason: CancelReason::ReturnedToCenter },
+            })
+        );
+        assert_eq!(controller.state(), InteractionState::Cancelling);
+        assert_eq!(controller.activation_up(), None);
+        assert_eq!(controller.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn continuous_distance_is_dpi_independent() {
+        let origin = ScreenPoint::new(-500, -500);
+        let mut high_dpi_snapshot = snapshot(origin);
+        high_dpi_snapshot.monitor_dpi = 192;
+        high_dpi_snapshot.geometry.monitor_dpi = 192;
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_behavior(
+                high_dpi_snapshot,
+                SliceCount::Eight,
+                ContinuousSliceMask::all(SliceCount::Eight),
+            )
+            .expect("high-DPI open");
+
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(-292, -500)),
+            Some(InteractionEffect::ContinuousChanged {
+                invocation_id: Uuid::nil(),
+                selection: ContinuousSelection { slice_index: 2, value: 0.5 },
             })
         );
     }
