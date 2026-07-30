@@ -166,6 +166,11 @@ fn validate_profile(profile: &Profile) -> Result<(), ConfigurationError> {
             found: profile.menu.slices.len(),
         });
     }
+    if let Some((slice_index, _)) =
+        profile.menu.slices.iter().enumerate().find(|(_, slice)| slice.label.trim().is_empty())
+    {
+        return Err(ConfigurationError::EmptyMenuLabel { profile_id: profile.id, slice_index });
+    }
     Ok(())
 }
 
@@ -213,6 +218,9 @@ pub enum ConfigurationError {
         "profile {profile_id} declares {slice_count} slices but contains {found} slice definitions"
     )]
     IncorrectMenuLength { profile_id: Uuid, slice_count: u8, found: usize },
+
+    #[error("profile {profile_id} slice {slice_index} has an empty label")]
+    EmptyMenuLabel { profile_id: Uuid, slice_index: usize },
 
     #[error("profile UUID {profile_id} appears more than once")]
     DuplicateProfileId { profile_id: Uuid },
@@ -365,6 +373,20 @@ mod tests {
         assert!(matches!(
             configuration.validate(),
             Err(ConfigurationError::IncorrectMenuLength { slice_count: 4, found: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn every_menu_slice_requires_a_visible_label() {
+        let mut configuration = Configuration::default();
+        configuration.global_profile.menu.slices[3].label = "  ".to_owned();
+
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationError::EmptyMenuLabel {
+                profile_id,
+                slice_index: 3,
+            }) if profile_id == configuration.global_profile.id
         ));
     }
 

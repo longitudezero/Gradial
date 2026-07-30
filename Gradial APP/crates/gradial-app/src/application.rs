@@ -347,17 +347,76 @@ impl GradialApp {
     }
 
     fn handle_settings_event(&mut self, context: &eframe::egui::Context, event: SettingsEvent) {
-        let SettingsEvent::SaveRequested(proposed) = event;
-        match self.save_settings(context, &proposed) {
-            Ok(saved) => self.settings.accept_saved(&saved),
-            Err(error) => {
-                self.settings.save_failed();
-                log::error!(
-                    target: "settings",
-                    "component=settings event_code=settings_save_failed result_code=failure \
-                     error_code=config_invalid config_revision={} error={error}",
-                    self.config_revision
-                );
+        match event {
+            SettingsEvent::Save(proposed) => match self.save_settings(context, &proposed) {
+                Ok(saved) => self.settings.accept_saved(&saved),
+                Err(error) => {
+                    self.settings.save_failed();
+                    log::error!(
+                        target: "settings",
+                        "component=settings event_code=settings_save_failed result_code=failure \
+                         error_code=config_invalid config_revision={} error={error}",
+                        self.config_revision
+                    );
+                }
+            },
+            SettingsEvent::Import(path) => {
+                match self.config_store.import_draft(&self.configuration, path.as_path()) {
+                    Ok(imported) => {
+                        let migration_from =
+                            imported.migration.map_or(0, |migration| migration.from_schema);
+                        let action_count = imported.configuration.actions.len();
+                        self.settings.accept_imported(imported.configuration, imported.migration);
+                        log::info!(
+                            target: "settings",
+                            "component=settings event_code=settings_imported_to_draft \
+                             result_code=ok config_revision={} action_count={} migration_from={}",
+                            self.config_revision,
+                            action_count,
+                            migration_from
+                        );
+                    }
+                    Err(error) => {
+                        self.settings.import_failed(error);
+                        log::error!(
+                            target: "settings",
+                            "component=settings event_code=settings_import_failed \
+                             result_code=failure error_code={} config_revision={}",
+                            error.code(),
+                            self.config_revision
+                        );
+                    }
+                }
+                context.request_repaint_of(settings_viewport_id());
+            }
+            SettingsEvent::Export { path, configuration } => {
+                match self.config_store.export_draft(
+                    &self.configuration,
+                    path.as_path(),
+                    &configuration,
+                ) {
+                    Ok(()) => {
+                        self.settings.accept_exported();
+                        log::info!(
+                            target: "settings",
+                            "component=settings event_code=settings_draft_exported \
+                             result_code=ok config_revision={} action_count={}",
+                            self.config_revision,
+                            configuration.actions.len()
+                        );
+                    }
+                    Err(error) => {
+                        self.settings.export_failed(error);
+                        log::error!(
+                            target: "settings",
+                            "component=settings event_code=settings_export_failed \
+                             result_code=failure error_code={} config_revision={}",
+                            error.code(),
+                            self.config_revision
+                        );
+                    }
+                }
+                context.request_repaint_of(settings_viewport_id());
             }
         }
     }

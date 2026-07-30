@@ -88,11 +88,13 @@ slices, and the current bounded Milestone 2 slices establish:
   one-shot hold/flick/release tester that cannot dispatch an action.
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
+- Native JSON import into the private settings draft and atomic export of the
+  current valid draft, including unsaved edits.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
 profiles with their independent menus and complete matching rules. Appearance,
-icons, import/export, and onboarding are not exposed yet. A release logs the
+icons, and onboarding are not exposed yet. A release logs the
 chosen slice, compiles its assigned plan, and submits it to the coordinator.
 Every schema-two action family can execute through its bounded backend.
 
@@ -156,6 +158,22 @@ the complete schema-three model and leave the original bytes untouched.
 Migration is persisted only through a later explicit, successful save. This
 prevents startup from silently rewriting either a valid legacy file or a file
 containing ambiguous fields.
+
+Settings import uses the same migration and complete model/profile/action-plan
+validation path, then resets the imported revision to the current saved
+revision and replaces only the editor's proposed draft. The source bytes,
+running configuration, and persistent primary remain untouched. A dirty editor
+requires an explicit **Import file** choice before its proposed draft is
+replaced.
+
+Settings export validates the current proposed draft, serializes schema-three
+JSON beside a uniquely named temporary file in the selected directory, flushes
+it, and atomically moves it over the selected destination. It may include
+unsaved edits but never changes the active revision. The three active
+configuration paths (`config.json`, its backup, and its save temporary file)
+are protected export destinations. Import and export preserve literal action
+paths, arguments, labels, and text; diagnostics expose only fixed result
+categories rather than selected paths or configuration values.
 
 Configuration is parsed and completely validated before input starts. Profile
 regular expressions are compiled into the retained resolver at load rather
@@ -854,7 +872,10 @@ confirms that neither its private path sentinel nor its configured argument
 appears in the local log. The isolated configuration is always removed.
 `smoke-settings-editor.ps1` starts the debug executable with a private
 schema-two eight-slice configuration and opens its real settings viewport. It
-edits the activation draft to exact Ctrl+M5, arms the safe tester, submits a
+opens and safely cancels the real native JSON import/export choosers, migrates
+a schema-two fixture into the private draft, and confirms that neither the
+source nor active `config.json` changes. It edits the activation draft to exact
+Ctrl+M5, arms the safe tester, submits a
 native hold/east-flick/release gesture, and requires that no production action
 run during the test. It creates and
 persists every leaf-action type plus a base and nested sequence, exercises
@@ -871,14 +892,17 @@ argument rows—one containing spaces and one empty—plus a working folder. The
 harness opens the real native application chooser, observes its window, and
 cancels it without changing the draft. It then selects the nested sequence and
 observes four expanded steps, depth two, and 275 ms total Delay before
-converting the Global draft to four slices. After the guarded close it requires
+converting the Global draft to four slices. It exports that complete unsaved
+draft, verifies schema three at the unchanged revision with literal executable
+path, working folder, and argument rows, and again confirms that the active
+configuration is untouched. After the guarded close it requires
 revision 2 on disk with the exact complete profile rule, priority, independent
 menu, action payloads, ordered sequence UUIDs, and Ctrl+M5 schema-three binding;
 the old profile-free schema-two revision remains in `config.json.bak`. It then
 requires a fresh Ctrl+M5 invocation to freeze the saved binding and use the
 reloaded Global menu. Optional screenshots cover activation, the menu,
 advanced profile tester, payload, sequence, shortcut-recorder, Windows chooser,
-and confirmation surfaces. The fixture never reads or writes the user's
+JSON import/export choosers, and confirmation surfaces. The fixture never reads or writes the user's
 Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of

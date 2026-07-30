@@ -189,10 +189,17 @@ rename or duplicate every action and safely delete unreferenced actions.
 Sequences provide ordered add, remove, move-up, and move-down controls; only
 additions that avoid cycles and stay within nested depth, executed-step, and
 Delay limits are offered. Closing a dirty draft requires **Discard changes**
-or **Keep editing**. A successful save validates and compiles the complete
+or **Keep editing**. **Import settings…** reads schema-one, schema-two, or
+schema-three JSON into the private editor draft, fully validates it, and asks
+before replacing existing unsaved edits. It does not change the running app or
+`config.json` until **Save changes**. **Export current draft…** writes the
+complete valid draft—including unsaved edits—to a self-contained schema-three
+JSON file through an atomic adjacent temporary file. Imported/exported paths,
+arguments, labels, and text stay literal; export does not attempt to make them
+portable. A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
-reloads new invocations without restarting Gradial. Import/export, icons,
-appearance, and onboarding remain future slices.
+reloads new invocations without restarting Gradial. Icons, appearance, and
+onboarding remain future slices.
 
 Run all local checks with:
 
@@ -264,3 +271,5 @@ Advanced profile matching and private tester results are recorded in
 [`Documentation/milestone-2-profile-matching-editor-results.md`](Documentation/milestone-2-profile-matching-editor-results.md).
 Activation binding and safe gesture-tester results are recorded in
 [`Documentation/milestone-2-activation-binding-editor-results.md`](Documentation/milestone-2-activation-binding-editor-results.md).
+Settings import/export and atomic draft-transfer results are recorded in
+[`Documentation/milestone-2-settings-transfer-results.md`](Documentation/milestone-2-settings-transfer-results.md).

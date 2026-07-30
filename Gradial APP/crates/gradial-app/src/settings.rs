@@ -9,8 +9,6 @@ use eframe::egui::{
     self, Align, Color32, ComboBox, DragValue, Id, Layout, Modal, RichText, ScrollArea, Sense,
     TextEdit, UiBuilder, Vec2, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
-#[cfg(debug_assertions)]
-use gradial_core::ShortcutModifier;
 use gradial_core::{
     ActionDefinition, ActionKind, ActionPlanCompiler, ActivationBinding, ActivationBindingId,
     ApplicationProfile, Configuration, ConfigurationError, ExecutionOperation,
@@ -19,10 +17,13 @@ use gradial_core::{
     ProfileRule, ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey, SliceCount,
     WindowCommand, slice_for_delta,
 };
+#[cfg(debug_assertions)]
+use gradial_core::{AppPaths, ShortcutModifier};
 use regex::Regex;
 use uuid::Uuid;
 
 use crate::{
+    configuration::{ConfigurationMigration, ConfigurationTransferError},
     input::{self, ActivationBindingTestResult},
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
     overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
@@ -95,6 +96,12 @@ impl SettingsDraft {
     fn accept_saved(&mut self, configuration: &Configuration) {
         self.original = configuration.clone();
         self.proposed = configuration.clone();
+        self.eight_slice_stashes.clear();
+    }
+
+    fn replace_proposed(&mut self, mut configuration: Configuration) {
+        configuration.config_revision = self.original.config_revision;
+        self.proposed = configuration;
         self.eight_slice_stashes.clear();
     }
 
@@ -214,6 +221,18 @@ enum SaveFeedback {
     None,
     Saved,
     Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TransferFeedback {
+    Info(String),
+    Error(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferOperation {
+    Import,
+    Export,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -424,9 +443,40 @@ impl ActionReferenceSummary {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct PrivatePath(PathBuf);
+
+impl PrivatePath {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PrivatePath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PrivatePath(<redacted>)")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum SettingsEvent {
-    SaveRequested(Configuration),
+    Save(Configuration),
+    Import(PrivatePath),
+    Export { path: PrivatePath, configuration: Configuration },
+}
+
+impl std::fmt::Debug for SettingsEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Save(_) => formatter.write_str("Save(<configuration>)"),
+            Self::Import(_) => formatter.write_str("Import(<path>)"),
+            Self::Export { .. } => formatter.write_str("Export(<path>, <configuration>)"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -482,6 +532,26 @@ impl SettingsEditor {
         self.state().save_failed();
     }
 
+    pub(crate) fn accept_imported(
+        &self,
+        configuration: Configuration,
+        migration: Option<ConfigurationMigration>,
+    ) {
+        self.state().accept_imported(configuration, migration);
+    }
+
+    pub(crate) fn import_failed(&self, error: ConfigurationTransferError) {
+        self.state().transfer_failed(TransferOperation::Import, error);
+    }
+
+    pub(crate) fn accept_exported(&self) {
+        self.state().accept_exported();
+    }
+
+    pub(crate) fn export_failed(&self, error: ConfigurationTransferError) {
+        self.state().transfer_failed(TransferOperation::Export, error);
+    }
+
     fn state(&self) -> MutexGuard<'_, SettingsState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -502,6 +572,8 @@ struct SettingsState {
     shortcut_recorder: ShortcutRecorder,
     recording_action_id: Option<Uuid>,
     save_feedback: SaveFeedback,
+    transfer_feedback: Option<TransferFeedback>,
+    pending_import_path: Option<PrivatePath>,
     recovery_warning: bool,
     preview_renderer: FoundationOverlayRenderer,
     pending_event: Option<SettingsEvent>,
@@ -523,6 +595,8 @@ impl SettingsState {
             shortcut_recorder: ShortcutRecorder::default(),
             recording_action_id: None,
             save_feedback: SaveFeedback::None,
+            transfer_feedback: None,
+            pending_import_path: None,
             recovery_warning,
             preview_renderer: FoundationOverlayRenderer::new(),
             pending_event: None,
@@ -548,6 +622,8 @@ impl SettingsState {
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
             self.save_feedback = SaveFeedback::None;
+            self.transfer_feedback = None;
+            self.pending_import_path = None;
             log::info!(
                 target: "settings",
                 "component=settings event_code=settings_opened result_code=ok \
@@ -563,6 +639,7 @@ impl SettingsState {
             draft.accept_saved(configuration);
         }
         self.save_feedback = SaveFeedback::Saved;
+        self.transfer_feedback = None;
         self.profile_feedback = None;
         self.action_feedback = None;
         self.cancel_binding_test();
@@ -573,6 +650,55 @@ impl SettingsState {
         self.save_feedback = SaveFeedback::Error(
             "Gradial could not save these settings. Your draft is still open.".to_owned(),
         );
+    }
+
+    fn accept_imported(
+        &mut self,
+        configuration: Configuration,
+        migration: Option<ConfigurationMigration>,
+    ) {
+        let Some(draft) = &mut self.draft else {
+            return;
+        };
+        draft.replace_proposed(configuration);
+        let imported_dirty = draft.is_dirty();
+        self.section = SettingsSection::Menu;
+        self.selected_slice = 0;
+        self.selected_profile =
+            draft.proposed.application_profiles.first().map(|application| application.profile.id);
+        self.selected_action = draft.proposed.actions.first().map(|action| action.id);
+        self.profile_feedback = None;
+        self.profile_test = ProfileTestState::Idle;
+        self.cancel_binding_test();
+        self.action_feedback = None;
+        self.shortcut_recorder.cancel();
+        self.recording_action_id = None;
+        self.save_feedback = SaveFeedback::None;
+        self.pending_import_path = None;
+        let message = if imported_dirty {
+            migration.map_or_else(
+                || "Settings imported into this draft. Save changes to apply them.".to_owned(),
+                |migration| {
+                    format!(
+                        "Settings imported and updated from version {}. Save changes to apply them.",
+                        migration.from_schema
+                    )
+                },
+            )
+        } else {
+            "Settings imported. They match the settings already loaded in Gradial.".to_owned()
+        };
+        self.transfer_feedback = Some(TransferFeedback::Info(message));
+    }
+
+    fn accept_exported(&mut self) {
+        self.transfer_feedback = Some(TransferFeedback::Info("Current draft exported.".to_owned()));
+    }
+
+    fn transfer_failed(&mut self, operation: TransferOperation, error: ConfigurationTransferError) {
+        self.pending_import_path = None;
+        self.transfer_feedback =
+            Some(TransferFeedback::Error(transfer_error_message(operation, error).to_owned()));
     }
 
     #[cfg(debug_assertions)]
@@ -893,6 +1019,44 @@ impl SettingsState {
     }
 
     #[cfg(debug_assertions)]
+    fn debug_open_native_configuration_picker(&mut self, kind: PathDialogKind) {
+        let result_code = match choose_path(kind) {
+            PathDialogOutcome::Selected(_) => "selected",
+            PathDialogOutcome::Cancelled => "cancelled",
+            PathDialogOutcome::Failed => "failed",
+        };
+        let picker_kind = match kind {
+            PathDialogKind::ConfigurationImport => "config_import",
+            PathDialogKind::ConfigurationExport => "config_export",
+            _ => "unsupported",
+        };
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_native_picker result_code={result_code} \
+             config_revision={} picker_kind={picker_kind}",
+            self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_import_event(&self) -> Option<SettingsEvent> {
+        let path = AppPaths::discover().ok()?.root.join("settings-import-smoke.json");
+        (self.lifecycle == EditorLifecycle::Editing)
+            .then(|| SettingsEvent::Import(PrivatePath::new(path)))
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_export_event(&self) -> Option<SettingsEvent> {
+        let draft = self.draft.as_ref()?;
+        let path = AppPaths::discover().ok()?.root.join("settings-export-smoke.json");
+        (self.lifecycle == EditorLifecycle::Editing && validate_draft(&draft.proposed).is_ok())
+            .then(|| SettingsEvent::Export {
+                path: PrivatePath::new(path),
+                configuration: draft.proposed.clone(),
+            })
+    }
+
+    #[cfg(debug_assertions)]
     fn debug_select_sequence_action(&mut self) -> bool {
         if !self.draft.as_ref().is_some_and(|draft| {
             draft.proposed.actions.iter().any(|action| action.id == DEBUG_NESTED_SEQUENCE_ACTION_ID)
@@ -932,7 +1096,7 @@ impl SettingsState {
         (self.lifecycle == EditorLifecycle::Editing
             && draft.is_dirty()
             && validate_draft(&draft.proposed).is_ok())
-        .then(|| SettingsEvent::SaveRequested(draft.proposed.clone()))
+        .then(|| SettingsEvent::Save(draft.proposed.clone()))
     }
 
     fn cancel_binding_test(&mut self) {
@@ -1041,6 +1205,27 @@ impl SettingsState {
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F8))
         {
             self.debug_save_event()
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F13))
+        {
+            self.debug_import_event()
+        } else if !self.shortcut_recorder.is_recording()
+            && ui.ctx().input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F14))
+        {
+            self.debug_export_event()
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F15))
+        {
+            self.debug_open_native_configuration_picker(PathDialogKind::ConfigurationImport);
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F16))
+        {
+            self.debug_open_native_configuration_picker(PathDialogKind::ConfigurationExport);
+            None
         } else {
             None
         };
@@ -1050,6 +1235,7 @@ impl SettingsState {
         self.poll_binding_test(ui.ctx());
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
         if close_requested {
+            self.pending_import_path = None;
             self.cancel_binding_test();
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
@@ -1083,6 +1269,58 @@ impl SettingsState {
                 ui.selectable_value(&mut self.section, SettingsSection::Profiles, "Profiles");
                 ui.selectable_value(&mut self.section, SettingsSection::Actions, "Actions");
             });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Import settings\u{2026}").clicked() {
+                    self.transfer_feedback = None;
+                    match choose_path(PathDialogKind::ConfigurationImport) {
+                        PathDialogOutcome::Selected(path) if dirty => {
+                            self.pending_import_path = Some(PrivatePath::new(path));
+                        }
+                        PathDialogOutcome::Selected(path) => {
+                            event = Some(SettingsEvent::Import(PrivatePath::new(path)));
+                        }
+                        PathDialogOutcome::Cancelled => {}
+                        PathDialogOutcome::Failed => {
+                            self.transfer_feedback = Some(TransferFeedback::Error(
+                                "Gradial could not open the import picker.".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                let export = ui.add_enabled(
+                    validation.is_ok(),
+                    egui::Button::new("Export current draft\u{2026}"),
+                );
+                if export.clicked() {
+                    self.transfer_feedback = None;
+                    match choose_path(PathDialogKind::ConfigurationExport) {
+                        PathDialogOutcome::Selected(path) => {
+                            event = Some(SettingsEvent::Export {
+                                path: PrivatePath::new(path),
+                                configuration: draft.proposed.clone(),
+                            });
+                        }
+                        PathDialogOutcome::Cancelled => {}
+                        PathDialogOutcome::Failed => {
+                            self.transfer_feedback = Some(TransferFeedback::Error(
+                                "Gradial could not open the export picker.".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                ui.weak("Import replaces only this draft. Export includes unsaved edits.");
+            });
+            if let Some(feedback) = &self.transfer_feedback {
+                match feedback {
+                    TransferFeedback::Info(message) => {
+                        ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+                    }
+                    TransferFeedback::Error(message) => {
+                        ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+                    }
+                }
+            }
             if self.recovery_warning {
                 ui.add_space(6.0);
                 ui.colored_label(
@@ -1103,7 +1341,7 @@ impl SettingsState {
             ui.horizontal(|ui| {
                 let save_enabled = dirty && validation.is_ok();
                 if ui.add_enabled(save_enabled, egui::Button::new("Save changes")).clicked() {
-                    event = Some(SettingsEvent::SaveRequested(draft.proposed.clone()));
+                    event = Some(SettingsEvent::Save(draft.proposed.clone()));
                     self.save_feedback = SaveFeedback::None;
                 }
                 if ui.add_enabled(dirty, egui::Button::new("Discard edits")).clicked() {
@@ -1123,6 +1361,8 @@ impl SettingsState {
                     self.shortcut_recorder.cancel();
                     self.recording_action_id = None;
                     self.save_feedback = SaveFeedback::None;
+                    self.transfer_feedback = None;
+                    self.pending_import_path = None;
                 }
                 if let Err(error) = &validation {
                     ui.colored_label(Color32::from_rgb(239, 113, 113), error.message());
@@ -1146,6 +1386,39 @@ impl SettingsState {
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
             SettingsSection::Profiles => self.render_profiles_section(ui, &mut draft),
             SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
+        }
+
+        if self.pending_import_path.is_some() {
+            let mut replace_draft = false;
+            let mut keep_draft = false;
+            let frame = egui::Frame::popup(ui.style()).fill(Color32::from_rgb(28, 28, 28));
+            Modal::new(Id::new("replace_settings_draft_confirmation"))
+                .frame(frame)
+                .backdrop_color(Color32::from_black_alpha(150))
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(360.0);
+                    ui.heading("Replace the current draft?");
+                    ui.label(
+                        "Importing will replace your unsaved edits in this settings window. \
+                         Gradial will not apply anything until you save.",
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Import file").clicked() {
+                            replace_draft = true;
+                        }
+                        if ui.button("Keep current draft").clicked() {
+                            keep_draft = true;
+                        }
+                    });
+                });
+            if replace_draft {
+                if let Some(path) = self.pending_import_path.take() {
+                    event = Some(SettingsEvent::Import(path));
+                }
+            } else if keep_draft {
+                self.pending_import_path = None;
+            }
         }
 
         if self.lifecycle == EditorLifecycle::ConfirmingClose {
@@ -3187,6 +3460,46 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
     Ok(())
 }
 
+const fn transfer_error_message(
+    operation: TransferOperation,
+    error: ConfigurationTransferError,
+) -> &'static str {
+    match (operation, error) {
+        (TransferOperation::Import, ConfigurationTransferError::InvalidPath) => {
+            "Choose a settings file from an available location."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::Missing) => {
+            "That settings file no longer exists."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::Read) => {
+            "Gradial could not read that settings file."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::Parse) => {
+            "That file is not valid Gradial settings."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::UnsupportedSchema) => {
+            "That file was made by a newer, unsupported version of Gradial."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::Invalid) => {
+            "Those settings contain invalid profiles, menus, or actions."
+        }
+        (TransferOperation::Import, _) => "Gradial could not import that settings file.",
+        (TransferOperation::Export, ConfigurationTransferError::InvalidPath) => {
+            "Choose an available folder and file name for the export."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::ProtectedDestination) => {
+            "Choose another file name. Export cannot replace Gradial's active settings files."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::Invalid) => {
+            "Fix the current draft before exporting it."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::Write) => {
+            "Gradial could not write the settings export."
+        }
+        (TransferOperation::Export, _) => "Gradial could not export the current draft.",
+    }
+}
+
 fn draft_validation_error(
     configuration: &Configuration,
     error: &ConfigurationError,
@@ -3205,6 +3518,9 @@ fn draft_validation_error(
             .map_or(DraftValidationError::InvalidConfiguration, |profile| {
                 DraftValidationError::EmptyApplicationProfileName { profile }
             }),
+        ConfigurationError::EmptyMenuLabel { profile_id, slice_index } => {
+            empty_menu_label_error(configuration, *profile_id, *slice_index)
+        }
         ConfigurationError::EmptyExecutablePath { profile_id } => profile_index(*profile_id)
             .map_or(DraftValidationError::InvalidConfiguration, |profile| {
                 DraftValidationError::EmptyApplicationProfilePath { profile }
@@ -3281,6 +3597,38 @@ fn draft_validation_error(
     }
 }
 
+fn empty_menu_label_error(
+    configuration: &Configuration,
+    profile_id: Uuid,
+    slice_index: usize,
+) -> DraftValidationError {
+    if profile_id == configuration.global_profile.id {
+        return DraftValidationError::EmptyLabel {
+            index: slice_index,
+            slice_count: configuration
+                .global_profile
+                .menu
+                .resolved_slice_count()
+                .unwrap_or_default(),
+        };
+    }
+    configuration
+        .application_profiles
+        .iter()
+        .position(|application| application.profile.id == profile_id)
+        .map_or(DraftValidationError::InvalidConfiguration, |profile| {
+            DraftValidationError::EmptyApplicationLabel {
+                profile,
+                index: slice_index,
+                slice_count: configuration.application_profiles[profile]
+                    .profile
+                    .menu
+                    .resolved_slice_count()
+                    .unwrap_or_default(),
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3298,8 +3646,9 @@ mod tests {
 
     use super::{
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
-        NewActionTemplate, PayloadEditOutcome, ProfileTestState, SequenceEditorContext,
-        SequenceMetrics, SequenceMove, SettingsDraft, SettingsState, action_references,
+        NewActionTemplate, PayloadEditOutcome, PrivatePath, ProfileTestState,
+        SequenceEditorContext, SequenceMetrics, SequenceMove, SettingsDraft, SettingsEvent,
+        SettingsSection, SettingsState, TransferFeedback, action_references,
         activation_binding_display, add_executable_argument, add_sequence_step,
         apply_dialog_outcome, binding_test_selection, countdown_seconds_remaining, create_action,
         create_application_profile, delete_action, delete_application_profile, duplicate_action,
@@ -3308,8 +3657,8 @@ mod tests {
         validate_draft,
     };
     use crate::{
-        input::ActivationBindingTestResult, native_file_dialog::PathDialogOutcome,
-        platform::ProfileTestTarget,
+        configuration::ConfigurationMigration, input::ActivationBindingTestResult,
+        native_file_dialog::PathDialogOutcome, platform::ProfileTestTarget,
     };
 
     #[test]
@@ -3549,6 +3898,68 @@ mod tests {
         draft.discard();
         assert_eq!(draft.proposed.activation_binding, ActivationBinding::default());
         assert!(!draft.is_dirty());
+    }
+
+    #[test]
+    fn imported_settings_replace_only_the_private_draft_and_reset_editor_state() {
+        let original = Configuration { config_revision: 7, ..Configuration::default() };
+        let mut editor = SettingsState::new(false);
+        assert!(editor.open(&original));
+        let prior_stash_id = original.global_profile.id;
+        editor
+            .draft
+            .as_mut()
+            .expect("open draft")
+            .eight_slice_stashes
+            .insert(prior_stash_id, original.global_profile.menu.slices.clone());
+        editor.section = SettingsSection::Actions;
+        editor.selected_slice = 6;
+
+        let mut imported = Configuration { config_revision: 999, ..Configuration::default() };
+        imported.global_profile.name = "Imported privately".to_owned();
+        imported.global_profile.menu.slices[0].label = "Imported north".to_owned();
+        imported.actions.push(ActionDefinition {
+            id: Uuid::from_u128(801),
+            name: "Imported delay".to_owned(),
+            kind: ActionKind::Delay { milliseconds: 100 },
+        });
+
+        editor.accept_imported(
+            imported,
+            Some(ConfigurationMigration {
+                from_schema: 2,
+                to_schema: gradial_core::CONFIG_SCHEMA_VERSION,
+            }),
+        );
+
+        let draft = editor.draft.as_ref().expect("retained draft");
+        assert_eq!(draft.original, original);
+        assert_eq!(draft.proposed.config_revision, original.config_revision);
+        assert_eq!(draft.proposed.global_profile.name, "Imported privately");
+        assert!(draft.is_dirty());
+        assert!(draft.eight_slice_stashes.is_empty());
+        assert_eq!(editor.section, SettingsSection::Menu);
+        assert_eq!(editor.selected_slice, 0);
+        assert_eq!(editor.selected_action, Some(Uuid::from_u128(801)));
+        assert!(matches!(
+            editor.transfer_feedback,
+            Some(TransferFeedback::Info(ref message))
+                if message.contains("version 2") && message.contains("Save changes")
+        ));
+    }
+
+    #[test]
+    fn transfer_events_redact_paths_and_configuration_values_from_debug_output() {
+        let private_path = PrivatePath::new(PathBuf::from(r"C:\Private\Export.json"));
+        let mut configuration = Configuration::default();
+        configuration.global_profile.name = "Private profile value".to_owned();
+        let event = SettingsEvent::Export { path: private_path, configuration };
+
+        let debug_output = format!("{event:?}");
+
+        assert!(!debug_output.contains("Private"));
+        assert!(!debug_output.contains("Export.json"));
+        assert_eq!(debug_output, "Export(<path>, <configuration>)");
     }
 
     #[test]

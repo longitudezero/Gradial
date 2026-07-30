@@ -7,12 +7,14 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use gradial_core::{
-    ACTION_CONFIG_SCHEMA_VERSION, AppPaths, CONFIG_SCHEMA_VERSION, Configuration,
-    LEGACY_CONFIG_SCHEMA_VERSION,
+    ACTION_CONFIG_SCHEMA_VERSION, ActionPlanCompiler, AppPaths, CONFIG_SCHEMA_VERSION,
+    Configuration, LEGACY_CONFIG_SCHEMA_VERSION, ProfileResolver,
 };
+use uuid::Uuid;
 use windows::{
     Win32::Storage::FileSystem::{
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
+        ReplaceFileW,
     },
     core::PCWSTR,
 };
@@ -54,6 +56,47 @@ pub(crate) struct ConfigurationMigration {
 pub(crate) struct ConfigurationWarning {
     pub(crate) primary_error: String,
     pub(crate) backup_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImportedConfiguration {
+    pub(crate) configuration: Configuration,
+    pub(crate) migration: Option<ConfigurationMigration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum ConfigurationTransferError {
+    #[error("the selected path is not available")]
+    InvalidPath,
+    #[error("the selected file does not exist")]
+    Missing,
+    #[error("the selected file could not be read")]
+    Read,
+    #[error("the selected file is not valid Gradial settings")]
+    Parse,
+    #[error("the selected file uses an unsupported settings version")]
+    UnsupportedSchema,
+    #[error("the selected settings are invalid")]
+    Invalid,
+    #[error("the selected destination is reserved by Gradial")]
+    ProtectedDestination,
+    #[error("the settings export could not be written")]
+    Write,
+}
+
+impl ConfigurationTransferError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidPath => "invalid_path",
+            Self::Missing => "missing",
+            Self::Read => "read_failed",
+            Self::Parse => "parse_failed",
+            Self::UnsupportedSchema => "unsupported_schema",
+            Self::Invalid => "config_invalid",
+            Self::ProtectedDestination => "protected_destination",
+            Self::Write => "write_failed",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +164,52 @@ impl ConfigStore {
         proposed: &Configuration,
     ) -> Result<Configuration> {
         self.save_internal(current, proposed, SaveInterruption::None)
+    }
+
+    pub(crate) fn import_draft(
+        &self,
+        current: &Configuration,
+        path: &Path,
+    ) -> Result<ImportedConfiguration, ConfigurationTransferError> {
+        if !path.is_absolute() {
+            return Err(ConfigurationTransferError::InvalidPath);
+        }
+        if windows_paths_equal(path, &self.paths.config_temporary) {
+            return Err(ConfigurationTransferError::InvalidPath);
+        }
+        let read = read_configuration(path).map_err(ConfigurationTransferError::from)?;
+        let mut configuration = read.configuration;
+        configuration.config_revision = current.config_revision;
+        validate_complete_configuration(&configuration)?;
+        Ok(ImportedConfiguration { configuration, migration: read.migration })
+    }
+
+    pub(crate) fn export_draft(
+        &self,
+        current: &Configuration,
+        path: &Path,
+        configuration: &Configuration,
+    ) -> Result<(), ConfigurationTransferError> {
+        if !path.is_absolute() || path.file_name().is_none() {
+            return Err(ConfigurationTransferError::InvalidPath);
+        }
+        if self.is_protected_destination(path) {
+            return Err(ConfigurationTransferError::ProtectedDestination);
+        }
+        if configuration.config_revision != current.config_revision {
+            return Err(ConfigurationTransferError::Invalid);
+        }
+        validate_complete_configuration(configuration)?;
+        let mut serialized = serde_json::to_vec_pretty(configuration)
+            .map_err(|_| ConfigurationTransferError::Invalid)?;
+        serialized.push(b'\n');
+        write_export_atomically(path, &serialized)
+    }
+
+    fn is_protected_destination(&self, path: &Path) -> bool {
+        [&self.paths.config, &self.paths.config_backup, &self.paths.config_temporary]
+            .into_iter()
+            .any(|protected| windows_paths_equal(path, protected))
     }
 
     fn save_internal(
@@ -213,6 +302,19 @@ enum ConfigurationFileError {
 
     #[error("configuration file {path} cannot migrate from schema {from_schema}: {reason}")]
     InvalidMigration { path: PathBuf, from_schema: u32, reason: &'static str },
+}
+
+impl From<ConfigurationFileError> for ConfigurationTransferError {
+    fn from(error: ConfigurationFileError) -> Self {
+        match error {
+            ConfigurationFileError::Missing { .. } => Self::Missing,
+            ConfigurationFileError::Read { .. } => Self::Read,
+            ConfigurationFileError::Parse { .. } => Self::Parse,
+            ConfigurationFileError::UnsupportedSchema { .. } => Self::UnsupportedSchema,
+            ConfigurationFileError::Invalid { .. }
+            | ConfigurationFileError::InvalidMigration { .. } => Self::Invalid,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -328,6 +430,76 @@ fn write_temporary_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("could not flush temporary configuration {}", path.display()))
 }
 
+fn validate_complete_configuration(
+    configuration: &Configuration,
+) -> Result<(), ConfigurationTransferError> {
+    configuration.validate().map_err(|_| ConfigurationTransferError::Invalid)?;
+    ProfileResolver::compile(configuration).map_err(|_| ConfigurationTransferError::Invalid)?;
+    ActionPlanCompiler::from_configuration(configuration)
+        .map_err(|_| ConfigurationTransferError::Invalid)?;
+    Ok(())
+}
+
+fn write_export_atomically(
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<(), ConfigurationTransferError> {
+    let Some(parent) = destination.parent().filter(|parent| parent.is_dir()) else {
+        return Err(ConfigurationTransferError::InvalidPath);
+    };
+    let temporary = parent.join(format!(".gradial-export-{}.tmp", Uuid::new_v4().as_hyphenated()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| ConfigurationTransferError::Write)?;
+        file.write_all(bytes).map_err(|_| ConfigurationTransferError::Write)?;
+        file.sync_all().map_err(|_| ConfigurationTransferError::Write)?;
+        drop(file);
+
+        let temporary_wide = wide_path(&temporary);
+        let destination_wide = wide_path(destination);
+        // SAFETY: both buffers are live, null-terminated paths in the same
+        // directory. Windows replaces an existing file as one move.
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(temporary_wide.as_ptr()),
+                PCWSTR::from_raw(destination_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|_| ConfigurationTransferError::Write)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _removed = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    let left = normalized_windows_path(left);
+    let right = normalized_windows_path(right);
+    left.as_os_str()
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(right.as_os_str().to_string_lossy().trim_end_matches(['\\', '/']))
+}
+
+fn normalized_windows_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Ok(canonical_parent) = fs::canonicalize(parent) else {
+        return path.to_path_buf();
+    };
+    path.file_name().map_or(canonical_parent.clone(), |name| canonical_parent.join(name))
+}
+
 fn replace_configuration(
     primary: &Path,
     temporary: &Path,
@@ -397,13 +569,14 @@ mod tests {
     use std::fs;
 
     use gradial_core::{
-        ACTION_CONFIG_SCHEMA_VERSION, ActivationBinding, AppPaths, CONFIG_SCHEMA_VERSION,
-        Configuration, LEGACY_CONFIG_SCHEMA_VERSION,
+        ACTION_CONFIG_SCHEMA_VERSION, ActionDefinition, ActionKind, ActivationBinding, AppPaths,
+        CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION,
     };
+    use uuid::Uuid;
 
     use super::{
-        ConfigStore, ConfigurationMigration, ConfigurationSource, SaveInterruption,
-        read_configuration,
+        ConfigStore, ConfigurationMigration, ConfigurationSource, ConfigurationTransferError,
+        SaveInterruption, read_configuration,
     };
 
     fn store() -> (tempfile::TempDir, AppPaths, ConfigStore) {
@@ -657,6 +830,148 @@ mod tests {
                 .expect("migration warning")
                 .primary_error
                 .contains("older schemas cannot contain an activation binding")
+        );
+    }
+
+    #[test]
+    fn import_migrates_privately_resets_revision_and_preserves_literal_paths() {
+        let (_temporary_directory, paths, store) = store();
+        let current = store.load_or_initialize().expect("current configuration").configuration;
+        let mut imported = Configuration { config_revision: 999, ..Configuration::default() };
+        imported.global_profile.name = "Imported draft".to_owned();
+        imported.actions.push(ActionDefinition {
+            id: Uuid::from_u128(701),
+            name: "Literal application".to_owned(),
+            kind: ActionKind::RunExecutable {
+                executable: std::path::PathBuf::from(r"C:\Private Folder\literal.exe"),
+                arguments: vec![r"--value=C:\Keep\This Exactly".to_owned()],
+                working_directory: Some(std::path::PathBuf::from(r"C:\Private Folder")),
+            },
+        });
+        let mut value = serde_json::to_value(&imported).expect("configuration value");
+        let root = value.as_object_mut().expect("configuration object");
+        root.insert(
+            "schema_version".to_owned(),
+            serde_json::Value::from(ACTION_CONFIG_SCHEMA_VERSION),
+        );
+        root.remove("activation_binding");
+        let bytes = serde_json::to_vec_pretty(&value).expect("import bytes");
+        let source = paths.root.join("private-import.json");
+        fs::write(&source, &bytes).expect("import source");
+
+        let result = store.import_draft(&current, &source).expect("imported draft");
+
+        assert_eq!(result.configuration.config_revision, current.config_revision);
+        assert_eq!(result.configuration.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            result.migration,
+            Some(ConfigurationMigration {
+                from_schema: ACTION_CONFIG_SCHEMA_VERSION,
+                to_schema: CONFIG_SCHEMA_VERSION,
+            })
+        );
+        let ActionKind::RunExecutable { executable, arguments, working_directory } =
+            &result.configuration.actions[0].kind
+        else {
+            panic!("application action");
+        };
+        assert_eq!(executable, &std::path::PathBuf::from(r"C:\Private Folder\literal.exe"));
+        assert_eq!(arguments, &[r"--value=C:\Keep\This Exactly"]);
+        assert_eq!(
+            working_directory.as_ref(),
+            Some(&std::path::PathBuf::from(r"C:\Private Folder"))
+        );
+        assert_eq!(fs::read(&source).expect("source retained"), bytes);
+        assert_eq!(
+            read_configuration(&paths.config).expect("active config").configuration,
+            current
+        );
+    }
+
+    #[test]
+    fn import_rejects_newer_and_invalid_files_with_fixed_categories() {
+        let (_temporary_directory, paths, store) = store();
+        let current = Configuration::default();
+        let newer = paths.root.join("newer.json");
+        fs::write(&newer, format!("{{\"schema_version\":{}}}", CONFIG_SCHEMA_VERSION + 1))
+            .expect("newer file");
+        let invalid = paths.root.join("invalid.json");
+        fs::write(&invalid, b"{ private broken data").expect("invalid file");
+        let invalid_model = paths.root.join("invalid-model.json");
+        let mut invalid_configuration = Configuration::default();
+        invalid_configuration.global_profile.menu.slices[0].label = " ".to_owned();
+        fs::write(
+            &invalid_model,
+            serde_json::to_vec_pretty(&invalid_configuration).expect("invalid model bytes"),
+        )
+        .expect("invalid model");
+
+        assert_eq!(
+            store.import_draft(&current, &newer),
+            Err(ConfigurationTransferError::UnsupportedSchema)
+        );
+        assert_eq!(store.import_draft(&current, &invalid), Err(ConfigurationTransferError::Parse));
+        assert_eq!(
+            store.import_draft(&current, &invalid_model),
+            Err(ConfigurationTransferError::Invalid)
+        );
+    }
+
+    #[test]
+    fn export_writes_a_complete_atomic_snapshot_without_temporary_debris() {
+        let (_temporary_directory, paths, store) = store();
+        let mut draft = Configuration::default();
+        draft.global_profile.menu.slices[0].label = "Unsaved exported label".to_owned();
+        let destination = paths.root.join("exports").join("draft.json");
+        fs::create_dir_all(destination.parent().expect("export parent")).expect("export parent");
+
+        store.export_draft(&draft, &destination, &draft).expect("export");
+
+        assert_eq!(read_configuration(&destination).expect("exported config").configuration, draft);
+        let debris = fs::read_dir(destination.parent().expect("export parent"))
+            .expect("export directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".gradial-export-"))
+            .count();
+        assert_eq!(debris, 0);
+    }
+
+    #[test]
+    fn invalid_exports_do_not_touch_an_existing_destination() {
+        let (_temporary_directory, paths, store) = store();
+        let destination = paths.root.join("existing.json");
+        fs::write(&destination, b"keep this").expect("existing destination");
+        let mut invalid = Configuration::default();
+        invalid.global_profile.menu.slice_count = 12;
+
+        assert_eq!(
+            store.export_draft(&Configuration::default(), &destination, &invalid),
+            Err(ConfigurationTransferError::Invalid)
+        );
+        assert_eq!(fs::read(&destination).expect("existing retained"), b"keep this");
+    }
+
+    #[test]
+    fn export_cannot_replace_any_active_configuration_path() {
+        let (_temporary_directory, paths, store) = store();
+        let draft = Configuration::default();
+
+        for protected in [&paths.config, &paths.config_backup, &paths.config_temporary] {
+            assert_eq!(
+                store.export_draft(&draft, protected, &draft),
+                Err(ConfigurationTransferError::ProtectedDestination)
+            );
+        }
+        let differently_cased =
+            std::path::PathBuf::from(paths.config.as_os_str().to_string_lossy().to_uppercase());
+        assert_eq!(
+            store.export_draft(&draft, &differently_cased, &draft),
+            Err(ConfigurationTransferError::ProtectedDestination)
+        );
+        let parent_alias = paths.icons.join("..").join("config.json");
+        assert_eq!(
+            store.export_draft(&draft, &parent_alias, &draft),
+            Err(ConfigurationTransferError::ProtectedDestination)
         );
     }
 }

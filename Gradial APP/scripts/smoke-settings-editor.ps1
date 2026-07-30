@@ -310,6 +310,8 @@ $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
 $gradialDirectory = Join-Path $temporaryRoot "Gradial"
 $configPath = Join-Path $gradialDirectory "config.json"
 $backupPath = Join-Path $gradialDirectory "config.json.bak"
+$importPath = Join-Path $gradialDirectory "settings-import-smoke.json"
+$exportPath = Join-Path $gradialDirectory "settings-export-smoke.json"
 $logPath = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
 $standardOutputPath = Join-Path $temporaryRoot "gradial.stdout.log"
 $standardErrorPath = Join-Path $temporaryRoot "gradial.stderr.log"
@@ -368,6 +370,17 @@ try {
         ($configuration | ConvertTo-Json -Depth 10),
         [System.Text.UTF8Encoding]::new($false)
     )
+    $importConfiguration = (
+        $configuration | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    )
+    $importConfiguration.config_revision = 999
+    $importConfiguration.global_profile.name = "Imported settings private 9A4D"
+    $importConfiguration.global_profile.menu.slices[0].label = "Imported north private 9A4D"
+    [System.IO.File]::WriteAllText(
+        $importPath,
+        ($importConfiguration | ConvertTo-Json -Depth 10),
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     $env:LOCALAPPDATA = $temporaryRoot
     $gradial = Start-Process `
@@ -412,6 +425,99 @@ try {
         Save-WindowScreenshot `
             -Window $settingsWindow `
             -Path (Join-Path $captureDirectory "settings-editor-smoke.png")
+    }
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x7E)) {
+        throw "Could not open the native settings import chooser."
+    }
+    $pickerWindow = [IntPtr]::Zero
+    $pickerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 100
+        $pickerWindow = [GradialSettingsSmokeNative]::FindVisibleWindow(
+            [uint32]$gradial.Id,
+            "Gradial: import settings"
+        )
+    } while (
+        $pickerWindow -eq [IntPtr]::Zero -and
+        [DateTime]::UtcNow -lt $pickerDeadline
+    )
+    if ($pickerWindow -eq [IntPtr]::Zero) {
+        throw "The native Windows settings import chooser was not visible."
+    }
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 500
+        Save-WindowScreenshot `
+            -Window $pickerWindow `
+            -Path (Join-Path $workspace "captures\settings-native-import-chooser-smoke.png")
+    }
+    if (-not [GradialSettingsSmokeNative]::CloseWindow($pickerWindow)) {
+        throw "Could not cancel the native settings import chooser."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_native_picker .*result_code=cancelled .*picker_kind=config_import" `
+        -Failure "The native settings import chooser did not report safe cancellation." |
+        Out-Null
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x7F)) {
+        throw "Could not open the native settings export chooser."
+    }
+    $pickerWindow = [IntPtr]::Zero
+    $pickerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 100
+        $pickerWindow = [GradialSettingsSmokeNative]::FindVisibleWindow(
+            [uint32]$gradial.Id,
+            "Gradial: export settings"
+        )
+    } while (
+        $pickerWindow -eq [IntPtr]::Zero -and
+        [DateTime]::UtcNow -lt $pickerDeadline
+    )
+    if ($pickerWindow -eq [IntPtr]::Zero) {
+        throw "The native Windows settings export chooser was not visible."
+    }
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 500
+        Save-WindowScreenshot `
+            -Window $pickerWindow `
+            -Path (Join-Path $workspace "captures\settings-native-export-chooser-smoke.png")
+    }
+    if (-not [GradialSettingsSmokeNative]::CloseWindow($pickerWindow)) {
+        throw "Could not cancel the native settings export chooser."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_native_picker .*result_code=cancelled .*picker_kind=config_export" `
+        -Failure "The native settings export chooser did not report safe cancellation." |
+        Out-Null
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x7C)) {
+        throw "Could not import the isolated settings fixture."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_imported_to_draft .*result_code=ok .*config_revision=1 .*action_count=1 .*migration_from=2" `
+        -Failure "The settings import did not migrate into the private draft." |
+        Out-Null
+    $activeAfterImport = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    if (
+        $activeAfterImport.schema_version -ne 2 -or
+        $activeAfterImport.config_revision -ne 1 -or
+        $activeAfterImport.global_profile.menu.slices[0].label -ne "North old" -or
+        $null -ne $activeAfterImport.activation_binding
+    ) {
+        throw "Import changed the active configuration before Save."
+    }
+    $sourceAfterImport = Get-Content -LiteralPath $importPath -Raw | ConvertFrom-Json
+    if (
+        $sourceAfterImport.schema_version -ne 2 -or
+        $sourceAfterImport.config_revision -ne 999 -or
+        $sourceAfterImport.global_profile.menu.slices[0].label -ne "Imported north private 9A4D" -or
+        $null -ne $sourceAfterImport.activation_binding
+    ) {
+        throw "Import changed its source file instead of retaining literal schema-two data."
     }
 
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x70)) {
@@ -585,6 +691,44 @@ try {
         -Path $logPath `
         -Pattern "event_code=settings_debug_draft_edited .*slice_count=4" `
         -Failure "The settings draft did not accept the isolated edit." | Out-Null
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x7D)) {
+        throw "Could not export the current unsaved settings draft."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_draft_exported .*result_code=ok .*config_revision=1 .*action_count=10" `
+        -Failure "The complete unsaved settings draft was not exported." |
+        Out-Null
+    $exported = Get-Content -LiteralPath $exportPath -Raw | ConvertFrom-Json
+    $exportedApplication = $exported.actions |
+        Where-Object { $_.id -eq $executableActionId }
+    if (
+        $exported.schema_version -ne 3 -or
+        $exported.config_revision -ne 1 -or
+        $exported.global_profile.menu.slice_count -ne 4 -or
+        @($exported.actions).Count -ne 10 -or
+        $exported.activation_binding.button -ne "m5" -or
+        $exported.activation_binding.modifiers.control -ne $true -or
+        -not $exportedApplication -or
+        $exportedApplication.kind.executable -ne "C:\Windows\System32\notepad.exe" -or
+        $exportedApplication.kind.working_directory -ne "C:\Windows" -or
+        (Compare-Object `
+            @("--editor-smoke", "literal argument with spaces", "") `
+            @($exportedApplication.kind.arguments) `
+            -SyncWindow 0
+        ).Count -ne 0
+    ) {
+        throw "Export did not preserve the valid draft, revision, or literal application fields."
+    }
+    $activeAfterExport = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    if (
+        $activeAfterExport.schema_version -ne 2 -or
+        $activeAfterExport.config_revision -ne 1 -or
+        $activeAfterExport.global_profile.menu.slice_count -ne 8
+    ) {
+        throw "Export changed the active configuration before Save."
+    }
 
     if (-not [GradialSettingsSmokeNative]::CloseWindow($settingsWindow)) {
         throw "Could not request a native close of the dirty settings window."
@@ -834,17 +978,22 @@ try {
     $logText = Get-Content -LiteralPath $logPath -Raw
     foreach ($privateValue in @(
         $profileTestTitle,
+        "Imported settings private 9A4D",
+        "Imported north private 9A4D",
+        "settings-import-smoke.json",
+        "settings-export-smoke.json",
         "C:\Windows\System32\notepad.exe",
         "Notepad"
     )) {
         if ($logText.Contains($privateValue)) {
-            throw "The profile tester wrote a private captured value to Gradial's log."
+            throw "The settings editor wrote a private imported or captured value to Gradial's log."
         }
     }
 
     Write-Host (
         "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
-        "advanced profiles, all action editors, schema-three save, and live reload."
+        "private import, draft export, advanced profiles, all action editors, " +
+        "schema-three save, and live reload."
     )
 }
 catch {

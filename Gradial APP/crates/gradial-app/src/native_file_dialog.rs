@@ -9,8 +9,9 @@ use windows::{
         },
         UI::Shell::{
             Common::COMDLG_FILTERSPEC, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
-            FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FOS_STRICTFILETYPES, FileOpenDialog, IFileDialog,
-            IFileOpenDialog, SIGDN_FILESYSPATH,
+            FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FOS_STRICTFILETYPES,
+            FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog,
+            SIGDN_FILESYSPATH,
         },
     },
     core::{HRESULT, PCWSTR, w},
@@ -21,6 +22,8 @@ pub(crate) enum PathDialogKind {
     File,
     Folder,
     Executable,
+    ConfigurationImport,
+    ConfigurationExport,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -55,6 +58,13 @@ fn choose_path_on_sta_thread(kind: PathDialogKind) -> PathDialogOutcome {
 }
 
 fn show_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
+    if kind == PathDialogKind::ConfigurationExport {
+        return show_save_dialog();
+    }
+    show_open_dialog(kind)
+}
+
+fn show_open_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
     // SAFETY: COM is initialized for this dedicated STA thread. The returned
     // interface and all derived shell items remain on this thread.
     let dialog: IFileOpenDialog =
@@ -66,7 +76,7 @@ fn show_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
     } else {
         options |= FOS_FILEMUSTEXIST;
     }
-    if kind == PathDialogKind::Executable {
+    if matches!(kind, PathDialogKind::Executable | PathDialogKind::ConfigurationImport) {
         options |= FOS_STRICTFILETYPES;
     }
 
@@ -81,6 +91,8 @@ fn show_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
                 pszSpec: w!("*.exe"),
             }])?;
             file_dialog.SetFileTypeIndex(1)?;
+        } else if kind == PathDialogKind::ConfigurationImport {
+            set_configuration_filter(file_dialog)?;
         }
         dialog.Show(None)?;
     }
@@ -96,11 +108,59 @@ fn show_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
     Ok(path_result?)
 }
 
+fn show_save_dialog() -> windows::core::Result<PathBuf> {
+    // SAFETY: COM is initialized for this dedicated STA thread. The returned
+    // interface and all derived shell items remain on this thread.
+    let dialog: IFileSaveDialog =
+        unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)? };
+    let file_dialog: &IFileDialog = &dialog;
+    let options = FOS_FORCEFILESYSTEM
+        | FOS_NOCHANGEDIR
+        | FOS_PATHMUSTEXIST
+        | FOS_OVERWRITEPROMPT
+        | FOS_STRICTFILETYPES;
+
+    // SAFETY: the dialog interface is valid on this STA thread, and all
+    // strings and filter specifications live through their synchronous calls.
+    unsafe {
+        file_dialog.SetOptions(options)?;
+        file_dialog.SetTitle(dialog_title(PathDialogKind::ConfigurationExport))?;
+        set_configuration_filter(file_dialog)?;
+        file_dialog.SetDefaultExtension(w!("json"))?;
+        file_dialog.SetFileName(w!("gradial-settings.json"))?;
+        dialog.Show(None)?;
+    }
+
+    // SAFETY: GetResult returns an item owned by the dialog result. The
+    // display-name buffer is allocated with the COM task allocator and freed
+    // exactly once after conversion.
+    let display_name = unsafe { file_dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)? };
+    let path_result = unsafe { display_name.to_string() }.map(PathBuf::from);
+    unsafe {
+        CoTaskMemFree(Some(display_name.0.cast()));
+    }
+    Ok(path_result?)
+}
+
+unsafe fn set_configuration_filter(file_dialog: &IFileDialog) -> windows::core::Result<()> {
+    // SAFETY: the caller guarantees the COM interface is valid on its owning
+    // STA thread, and these static strings outlive the synchronous calls.
+    unsafe {
+        file_dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+            pszName: w!("Gradial settings"),
+            pszSpec: w!("*.json"),
+        }])?;
+        file_dialog.SetFileTypeIndex(1)
+    }
+}
+
 const fn dialog_title(kind: PathDialogKind) -> PCWSTR {
     match kind {
         PathDialogKind::File => w!("Gradial: choose a file"),
         PathDialogKind::Folder => w!("Gradial: choose a folder"),
         PathDialogKind::Executable => w!("Gradial: choose an application"),
+        PathDialogKind::ConfigurationImport => w!("Gradial: import settings"),
+        PathDialogKind::ConfigurationExport => w!("Gradial: export settings"),
     }
 }
 
@@ -143,7 +203,13 @@ mod tests {
 
     #[test]
     fn every_dialog_kind_has_a_nonempty_title() {
-        for kind in [PathDialogKind::File, PathDialogKind::Folder, PathDialogKind::Executable] {
+        for kind in [
+            PathDialogKind::File,
+            PathDialogKind::Folder,
+            PathDialogKind::Executable,
+            PathDialogKind::ConfigurationImport,
+            PathDialogKind::ConfigurationExport,
+        ] {
             assert!(!dialog_title(kind).is_null());
         }
     }
