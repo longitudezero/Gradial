@@ -62,6 +62,12 @@ impl GradialApp {
     ) -> Result<Self> {
         let config_revision = configuration.config_revision;
         let icons = Arc::new(IconManager::new(config_store.icon_directory()));
+        let icon_protection = config_store.icon_protection_snapshot(&configuration, None);
+        icons.reconcile_storage(
+            &icon_protection.references,
+            icon_protection.quarantine_allowed,
+            config_revision,
+        );
         icons.preload_configuration(&creation_context.egui_ctx, &configuration);
         let profile_resolver = Arc::new(
             ProfileResolver::compile(&configuration)
@@ -357,6 +363,7 @@ impl GradialApp {
         self.action_plan_compiler = action_plan_compiler;
         self.config_revision = saved.config_revision;
         self.configuration = saved.clone();
+        self.reconcile_icon_storage(None);
         self.overlay_pool.set_configuration(saved.config_revision, saved.appearance);
         self.action_executor.set_config_revision(saved.config_revision);
         context.request_repaint();
@@ -509,6 +516,8 @@ impl GradialApp {
                 match self.icons.import(context, path.as_path(), self.config_revision) {
                     Ok(icon) => {
                         self.settings.accept_icon_import(profile_id, slice_index, icon);
+                        let draft = self.settings.proposed_configuration();
+                        self.reconcile_icon_storage(draft.as_ref());
                     }
                     Err(error) => {
                         self.settings.icon_import_failed(profile_id, slice_index, error);
@@ -529,7 +538,17 @@ impl GradialApp {
             SettingsEvent::Export { path, configuration } => {
                 self.export_settings_draft(context, path.as_path(), &configuration);
             }
+            SettingsEvent::Closed => self.reconcile_icon_storage(None),
         }
+    }
+
+    fn reconcile_icon_storage(&self, draft: Option<&Configuration>) {
+        let protection = self.config_store.icon_protection_snapshot(&self.configuration, draft);
+        self.icons.reconcile_storage(
+            &protection.references,
+            protection.quarantine_allowed,
+            self.config_revision,
+        );
     }
 
     fn import_settings_draft(&mut self, context: &eframe::egui::Context, path: &Path) {
@@ -538,6 +557,7 @@ impl GradialApp {
                 let migration_from =
                     imported.migration.map_or(0, |migration| migration.from_schema);
                 let action_count = imported.configuration.actions.len();
+                self.reconcile_icon_storage(Some(&imported.configuration));
                 self.icons.refresh_configuration(context, &imported.configuration);
                 self.settings.accept_imported(
                     imported.configuration,

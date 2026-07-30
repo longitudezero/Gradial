@@ -314,6 +314,12 @@ $importPath = Join-Path $gradialDirectory "settings-import-smoke.json"
 $exportDirectory = Join-Path $gradialDirectory "settings-export-smoke"
 $exportPath = Join-Path $exportDirectory "settings.json"
 $iconSourcePath = Join-Path $gradialDirectory "settings-icon-smoke.png"
+$managedIconDirectory = Join-Path $gradialDirectory "icons"
+$orphanIconId = "67726164-6961-4c00-8000-000000000930"
+$orphanManagedPath = Join-Path $managedIconDirectory ($orphanIconId + ".png")
+$orphanQuarantinePath = Join-Path (
+    Join-Path $managedIconDirectory "quarantine"
+) ($orphanIconId + ".png")
 $logPath = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
 $standardOutputPath = Join-Path $temporaryRoot "gradial.stdout.log"
 $standardErrorPath = Join-Path $temporaryRoot "gradial.stderr.log"
@@ -404,6 +410,8 @@ try {
         $iconGraphics.Dispose()
         $iconBitmap.Dispose()
     }
+    New-Item -ItemType Directory -Path $managedIconDirectory -Force | Out-Null
+    Copy-Item -LiteralPath $iconSourcePath -Destination $orphanManagedPath
 
     $env:LOCALAPPDATA = $temporaryRoot
     $gradial = Start-Process `
@@ -420,6 +428,19 @@ try {
         -Path $logPath `
         -Pattern "event_code=overlay_pool_ready .*config_revision=1" `
         -Failure "Gradial did not reach its initial ready state." | Out-Null
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=icon_storage_reconciled .*result_code=ok .*protected_count=0 .*restored_count=0 .*quarantined_count=1 .*quarantine_allowed=true" `
+        -Failure "Startup did not quarantine the isolated unreferenced managed icon." |
+        Out-Null
+    if (
+        (Test-Path -LiteralPath $orphanManagedPath) -or
+        -not (Test-Path -LiteralPath $orphanQuarantinePath -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $orphanQuarantinePath -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $iconSourcePath -Algorithm SHA256).Hash
+    ) {
+        throw "Quarantine did not recoverably move the exact orphan PNG bytes."
+    }
 
     Wait-LogPattern `
         -Path $logPath `
@@ -571,7 +592,7 @@ try {
         -Failure "The icon importer did not validate, copy, and cache the PNG fixture." |
         Out-Null
     $managedIcons = @(
-        Get-ChildItem -LiteralPath (Join-Path $gradialDirectory "icons") -Filter "*.png"
+        Get-ChildItem -LiteralPath $managedIconDirectory -Filter "*.png"
     )
     if ($managedIcons.Count -ne 1) {
         throw "The icon importer did not create exactly one managed PNG source."
@@ -1100,8 +1121,9 @@ try {
 
     Write-Host (
         "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
-        "private import, appearance and icon previews, managed PNG import, portable draft " +
-        "export, advanced profiles, all action editors, schema-five save, and live reload."
+        "recoverable orphan quarantine, private import, appearance and icon previews, " +
+        "managed PNG import, portable draft export, advanced profiles, all action editors, " +
+        "schema-five save, and live reload."
     )
 }
 catch {

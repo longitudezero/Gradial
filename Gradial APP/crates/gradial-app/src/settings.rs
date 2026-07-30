@@ -497,6 +497,7 @@ pub(crate) enum SettingsEvent {
     Import(PrivatePath),
     Export { path: PrivatePath, configuration: Configuration },
     ImportIcon { path: PrivatePath, profile_id: Uuid, slice_index: usize },
+    Closed,
 }
 
 impl std::fmt::Debug for SettingsEvent {
@@ -511,6 +512,7 @@ impl std::fmt::Debug for SettingsEvent {
                 .field("profile_id", profile_id)
                 .field("slice_index", slice_index)
                 .finish(),
+            Self::Closed => formatter.write_str("Closed"),
         }
     }
 }
@@ -562,6 +564,15 @@ impl SettingsEditor {
 
     pub(crate) fn is_open(&self) -> bool {
         self.state().lifecycle != EditorLifecycle::Closed
+    }
+
+    pub(crate) fn proposed_configuration(&self) -> Option<Configuration> {
+        let state = self.state();
+        if state.lifecycle == EditorLifecycle::Closed {
+            None
+        } else {
+            state.draft.as_ref().map(|draft| draft.proposed.clone())
+        }
     }
 
     pub(crate) fn accept_saved(&self, configuration: &Configuration) {
@@ -1417,7 +1428,7 @@ impl SettingsState {
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
             match self.request_close() {
-                CloseOutcome::Closed => return None,
+                CloseOutcome::Closed => return Some(SettingsEvent::Closed),
                 CloseOutcome::ConfirmationShown => {
                     ui.ctx().send_viewport_cmd(ViewportCommand::CancelClose);
                 }
@@ -1637,6 +1648,7 @@ impl SettingsState {
                 self.profile_test = ProfileTestState::Idle;
                 self.cancel_binding_test();
                 self.lifecycle = EditorLifecycle::Closed;
+                event = Some(SettingsEvent::Closed);
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                 log::info!(
                     target: "settings",

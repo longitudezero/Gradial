@@ -13,8 +13,8 @@ gesture or action boundaries:
 - a built-in placeholder for missing or damaged managed assets.
 
 Portable export-side icon copying was completed by the later
-`milestone-2-portable-icon-transfer-results.md` slice. Managed-asset garbage
-collection remains separate follow-up work.
+`milestone-2-portable-icon-transfer-results.md` slice. Recoverable managed
+quarantine was completed by `milestone-2-icon-quarantine-results.md`.
 
 ## Schema-five model and migration
 
@@ -68,7 +68,8 @@ temporary file in the managed icon directory, flush it, and rename it to its
 final managed name. The draft receives the reference only after that completes.
 Discarding or removing an assignment deliberately leaves the managed file
 alone because another profile, the saved configuration, or a backup can still
-reference it.
+reference it. A later reconciliation slice moves the file only after all of
+those protection sources stop referencing it.
 
 ## Load-time renderer cache
 
@@ -162,7 +163,6 @@ exact disposable tree and process created by the harness.
 ## Remaining boundary
 
 Portable export/import is now covered by
-`milestone-2-portable-icon-transfer-results.md`. Safe reclamation of managed
-assets still requires reference analysis across the active configuration and
-backup, so it remains intentionally deferred rather than deleting files during
-draft edits.
+`milestone-2-portable-icon-transfer-results.md`. Recoverable reference-aware
+quarantine is covered by `milestone-2-icon-quarantine-results.md`; permanent
+deletion remains intentionally deferred.

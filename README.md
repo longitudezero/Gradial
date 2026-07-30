@@ -199,6 +199,9 @@ icon, and select directions directly in the live radial preview. Icon imports
 accept PNG or SVG sources no larger than 256 KiB or 512×512 logical pixels,
 then copy them under `%LOCALAPPDATA%\Gradial\icons`. Missing or damaged managed
 files render a built-in placeholder instead of blocking the radial menu.
+Gradial protects every icon referenced by the active settings, backup, or open
+draft. Exact unreferenced UUID-named assets move into a recoverable
+`icons\quarantine` directory; unknown files are never touched.
 The **Profiles** tab creates an application profile
 by choosing an `.exe`, copies the current Global menu as an independent
 starting point, and supports rename, priority, duplication, deletion, complete
@@ -318,3 +321,5 @@ recorded in
 [`Documentation/milestone-2-custom-icons-results.md`](Documentation/milestone-2-custom-icons-results.md).
 Portable icon export/import and collision-handling results are recorded in
 [`Documentation/milestone-2-portable-icon-transfer-results.md`](Documentation/milestone-2-portable-icon-transfer-results.md).
+Recoverable managed-icon quarantine results are recorded in
+[`Documentation/milestone-2-icon-quarantine-results.md`](Documentation/milestone-2-icon-quarantine-results.md).

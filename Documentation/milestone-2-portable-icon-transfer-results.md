@@ -86,8 +86,9 @@ the import before the proposed draft is replaced.
 If a later asset fails, managed files created earlier in that import are
 removed. Existing managed assets are never modified. As with direct icon
 selection, a successful import may leave newly copied but unreferenced assets
-if the user later discards the draft; safe garbage collection requires active
-and backup reference analysis and remains deferred.
+if the user later discards the draft. The later
+`milestone-2-icon-quarantine-results.md` slice now moves those files into
+recoverable quarantine after active, backup, and draft reference analysis.
 
 ## Cache and Settings behavior
 
@@ -145,6 +146,6 @@ New coverage verifies:
 ## Remaining boundary
 
 Portable schema-five settings and icons are complete. The remaining icon
-storage task is conservative garbage collection across the active
-configuration, backup, and open draft. It must never reclaim an asset still
-needed for recovery, so it remains a separate bounded slice.
+storage task at this checkpoint was conservative reference-aware cleanup. The
+later `milestone-2-icon-quarantine-results.md` slice implements recoverable
+quarantine; permanent deletion remains deferred.

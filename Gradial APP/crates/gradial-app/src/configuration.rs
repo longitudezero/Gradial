@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Write},
     os::windows::ffi::OsStrExt,
@@ -9,7 +10,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use gradial_core::{
     ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,
     APPEARANCE_CONFIG_SCHEMA_VERSION, ActionPlanCompiler, AppPaths, Appearance,
-    CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION, ProfileResolver,
+    CONFIG_SCHEMA_VERSION, Configuration, IconReference, LEGACY_CONFIG_SCHEMA_VERSION,
+    ProfileResolver,
 };
 use uuid::Uuid;
 use windows::{
@@ -77,6 +79,12 @@ pub(crate) struct PortableIconSummary {
     pub(crate) bundle_present: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IconProtectionSnapshot {
+    pub(crate) references: HashSet<IconReference>,
+    pub(crate) quarantine_allowed: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ConfigurationTransferError {
     #[error("the selected path is not available")]
@@ -139,6 +147,27 @@ impl ConfigStore {
 
     pub(crate) fn icon_directory(&self) -> PathBuf {
         self.paths.icons.clone()
+    }
+
+    pub(crate) fn icon_protection_snapshot(
+        &self,
+        active: &Configuration,
+        draft: Option<&Configuration>,
+    ) -> IconProtectionSnapshot {
+        let mut references =
+            configuration_icon_references(active).into_iter().collect::<HashSet<_>>();
+        if let Some(draft) = draft {
+            references.extend(configuration_icon_references(draft));
+        }
+        let quarantine_allowed = match read_configuration(&self.paths.config_backup) {
+            Ok(backup) => {
+                references.extend(configuration_icon_references(&backup.configuration));
+                true
+            }
+            Err(ConfigurationFileError::Missing { .. }) => true,
+            Err(_) => false,
+        };
+        IconProtectionSnapshot { references, quarantine_allowed }
     }
 
     pub(crate) fn load_or_initialize(&self) -> Result<LoadedConfiguration> {
@@ -1493,6 +1522,41 @@ mod tests {
         let second = store.import_draft(&current, &source).expect("repeat import");
         assert_eq!(second.icons.copied, 0);
         assert_eq!(second.icons.reused, 1);
+    }
+
+    #[test]
+    fn icon_protection_unions_active_backup_and_draft_and_disables_cleanup_for_bad_backup() {
+        let (_temporary_directory, paths, store) = store();
+        let active_reference =
+            IconReference { asset_id: Uuid::from_u128(0x510), format: IconFormat::Png };
+        let backup_reference =
+            IconReference { asset_id: Uuid::from_u128(0x511), format: IconFormat::Svg };
+        let draft_reference =
+            IconReference { asset_id: Uuid::from_u128(0x512), format: IconFormat::Png };
+        let mut active = Configuration::default();
+        active.global_profile.menu.slices[0].icon = Some(active_reference);
+        let mut backup = Configuration::default();
+        backup.global_profile.menu.slices[0].icon = Some(backup_reference);
+        let mut draft = active.clone();
+        draft.global_profile.menu.slices[1].icon = Some(draft_reference);
+        fs::write(&paths.config_backup, serde_json::to_vec_pretty(&backup).expect("backup JSON"))
+            .expect("backup");
+
+        let complete = store.icon_protection_snapshot(&active, Some(&draft));
+
+        assert!(complete.quarantine_allowed);
+        assert_eq!(
+            complete.references,
+            [active_reference, backup_reference, draft_reference].into_iter().collect()
+        );
+
+        fs::write(&paths.config_backup, b"damaged backup").expect("damaged backup");
+        let conservative = store.icon_protection_snapshot(&active, Some(&draft));
+        assert!(!conservative.quarantine_allowed);
+        assert_eq!(
+            conservative.references,
+            [active_reference, draft_reference].into_iter().collect()
+        );
     }
 
     #[test]

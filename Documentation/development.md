@@ -99,6 +99,8 @@ slices, and the current bounded Milestone 2 slices establish:
   the production renderer, with immediate post-save application.
 - Per-slice managed PNG/SVG icons with bounded import validation, load-time
   texture caching, production-preview rendering, and non-fatal placeholders.
+- Reference-aware managed-icon restoration and recoverable quarantine across
+  active, backup, and open-draft settings.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -153,6 +155,7 @@ On first run, Gradial creates:
     config.json
     onboarding-v1.json
     icons\
+        quarantine\
     logs\
 ```
 
@@ -206,6 +209,17 @@ it into the adjacent `icons` directory through a flushed temporary file.
 Existing byte-identical assets are reused; conflicting same-ID files reject the
 export without touching the selected JSON. Files and a directory created by a
 failed attempt are removed, while unrelated existing files are never deleted.
+
+Managed-icon reconciliation builds one protected set from the active
+configuration, a valid backup, and the complete open draft when present. A
+missing backup is an empty contribution; an unreadable or invalid backup
+disables quarantine entirely. Before renderer preload, valid protected assets
+found under `icons\quarantine` are restored to the managed root. Only regular
+files whose names exactly match canonical lowercase
+`<non-nil-UUID>.png|svg` are candidates for quarantine. Directories,
+reparse/symlink entries, temporary files, noncanonical names, and all other
+files remain untouched. Existing quarantine destinations are never
+overwritten, and no quarantined file is permanently deleted.
 
 Configuration is parsed and completely validated before input starts. Profile
 regular expressions are compiled into the retained resolver at load rather
@@ -427,8 +441,10 @@ sources over 256 KiB, dimensions outside 1–512 logical pixels, invalid
 PNG/SVG data, and SVG document/embedded-image/text features. Accepted bytes
 are flushed into `%LOCALAPPDATA%\Gradial\icons` under a generated UUID name;
 the configuration never stores a selected path. Removing or discarding an
-assignment does not delete managed files because another profile or saved
-backup may still reference them.
+assignment never deletes managed files. Reconciliation retains every reference
+from the active configuration, backup, and open draft; once no protected
+configuration needs an exact managed asset, it moves to the recoverable
+quarantine.
 Eight-to-four conversion retains the four cardinal slices. Diagonal slices are
 stashed while the draft remains open and restored if the user switches back;
 expanding a configuration that was already saved with four slices creates the
@@ -781,7 +797,10 @@ vectors, and registers egui textures. The same cache is shared by every
 prewarmed display renderer and the Settings preview. A Settings import or icon
 choice extends that cache while still editing the private draft; saving
 recompiles the complete menu but never decodes an icon on activation. A cached
-placeholder is retried after portable import restores its managed source.
+placeholder is retried after portable import or quarantine recovery restores
+its managed source. Reconciliation runs before the startup preload and after
+successful icon imports, configuration saves, or Settings close/discard
+events. Quarantining an unprotected asset also drops its unused texture handle.
 
 `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, and `WM_SETTINGCHANGE` for the work area
 invalidate the pool. Monitoring is deliberately disabled while windows are
@@ -994,7 +1013,10 @@ confirms that neither its private path sentinel nor its configured argument
 appears in the local log. The isolated configuration is always removed.
 `smoke-settings-editor.ps1` starts the debug executable with a private
 schema-two eight-slice configuration and opens its real settings viewport. It
-opens and safely cancels the real native JSON import/export choosers, migrates
+seeds one canonical unreferenced PNG in managed storage, requires startup to
+move it into quarantine, and compares SHA-256 hashes to prove the recoverable
+move preserved its bytes. It opens and safely cancels the real native JSON
+import/export choosers, migrates
 a schema-two fixture into the private draft, and confirms that neither the
 source nor active `config.json` changes. It edits the activation draft to exact
 Ctrl+M5, arms the safe tester, submits a
