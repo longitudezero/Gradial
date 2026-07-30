@@ -37,8 +37,8 @@ slices, and the current bounded Milestone 2 slices establish:
   Explorer restart.
 - Persistent per-monitor geometry caches and bounded 60/35/50 ms
   open/selection/close animation state.
-- A validated schema-four configuration with safe in-memory schema-one,
-  schema-two, and schema-three migration plus atomic primary/backup
+- A validated schema-five configuration with safe in-memory schema-one through
+  schema-four migration plus atomic primary/backup
   replacement.
 - Complete immutable target/display/modifier identity for every invocation.
 - A compiled, deterministic application-profile resolver with explanation
@@ -96,11 +96,13 @@ slices, and the current bounded Milestone 2 slices establish:
   and cancellation through an action-free production interaction.
 - Draft-safe accent, label-theme, and size-preset appearance editing through
   the production renderer, with immediate post-save application.
+- Per-slice managed PNG/SVG icons with bounded import validation, load-time
+  texture caching, production-preview rendering, and non-fatal placeholders.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
 profiles with their independent menus and complete matching rules. Required
-onboarding and v1 appearance are complete; custom icons are not exposed yet. A release logs the
+onboarding, v1 appearance, and per-slice custom icons are complete. A release logs the
 chosen slice, compiles its assigned plan, and submits it to the coordinator.
 Every schema-two action family can execute through its bounded backend.
 
@@ -153,10 +155,11 @@ On first run, Gradial creates:
     logs\
 ```
 
-`config.json` starts at schema 4 and revision 1 with the default unmodified M4
+`config.json` starts at schema 5 and revision 1 with the default unmodified M4
 binding, original blue/light/standard appearance, stable global profile,
 eight-slice menu, and empty action catalog.
-Each menu slice has an optional action UUID. A successful later replacement
+Each menu slice has an optional action UUID and optional managed icon reference.
+A successful later replacement
 preserves the previous valid primary as `config.json.bak`; `config.json.tmp`
 exists only during a save.
 
@@ -169,8 +172,9 @@ successful completion.
 Existing schema-one files are accepted only when they contain no schema-two
 action fields. Gradial adds the action, binding, and appearance defaults in
 memory. Schema-two files gain binding and appearance; schema-three files gain
-only appearance. All paths validate the complete schema-four model and leave
-the original bytes untouched.
+appearance. Schema-one through schema-four all gain no icon assignments. Every
+path validates the complete schema-five model and leaves the original bytes
+untouched.
 Migration is persisted only through a later explicit, successful save. This
 prevents startup from silently rewriting either a valid legacy file or a file
 containing ambiguous fields.
@@ -182,14 +186,16 @@ running configuration, and persistent primary remain untouched. A dirty editor
 requires an explicit **Import file** choice before its proposed draft is
 replaced.
 
-Settings export validates the current proposed draft, serializes schema-four
+Settings export validates the current proposed draft, serializes schema-five
 JSON beside a uniquely named temporary file in the selected directory, flushes
 it, and atomically moves it over the selected destination. It may include
 unsaved edits but never changes the active revision. Gradial's three active
 configuration paths and both onboarding-marker paths are protected export
 destinations. Import and export preserve literal action
 paths, arguments, labels, and text; diagnostics expose only fixed result
-categories rather than selected paths or configuration values.
+categories rather than selected paths or configuration values. Portable export
+of the referenced managed icon files remains separate, so the current JSON
+export does not copy an adjacent `icons` directory.
 
 Configuration is parsed and completely validated before input starts. Profile
 regular expressions are compiled into the retained resolver at load rather
@@ -336,8 +342,9 @@ written to routine logs.
 
 The configuration model contains one global profile and zero or more
 application profiles. Every profile has an immutable UUID, name, and complete
-four- or eight-slice menu. Each slice contains its visible label and an
-optional action UUID. Application rules require an executable path and may add
+four- or eight-slice menu. Each slice contains its visible label, an optional
+action UUID, and an optional path-safe icon reference consisting only of a UUID
+and closed PNG/SVG format. Application rules require an executable path and may add
 window-class and title-regex predicates with an explicit priority from 0
 through 100.
 
@@ -354,8 +361,8 @@ immutable copy of that profile's complete menu. The interaction log records
 the explanation without target path, class, title, or menu-label content.
 
 The selected menu is frozen with the active invocation. Its slice count drives
-gesture recognition and chooses the matching renderer cache; its label and
-action-reference lists remain paired. A title change after activation
+gesture recognition and chooses the matching renderer cache; its label,
+action-reference, and icon-reference lists remain paired. A title change after activation
 therefore cannot switch profiles or produce a gesture/render/action mismatch.
 
 ## Settings editor and live reload
@@ -383,7 +390,7 @@ executor, and it never logs target-window data. Leaving the tab, discarding,
 saving, or closing disarms the tester; a release already paired with a
 consumed down remains suppressed.
 
-The **Appearance** tab edits one global schema-four value shared by Global and
+The **Appearance** tab edits one global schema-five value shared by Global and
 all application profiles. The accent is stored as three bounded RGB bytes.
 Label theme is a closed light/dark choice, and size is a closed
 compact/standard/large choice. The original `(124, 154, 255)` accent, light
@@ -403,7 +410,15 @@ complete configuration, updates the existing prewarmed pool's appearance, and
 restarts input against the new revision without rebuilding geometry caches.
 
 The **Menu** tab can switch between four and eight clockwise directions, edit
-each label, and assign or clear any action in the validated catalog.
+each label, assign or clear any action in the validated catalog, and choose,
+replace, or remove one PNG/SVG icon per direction. The native icon chooser
+accepts only those two source types. Import rejects empty or unreadable files,
+sources over 256 KiB, dimensions outside 1–512 logical pixels, invalid
+PNG/SVG data, and SVG document/embedded-image/text features. Accepted bytes
+are flushed into `%LOCALAPPDATA%\Gradial\icons` under a generated UUID name;
+the configuration never stores a selected path. Removing or discarding an
+assignment does not delete managed files because another profile or saved
+backup may still reference them.
 Eight-to-four conversion retains the four cardinal slices. Diagonal slices are
 stashed while the draft remains open and restored if the user switches back;
 expanding a configuration that was already saved with four slices creates the
@@ -413,7 +428,10 @@ equivalent across conversions.
 The clickable live preview uses `FoundationOverlayRenderer` and
 `ResolvedMenu`, so it shares production geometry, label placement, slice
 ordering, and selection rendering. It does not contain a second gesture or
-layout implementation.
+layout implementation. Directions with icons render a fitted 30-DIP image and
+a smaller outward label; iconless directions preserve the original label
+layout. A missing or damaged managed source renders the bounded built-in
+question-mark placeholder.
 
 The **Profiles** tab lists application-specific profiles separately from the
 Global fallback. **New profile** opens the native application chooser and adds
@@ -747,6 +765,13 @@ chooses a complete contrast palette, and the size preset multiplies cached
 coordinates at paint time. None of these choices invalidates the prewarmed
 four/eight cache pair or enters the interaction thread's gesture calculations.
 
+The icon manager enumerates the complete configuration before interaction
+starts, enforces the source bounds again, decodes PNG pixels or rasterizes SVG
+vectors, and registers egui textures. The same cache is shared by every
+prewarmed display renderer and the Settings preview. A Settings import or icon
+choice extends that cache while still editing the private draft; saving
+recompiles the complete menu but never decodes an icon on activation.
+
 `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, and `WM_SETTINGCHANGE` for the work area
 invalidate the pool. Monitoring is deliberately disabled while windows are
 being placed, because initial PMv2 placement can itself emit DPI messages. A
@@ -964,8 +989,10 @@ source nor active `config.json` changes. It edits the activation draft to exact
 Ctrl+M5, arms the safe tester, submits a
 native hold/east-flick/release gesture, and requires that no production action
 run during the test. It also edits the appearance draft to RGB `(224, 96, 72)`,
-dark labels, and large size, and optionally captures the real production
-preview with its contrast backings. It creates and
+dark labels, and large size. It generates a 48×48 transparent PNG, imports it
+through the real managed storage/cache path, assigns it to north, and
+optionally captures the real production preview with the fitted icon and
+contrast backings. It creates and
 persists every leaf-action type plus a base and nested sequence, exercises
 duplication, unreferenced deletion, sequence addition/removal/reordering, and
 records an exact left-Ctrl+F14 combination through native key messages. It
@@ -981,15 +1008,17 @@ harness opens the real native application chooser, observes its window, and
 cancels it without changing the draft. It then selects the nested sequence and
 observes four expanded steps, depth two, and 275 ms total Delay before
 converting the Global draft to four slices. It exports that complete unsaved
-draft, verifies schema four at the unchanged revision with the exact
-appearance, literal executable path, working folder, and argument rows, and
+draft, verifies schema five at the unchanged revision with the exact
+appearance, icon reference, literal executable path, working folder, and
+argument rows, and
 again confirms that the active configuration is untouched. After the guarded close it requires
 revision 2 on disk with the exact complete profile rule, priority, independent
-menu, action payloads, ordered sequence UUIDs, Ctrl+M5 binding, and appearance;
+menu, action payloads, ordered sequence UUIDs, Ctrl+M5 binding, appearance, and
+the one shared managed icon source;
 the old profile-free schema-two revision remains in `config.json.bak`. It then
 requires the renderer appearance update and a fresh Ctrl+M5 invocation to
 freeze the saved binding and use the reloaded Global menu. Optional screenshots
-cover appearance, activation, the menu,
+cover appearance, icons, activation, the menu,
 advanced profile tester, payload, sequence, shortcut-recorder, Windows chooser,
 JSON import/export choosers, and confirmation surfaces. The fixture never reads or writes the user's
 Gradial configuration.

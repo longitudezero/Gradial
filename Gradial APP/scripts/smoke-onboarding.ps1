@@ -282,7 +282,7 @@ try {
             }
     )
     $configuration = [ordered]@{
-        schema_version = 4
+        schema_version = 5
         config_revision = 1
         activation_binding = [ordered]@{
             button = "m4"

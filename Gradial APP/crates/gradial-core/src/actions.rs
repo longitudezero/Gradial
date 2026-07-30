@@ -847,7 +847,7 @@ mod tests {
         let missing = Uuid::from_u128(99);
         let mut configuration = Configuration::default();
         configuration.global_profile.menu.slices[2] =
-            MenuSlice { label: "Missing".to_owned(), action_id: Some(missing) };
+            MenuSlice { label: "Missing".to_owned(), action_id: Some(missing), icon: None };
         assert!(matches!(
             configuration.validate(),
             Err(ConfigurationError::MissingMenuActionReference {

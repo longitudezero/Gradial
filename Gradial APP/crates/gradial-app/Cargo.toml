@@ -16,9 +16,11 @@ crossbeam-channel.workspace = true
 eframe.workspace = true
 flexi_logger.workspace = true
 gradial-core = { path = "../gradial-core" }
+image.workspace = true
 log.workspace = true
 raw-window-handle.workspace = true
 regex.workspace = true
+resvg.workspace = true
 rtrb.workspace = true
 serde.workspace = true
 serde_json.workspace = true

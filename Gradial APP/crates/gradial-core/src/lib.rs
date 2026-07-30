@@ -14,8 +14,9 @@ pub use actions::{
     MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
 };
 pub use configuration::{
-    ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION, AccentColor, Appearance,
-    ApplicationProfile, CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError,
+    ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,
+    APPEARANCE_CONFIG_SCHEMA_VERSION, AccentColor, Appearance, ApplicationProfile,
+    CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError, IconFormat, IconReference,
     LEGACY_CONFIG_SCHEMA_VERSION, LabelTheme, Menu, MenuSlice, Profile, ProfileRule, SizePreset,
 };
 pub use geometry::{Point, SliceCount};

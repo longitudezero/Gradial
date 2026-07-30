@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Stroke, Vec2, epaint::CircleShape};
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2, epaint::CircleShape};
 use gradial_core::{
     AccentColor, ActivationBindingId, Appearance, LabelTheme, ResolvedMenu, SliceCount,
 };
 use uuid::Uuid;
+
+use crate::icons::{IconManager, IconVisual};
 
 use super::animation::{AnimationMode, selection_progress};
 
@@ -14,6 +16,9 @@ const RING_WIDTH_DIP: f32 = 46.0;
 const INNER_RADIUS_DIP: f32 = RING_RADIUS_DIP - RING_WIDTH_DIP / 2.0;
 const OUTER_RADIUS_DIP: f32 = RING_RADIUS_DIP + RING_WIDTH_DIP / 2.0;
 const LABEL_RADIUS_DIP: f32 = 84.0;
+const ICON_RADIUS_DIP: f32 = 74.0;
+const ICON_LABEL_RADIUS_DIP: f32 = 106.0;
+const ICON_SIZE_DIP: f32 = 30.0;
 const SELECTED_ARC_STEPS: u8 = 24;
 const SELECTED_ARC_INSET_RADIANS: f32 = 0.035;
 const MAX_SLICE_COUNT: usize = 8;
@@ -41,20 +46,22 @@ pub(crate) trait OverlayRenderer {
 #[derive(Debug)]
 pub(crate) struct FoundationOverlayRenderer {
     geometry: RendererGeometryCaches,
+    icons: Arc<IconManager>,
     active_invocation: Option<Uuid>,
     selection: SelectionTransition,
 }
 
 impl Default for FoundationOverlayRenderer {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(IconManager::new(std::path::PathBuf::new())))
     }
 }
 
 impl FoundationOverlayRenderer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(icons: Arc<IconManager>) -> Self {
         Self {
             geometry: RendererGeometryCaches::new(),
+            icons,
             active_invocation: None,
             selection: SelectionTransition::default(),
         }
@@ -112,7 +119,14 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         );
 
         draw_slice_boundaries(painter, center, geometry, opacity, scale, accent);
-        draw_slice_labels(painter, center, geometry, menu.labels(), opacity, scale, theme);
+        draw_slice_content(
+            painter,
+            center,
+            geometry,
+            menu,
+            SliceContentStyle { opacity, scale, theme },
+            &self.icons,
+        );
 
         painter.circle_filled(center, 28.0 * scale, faded(theme.center, opacity));
         painter.text(
@@ -311,39 +325,127 @@ fn draw_slice_boundaries(
     }
 }
 
-fn draw_slice_labels(
+fn draw_slice_content(
     painter: &egui::Painter,
     center: Pos2,
     geometry: &RendererGeometryCache,
-    labels: &[String],
+    menu: &ResolvedMenu,
+    style: SliceContentStyle,
+    icons: &IconManager,
+) {
+    let SliceContentStyle { opacity, scale, theme } = style;
+    for (index, (offset, label)) in menu_label_layout(geometry, menu.labels()).enumerate() {
+        if let Some(reference) = menu.icon(index) {
+            let (icon_offset, label_offset) = icon_and_label_offsets(offset);
+            let icon_center = center + icon_offset * scale;
+            let visual = icons.visual(reference);
+            let icon_rect = fitted_icon_rect(icon_center, visual, ICON_SIZE_DIP * scale);
+            match visual {
+                IconVisual::Texture { texture_id, .. } => {
+                    painter.image(
+                        texture_id,
+                        icon_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        faded(Color32::WHITE, opacity),
+                    );
+                }
+                IconVisual::Placeholder => {
+                    draw_icon_placeholder(painter, icon_rect, opacity, scale, theme);
+                }
+            }
+            draw_label(
+                painter,
+                center + label_offset * scale,
+                label,
+                opacity,
+                scale,
+                theme,
+                Some(theme.label_background.unwrap_or(theme.center)),
+                10.0,
+            );
+            continue;
+        }
+        draw_label(
+            painter,
+            center + offset * scale,
+            label,
+            opacity,
+            scale,
+            theme,
+            theme.label_background,
+            12.0,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SliceContentStyle {
+    opacity: f32,
+    scale: f32,
+    theme: ThemeColors,
+}
+
+fn icon_and_label_offsets(label_offset: Vec2) -> (Vec2, Vec2) {
+    let direction = label_offset / LABEL_RADIUS_DIP;
+    (direction * ICON_RADIUS_DIP, direction * ICON_LABEL_RADIUS_DIP)
+}
+
+fn fitted_icon_rect(center: Pos2, visual: IconVisual, maximum: f32) -> Rect {
+    let dimensions = match visual {
+        IconVisual::Texture { dimensions, .. } => dimensions,
+        IconVisual::Placeholder => [1, 1],
+    };
+    let width = f32::from(u16::try_from(dimensions[0]).unwrap_or(1));
+    let height = f32::from(u16::try_from(dimensions[1]).unwrap_or(1));
+    let scale = maximum / width.max(height).max(1.0);
+    Rect::from_center_size(center, Vec2::new(width * scale, height * scale))
+}
+
+fn draw_icon_placeholder(
+    painter: &egui::Painter,
+    rect: Rect,
     opacity: f32,
     scale: f32,
     theme: ThemeColors,
 ) {
+    painter.rect_filled(rect, egui::CornerRadius::same(5), faded(theme.center, opacity));
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(5),
+        Stroke::new(1.5 * scale, faded(theme.label, opacity)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "?",
+        FontId::proportional(16.0 * scale),
+        faded(theme.label, opacity),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_label(
+    painter: &egui::Painter,
+    center: Pos2,
+    label: &str,
+    opacity: f32,
+    scale: f32,
+    theme: ThemeColors,
+    background: Option<Color32>,
+    font_size: f32,
+) {
     let color = faded(theme.label, opacity);
-    for (offset, label) in menu_label_layout(geometry, labels) {
-        let label_center = center + offset * scale;
-        if let Some(background) = theme.label_background {
-            let font = FontId::monospace(12.0 * scale);
-            let galley = painter.layout_no_wrap(label.to_owned(), font, color);
-            let label_rect = egui::Rect::from_center_size(label_center, galley.size())
-                .expand2(Vec2::new(5.0, 2.5) * scale);
-            painter.rect_filled(
-                label_rect,
-                egui::CornerRadius::same(4),
-                faded(background, opacity),
-            );
-            painter.galley(label_rect.center() - galley.size() / 2.0, galley, color);
-            continue;
-        }
-        painter.text(
-            label_center,
-            Align2::CENTER_CENTER,
-            label,
-            FontId::monospace(12.0 * scale),
-            color,
-        );
+    if let Some(background) = background {
+        let font = FontId::monospace(font_size * scale);
+        let galley = painter.layout_no_wrap(label.to_owned(), font, color);
+        let label_rect =
+            Rect::from_center_size(center, galley.size()).expand2(Vec2::new(5.0, 2.5) * scale);
+        painter.rect_filled(label_rect, egui::CornerRadius::same(4), faded(background, opacity));
+        painter.galley(label_rect.center() - galley.size() / 2.0, galley, color);
+        return;
     }
+    painter.text(center, Align2::CENTER_CENTER, label, FontId::monospace(font_size * scale), color);
 }
 
 fn menu_label_layout<'a>(
@@ -414,9 +516,10 @@ mod tests {
     use gradial_core::{AccentColor, Appearance, LabelTheme, ResolvedMenu, SizePreset, SliceCount};
 
     use super::{
-        FoundationOverlayRenderer, SelectionTransition, half_slice_angle, menu_label_layout,
-        selected_accent_color, theme_colors,
+        FoundationOverlayRenderer, SelectionTransition, fitted_icon_rect, half_slice_angle,
+        icon_and_label_offsets, menu_label_layout, selected_accent_color, theme_colors,
     };
+    use crate::icons::IconVisual;
     use crate::overlay::AnimationMode;
 
     fn assert_close(actual: f32, expected: f32) {
@@ -437,7 +540,7 @@ mod tests {
 
     #[test]
     fn renderer_caches_every_geometry_once_per_display() {
-        let renderer = FoundationOverlayRenderer::new();
+        let renderer = FoundationOverlayRenderer::default();
         assert_eq!(renderer.cached_geometry_counts(SliceCount::Four), (4, 4, 4));
         assert_eq!(renderer.cached_geometry_counts(SliceCount::Eight), (8, 8, 8));
         assert!(renderer.geometry.four.selected_arcs.iter().all(|arc| arc.len() == 24));
@@ -446,7 +549,7 @@ mod tests {
 
     #[test]
     fn renderer_layout_uses_the_resolved_profile_labels() {
-        let renderer = FoundationOverlayRenderer::new();
+        let renderer = FoundationOverlayRenderer::default();
         let menu = ResolvedMenu::new(
             SliceCount::Four,
             Arc::from([
@@ -464,6 +567,25 @@ mod tests {
                 .collect();
 
         assert_eq!(labels, ["Build", "Search", "Tests", "Terminal"]);
+    }
+
+    #[test]
+    fn icon_layout_fits_aspect_ratio_and_moves_its_label_outward() {
+        let (icon, label) = icon_and_label_offsets(eframe::egui::Vec2::new(0.0, -84.0));
+        assert_close(icon.x, 0.0);
+        assert_close(icon.y, -74.0);
+        assert_close(label.y, -106.0);
+
+        let rect = fitted_icon_rect(
+            eframe::egui::Pos2::ZERO,
+            IconVisual::Texture {
+                texture_id: eframe::egui::TextureId::Managed(7),
+                dimensions: [64, 32],
+            },
+            30.0,
+        );
+        assert_close(rect.width(), 30.0);
+        assert_close(rect.height(), 15.0);
     }
 
     #[test]

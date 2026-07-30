@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::{
     diagnostics::TimingMarkers,
     focus,
+    icons::IconManager,
     platform::{self, OverlayWakeHandle},
 };
 
@@ -94,6 +95,7 @@ impl OverlayPool {
         monitors: Vec<MonitorGeometry>,
         animation_mode: AnimationMode,
         appearance: Appearance,
+        icons: &Arc<IconManager>,
         config_revision: u64,
         timing_markers: Arc<TimingMarkers>,
     ) -> Self {
@@ -103,12 +105,15 @@ impl OverlayPool {
             .iter()
             .copied()
             .enumerate()
-            .map(|(index, monitor)| OverlaySlot {
-                viewport_id: ViewportId::from_hash_of(("gradial-overlay", generation, index)),
-                title: format!("Gradial Overlay {process_id}-{generation}-{index}"),
-                monitor,
-                state: Arc::new(Mutex::new(OverlayViewportState::default())),
-                renderer: Arc::new(Mutex::new(FoundationOverlayRenderer::new())),
+            .map(|(index, monitor)| {
+                let icons = Arc::clone(icons);
+                OverlaySlot {
+                    viewport_id: ViewportId::from_hash_of(("gradial-overlay", generation, index)),
+                    title: format!("Gradial Overlay {process_id}-{generation}-{index}"),
+                    monitor,
+                    state: Arc::new(Mutex::new(OverlayViewportState::default())),
+                    renderer: Arc::new(Mutex::new(FoundationOverlayRenderer::new(icons))),
+                }
             })
             .collect();
         log::info!(
@@ -117,14 +122,16 @@ impl OverlayPool {
              config_revision={config_revision} generation={generation} monitor_count={} \
              slice_counts=4,8 \
              reduced_motion={} accent_red={} accent_green={} accent_blue={} \
-             label_theme={} size_preset={} open_ms=60 selection_ms=35 close_ms=50",
+             label_theme={} size_preset={} cached_icon_count={} \
+             open_ms=60 selection_ms=35 close_ms=50",
             slots.len(),
             animation_mode.is_reduced(),
             appearance.accent_color.red,
             appearance.accent_color.green,
             appearance.accent_color.blue,
             appearance.label_theme.as_str(),
-            appearance.size_preset.as_str()
+            appearance.size_preset.as_str(),
+            icons.cached_count()
         );
 
         Self {

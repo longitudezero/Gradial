@@ -10,14 +10,15 @@ use crate::{
     actions::{ActionDefinition, ShortcutModifier, validate_actions},
 };
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const CONFIG_SCHEMA_VERSION: u32 = 5;
 pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const ACTION_CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const ACTIVATION_CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const APPEARANCE_CONFIG_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_GLOBAL_PROFILE_ID: Uuid =
     Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0001);
 
-/// The complete schema-four configuration model.
+/// The complete schema-five configuration model.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
@@ -215,7 +216,7 @@ impl Menu {
         Self {
             slice_count: 8,
             slices: ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-                .map(|label| MenuSlice { label: label.to_owned(), action_id: None })
+                .map(|label| MenuSlice { label: label.to_owned(), action_id: None, icon: None })
                 .into(),
         }
     }
@@ -236,6 +237,40 @@ pub struct MenuSlice {
     pub label: String,
     #[serde(default)]
     pub action_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<IconReference>,
+}
+
+/// A path-safe reference to one source file in Gradial's managed icon folder.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IconReference {
+    pub asset_id: Uuid,
+    pub format: IconFormat,
+}
+
+impl IconReference {
+    #[must_use]
+    pub fn file_name(self) -> String {
+        format!("{}.{}", self.asset_id.as_hyphenated(), self.format.extension())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IconFormat {
+    Png,
+    Svg,
+}
+
+impl IconFormat {
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Svg => "svg",
+        }
+    }
 }
 
 fn validate_profile(profile: &Profile) -> Result<(), ConfigurationError> {
@@ -259,6 +294,15 @@ fn validate_profile(profile: &Profile) -> Result<(), ConfigurationError> {
         profile.menu.slices.iter().enumerate().find(|(_, slice)| slice.label.trim().is_empty())
     {
         return Err(ConfigurationError::EmptyMenuLabel { profile_id: profile.id, slice_index });
+    }
+    if let Some((slice_index, _)) = profile
+        .menu
+        .slices
+        .iter()
+        .enumerate()
+        .find(|(_, slice)| slice.icon.is_some_and(|icon| icon.asset_id.is_nil()))
+    {
+        return Err(ConfigurationError::NilIconAssetId { profile_id: profile.id, slice_index });
     }
     Ok(())
 }
@@ -310,6 +354,9 @@ pub enum ConfigurationError {
 
     #[error("profile {profile_id} slice {slice_index} has an empty label")]
     EmptyMenuLabel { profile_id: Uuid, slice_index: usize },
+
+    #[error("profile {profile_id} slice {slice_index} has a nil icon asset UUID")]
+    NilIconAssetId { profile_id: Uuid, slice_index: usize },
 
     #[error("profile UUID {profile_id} appears more than once")]
     DuplicateProfileId { profile_id: Uuid },
@@ -398,7 +445,8 @@ mod tests {
 
     use super::{
         AccentColor, ActivationBinding, Appearance, ApplicationProfile, CONFIG_SCHEMA_VERSION,
-        Configuration, ConfigurationError, LabelTheme, Menu, Profile, ProfileRule, SizePreset,
+        Configuration, ConfigurationError, IconFormat, IconReference, LabelTheme, Menu, Profile,
+        ProfileRule, SizePreset,
     };
 
     fn application_profile(id: u128) -> ApplicationProfile {
@@ -418,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn default_schema_four_configuration_preserves_the_foundation_appearance() {
+    fn default_schema_five_configuration_preserves_foundation_visuals() {
         let configuration = Configuration::default();
         configuration.validate().expect("default configuration");
         assert_eq!(configuration.schema_version, CONFIG_SCHEMA_VERSION);
@@ -432,6 +480,7 @@ mod tests {
             }
         );
         assert_eq!(configuration.global_profile.menu.slices.len(), 8);
+        assert!(configuration.global_profile.menu.slices.iter().all(|slice| slice.icon.is_none()));
         assert!(configuration.application_profiles.is_empty());
         assert!(configuration.actions.is_empty());
     }
@@ -443,6 +492,35 @@ mod tests {
         assert!((SizePreset::Large.visual_scale() - 1.15).abs() < f32::EPSILON);
         assert!(serde_json::from_str::<LabelTheme>("\"automatic\"").is_err());
         assert!(serde_json::from_str::<SizePreset>("\"custom\"").is_err());
+    }
+
+    #[test]
+    fn icon_references_use_closed_formats_and_managed_file_names() {
+        let reference = IconReference { asset_id: Uuid::from_u128(7), format: IconFormat::Png };
+        assert_eq!(reference.file_name(), "00000000-0000-0000-0000-000000000007.png");
+        assert_eq!(IconFormat::Svg.extension(), "svg");
+        assert!(serde_json::from_str::<IconFormat>("\"ico\"").is_err());
+        assert!(
+            serde_json::from_str::<IconReference>(
+                r#"{"asset_id":"00000000-0000-0000-0000-000000000007","format":"png","path":"..\\escape"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nil_icon_asset_ids_are_rejected_before_activation() {
+        let mut configuration = Configuration::default();
+        configuration.global_profile.menu.slices[2].icon =
+            Some(IconReference { asset_id: Uuid::nil(), format: IconFormat::Svg });
+
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationError::NilIconAssetId {
+                profile_id,
+                slice_index: 2,
+            }) if profile_id == configuration.global_profile.id
+        ));
     }
 
     #[test]

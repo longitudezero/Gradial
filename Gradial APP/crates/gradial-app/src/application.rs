@@ -9,6 +9,7 @@ use crate::{
     action_executor::ActionExecutor,
     configuration::ConfigStore,
     diagnostics::TimingMarkers,
+    icons::IconManager,
     input::InputConfiguration,
     interaction::{InteractionRuntime, RuntimeEvent},
     onboarding::{
@@ -39,6 +40,7 @@ pub(crate) struct GradialApp {
     action_plan_compiler: Arc<ActionPlanCompiler>,
     configuration: Configuration,
     config_store: ConfigStore,
+    icons: Arc<IconManager>,
     settings: SettingsEditor,
     onboarding_store: OnboardingStore,
     onboarding: OnboardingEditor,
@@ -59,6 +61,8 @@ impl GradialApp {
         recovery_warning: bool,
     ) -> Result<Self> {
         let config_revision = configuration.config_revision;
+        let icons = Arc::new(IconManager::new(config_store.icon_directory()));
+        icons.preload_configuration(&creation_context.egui_ctx, &configuration);
         let profile_resolver = Arc::new(
             ProfileResolver::compile(&configuration)
                 .context("could not compile Gradial profiles")?,
@@ -105,11 +109,12 @@ impl GradialApp {
             monitors,
             animation_mode,
             configuration.appearance,
+            &icons,
             config_revision,
             Arc::clone(&timing_markers),
         );
         creation_context.egui_ctx.request_repaint();
-        let settings = SettingsEditor::new(recovery_warning);
+        let settings = SettingsEditor::new(recovery_warning, Arc::clone(&icons));
         let onboarding =
             OnboardingEditor::new(onboarding_startup.required, configuration.activation_binding);
         if startup_options.debug_open_settings {
@@ -133,6 +138,7 @@ impl GradialApp {
             action_plan_compiler,
             configuration,
             config_store,
+            icons,
             settings,
             onboarding_store: onboarding_startup.store,
             onboarding,
@@ -184,6 +190,7 @@ impl GradialApp {
             monitors,
             self.animation_mode,
             self.configuration.appearance,
+            &self.icons,
             self.config_revision,
             Arc::clone(&self.timing_markers),
         );
@@ -328,6 +335,7 @@ impl GradialApp {
             .checked_add(1)
             .context("configuration revision is exhausted")?;
         prepared.validate().context("settings draft is invalid")?;
+        self.icons.preload_configuration(context, &prepared);
         let profile_resolver = Arc::new(
             ProfileResolver::compile(&prepared)
                 .context("could not compile the settings profile rules")?,
@@ -361,12 +369,26 @@ impl GradialApp {
         proposed: &Configuration,
     ) -> Result<Configuration> {
         let saved = self.persist_configuration(context, proposed)?;
+        let icon_assignment_count = saved
+            .global_profile
+            .menu
+            .slices
+            .iter()
+            .chain(
+                saved
+                    .application_profiles
+                    .iter()
+                    .flat_map(|application| &application.profile.menu.slices),
+            )
+            .filter(|slice| slice.icon.is_some())
+            .count();
         log::info!(
             target: "settings",
             "component=settings event_code=settings_saved result_code=ok \
              config_revision={} slice_count={} action_count={} activation_button={} \
              activation_control={} activation_alt={} activation_shift={} \
-             accent_red={} accent_green={} accent_blue={} label_theme={} size_preset={}",
+             accent_red={} accent_green={} accent_blue={} label_theme={} size_preset={} \
+             icon_assignment_count={}",
             saved.config_revision,
             saved.global_profile.menu.slice_count,
             saved.actions.len(),
@@ -378,7 +400,8 @@ impl GradialApp {
             saved.appearance.accent_color.green,
             saved.appearance.accent_color.blue,
             saved.appearance.label_theme.as_str(),
-            saved.appearance.size_preset.as_str()
+            saved.appearance.size_preset.as_str(),
+            icon_assignment_count
         );
         Ok(saved)
     }
@@ -487,6 +510,7 @@ impl GradialApp {
                         let migration_from =
                             imported.migration.map_or(0, |migration| migration.from_schema);
                         let action_count = imported.configuration.actions.len();
+                        self.icons.preload_configuration(context, &imported.configuration);
                         self.settings.accept_imported(imported.configuration, imported.migration);
                         log::info!(
                             target: "settings",
@@ -505,6 +529,27 @@ impl GradialApp {
                              result_code=failure error_code={} config_revision={}",
                             error.code(),
                             self.config_revision
+                        );
+                    }
+                }
+                context.request_repaint_of(settings_viewport_id());
+            }
+            SettingsEvent::ImportIcon { path, profile_id, slice_index } => {
+                match self.icons.import(context, path.as_path(), self.config_revision) {
+                    Ok(icon) => {
+                        self.settings.accept_icon_import(profile_id, slice_index, icon);
+                    }
+                    Err(error) => {
+                        self.settings.icon_import_failed(profile_id, slice_index, error);
+                        log::warn!(
+                            target: "settings",
+                            "component=settings event_code=icon_import_failed \
+                             result_code=failure error_code={} config_revision={} \
+                             profile_id={} slice_index={}",
+                            error.code(),
+                            self.config_revision,
+                            profile_id,
+                            slice_index
                         );
                     }
                 }
@@ -569,6 +614,7 @@ impl GradialApp {
                 current_monitors,
                 self.animation_mode,
                 self.configuration.appearance,
+                &self.icons,
                 self.config_revision,
                 Arc::clone(&self.timing_markers),
             );

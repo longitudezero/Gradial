@@ -3,7 +3,7 @@ use std::{cmp::Ordering, path::Path, sync::Arc};
 use regex::Regex;
 use uuid::Uuid;
 
-use crate::{Configuration, ConfigurationError, SliceCount};
+use crate::{Configuration, ConfigurationError, Profile, SliceCount};
 
 #[derive(Debug)]
 pub struct ProfileResolver {
@@ -26,12 +26,6 @@ impl ProfileResolver {
             .iter()
             .map(|application_profile| {
                 let profile_id = application_profile.profile.id;
-                let slice_count = application_profile.profile.menu.resolved_slice_count().ok_or(
-                    ConfigurationError::UnsupportedSliceCount {
-                        profile_id,
-                        slice_count: application_profile.profile.menu.slice_count,
-                    },
-                )?;
                 let title_regex = application_profile
                     .rule
                     .title_regex
@@ -44,32 +38,7 @@ impl ProfileResolver {
                     .transpose()?;
                 Ok(CompiledApplicationProfile {
                     profile_id,
-                    menu: Arc::new(
-                        ResolvedMenu::new(
-                            slice_count,
-                            application_profile
-                                .profile
-                                .menu
-                                .slices
-                                .iter()
-                                .map(|slice| slice.label.clone())
-                                .collect::<Arc<[_]>>(),
-                            application_profile
-                                .profile
-                                .menu
-                                .slices
-                                .iter()
-                                .map(|slice| slice.action_id)
-                                .collect::<Arc<[_]>>(),
-                        )
-                        .ok_or(
-                            ConfigurationError::IncorrectMenuLength {
-                                profile_id,
-                                slice_count: application_profile.profile.menu.slice_count,
-                                found: application_profile.profile.menu.slices.len(),
-                            },
-                        )?,
-                    ),
+                    menu: compile_resolved_menu(&application_profile.profile)?,
                     executable_path: normalize_windows_path(
                         &application_profile.rule.executable_path,
                     ),
@@ -83,38 +52,9 @@ impl ProfileResolver {
                 })
             })
             .collect::<Result<Vec<_>, ConfigurationError>>()?;
-        let global_slice_count = configuration.global_profile.menu.resolved_slice_count().ok_or(
-            ConfigurationError::UnsupportedSliceCount {
-                profile_id: configuration.global_profile.id,
-                slice_count: configuration.global_profile.menu.slice_count,
-            },
-        )?;
         Ok(Self {
             global_profile_id: configuration.global_profile.id,
-            global_menu: Arc::new(
-                ResolvedMenu::new(
-                    global_slice_count,
-                    configuration
-                        .global_profile
-                        .menu
-                        .slices
-                        .iter()
-                        .map(|slice| slice.label.clone())
-                        .collect::<Arc<[_]>>(),
-                    configuration
-                        .global_profile
-                        .menu
-                        .slices
-                        .iter()
-                        .map(|slice| slice.action_id)
-                        .collect::<Arc<[_]>>(),
-                )
-                .ok_or(ConfigurationError::IncorrectMenuLength {
-                    profile_id: configuration.global_profile.id,
-                    slice_count: configuration.global_profile.menu.slice_count,
-                    found: configuration.global_profile.menu.slices.len(),
-                })?,
-            ),
+            global_menu: compile_resolved_menu(&configuration.global_profile)?,
             application_profiles,
         })
     }
@@ -179,6 +119,26 @@ impl ProfileResolver {
     }
 }
 
+fn compile_resolved_menu(profile: &Profile) -> Result<Arc<ResolvedMenu>, ConfigurationError> {
+    let slice_count =
+        profile.menu.resolved_slice_count().ok_or(ConfigurationError::UnsupportedSliceCount {
+            profile_id: profile.id,
+            slice_count: profile.menu.slice_count,
+        })?;
+    ResolvedMenu::new_with_icons(
+        slice_count,
+        profile.menu.slices.iter().map(|slice| slice.label.clone()).collect(),
+        profile.menu.slices.iter().map(|slice| slice.action_id).collect(),
+        profile.menu.slices.iter().map(|slice| slice.icon).collect(),
+    )
+    .map(Arc::new)
+    .ok_or(ConfigurationError::IncorrectMenuLength {
+        profile_id: profile.id,
+        slice_count: profile.menu.slice_count,
+        found: profile.menu.slices.len(),
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ProfileTarget<'a> {
     pub executable_path: Option<&'a Path>,
@@ -213,6 +173,7 @@ pub struct ResolvedMenu {
     slice_count: SliceCount,
     labels: Arc<[String]>,
     action_ids: Arc<[Option<Uuid>]>,
+    icons: Arc<[Option<crate::IconReference>]>,
 }
 
 impl ResolvedMenu {
@@ -224,8 +185,22 @@ impl ResolvedMenu {
         labels: Arc<[String]>,
         action_ids: Arc<[Option<Uuid>]>,
     ) -> Option<Self> {
-        (labels.len() == slice_count.get() && action_ids.len() == slice_count.get())
-            .then_some(Self { slice_count, labels, action_ids })
+        let icons = vec![None; slice_count.get()].into();
+        Self::new_with_icons(slice_count, labels, action_ids, icons)
+    }
+
+    /// Creates a complete menu including one optional icon reference per slice.
+    #[must_use]
+    pub fn new_with_icons(
+        slice_count: SliceCount,
+        labels: Arc<[String]>,
+        action_ids: Arc<[Option<Uuid>]>,
+        icons: Arc<[Option<crate::IconReference>]>,
+    ) -> Option<Self> {
+        (labels.len() == slice_count.get()
+            && action_ids.len() == slice_count.get()
+            && icons.len() == slice_count.get())
+        .then_some(Self { slice_count, labels, action_ids, icons })
     }
 
     #[must_use]
@@ -243,6 +218,11 @@ impl ResolvedMenu {
         self.action_ids.get(slice_index).copied().flatten()
     }
 
+    #[must_use]
+    pub fn icon(&self, slice_index: usize) -> Option<crate::IconReference> {
+        self.icons.get(slice_index).copied().flatten()
+    }
+
     /// Creates the direction-labelled menu used by debug interaction checks.
     #[must_use]
     pub fn directional(slice_count: SliceCount) -> Self {
@@ -254,6 +234,7 @@ impl ResolvedMenu {
             slice_count,
             labels: labels.iter().map(|label| (*label).to_owned()).collect(),
             action_ids: vec![None; slice_count.get()].into(),
+            icons: vec![None; slice_count.get()].into(),
         }
     }
 }
@@ -345,8 +326,8 @@ mod tests {
 
     use super::{ProfileResolver, ProfileTarget, ResolutionDecision};
     use crate::{
-        ApplicationProfile, Configuration, Menu, MenuSlice, Profile, ProfileRule, SliceCount,
-        configuration::DEFAULT_GLOBAL_PROFILE_ID,
+        ApplicationProfile, Configuration, IconFormat, IconReference, Menu, MenuSlice, Profile,
+        ProfileRule, SliceCount, configuration::DEFAULT_GLOBAL_PROFILE_ID,
     };
 
     fn profile(
@@ -482,15 +463,18 @@ mod tests {
         application_profile.profile.menu = Menu {
             slice_count: 4,
             slices: ["Build", "Search", "Tests", "Terminal"]
-                .map(|label| MenuSlice { label: label.to_owned(), action_id: None })
+                .map(|label| MenuSlice { label: label.to_owned(), action_id: None, icon: None })
                 .into(),
         };
         let mut configuration = Configuration {
             application_profiles: vec![application_profile],
             ..Configuration::default()
         };
+        let icon = IconReference { asset_id: Uuid::from_u128(88), format: IconFormat::Svg };
+        configuration.application_profiles[0].profile.menu.slices[0].icon = Some(icon);
         let resolver = ProfileResolver::compile(&configuration).expect("resolver");
         configuration.application_profiles[0].profile.menu.slices[0].label = "Changed".to_owned();
+        configuration.application_profiles[0].profile.menu.slices[0].icon = None;
 
         let first =
             resolver.resolve(target(Some(Path::new(r"C:\Apps\Editor.exe")), "", "Document"));
@@ -499,6 +483,7 @@ mod tests {
 
         assert_eq!(first.menu.slice_count(), SliceCount::Four);
         assert_eq!(first.menu.labels(), ["Build", "Search", "Tests", "Terminal"]);
+        assert_eq!(first.menu.icon(0), Some(icon));
         assert!(std::sync::Arc::ptr_eq(&first.menu, &second.menu));
     }
 

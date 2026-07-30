@@ -12,10 +12,11 @@ use eframe::egui::{
 use gradial_core::{
     AccentColor, ActionDefinition, ActionKind, ActionPlanCompiler, ActivationBinding,
     ActivationBindingId, Appearance, ApplicationProfile, Configuration, ConfigurationError,
-    ExecutionOperation, LabelTheme, MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS,
-    MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, PhysicalModifiers, Profile,
-    ProfileResolver, ProfileRule, ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey,
-    SizePreset, SliceCount, WindowCommand, slice_for_delta,
+    ExecutionOperation, IconReference, LabelTheme, MAX_ACTION_SEQUENCE_DEPTH,
+    MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu,
+    MenuSlice, PhysicalModifiers, Profile, ProfileResolver, ProfileRule, ProfileTarget,
+    ResolutionDecision, ResolvedMenu, ShortcutKey, SizePreset, SliceCount, WindowCommand,
+    slice_for_delta,
 };
 #[cfg(debug_assertions)]
 use gradial_core::{AppPaths, ShortcutModifier};
@@ -24,6 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     configuration::{ConfigurationMigration, ConfigurationTransferError},
+    icons::{IconImportError, IconManager},
     input::{self, ActivationBindingTestResult},
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
     overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
@@ -234,6 +236,31 @@ enum TransferFeedback {
 enum TransferOperation {
     Import,
     Export,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IconEditorFeedback {
+    profile_id: Uuid,
+    slice_index: usize,
+    message: String,
+    error: bool,
+}
+
+impl IconEditorFeedback {
+    fn info(profile_id: Uuid, slice_index: usize, message: impl Into<String>) -> Self {
+        Self { profile_id, slice_index, message: message.into(), error: false }
+    }
+
+    fn error(profile_id: Uuid, slice_index: usize, message: impl Into<String>) -> Self {
+        Self { profile_id, slice_index, message: message.into(), error: true }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingIconImport {
+    path: PrivatePath,
+    profile_id: Uuid,
+    slice_index: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -468,6 +495,7 @@ pub(crate) enum SettingsEvent {
     Save(Configuration),
     Import(PrivatePath),
     Export { path: PrivatePath, configuration: Configuration },
+    ImportIcon { path: PrivatePath, profile_id: Uuid, slice_index: usize },
 }
 
 impl std::fmt::Debug for SettingsEvent {
@@ -476,6 +504,12 @@ impl std::fmt::Debug for SettingsEvent {
             Self::Save(_) => formatter.write_str("Save(<configuration>)"),
             Self::Import(_) => formatter.write_str("Import(<path>)"),
             Self::Export { .. } => formatter.write_str("Export(<path>, <configuration>)"),
+            Self::ImportIcon { profile_id, slice_index, .. } => formatter
+                .debug_struct("ImportIcon")
+                .field("path", &"<redacted>")
+                .field("profile_id", profile_id)
+                .field("slice_index", slice_index)
+                .finish(),
         }
     }
 }
@@ -486,8 +520,8 @@ pub(crate) struct SettingsEditor {
 }
 
 impl SettingsEditor {
-    pub(crate) fn new(recovery_warning: bool) -> Self {
-        Self { state: Arc::new(Mutex::new(SettingsState::new(recovery_warning))) }
+    pub(crate) fn new(recovery_warning: bool, icons: Arc<IconManager>) -> Self {
+        Self { state: Arc::new(Mutex::new(SettingsState::new(recovery_warning, icons))) }
     }
 
     pub(crate) fn open(&self, configuration: &Configuration) -> bool {
@@ -557,6 +591,24 @@ impl SettingsEditor {
         self.state().transfer_failed(TransferOperation::Export, error);
     }
 
+    pub(crate) fn accept_icon_import(
+        &self,
+        profile_id: Uuid,
+        slice_index: usize,
+        icon: IconReference,
+    ) {
+        self.state().accept_icon_import(profile_id, slice_index, icon);
+    }
+
+    pub(crate) fn icon_import_failed(
+        &self,
+        profile_id: Uuid,
+        slice_index: usize,
+        error: IconImportError,
+    ) {
+        self.state().icon_import_failed(profile_id, slice_index, error);
+    }
+
     fn state(&self) -> MutexGuard<'_, SettingsState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -578,6 +630,8 @@ struct SettingsState {
     recording_action_id: Option<Uuid>,
     save_feedback: SaveFeedback,
     transfer_feedback: Option<TransferFeedback>,
+    icon_feedback: Option<IconEditorFeedback>,
+    pending_icon_import: Option<PendingIconImport>,
     pending_import_path: Option<PrivatePath>,
     recovery_warning: bool,
     preview_renderer: FoundationOverlayRenderer,
@@ -585,7 +639,7 @@ struct SettingsState {
 }
 
 impl SettingsState {
-    fn new(recovery_warning: bool) -> Self {
+    fn new(recovery_warning: bool, icons: Arc<IconManager>) -> Self {
         Self {
             lifecycle: EditorLifecycle::Closed,
             draft: None,
@@ -601,9 +655,11 @@ impl SettingsState {
             recording_action_id: None,
             save_feedback: SaveFeedback::None,
             transfer_feedback: None,
+            icon_feedback: None,
+            pending_icon_import: None,
             pending_import_path: None,
             recovery_warning,
-            preview_renderer: FoundationOverlayRenderer::new(),
+            preview_renderer: FoundationOverlayRenderer::new(icons),
             pending_event: None,
         }
     }
@@ -628,6 +684,8 @@ impl SettingsState {
             self.recording_action_id = None;
             self.save_feedback = SaveFeedback::None;
             self.transfer_feedback = None;
+            self.icon_feedback = None;
+            self.pending_icon_import = None;
             self.pending_import_path = None;
             log::info!(
                 target: "settings",
@@ -645,6 +703,8 @@ impl SettingsState {
         }
         self.save_feedback = SaveFeedback::Saved;
         self.transfer_feedback = None;
+        self.icon_feedback = None;
+        self.pending_icon_import = None;
         self.profile_feedback = None;
         self.action_feedback = None;
         self.cancel_binding_test();
@@ -680,6 +740,8 @@ impl SettingsState {
         self.recording_action_id = None;
         self.save_feedback = SaveFeedback::None;
         self.pending_import_path = None;
+        self.pending_icon_import = None;
+        self.icon_feedback = None;
         let message = if imported_dirty {
             migration.map_or_else(
                 || "Settings imported into this draft. Save changes to apply them.".to_owned(),
@@ -704,6 +766,37 @@ impl SettingsState {
         self.pending_import_path = None;
         self.transfer_feedback =
             Some(TransferFeedback::Error(transfer_error_message(operation, error).to_owned()));
+    }
+
+    fn accept_icon_import(&mut self, profile_id: Uuid, slice_index: usize, icon: IconReference) {
+        let Some(draft) = &mut self.draft else {
+            return;
+        };
+        let Some(slice) = profile_menu_mut(&mut draft.proposed, profile_id)
+            .and_then(|menu| menu.slices.get_mut(slice_index))
+        else {
+            self.icon_feedback = Some(IconEditorFeedback::error(
+                profile_id,
+                slice_index,
+                "That menu direction is no longer available.",
+            ));
+            return;
+        };
+        slice.icon = Some(icon);
+        self.save_feedback = SaveFeedback::None;
+        self.icon_feedback = Some(IconEditorFeedback::info(
+            profile_id,
+            slice_index,
+            "Icon imported into this draft. Save changes to apply it.",
+        ));
+    }
+
+    fn icon_import_failed(&mut self, profile_id: Uuid, slice_index: usize, error: IconImportError) {
+        self.icon_feedback = Some(IconEditorFeedback::error(
+            profile_id,
+            slice_index,
+            icon_import_error_message(error),
+        ));
     }
 
     #[cfg(debug_assertions)]
@@ -1084,6 +1177,22 @@ impl SettingsState {
     }
 
     #[cfg(debug_assertions)]
+    fn debug_icon_import_event(&mut self) -> Option<SettingsEvent> {
+        let draft = self.draft.as_ref()?;
+        let profile_id = draft.proposed.global_profile.id;
+        let config_revision = draft.original.config_revision;
+        let path = AppPaths::discover().ok()?.root.join("settings-icon-smoke.png");
+        self.section = SettingsSection::Menu;
+        self.selected_slice = 0;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_icon_import_requested \
+             result_code=ok config_revision={config_revision} profile_id={profile_id} slice_index=0"
+        );
+        Some(SettingsEvent::ImportIcon { path: PrivatePath::new(path), profile_id, slice_index: 0 })
+    }
+
+    #[cfg(debug_assertions)]
     fn debug_select_sequence_action(&mut self) -> bool {
         if !self.draft.as_ref().is_some_and(|draft| {
             draft.proposed.actions.iter().any(|action| action.id == DEBUG_NESTED_SEQUENCE_ACTION_ID)
@@ -1181,6 +1290,11 @@ impl SettingsState {
             None
         } else if ui
             .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F18))
+        {
+            self.debug_icon_import_event()
+        } else if ui
+            .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F9))
         {
             let _edited = self.debug_apply_action_fixture_edit();
@@ -1269,6 +1383,7 @@ impl SettingsState {
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
         if close_requested {
             self.pending_import_path = None;
+            self.pending_icon_import = None;
             self.cancel_binding_test();
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
@@ -1396,6 +1511,8 @@ impl SettingsState {
                     self.recording_action_id = None;
                     self.save_feedback = SaveFeedback::None;
                     self.transfer_feedback = None;
+                    self.icon_feedback = None;
+                    self.pending_icon_import = None;
                     self.pending_import_path = None;
                 }
                 if let Err(error) = &validation {
@@ -1421,6 +1538,15 @@ impl SettingsState {
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
             SettingsSection::Profiles => self.render_profiles_section(ui, &mut draft),
             SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
+        }
+        if event.is_none()
+            && let Some(pending) = self.pending_icon_import.take()
+        {
+            event = Some(SettingsEvent::ImportIcon {
+                path: pending.path,
+                profile_id: pending.profile_id,
+                slice_index: pending.slice_index,
+            });
         }
 
         if self.pending_import_path.is_some() {
@@ -1714,6 +1840,7 @@ impl SettingsState {
     }
 
     fn render_menu_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
+        let global_profile_id = draft.proposed.global_profile.id;
         let global_slice_count =
             draft.proposed.global_profile.menu.resolved_slice_count().unwrap_or_default();
         self.selected_slice = self.selected_slice.min(global_slice_count.get().saturating_sub(1));
@@ -1779,6 +1906,8 @@ impl SettingsState {
                         self.section = SettingsSection::Actions;
                     }
                 }
+                ui.add_space(12.0);
+                self.render_slice_icon_editor(ui, global_profile_id, self.selected_slice, slice);
             }
         });
 
@@ -2003,6 +2132,8 @@ impl SettingsState {
                             }
                         }
                     });
+                    ui.add_space(12.0);
+                    self.render_slice_icon_editor(ui, profile_id, self.selected_slice, slice);
                 }
                 if action_catalog_empty && ui.link("Create an action first.").clicked() {
                     self.section = SettingsSection::Actions;
@@ -2212,6 +2343,68 @@ impl SettingsState {
         self.render_action_catalog(ui, &mut draft.proposed);
         self.render_action_details(ui, &mut draft.proposed);
         self.render_shortcut_recorder(ui.ctx(), &mut draft.proposed);
+    }
+
+    fn render_slice_icon_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile_id: Uuid,
+        slice_index: usize,
+        slice: &mut MenuSlice,
+    ) {
+        ui.label(RichText::new("Icon").strong());
+        ui.label(match slice.icon {
+            Some(icon) => format!("{} icon assigned", icon.format.extension().to_uppercase()),
+            None => "No custom icon".to_owned(),
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button(if slice.icon.is_some() { "Replace icon..." } else { "Choose icon..." })
+                .clicked()
+            {
+                match choose_path(PathDialogKind::Icon) {
+                    PathDialogOutcome::Selected(path) => {
+                        self.pending_icon_import = Some(PendingIconImport {
+                            path: PrivatePath::new(path),
+                            profile_id,
+                            slice_index,
+                        });
+                        self.icon_feedback = None;
+                    }
+                    PathDialogOutcome::Cancelled => {}
+                    PathDialogOutcome::Failed => {
+                        self.icon_feedback = Some(IconEditorFeedback::error(
+                            profile_id,
+                            slice_index,
+                            "Gradial could not open the icon chooser.",
+                        ));
+                    }
+                }
+            }
+            if slice.icon.is_some() && ui.button("Remove icon").clicked() {
+                slice.icon = None;
+                self.pending_icon_import = None;
+                self.icon_feedback = Some(IconEditorFeedback::info(
+                    profile_id,
+                    slice_index,
+                    "Icon removed from this draft.",
+                ));
+                self.save_feedback = SaveFeedback::None;
+            }
+        });
+        ui.weak("PNG or SVG, up to 512×512 and 256 KiB. Imported files are copied into Gradial.");
+        if let Some(feedback) = self.icon_feedback.as_ref().filter(|feedback| {
+            feedback.profile_id == profile_id && feedback.slice_index == slice_index
+        }) {
+            ui.colored_label(
+                if feedback.error {
+                    Color32::from_rgb(239, 113, 113)
+                } else {
+                    Color32::from_rgb(112, 205, 151)
+                },
+                &feedback.message,
+            );
+        }
     }
 
     fn render_action_catalog(&mut self, ui: &mut egui::Ui, configuration: &mut Configuration) {
@@ -3433,10 +3626,11 @@ const fn action_kind_name(kind: &ActionKind) -> &'static str {
 }
 
 fn resolved_menu(menu: &Menu) -> Option<Arc<ResolvedMenu>> {
-    ResolvedMenu::new(
+    ResolvedMenu::new_with_icons(
         menu.resolved_slice_count()?,
         menu.slices.iter().map(|slice| slice.label.clone()).collect(),
         menu.slices.iter().map(|slice| slice.action_id).collect(),
+        menu.slices.iter().map(|slice| slice.icon).collect(),
     )
     .map(Arc::new)
 }
@@ -3615,6 +3809,24 @@ const fn transfer_error_message(
     }
 }
 
+const fn icon_import_error_message(error: IconImportError) -> &'static str {
+    match error {
+        IconImportError::InvalidPath => "Choose a regular icon file.",
+        IconImportError::Missing => "That icon file is no longer available.",
+        IconImportError::Read => "Gradial could not read that icon file.",
+        IconImportError::UnsupportedType => "Choose a PNG or SVG icon.",
+        IconImportError::Empty => "That icon file is empty.",
+        IconImportError::SourceTooLarge => "Choose an icon no larger than 256 KiB.",
+        IconImportError::InvalidPng => "That file is not a valid PNG icon.",
+        IconImportError::InvalidSvg => "That file is not a valid SVG icon.",
+        IconImportError::UnsupportedSvgContent => {
+            "Convert SVG text and embedded images to vector paths before importing."
+        }
+        IconImportError::Dimensions => "Choose an icon between 1×1 and 512×512 logical pixels.",
+        IconImportError::Write => "Gradial could not copy that icon into managed storage.",
+    }
+}
+
 fn draft_validation_error(
     configuration: &Configuration,
     error: &ConfigurationError,
@@ -3748,15 +3960,16 @@ fn empty_menu_label_error(
 mod tests {
     use std::{
         path::PathBuf,
+        sync::Arc,
         time::{Duration, Instant},
     };
 
     use eframe::egui::Vec2;
     use gradial_core::{
         AccentColor, ActionDefinition, ActionKind, ActivationBinding, ActivationBindingId,
-        Appearance, Configuration, LabelTheme, MAX_TYPED_TEXT_BYTES, MenuSlice, PhysicalModifiers,
-        ResolutionDecision, ScreenPoint, ShortcutKey, ShortcutModifier, SizePreset, SliceCount,
-        WindowCommand,
+        Appearance, Configuration, IconFormat, IconReference, LabelTheme, MAX_TYPED_TEXT_BYTES,
+        MenuSlice, PhysicalModifiers, ResolutionDecision, ScreenPoint, ShortcutKey,
+        ShortcutModifier, SizePreset, SliceCount, WindowCommand,
     };
     use uuid::Uuid;
 
@@ -3773,8 +3986,11 @@ mod tests {
         remove_sequence_step, resize_menu, resolution_decision_text, validate_draft,
     };
     use crate::{
-        configuration::ConfigurationMigration, input::ActivationBindingTestResult,
-        native_file_dialog::PathDialogOutcome, platform::ProfileTestTarget,
+        configuration::ConfigurationMigration,
+        icons::{IconImportError, IconManager},
+        input::ActivationBindingTestResult,
+        native_file_dialog::PathDialogOutcome,
+        platform::ProfileTestTarget,
     };
 
     #[test]
@@ -3807,7 +4023,7 @@ mod tests {
         let mut menu = gradial_core::Menu {
             slice_count: 4,
             slices: ["One", "Two", "Three", "Four"]
-                .map(|label| MenuSlice { label: label.to_owned(), action_id: None })
+                .map(|label| MenuSlice { label: label.to_owned(), action_id: None, icon: None })
                 .into(),
         };
         let mut stash = None;
@@ -3962,7 +4178,7 @@ mod tests {
     #[test]
     fn dirty_close_requires_an_explicit_choice_and_keep_editing_preserves_the_draft() {
         let configuration = Configuration::default();
-        let mut editor = SettingsState::new(false);
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
         editor.open(&configuration);
         editor.draft.as_mut().expect("open draft").proposed.global_profile.menu.slices[0].label =
             "Changed".to_owned();
@@ -3981,7 +4197,7 @@ mod tests {
     #[test]
     fn clean_close_does_not_prompt() {
         let configuration = Configuration::default();
-        let mut editor = SettingsState::new(false);
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
         editor.open(&configuration);
         let private_target = ProfileTestTarget {
             executable_path: Some(PathBuf::from(r"C:\Private\Target.exe")),
@@ -4043,9 +4259,39 @@ mod tests {
     }
 
     #[test]
+    fn icon_import_and_failure_feedback_remain_private_to_the_draft() {
+        let configuration = Configuration::default();
+        let profile_id = configuration.global_profile.id;
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
+        assert!(editor.open(&configuration));
+        let icon = IconReference { asset_id: Uuid::from_u128(77), format: IconFormat::Png };
+
+        editor.accept_icon_import(profile_id, 0, icon);
+
+        let draft = editor.draft.as_ref().expect("draft");
+        assert_eq!(draft.original.global_profile.menu.slices[0].icon, None);
+        assert_eq!(draft.proposed.global_profile.menu.slices[0].icon, Some(icon));
+        assert!(draft.is_dirty());
+        assert!(editor.icon_feedback.as_ref().is_some_and(|feedback| !feedback.error));
+
+        editor.icon_import_failed(profile_id, 0, IconImportError::SourceTooLarge);
+        assert!(
+            editor
+                .icon_feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.error && feedback.message.contains("256 KiB"))
+        );
+        editor.draft.as_mut().expect("draft").discard();
+        assert_eq!(
+            editor.draft.as_ref().expect("draft").proposed.global_profile.menu.slices[0].icon,
+            None
+        );
+    }
+
+    #[test]
     fn imported_settings_replace_only_the_private_draft_and_reset_editor_state() {
         let original = Configuration { config_revision: 7, ..Configuration::default() };
-        let mut editor = SettingsState::new(false);
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
         assert!(editor.open(&original));
         let prior_stash_id = original.global_profile.id;
         editor
@@ -4102,6 +4348,16 @@ mod tests {
         assert!(!debug_output.contains("Private"));
         assert!(!debug_output.contains("Export.json"));
         assert_eq!(debug_output, "Export(<path>, <configuration>)");
+
+        let icon_event = SettingsEvent::ImportIcon {
+            path: PrivatePath::new(PathBuf::from(r"C:\Private\Icon.png")),
+            profile_id: Uuid::from_u128(42),
+            slice_index: 3,
+        };
+        let icon_debug = format!("{icon_event:?}");
+        assert!(!icon_debug.contains(r"C:\Private"));
+        assert!(!icon_debug.contains("Icon.png"));
+        assert!(icon_debug.contains("slice_index: 3"));
     }
 
     #[test]
@@ -4149,7 +4405,7 @@ mod tests {
     #[test]
     fn opening_an_existing_editor_preserves_its_unsaved_draft() {
         let configuration = Configuration { config_revision: 1, ..Configuration::default() };
-        let mut editor = SettingsState::new(false);
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
         assert!(editor.open(&configuration));
         editor.draft.as_mut().expect("open draft").proposed.global_profile.menu.slices[0].label =
             "Unsaved".to_owned();

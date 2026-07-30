@@ -6,6 +6,7 @@ mod application;
 mod configuration;
 mod diagnostics;
 mod focus;
+mod icons;
 mod input;
 mod interaction;
 mod native_file_dialog;

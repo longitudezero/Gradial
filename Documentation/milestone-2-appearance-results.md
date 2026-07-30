@@ -138,3 +138,8 @@ V1 color, label contrast, and size configuration are complete. Per-slice custom
 PNG/SVG icon metadata, bounded decoding, GPU upload at configuration load,
 placeholder fallback, editor assignment, and optional export-side icon copying
 remain the next separate slice.
+
+Follow-up: per-slice import, validation, managed storage, caching, fallback,
+editor assignment, and rendering are now complete in
+[`milestone-2-custom-icons-results.md`](milestone-2-custom-icons-results.md).
+Portable export-side icon copying remains deferred.

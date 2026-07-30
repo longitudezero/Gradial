@@ -22,6 +22,7 @@ pub(crate) enum PathDialogKind {
     File,
     Folder,
     Executable,
+    Icon,
     ConfigurationImport,
     ConfigurationExport,
 }
@@ -76,7 +77,10 @@ fn show_open_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
     } else {
         options |= FOS_FILEMUSTEXIST;
     }
-    if matches!(kind, PathDialogKind::Executable | PathDialogKind::ConfigurationImport) {
+    if matches!(
+        kind,
+        PathDialogKind::Executable | PathDialogKind::Icon | PathDialogKind::ConfigurationImport
+    ) {
         options |= FOS_STRICTFILETYPES;
     }
 
@@ -89,6 +93,12 @@ fn show_open_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
             file_dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
                 pszName: w!("Applications"),
                 pszSpec: w!("*.exe"),
+            }])?;
+            file_dialog.SetFileTypeIndex(1)?;
+        } else if kind == PathDialogKind::Icon {
+            file_dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("PNG or SVG icons"),
+                pszSpec: w!("*.png;*.svg"),
             }])?;
             file_dialog.SetFileTypeIndex(1)?;
         } else if kind == PathDialogKind::ConfigurationImport {
@@ -159,6 +169,7 @@ const fn dialog_title(kind: PathDialogKind) -> PCWSTR {
         PathDialogKind::File => w!("Gradial: choose a file"),
         PathDialogKind::Folder => w!("Gradial: choose a folder"),
         PathDialogKind::Executable => w!("Gradial: choose an application"),
+        PathDialogKind::Icon => w!("Gradial: choose an icon"),
         PathDialogKind::ConfigurationImport => w!("Gradial: import settings"),
         PathDialogKind::ConfigurationExport => w!("Gradial: export settings"),
     }
@@ -207,6 +218,7 @@ mod tests {
             PathDialogKind::File,
             PathDialogKind::Folder,
             PathDialogKind::Executable,
+            PathDialogKind::Icon,
             PathDialogKind::ConfigurationImport,
             PathDialogKind::ConfigurationExport,
         ] {

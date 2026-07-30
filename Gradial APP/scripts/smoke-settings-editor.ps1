@@ -312,6 +312,7 @@ $configPath = Join-Path $gradialDirectory "config.json"
 $backupPath = Join-Path $gradialDirectory "config.json.bak"
 $importPath = Join-Path $gradialDirectory "settings-import-smoke.json"
 $exportPath = Join-Path $gradialDirectory "settings-export-smoke.json"
+$iconSourcePath = Join-Path $gradialDirectory "settings-icon-smoke.png"
 $logPath = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
 $standardOutputPath = Join-Path $temporaryRoot "gradial.stdout.log"
 $standardErrorPath = Join-Path $temporaryRoot "gradial.stderr.log"
@@ -386,6 +387,21 @@ try {
         ($importConfiguration | ConvertTo-Json -Depth 10),
         [System.Text.UTF8Encoding]::new($false)
     )
+    $iconBitmap = New-Object System.Drawing.Bitmap 48, 48
+    $iconGraphics = [System.Drawing.Graphics]::FromImage($iconBitmap)
+    $iconBrush = New-Object System.Drawing.SolidBrush (
+        [System.Drawing.Color]::FromArgb(255, 224, 96, 72)
+    )
+    try {
+        $iconGraphics.Clear([System.Drawing.Color]::Transparent)
+        $iconGraphics.FillEllipse($iconBrush, 4, 4, 40, 40)
+        $iconBitmap.Save($iconSourcePath, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally {
+        $iconBrush.Dispose()
+        $iconGraphics.Dispose()
+        $iconBitmap.Dispose()
+    }
 
     $env:LOCALAPPDATA = $temporaryRoot
     $gradial = Start-Process `
@@ -538,6 +554,32 @@ try {
         Save-WindowScreenshot `
             -Window $settingsWindow `
             -Path (Join-Path $workspace "captures\settings-appearance-editor-smoke.png")
+    }
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x81)) {
+        throw "Could not import the icon fixture into the settings draft."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_icon_import_requested .*result_code=ok .*slice_index=0" `
+        -Failure "The icon editor did not request the isolated fixture." | Out-Null
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=icon_imported .*result_code=ok .*format=png .*width=48 .*height=48" `
+        -Failure "The icon importer did not validate, copy, and cache the PNG fixture." |
+        Out-Null
+    $managedIcons = @(
+        Get-ChildItem -LiteralPath (Join-Path $gradialDirectory "icons") -Filter "*.png"
+    )
+    if ($managedIcons.Count -ne 1) {
+        throw "The icon importer did not create exactly one managed PNG source."
+    }
+    $managedIconId = $managedIcons[0].BaseName
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-icon-editor-smoke.png")
     }
 
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x70)) {
@@ -724,7 +766,7 @@ try {
     $exportedApplication = $exported.actions |
         Where-Object { $_.id -eq $executableActionId }
     if (
-        $exported.schema_version -ne 4 -or
+        $exported.schema_version -ne 5 -or
         $exported.config_revision -ne 1 -or
         $exported.global_profile.menu.slice_count -ne 4 -or
         @($exported.actions).Count -ne 10 -or
@@ -733,6 +775,8 @@ try {
         $exported.appearance.accent_color.blue -ne 72 -or
         $exported.appearance.label_theme -ne "dark" -or
         $exported.appearance.size_preset -ne "large" -or
+        $exported.global_profile.menu.slices[0].icon.asset_id -ne $managedIconId -or
+        $exported.global_profile.menu.slices[0].icon.format -ne "png" -or
         $exported.activation_binding.button -ne "m5" -or
         $exported.activation_binding.modifiers.control -ne $true -or
         -not $exportedApplication -or
@@ -791,7 +835,7 @@ try {
     }
     Wait-LogPattern `
         -Path $logPath `
-        -Pattern "event_code=settings_saved .*config_revision=2 .*slice_count=4 .*accent_red=224 .*accent_green=96 .*accent_blue=72 .*label_theme=dark .*size_preset=large" `
+        -Pattern "event_code=settings_saved .*config_revision=2 .*slice_count=4 .*accent_red=224 .*accent_green=96 .*accent_blue=72 .*label_theme=dark .*size_preset=large .*icon_assignment_count=2" `
         -Failure "The settings draft did not save atomically." | Out-Null
     Wait-LogPattern `
         -Path $logPath `
@@ -804,7 +848,7 @@ try {
 
     $saved = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     if (
-        $saved.schema_version -ne 4 -or
+        $saved.schema_version -ne 5 -or
         $saved.config_revision -ne 2 -or
         $saved.global_profile.menu.slice_count -ne 4
     ) {
@@ -826,6 +870,17 @@ try {
         $saved.appearance.size_preset -ne "large"
     ) {
         throw "The saved appearance does not match the editor draft."
+    }
+    if (
+        $saved.global_profile.menu.slices[0].icon.asset_id -ne $managedIconId -or
+        $saved.global_profile.menu.slices[0].icon.format -ne "png" -or
+        -not (Test-Path -LiteralPath (
+            Join-Path $gradialDirectory (
+                "icons\" + $managedIconId + ".png"
+            )
+        ))
+    ) {
+        throw "The saved north slice does not reference the managed PNG icon."
     }
     $expectedEditedLabels = @(
         "North edited",
@@ -952,6 +1007,8 @@ try {
         $applicationProfile.profile.menu.slice_count -ne 8 -or
         @($applicationProfile.profile.menu.slices).Count -ne 8 -or
         $applicationProfile.profile.menu.slices[1].label -ne "NE old" -or
+        $applicationProfile.profile.menu.slices[0].icon.asset_id -ne $managedIconId -or
+        $applicationProfile.profile.menu.slices[0].icon.format -ne "png" -or
         $applicationProfile.profile.menu.slices[2].label -ne "Profile east" -or
         $applicationProfile.profile.menu.slices[2].action_id -ne $nestedSequenceActionId
     ) {
@@ -1020,6 +1077,7 @@ try {
         "Imported north private 9A4D",
         "settings-import-smoke.json",
         "settings-export-smoke.json",
+        "settings-icon-smoke.png",
         "C:\Windows\System32\notepad.exe",
         "Notepad"
     )) {
@@ -1030,8 +1088,8 @@ try {
 
     Write-Host (
         "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
-        "private import, appearance preview, draft export, advanced profiles, all action " +
-        "editors, schema-four save, and live reload."
+        "private import, appearance and icon previews, managed PNG import, draft export, " +
+        "advanced profiles, all action editors, schema-five save, and live reload."
     )
 }
 catch {

@@ -52,6 +52,8 @@ acknowledging that dedicated chord, opening the production radial interaction,
 selecting an inert sample slice, and cancelling once before completion. The
 appearance editor adds an accent color, contrasting light/dark label themes,
 and compact/standard/large visual sizing through the same production preview.
+Each Global or application-profile direction can now import, replace, or
+remove a bounded PNG/SVG icon, rendered by that same production path.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -154,7 +156,7 @@ arguments, or target titles. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
 First startup opens required onboarding and creates
-`%LOCALAPPDATA%\Gradial\config.json` with schema 4, revision 1, the default M4
+`%LOCALAPPDATA%\Gradial\config.json` with schema 5, revision 1, the default M4
 binding, original blue/light/standard appearance, a global eight-slice profile,
 and an empty action catalog. Onboarding
 does not finish until the user acknowledges that the exact activation chord is
@@ -164,13 +166,14 @@ uses the production hook, controller, geometry, and overlay but cannot compile
 or dispatch a configured action. Successful completion is saved separately in
 `onboarding-v1.json`; the tray's **Restart onboarding** command replays the
 flow without making a previously completed installation incomplete.
-Existing schema-one, schema-two, and schema-three files are migrated to
-schema four in memory without being rewritten; the next explicit successful
-save persists schema four. Configuration
+Existing schema-one through schema-four files are migrated to schema five in
+memory without being rewritten; the next explicit successful save persists
+schema five. Configuration
 replacement is validated and atomic, preserves the previous valid primary as
 `config.json.bak`, and recovers from that backup without overwriting a broken
 primary. Application-profile rules are resolved at every activation. The
-selected profile's complete menu—including optional action UUIDs—is frozen for
+selected profile's complete menu—including optional action UUIDs and managed
+icon references—is frozen for
 the invocation, so title or configuration changes cannot switch geometry,
 labels, or the selected action while a gesture is open. Delay, keyboard
 shortcut, Unicode text, HTTP/HTTPS URL, existing absolute file/folder open, and
@@ -189,8 +192,12 @@ light surface and backing for contrast. The live preview updates from the
 draft, while production keeps the saved appearance until the complete draft
 is atomically saved.
 The window can switch between four and eight directions, edit every
-visible label, assign or clear catalog actions, and select directions directly
-in the live radial preview. The **Profiles** tab creates an application profile
+visible label, assign or clear catalog actions, import/replace/remove a custom
+icon, and select directions directly in the live radial preview. Icon imports
+accept PNG or SVG sources no larger than 256 KiB or 512×512 logical pixels,
+then copy them under `%LOCALAPPDATA%\Gradial\icons`. Missing or damaged managed
+files render a built-in placeholder instead of blocking the radial menu.
+The **Profiles** tab creates an application profile
 by choosing an `.exe`, copies the current Global menu as an independent
 starting point, and supports rename, priority, duplication, deletion, complete
 four/eight-direction editing, action assignment, and a production preview.
@@ -208,17 +215,18 @@ rename or duplicate every action and safely delete unreferenced actions.
 Sequences provide ordered add, remove, move-up, and move-down controls; only
 additions that avoid cycles and stay within nested depth, executed-step, and
 Delay limits are offered. Closing a dirty draft requires **Discard changes**
-or **Keep editing**. **Import settings…** reads schema-one through schema-four
+or **Keep editing**. **Import settings…** reads schema-one through schema-five
 JSON into the private editor draft, fully validates it, and asks
 before replacing existing unsaved edits. It does not change the running app or
 `config.json` until **Save changes**. **Export current draft…** writes the
-complete valid draft—including unsaved edits—to a self-contained schema-four
-JSON file through an atomic adjacent temporary file. Imported/exported paths,
+complete valid draft—including unsaved edits—to a schema-five JSON file
+through an atomic adjacent temporary file. Imported/exported paths,
 arguments, labels, and text stay literal; export does not attempt to make them
-portable. A successful save validates and compiles the complete
+portable. Managed icon files are not copied beside an export in this slice, so
+icon-bearing exports require their referenced files to be copied separately.
+A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
-reloads new invocations without restarting Gradial. Custom icons remain a
-future slice.
+reloads new invocations without restarting Gradial.
 
 Run all local checks with:
 
@@ -298,3 +306,6 @@ recorded in
 [`Documentation/milestone-2-onboarding-results.md`](Documentation/milestone-2-onboarding-results.md).
 Appearance configuration and production-renderer results are recorded in
 [`Documentation/milestone-2-appearance-results.md`](Documentation/milestone-2-appearance-results.md).
+Custom icon import, validation, caching, fallback, and renderer results are
+recorded in
+[`Documentation/milestone-2-custom-icons-results.md`](Documentation/milestone-2-custom-icons-results.md).
