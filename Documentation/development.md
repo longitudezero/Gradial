@@ -90,7 +90,8 @@ slices, and the current bounded Milestone 2 slices establish:
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
 - Native JSON import into the private settings draft and atomic export of the
-  current valid draft, including unsaved edits.
+  current valid draft, including unsaved edits and an optional adjacent
+  portable-icon directory.
 - Required, versioned first-run onboarding that chooses the exact activation
   chord, requires the dedicated-button acknowledgment, and practices selection
   and cancellation through an action-free production interaction.
@@ -184,7 +185,13 @@ validation path, then resets the imported revision to the current saved
 revision and replaces only the editor's proposed draft. The source bytes,
 running configuration, and persistent primary remain untouched. A dirty editor
 requires an explicit **Import file** choice before its proposed draft is
-replaced.
+replaced. For each unique icon reference, import looks for
+`icons/<asset-id>.<format>` beside the selected JSON. A missing directory or
+file is non-fatal and produces a placeholder warning. Any present asset must
+pass the same size, dimension, PNG/SVG, and SVG-content checks as a directly
+chosen icon. Valid sources are atomically copied into managed storage;
+byte-identical existing IDs are reused and differing same-ID bytes reject the
+whole draft import. Files created earlier in a failed import are removed.
 
 Settings export validates the current proposed draft, serializes schema-five
 JSON beside a uniquely named temporary file in the selected directory, flushes
@@ -193,9 +200,12 @@ unsaved edits but never changes the active revision. Gradial's three active
 configuration paths and both onboarding-marker paths are protected export
 destinations. Import and export preserve literal action
 paths, arguments, labels, and text; diagnostics expose only fixed result
-categories rather than selected paths or configuration values. Portable export
-of the referenced managed icon files remains separate, so the current JSON
-export does not copy an adjacent `icons` directory.
+categories rather than selected paths or configuration values. Before the JSON
+replacement, export validates every unique referenced managed icon and copies
+it into the adjacent `icons` directory through a flushed temporary file.
+Existing byte-identical assets are reused; conflicting same-ID files reject the
+export without touching the selected JSON. Files and a directory created by a
+failed attempt are removed, while unrelated existing files are never deleted.
 
 Configuration is parsed and completely validated before input starts. Profile
 regular expressions are compiled into the retained resolver at load rather
@@ -770,7 +780,8 @@ starts, enforces the source bounds again, decodes PNG pixels or rasterizes SVG
 vectors, and registers egui textures. The same cache is shared by every
 prewarmed display renderer and the Settings preview. A Settings import or icon
 choice extends that cache while still editing the private draft; saving
-recompiles the complete menu but never decodes an icon on activation.
+recompiles the complete menu but never decodes an icon on activation. A cached
+placeholder is retried after portable import restores its managed source.
 
 `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, and `WM_SETTINGCHANGE` for the work area
 invalidate the pool. Monitoring is deliberately disabled while windows are
@@ -1010,7 +1021,8 @@ observes four expanded steps, depth two, and 275 ms total Delay before
 converting the Global draft to four slices. It exports that complete unsaved
 draft, verifies schema five at the unchanged revision with the exact
 appearance, icon reference, literal executable path, working folder, and
-argument rows, and
+argument rows, verifies the referenced PNG was copied byte-for-byte into the
+adjacent portable `icons` directory, and
 again confirms that the active configuration is untouched. After the guarded close it requires
 revision 2 on disk with the exact complete profile rule, priority, independent
 menu, action payloads, ordered sequence UUIDs, Ctrl+M5 binding, appearance, and

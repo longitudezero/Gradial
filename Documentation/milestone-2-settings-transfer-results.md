@@ -113,8 +113,8 @@ paths are inside the disposable test tree and are removed during cleanup.
 
 ## Remaining boundary
 
-JSON configuration transfer is complete for this slice. Icon assets are not
-copied beside exports or imported from adjacent directories, and configured
-paths are intentionally not rewritten for portability. Appearance, icons, and
-onboarding were separate at this checkpoint; onboarding is covered by the
-later `milestone-2-onboarding-results.md` slice.
+JSON configuration transfer was complete for this checkpoint. Portable icon
+copying was added later and is covered by
+`milestone-2-portable-icon-transfer-results.md`; configured action paths remain
+literal. Appearance, icons, and onboarding were separate at this checkpoint;
+onboarding is covered by the later `milestone-2-onboarding-results.md` slice.

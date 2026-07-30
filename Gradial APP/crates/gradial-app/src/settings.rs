@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -24,7 +25,7 @@ use regex::Regex;
 use uuid::Uuid;
 
 use crate::{
-    configuration::{ConfigurationMigration, ConfigurationTransferError},
+    configuration::{ConfigurationMigration, ConfigurationTransferError, PortableIconSummary},
     icons::{IconImportError, IconManager},
     input::{self, ActivationBindingTestResult},
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
@@ -575,16 +576,17 @@ impl SettingsEditor {
         &self,
         configuration: Configuration,
         migration: Option<ConfigurationMigration>,
+        icons: PortableIconSummary,
     ) {
-        self.state().accept_imported(configuration, migration);
+        self.state().accept_imported(configuration, migration, icons);
     }
 
     pub(crate) fn import_failed(&self, error: ConfigurationTransferError) {
         self.state().transfer_failed(TransferOperation::Import, error);
     }
 
-    pub(crate) fn accept_exported(&self) {
-        self.state().accept_exported();
+    pub(crate) fn accept_exported(&self, icons: PortableIconSummary) {
+        self.state().accept_exported(icons);
     }
 
     pub(crate) fn export_failed(&self, error: ConfigurationTransferError) {
@@ -721,6 +723,7 @@ impl SettingsState {
         &mut self,
         configuration: Configuration,
         migration: Option<ConfigurationMigration>,
+        icons: PortableIconSummary,
     ) {
         let Some(draft) = &mut self.draft else {
             return;
@@ -742,7 +745,7 @@ impl SettingsState {
         self.pending_import_path = None;
         self.pending_icon_import = None;
         self.icon_feedback = None;
-        let message = if imported_dirty {
+        let mut message = if imported_dirty {
             migration.map_or_else(
                 || "Settings imported into this draft. Save changes to apply them.".to_owned(),
                 |migration| {
@@ -755,11 +758,36 @@ impl SettingsState {
         } else {
             "Settings imported. They match the settings already loaded in Gradial.".to_owned()
         };
+        if icons.missing > 0 {
+            let _written = write!(
+                &mut message,
+                " {} referenced {} not included; Gradial will show {} until the assets are restored.",
+                icons.missing,
+                if icons.missing == 1 { "icon was" } else { "icons were" },
+                if icons.missing == 1 { "a placeholder" } else { "placeholders" }
+            );
+        } else if icons.copied > 0 || icons.reused > 0 {
+            let _written = write!(
+                &mut message,
+                " {} portable icon {} ready.",
+                icons.copied.saturating_add(icons.reused),
+                if icons.copied.saturating_add(icons.reused) == 1 { "is" } else { "are" }
+            );
+        }
         self.transfer_feedback = Some(TransferFeedback::Info(message));
     }
 
-    fn accept_exported(&mut self) {
-        self.transfer_feedback = Some(TransferFeedback::Info("Current draft exported.".to_owned()));
+    fn accept_exported(&mut self, icons: PortableIconSummary) {
+        let message = if icons.referenced == 0 {
+            "Current draft exported. It does not reference custom icons.".to_owned()
+        } else {
+            format!(
+                "Current draft and {} custom {} exported.",
+                icons.referenced,
+                if icons.referenced == 1 { "icon" } else { "icons" }
+            )
+        };
+        self.transfer_feedback = Some(TransferFeedback::Info(message));
     }
 
     fn transfer_failed(&mut self, operation: TransferOperation, error: ConfigurationTransferError) {
@@ -1168,7 +1196,8 @@ impl SettingsState {
     #[cfg(debug_assertions)]
     fn debug_export_event(&self) -> Option<SettingsEvent> {
         let draft = self.draft.as_ref()?;
-        let path = AppPaths::discover().ok()?.root.join("settings-export-smoke.json");
+        let path =
+            AppPaths::discover().ok()?.root.join("settings-export-smoke").join("settings.json");
         (self.lifecycle == EditorLifecycle::Editing && validate_draft(&draft.proposed).is_ok())
             .then(|| SettingsEvent::Export {
                 path: PrivatePath::new(path),
@@ -3792,6 +3821,21 @@ const fn transfer_error_message(
         (TransferOperation::Import, ConfigurationTransferError::Invalid) => {
             "Those settings contain invalid profiles, menus, or actions."
         }
+        (TransferOperation::Import, ConfigurationTransferError::IconMissing) => {
+            "A portable icon disappeared while Gradial was importing it."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::IconRead) => {
+            "Gradial could not read one of the portable icons."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::IconInvalid) => {
+            "A portable icon is damaged or does not meet Gradial's icon limits."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::IconConflict) => {
+            "A portable icon conflicts with a different managed icon that has the same ID."
+        }
+        (TransferOperation::Import, ConfigurationTransferError::IconWrite) => {
+            "Gradial could not copy a portable icon into managed storage."
+        }
         (TransferOperation::Import, _) => "Gradial could not import that settings file.",
         (TransferOperation::Export, ConfigurationTransferError::InvalidPath) => {
             "Choose an available folder and file name for the export."
@@ -3804,6 +3848,21 @@ const fn transfer_error_message(
         }
         (TransferOperation::Export, ConfigurationTransferError::Write) => {
             "Gradial could not write the settings export."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::IconMissing) => {
+            "A custom icon used by this draft is missing from Gradial's managed storage."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::IconRead) => {
+            "Gradial could not read a custom icon used by this draft."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::IconInvalid) => {
+            "A custom icon used by this draft is damaged or no longer valid."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::IconConflict) => {
+            "The export folder already contains a different icon with the same ID."
+        }
+        (TransferOperation::Export, ConfigurationTransferError::IconWrite) => {
+            "Gradial could not write the portable icon files."
         }
         (TransferOperation::Export, _) => "Gradial could not export the current draft.",
     }
@@ -3975,7 +4034,7 @@ mod tests {
 
     use super::{
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
-        NewActionTemplate, PayloadEditOutcome, PrivatePath, ProfileTestState,
+        NewActionTemplate, PayloadEditOutcome, PortableIconSummary, PrivatePath, ProfileTestState,
         SequenceEditorContext, SequenceMetrics, SequenceMove, SettingsDraft, SettingsEvent,
         SettingsSection, SettingsState, TransferFeedback, action_references,
         activation_binding_display, add_executable_argument, add_sequence_step,
@@ -4318,6 +4377,7 @@ mod tests {
                 from_schema: 2,
                 to_schema: gradial_core::CONFIG_SCHEMA_VERSION,
             }),
+            PortableIconSummary { referenced: 1, missing: 1, ..PortableIconSummary::default() },
         );
 
         let draft = editor.draft.as_ref().expect("retained draft");
@@ -4332,7 +4392,9 @@ mod tests {
         assert!(matches!(
             editor.transfer_feedback,
             Some(TransferFeedback::Info(ref message))
-                if message.contains("version 2") && message.contains("Save changes")
+                if message.contains("version 2")
+                    && message.contains("Save changes")
+                    && message.contains("placeholder")
         ));
     }
 

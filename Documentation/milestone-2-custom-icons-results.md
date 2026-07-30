@@ -12,8 +12,9 @@ gesture or action boundaries:
 - the same icon rendering in production overlays and Settings previews;
 - a built-in placeholder for missing or damaged managed assets.
 
-Portable export-side icon copying and managed-asset garbage collection remain
-separate follow-up work.
+Portable export-side icon copying was completed by the later
+`milestone-2-portable-icon-transfer-results.md` slice. Managed-asset garbage
+collection remains separate follow-up work.
 
 ## Schema-five model and migration
 
@@ -109,10 +110,9 @@ preserves cardinal icon assignments and stashes diagonal assignments.
 New/duplicated profiles copy their complete menus and therefore reuse the same
 managed asset references rather than duplicating source files.
 
-Current JSON export writes schema five and preserves icon references, but it
-does not yet create the optional adjacent `icons` directory. The Settings UI
-and documentation state that icon files must currently be copied separately
-for portability.
+At this checkpoint, JSON export wrote schema five and preserved icon references
+without copying assets. The later portable-transfer slice now creates and reads
+the optional adjacent `icons` directory.
 
 ## Automated coverage
 
@@ -161,7 +161,8 @@ exact disposable tree and process created by the harness.
 
 ## Remaining boundary
 
-The optional adjacent `icons` directory for portable export/import remains the
-next bounded configuration-transfer slice. Safe reclamation of managed assets
-requires reference analysis across the active configuration and backup, so it
-is intentionally deferred rather than deleting files during draft edits.
+Portable export/import is now covered by
+`milestone-2-portable-icon-transfer-results.md`. Safe reclamation of managed
+assets still requires reference analysis across the active configuration and
+backup, so it remains intentionally deferred rather than deleting files during
+draft edits.

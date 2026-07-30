@@ -53,7 +53,9 @@ selecting an inert sample slice, and cancelling once before completion. The
 appearance editor adds an accent color, contrasting light/dark label themes,
 and compact/standard/large visual sizing through the same production preview.
 Each Global or application-profile direction can now import, replace, or
-remove a bounded PNG/SVG icon, rendered by that same production path.
+remove a bounded PNG/SVG icon, rendered by that same production path. Settings
+exports carry referenced icons in an adjacent `icons` directory for portable
+round trips.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -220,10 +222,15 @@ JSON into the private editor draft, fully validates it, and asks
 before replacing existing unsaved edits. It does not change the running app or
 `config.json` until **Save changes**. **Export current draft…** writes the
 complete valid draft—including unsaved edits—to a schema-five JSON file
-through an atomic adjacent temporary file. Imported/exported paths,
-arguments, labels, and text stay literal; export does not attempt to make them
-portable. Managed icon files are not copied beside an export in this slice, so
-icon-bearing exports require their referenced files to be copied separately.
+through an atomic adjacent temporary file. When the draft references custom
+icons, export validates each managed source and copies each unique asset into
+an adjacent `icons` directory. Import validates that optional directory and
+copies its assets into managed storage. Byte-identical UUID assets are reused;
+same-ID files with different bytes are rejected instead of overwritten.
+Missing adjacent assets do not block a JSON-only import: Settings reports the
+count and the affected directions use placeholders. Imported/exported action
+paths, arguments, labels, and text stay literal and are not rewritten for
+portability.
 A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
 reloads new invocations without restarting Gradial.
@@ -309,3 +316,5 @@ Appearance configuration and production-renderer results are recorded in
 Custom icon import, validation, caching, fallback, and renderer results are
 recorded in
 [`Documentation/milestone-2-custom-icons-results.md`](Documentation/milestone-2-custom-icons-results.md).
+Portable icon export/import and collision-handling results are recorded in
+[`Documentation/milestone-2-portable-icon-transfer-results.md`](Documentation/milestone-2-portable-icon-transfer-results.md).

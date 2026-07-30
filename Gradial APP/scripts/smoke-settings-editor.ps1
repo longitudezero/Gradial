@@ -311,7 +311,8 @@ $gradialDirectory = Join-Path $temporaryRoot "Gradial"
 $configPath = Join-Path $gradialDirectory "config.json"
 $backupPath = Join-Path $gradialDirectory "config.json.bak"
 $importPath = Join-Path $gradialDirectory "settings-import-smoke.json"
-$exportPath = Join-Path $gradialDirectory "settings-export-smoke.json"
+$exportDirectory = Join-Path $gradialDirectory "settings-export-smoke"
+$exportPath = Join-Path $exportDirectory "settings.json"
 $iconSourcePath = Join-Path $gradialDirectory "settings-icon-smoke.png"
 $logPath = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
 $standardOutputPath = Join-Path $temporaryRoot "gradial.stdout.log"
@@ -337,6 +338,7 @@ $controlIsDown = $false
 
 try {
     New-Item -ItemType Directory -Path $gradialDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $exportDirectory -Force | Out-Null
     [System.IO.File]::WriteAllText(
         (Join-Path $gradialDirectory "onboarding-v1.json"),
         '{"schema_version":1,"completed":true}',
@@ -759,7 +761,7 @@ try {
     }
     Wait-LogPattern `
         -Path $logPath `
-        -Pattern "event_code=settings_draft_exported .*result_code=ok .*config_revision=1 .*action_count=10" `
+        -Pattern "event_code=settings_draft_exported .*result_code=ok .*config_revision=1 .*action_count=10 .*icon_referenced_count=1 .*icon_copied_count=1 .*icon_reused_count=0" `
         -Failure "The complete unsaved settings draft was not exported." |
         Out-Null
     $exported = Get-Content -LiteralPath $exportPath -Raw | ConvertFrom-Json
@@ -789,6 +791,16 @@ try {
         ).Count -ne 0
     ) {
         throw "Export did not preserve the valid draft, revision, or literal application fields."
+    }
+    $portableIconPath = Join-Path (
+        Join-Path $exportDirectory "icons"
+    ) ($managedIconId + ".png")
+    if (
+        -not (Test-Path -LiteralPath $portableIconPath -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $portableIconPath -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $managedIcons[0].FullName -Algorithm SHA256).Hash
+    ) {
+        throw "Export did not copy the referenced icon into its portable icons directory."
     }
     $activeAfterExport = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     if (
@@ -1076,7 +1088,7 @@ try {
         "Imported settings private 9A4D",
         "Imported north private 9A4D",
         "settings-import-smoke.json",
-        "settings-export-smoke.json",
+        "settings-export-smoke",
         "settings-icon-smoke.png",
         "C:\Windows\System32\notepad.exe",
         "Notepad"
@@ -1088,8 +1100,8 @@ try {
 
     Write-Host (
         "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
-        "private import, appearance and icon previews, managed PNG import, draft export, " +
-        "advanced profiles, all action editors, schema-five save, and live reload."
+        "private import, appearance and icon previews, managed PNG import, portable draft " +
+        "export, advanced profiles, all action editors, schema-five save, and live reload."
     )
 }
 catch {

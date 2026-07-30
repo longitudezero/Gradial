@@ -20,6 +20,8 @@ use windows::{
     core::PCWSTR,
 };
 
+use crate::icons::{IconImportError, configuration_icon_references, read_validated_icon_source};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigurationSource {
     Primary,
@@ -63,6 +65,16 @@ pub(crate) struct ConfigurationWarning {
 pub(crate) struct ImportedConfiguration {
     pub(crate) configuration: Configuration,
     pub(crate) migration: Option<ConfigurationMigration>,
+    pub(crate) icons: PortableIconSummary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PortableIconSummary {
+    pub(crate) referenced: usize,
+    pub(crate) copied: usize,
+    pub(crate) reused: usize,
+    pub(crate) missing: usize,
+    pub(crate) bundle_present: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -83,6 +95,16 @@ pub(crate) enum ConfigurationTransferError {
     ProtectedDestination,
     #[error("the settings export could not be written")]
     Write,
+    #[error("a referenced icon is missing from the portable settings")]
+    IconMissing,
+    #[error("a referenced icon could not be read")]
+    IconRead,
+    #[error("a referenced icon is invalid")]
+    IconInvalid,
+    #[error("a referenced icon conflicts with an existing asset")]
+    IconConflict,
+    #[error("a referenced icon could not be copied")]
+    IconWrite,
 }
 
 impl ConfigurationTransferError {
@@ -96,6 +118,11 @@ impl ConfigurationTransferError {
             Self::Invalid => "config_invalid",
             Self::ProtectedDestination => "protected_destination",
             Self::Write => "write_failed",
+            Self::IconMissing => "icon_missing",
+            Self::IconRead => "icon_read_failed",
+            Self::IconInvalid => "icon_invalid",
+            Self::IconConflict => "icon_conflict",
+            Self::IconWrite => "icon_write_failed",
         }
     }
 }
@@ -186,7 +213,8 @@ impl ConfigStore {
         let mut configuration = read.configuration;
         configuration.config_revision = current.config_revision;
         validate_complete_configuration(&configuration)?;
-        Ok(ImportedConfiguration { configuration, migration: read.migration })
+        let icons = self.import_portable_icons(path, &configuration)?;
+        Ok(ImportedConfiguration { configuration, migration: read.migration, icons })
     }
 
     pub(crate) fn export_draft(
@@ -194,7 +222,7 @@ impl ConfigStore {
         current: &Configuration,
         path: &Path,
         configuration: &Configuration,
-    ) -> Result<(), ConfigurationTransferError> {
+    ) -> Result<PortableIconSummary, ConfigurationTransferError> {
         if !path.is_absolute() || path.file_name().is_none() {
             return Err(ConfigurationTransferError::InvalidPath);
         }
@@ -208,7 +236,142 @@ impl ConfigStore {
         let mut serialized = serde_json::to_vec_pretty(configuration)
             .map_err(|_| ConfigurationTransferError::Invalid)?;
         serialized.push(b'\n');
-        write_export_atomically(path, &serialized)
+        self.export_portable(path, configuration, &serialized)
+    }
+
+    fn import_portable_icons(
+        &self,
+        configuration_path: &Path,
+        configuration: &Configuration,
+    ) -> Result<PortableIconSummary, ConfigurationTransferError> {
+        let references = configuration_icon_references(configuration);
+        let mut summary =
+            PortableIconSummary { referenced: references.len(), ..PortableIconSummary::default() };
+        if references.is_empty() {
+            return Ok(summary);
+        }
+        let icon_directory = adjacent_icon_directory(configuration_path)?;
+        let metadata = match fs::metadata(&icon_directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                summary.missing = references.len();
+                return Ok(summary);
+            }
+            Err(_) => return Err(ConfigurationTransferError::IconRead),
+        };
+        if !metadata.is_dir() {
+            return Err(ConfigurationTransferError::IconInvalid);
+        }
+        summary.bundle_present = true;
+
+        let mut created = Vec::new();
+        let result = (|| {
+            for reference in references {
+                let source = icon_directory.join(reference.file_name());
+                let source_metadata = match fs::metadata(&source) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        summary.missing = summary.missing.saturating_add(1);
+                        continue;
+                    }
+                    Err(_) => return Err(ConfigurationTransferError::IconRead),
+                };
+                if !source_metadata.is_file() {
+                    return Err(ConfigurationTransferError::IconInvalid);
+                }
+                let bytes = read_validated_icon_source(&source, reference.format)
+                    .map_err(map_present_icon_error)?;
+                let destination = self.paths.icons.join(reference.file_name());
+                match fs::metadata(&destination) {
+                    Ok(metadata) => {
+                        if !metadata.is_file() {
+                            return Err(ConfigurationTransferError::IconConflict);
+                        }
+                        let existing = read_validated_icon_source(&destination, reference.format)
+                            .map_err(map_existing_icon_error)?;
+                        if existing != bytes {
+                            return Err(ConfigurationTransferError::IconConflict);
+                        }
+                        summary.reused = summary.reused.saturating_add(1);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        write_new_icon_atomically(&destination, &bytes)?;
+                        created.push(destination);
+                        summary.copied = summary.copied.saturating_add(1);
+                    }
+                    Err(_) => return Err(ConfigurationTransferError::IconRead),
+                }
+            }
+            Ok(summary)
+        })();
+        if result.is_err() {
+            remove_created_files(&created);
+        }
+        result
+    }
+
+    fn export_portable(
+        &self,
+        configuration_path: &Path,
+        configuration: &Configuration,
+        serialized: &[u8],
+    ) -> Result<PortableIconSummary, ConfigurationTransferError> {
+        let references = configuration_icon_references(configuration);
+        let mut summary =
+            PortableIconSummary { referenced: references.len(), ..PortableIconSummary::default() };
+        let icon_directory = adjacent_icon_directory(configuration_path)?;
+        let mut created_directory = false;
+        if !references.is_empty() {
+            match fs::metadata(&icon_directory) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err(ConfigurationTransferError::IconConflict),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&icon_directory)
+                        .map_err(|_| ConfigurationTransferError::IconWrite)?;
+                    created_directory = true;
+                }
+                Err(_) => return Err(ConfigurationTransferError::IconRead),
+            }
+            summary.bundle_present = true;
+        }
+
+        let mut created = Vec::new();
+        let result = (|| {
+            for reference in references {
+                let source = self.paths.icons.join(reference.file_name());
+                let bytes = read_validated_icon_source(&source, reference.format)
+                    .map_err(map_export_icon_error)?;
+                let destination = icon_directory.join(reference.file_name());
+                match fs::metadata(&destination) {
+                    Ok(metadata) => {
+                        if !metadata.is_file() {
+                            return Err(ConfigurationTransferError::IconConflict);
+                        }
+                        let existing = read_validated_icon_source(&destination, reference.format)
+                            .map_err(|_| ConfigurationTransferError::IconConflict)?;
+                        if existing != bytes {
+                            return Err(ConfigurationTransferError::IconConflict);
+                        }
+                        summary.reused = summary.reused.saturating_add(1);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        write_new_icon_atomically(&destination, &bytes)?;
+                        created.push(destination);
+                        summary.copied = summary.copied.saturating_add(1);
+                    }
+                    Err(_) => return Err(ConfigurationTransferError::IconRead),
+                }
+            }
+            write_export_atomically(configuration_path, serialized)?;
+            Ok(summary)
+        })();
+        if result.is_err() {
+            remove_created_files(&created);
+            if created_directory {
+                let _removed = fs::remove_dir(&icon_directory);
+            }
+        }
+        result
     }
 
     fn is_protected_destination(&self, path: &Path) -> bool {
@@ -501,6 +664,78 @@ fn validate_complete_configuration(
     Ok(())
 }
 
+fn adjacent_icon_directory(
+    configuration_path: &Path,
+) -> Result<PathBuf, ConfigurationTransferError> {
+    configuration_path
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .map(|parent| parent.join("icons"))
+        .ok_or(ConfigurationTransferError::InvalidPath)
+}
+
+fn map_present_icon_error(error: IconImportError) -> ConfigurationTransferError {
+    match error {
+        IconImportError::Read => ConfigurationTransferError::IconRead,
+        IconImportError::Write => ConfigurationTransferError::IconWrite,
+        IconImportError::Missing => ConfigurationTransferError::IconMissing,
+        IconImportError::InvalidPath
+        | IconImportError::UnsupportedType
+        | IconImportError::Empty
+        | IconImportError::SourceTooLarge
+        | IconImportError::InvalidPng
+        | IconImportError::InvalidSvg
+        | IconImportError::UnsupportedSvgContent
+        | IconImportError::Dimensions => ConfigurationTransferError::IconInvalid,
+    }
+}
+
+fn map_export_icon_error(error: IconImportError) -> ConfigurationTransferError {
+    match error {
+        IconImportError::Missing => ConfigurationTransferError::IconMissing,
+        other => map_present_icon_error(other),
+    }
+}
+
+fn map_existing_icon_error(error: IconImportError) -> ConfigurationTransferError {
+    match error {
+        IconImportError::Read => ConfigurationTransferError::IconRead,
+        _ => ConfigurationTransferError::IconConflict,
+    }
+}
+
+fn write_new_icon_atomically(
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<(), ConfigurationTransferError> {
+    let Some(parent) = destination.parent().filter(|parent| parent.is_dir()) else {
+        return Err(ConfigurationTransferError::IconWrite);
+    };
+    let temporary =
+        parent.join(format!(".gradial-icon-transfer-{}.tmp", Uuid::new_v4().as_hyphenated()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| ConfigurationTransferError::IconWrite)?;
+        file.write_all(bytes).map_err(|_| ConfigurationTransferError::IconWrite)?;
+        file.sync_all().map_err(|_| ConfigurationTransferError::IconWrite)?;
+        drop(file);
+        fs::rename(&temporary, destination).map_err(|_| ConfigurationTransferError::IconWrite)
+    })();
+    if result.is_err() {
+        let _removed = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn remove_created_files(files: &[PathBuf]) {
+    for file in files {
+        let _removed = fs::remove_file(file);
+    }
+}
+
 fn write_export_atomically(
     destination: &Path,
     bytes: &[u8],
@@ -635,6 +870,7 @@ mod tests {
         AppPaths, Appearance, CONFIG_SCHEMA_VERSION, Configuration, IconFormat, IconReference,
         LEGACY_CONFIG_SCHEMA_VERSION,
     };
+    use image::{ImageEncoder, codecs::png::PngEncoder};
     use uuid::Uuid;
 
     use super::{
@@ -652,6 +888,14 @@ mod tests {
 
     fn active_configuration(path: &std::path::Path) -> Configuration {
         read_configuration(path).expect("configuration").configuration
+    }
+
+    fn png(red: u8, green: u8, blue: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        PngEncoder::new(&mut bytes)
+            .write_image(&[red, green, blue, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .expect("PNG fixture");
+        bytes
     }
 
     fn schema_one_bytes() -> Vec<u8> {
@@ -1140,15 +1384,179 @@ mod tests {
         let destination = paths.root.join("exports").join("draft.json");
         fs::create_dir_all(destination.parent().expect("export parent")).expect("export parent");
 
-        store.export_draft(&draft, &destination, &draft).expect("export");
+        let icons = store.export_draft(&draft, &destination, &draft).expect("export");
 
         assert_eq!(read_configuration(&destination).expect("exported config").configuration, draft);
+        assert_eq!(icons.referenced, 0);
         let debris = fs::read_dir(destination.parent().expect("export parent"))
             .expect("export directory")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".gradial-export-"))
             .count();
         assert_eq!(debris, 0);
+    }
+
+    #[test]
+    fn portable_export_copies_each_referenced_icon_and_reuses_identical_assets() {
+        let (_temporary_directory, paths, store) = store();
+        let reference = IconReference { asset_id: Uuid::from_u128(0x501), format: IconFormat::Png };
+        let source_bytes = png(224, 96, 72);
+        fs::write(paths.icons.join(reference.file_name()), &source_bytes).expect("managed icon");
+        let mut draft = Configuration::default();
+        draft.global_profile.menu.slices[0].icon = Some(reference);
+        draft.global_profile.menu.slices[1].icon = Some(reference);
+        let export_root = paths.root.join("portable");
+        fs::create_dir(&export_root).expect("export directory");
+        let destination = export_root.join("settings.json");
+
+        let first = store.export_draft(&draft, &destination, &draft).expect("first export");
+
+        assert_eq!(first.referenced, 1);
+        assert_eq!(first.copied, 1);
+        assert_eq!(first.reused, 0);
+        assert_eq!(
+            fs::read(export_root.join("icons").join(reference.file_name())).expect("portable icon"),
+            source_bytes
+        );
+
+        let second = store.export_draft(&draft, &destination, &draft).expect("repeat export");
+        assert_eq!(second.referenced, 1);
+        assert_eq!(second.copied, 0);
+        assert_eq!(second.reused, 1);
+    }
+
+    #[test]
+    fn portable_export_rejects_missing_icons_and_collisions_without_touching_the_json() {
+        let (_temporary_directory, paths, store) = store();
+        let reference = IconReference { asset_id: Uuid::from_u128(0x502), format: IconFormat::Png };
+        let mut draft = Configuration::default();
+        draft.global_profile.menu.slices[0].icon = Some(reference);
+        let export_root = paths.root.join("portable");
+        fs::create_dir(&export_root).expect("export root");
+        let destination = export_root.join("settings.json");
+        fs::write(&destination, b"retain existing JSON").expect("existing JSON");
+
+        assert_eq!(
+            store.export_draft(&draft, &destination, &draft),
+            Err(ConfigurationTransferError::IconMissing)
+        );
+        assert!(!export_root.join("icons").exists());
+        assert_eq!(
+            fs::read(&destination).expect("existing JSON retained"),
+            b"retain existing JSON"
+        );
+
+        fs::write(paths.icons.join(reference.file_name()), png(224, 96, 72)).expect("managed icon");
+        let export_icons = export_root.join("icons");
+        fs::create_dir(&export_icons).expect("export icons");
+        fs::write(export_icons.join(reference.file_name()), png(36, 118, 224))
+            .expect("conflicting icon");
+
+        assert_eq!(
+            store.export_draft(&draft, &destination, &draft),
+            Err(ConfigurationTransferError::IconConflict)
+        );
+        assert_eq!(
+            fs::read(&destination).expect("existing JSON retained"),
+            b"retain existing JSON"
+        );
+    }
+
+    #[test]
+    fn portable_import_copies_valid_icons_and_reuses_identical_managed_assets() {
+        let (_temporary_directory, paths, store) = store();
+        let current = Configuration::default();
+        let reference = IconReference { asset_id: Uuid::from_u128(0x503), format: IconFormat::Png };
+        let source_bytes = png(224, 96, 72);
+        let mut imported = Configuration::default();
+        imported.global_profile.menu.slices[0].icon = Some(reference);
+        let import_root = paths.root.join("incoming");
+        let import_icons = import_root.join("icons");
+        fs::create_dir_all(&import_icons).expect("import icons");
+        let source = import_root.join("settings.json");
+        fs::write(&source, serde_json::to_vec_pretty(&imported).expect("import JSON"))
+            .expect("import config");
+        fs::write(import_icons.join(reference.file_name()), &source_bytes).expect("portable icon");
+
+        let first = store.import_draft(&current, &source).expect("first import");
+
+        assert_eq!(first.icons.referenced, 1);
+        assert_eq!(first.icons.copied, 1);
+        assert_eq!(first.icons.reused, 0);
+        assert_eq!(first.icons.missing, 0);
+        assert!(first.icons.bundle_present);
+        assert_eq!(
+            fs::read(paths.icons.join(reference.file_name())).expect("managed icon"),
+            source_bytes
+        );
+
+        let second = store.import_draft(&current, &source).expect("repeat import");
+        assert_eq!(second.icons.copied, 0);
+        assert_eq!(second.icons.reused, 1);
+    }
+
+    #[test]
+    fn portable_import_warns_for_missing_assets_but_rejects_invalid_and_conflicting_ones() {
+        let (_temporary_directory, paths, store) = store();
+        let current = Configuration::default();
+        let reference = IconReference { asset_id: Uuid::from_u128(0x504), format: IconFormat::Png };
+        let mut imported = Configuration::default();
+        imported.global_profile.menu.slices[0].icon = Some(reference);
+        let import_root = paths.root.join("incoming");
+        fs::create_dir(&import_root).expect("import root");
+        let source = import_root.join("settings.json");
+        fs::write(&source, serde_json::to_vec_pretty(&imported).expect("import JSON"))
+            .expect("import config");
+
+        let missing = store.import_draft(&current, &source).expect("JSON-only import");
+        assert_eq!(missing.icons.missing, 1);
+        assert!(!missing.icons.bundle_present);
+
+        let import_icons = import_root.join("icons");
+        fs::create_dir(&import_icons).expect("import icons");
+        fs::write(import_icons.join(reference.file_name()), b"damaged PNG")
+            .expect("damaged portable icon");
+        assert_eq!(
+            store.import_draft(&current, &source),
+            Err(ConfigurationTransferError::IconInvalid)
+        );
+
+        fs::write(import_icons.join(reference.file_name()), png(36, 118, 224))
+            .expect("valid portable icon");
+        fs::write(paths.icons.join(reference.file_name()), png(224, 96, 72))
+            .expect("different managed icon");
+        assert_eq!(
+            store.import_draft(&current, &source),
+            Err(ConfigurationTransferError::IconConflict)
+        );
+    }
+
+    #[test]
+    fn failed_portable_import_removes_assets_created_earlier_in_the_transaction() {
+        let (_temporary_directory, paths, store) = store();
+        let current = Configuration::default();
+        let first = IconReference { asset_id: Uuid::from_u128(0x505), format: IconFormat::Png };
+        let second = IconReference { asset_id: Uuid::from_u128(0x506), format: IconFormat::Png };
+        let mut imported = Configuration::default();
+        imported.global_profile.menu.slices[0].icon = Some(first);
+        imported.global_profile.menu.slices[1].icon = Some(second);
+        let import_root = paths.root.join("incoming");
+        let import_icons = import_root.join("icons");
+        fs::create_dir_all(&import_icons).expect("import icons");
+        let source = import_root.join("settings.json");
+        fs::write(&source, serde_json::to_vec_pretty(&imported).expect("import JSON"))
+            .expect("import config");
+        fs::write(import_icons.join(first.file_name()), png(224, 96, 72))
+            .expect("first portable icon");
+        fs::write(import_icons.join(second.file_name()), b"damaged PNG")
+            .expect("second portable icon");
+
+        assert_eq!(
+            store.import_draft(&current, &source),
+            Err(ConfigurationTransferError::IconInvalid)
+        );
+        assert!(!paths.icons.join(first.file_name()).exists());
+        assert!(!paths.icons.join(second.file_name()).exists());
     }
 
     #[test]

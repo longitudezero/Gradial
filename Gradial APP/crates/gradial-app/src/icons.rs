@@ -51,11 +51,19 @@ impl IconManager {
     }
 
     pub(crate) fn preload_configuration(&self, context: &Context, configuration: &Configuration) {
+        self.load_configuration(context, configuration, false);
+    }
+
+    pub(crate) fn refresh_configuration(&self, context: &Context, configuration: &Configuration) {
+        self.load_configuration(context, configuration, true);
+    }
+
+    fn load_configuration(&self, context: &Context, configuration: &Configuration, refresh: bool) {
         let references = configuration_icon_references(configuration);
         let mut loaded = 0_usize;
         let mut placeholders = 0_usize;
         for reference in references.iter().copied() {
-            if self.contains(reference) {
+            if !refresh && self.has_texture(reference) {
                 continue;
             }
             match self.load_managed(context, reference) {
@@ -83,12 +91,13 @@ impl IconManager {
             target: "renderer",
             "component=renderer event_code=icon_cache_preloaded result_code=ok \
              config_revision={} referenced_count={} newly_loaded={} placeholder_count={} \
-             cached_count={}",
+             cached_count={} refresh={}",
             configuration.config_revision,
             references.len(),
             loaded,
             placeholders,
-            self.cached_count()
+            self.cached_count(),
+            refresh
         );
     }
 
@@ -136,11 +145,11 @@ impl IconManager {
         self.entries.read().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
-    fn contains(&self, reference: IconReference) -> bool {
-        self.entries
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&reference)
+    fn has_texture(&self, reference: IconReference) -> bool {
+        matches!(
+            self.entries.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&reference),
+            Some(CachedIcon::Texture { .. })
+        )
     }
 
     fn insert(&self, reference: IconReference, cached: CachedIcon) {
@@ -182,8 +191,8 @@ impl IconManager {
     }
 }
 
-fn configuration_icon_references(configuration: &Configuration) -> HashSet<IconReference> {
-    configuration
+pub(crate) fn configuration_icon_references(configuration: &Configuration) -> Vec<IconReference> {
+    let mut references = configuration
         .global_profile
         .menu
         .slices
@@ -195,7 +204,11 @@ fn configuration_icon_references(configuration: &Configuration) -> HashSet<IconR
                 .flat_map(|application| &application.profile.menu.slices),
         )
         .filter_map(|slice| slice.icon)
-        .collect()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    references.sort_unstable_by_key(|reference| reference.file_name());
+    references
 }
 
 fn icon_format_from_path(path: &Path) -> Result<IconFormat, IconImportError> {
@@ -232,6 +245,15 @@ fn read_bounded_source(path: &Path) -> Result<Vec<u8>, IconImportError> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_ICON_SOURCE_BYTES {
         return Err(IconImportError::SourceTooLarge);
     }
+    Ok(bytes)
+}
+
+pub(crate) fn read_validated_icon_source(
+    path: &Path,
+    format: IconFormat,
+) -> Result<Vec<u8>, IconImportError> {
+    let bytes = read_bounded_source(path)?;
+    let _decoded = decode_icon(format, &bytes)?;
     Ok(bytes)
 }
 
@@ -455,5 +477,26 @@ mod tests {
         manager.preload_configuration(&context, &configuration);
 
         assert_eq!(manager.visual(reference), IconVisual::Placeholder);
+    }
+
+    #[test]
+    fn preload_retries_a_placeholder_after_the_managed_asset_is_restored() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let manager = IconManager::new(temporary.path().to_path_buf());
+        let context = Context::default();
+        let mut configuration = Configuration::default();
+        let reference = gradial_core::IconReference {
+            asset_id: uuid::Uuid::from_u128(8),
+            format: IconFormat::Png,
+        };
+        configuration.global_profile.menu.slices[0].icon = Some(reference);
+
+        manager.preload_configuration(&context, &configuration);
+        assert_eq!(manager.visual(reference), IconVisual::Placeholder);
+        fs::write(temporary.path().join(reference.file_name()), minimal_png())
+            .expect("restored managed icon");
+        manager.preload_configuration(&context, &configuration);
+
+        assert!(matches!(manager.visual(reference), IconVisual::Texture { .. }));
     }
 }
