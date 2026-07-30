@@ -20,6 +20,7 @@ mod settings;
 mod shell_open;
 mod shortcut;
 mod shortcut_recorder;
+mod start_at_login;
 mod tray;
 mod unicode_text;
 mod window_action;

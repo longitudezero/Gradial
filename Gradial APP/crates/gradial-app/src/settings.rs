@@ -35,6 +35,7 @@ use crate::{
     overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
     platform::{self, ProfileTestTarget},
     shortcut_recorder::{CaptureOutcome, ShortcutRecorder, shortcut_display},
+    start_at_login::{StartAtLoginAction, StartAtLoginError, StartAtLoginStatus},
 };
 
 const SETTINGS_SIZE: [f32; 2] = [940.0, 680.0];
@@ -145,11 +146,18 @@ enum EditorLifecycle {
 enum SettingsSection {
     #[default]
     Menu,
+    General,
     Binding,
     Appearance,
     Profiles,
     Actions,
     Diagnostics,
+}
+
+impl SettingsSection {
+    const fn edits_configuration(self) -> bool {
+        !matches!(self, Self::General | Self::Diagnostics)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +247,12 @@ enum TransferFeedback {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DiagnosticFeedback {
+    Info(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StartAtLoginFeedback {
     Info(String),
     Error(String),
 }
@@ -509,6 +523,8 @@ pub(crate) enum SettingsEvent {
     ImportIcon { path: PrivatePath, profile_id: Uuid, slice_index: usize },
     RefreshDiagnostics,
     ExportDiagnostics { path: PrivatePath, request: DiagnosticBundleRequest },
+    RefreshStartAtLogin,
+    ChangeStartAtLogin(StartAtLoginAction),
     Closed,
 }
 
@@ -530,6 +546,10 @@ impl std::fmt::Debug for SettingsEvent {
                 .field("path", &"<redacted>")
                 .field("request", request)
                 .finish(),
+            Self::RefreshStartAtLogin => formatter.write_str("RefreshStartAtLogin"),
+            Self::ChangeStartAtLogin(action) => {
+                formatter.debug_tuple("ChangeStartAtLogin").field(action).finish()
+            }
             Self::Closed => formatter.write_str("Closed"),
         }
     }
@@ -656,6 +676,29 @@ impl SettingsEditor {
         self.state().diagnostic_failed(error);
     }
 
+    pub(crate) fn update_start_at_login_status(
+        &self,
+        status: Result<StartAtLoginStatus, StartAtLoginError>,
+    ) {
+        self.state().update_start_at_login_status(status);
+    }
+
+    pub(crate) fn accept_start_at_login_changed(
+        &self,
+        action: StartAtLoginAction,
+        status: StartAtLoginStatus,
+    ) {
+        self.state().accept_start_at_login_changed(action, status);
+    }
+
+    pub(crate) fn start_at_login_failed(
+        &self,
+        action: StartAtLoginAction,
+        error: StartAtLoginError,
+    ) {
+        self.state().start_at_login_failed(action, error);
+    }
+
     fn state(&self) -> MutexGuard<'_, SettingsState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -683,6 +726,8 @@ struct SettingsState {
     diagnostic_snapshot: Option<Arc<DiagnosticSnapshot>>,
     diagnostic_include_process_paths: bool,
     diagnostic_feedback: Option<DiagnosticFeedback>,
+    start_at_login_status: Option<Result<StartAtLoginStatus, StartAtLoginError>>,
+    start_at_login_feedback: Option<StartAtLoginFeedback>,
     recovery_warning: bool,
     preview_renderer: FoundationOverlayRenderer,
     pending_event: Option<SettingsEvent>,
@@ -711,6 +756,8 @@ impl SettingsState {
             diagnostic_snapshot: None,
             diagnostic_include_process_paths: false,
             diagnostic_feedback: None,
+            start_at_login_status: None,
+            start_at_login_feedback: None,
             recovery_warning,
             preview_renderer: FoundationOverlayRenderer::new(icons),
             pending_event: None,
@@ -743,6 +790,7 @@ impl SettingsState {
             self.diagnostic_snapshot = None;
             self.diagnostic_include_process_paths = false;
             self.diagnostic_feedback = None;
+            self.start_at_login_feedback = None;
             log::info!(
                 target: "settings",
                 "component=settings event_code=settings_opened result_code=ok \
@@ -881,6 +929,39 @@ impl SettingsState {
     fn diagnostic_failed(&mut self, error: DiagnosticBundleError) {
         self.diagnostic_feedback =
             Some(DiagnosticFeedback::Error(diagnostic_error_message(error).to_owned()));
+    }
+
+    fn update_start_at_login_status(
+        &mut self,
+        status: Result<StartAtLoginStatus, StartAtLoginError>,
+    ) {
+        self.start_at_login_status = Some(status);
+    }
+
+    fn accept_start_at_login_changed(
+        &mut self,
+        action: StartAtLoginAction,
+        status: StartAtLoginStatus,
+    ) {
+        self.start_at_login_status = Some(Ok(status));
+        self.start_at_login_feedback = Some(StartAtLoginFeedback::Info(
+            match action {
+                StartAtLoginAction::Enable => "Gradial will start when you sign in to Windows.",
+                StartAtLoginAction::Disable => {
+                    "Gradial will no longer start automatically when you sign in."
+                }
+                StartAtLoginAction::Repair => {
+                    "The start-at-login entry now points to this Gradial application."
+                }
+            }
+            .to_owned(),
+        ));
+    }
+
+    fn start_at_login_failed(&mut self, _action: StartAtLoginAction, error: StartAtLoginError) {
+        self.start_at_login_status = Some(Err(error));
+        self.start_at_login_feedback =
+            Some(StartAtLoginFeedback::Error(start_at_login_error_message(error).to_owned()));
     }
 
     fn accept_icon_import(&mut self, profile_id: Uuid, slice_index: usize, icon: IconReference) {
@@ -1303,6 +1384,26 @@ impl SettingsState {
     }
 
     #[cfg(debug_assertions)]
+    fn debug_refresh_start_at_login_event(&mut self) -> Option<SettingsEvent> {
+        self.section = SettingsSection::General;
+        self.start_at_login_feedback = None;
+        (self.lifecycle == EditorLifecycle::Editing).then_some(SettingsEvent::RefreshStartAtLogin)
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_cycle_start_at_login_event(&mut self) -> SettingsEvent {
+        self.section = SettingsSection::General;
+        self.start_at_login_feedback = None;
+        let action = match self.start_at_login_status {
+            Some(Ok(StartAtLoginStatus::Disabled)) => StartAtLoginAction::Enable,
+            Some(Ok(StartAtLoginStatus::Enabled)) => StartAtLoginAction::Disable,
+            Some(Ok(StartAtLoginStatus::NeedsRepair)) => StartAtLoginAction::Repair,
+            Some(Err(_)) | None => return SettingsEvent::RefreshStartAtLogin,
+        };
+        SettingsEvent::ChangeStartAtLogin(action)
+    }
+
+    #[cfg(debug_assertions)]
     fn debug_export_diagnostics_event(
         &mut self,
         include_process_paths: bool,
@@ -1541,6 +1642,16 @@ impl SettingsState {
         {
             self.debug_open_native_configuration_picker(PathDialogKind::DiagnosticBundleExport);
             None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F23))
+        {
+            self.debug_refresh_start_at_login_event()
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F24))
+        {
+            Some(self.debug_cycle_start_at_login_event())
         } else {
             None
         };
@@ -1570,6 +1681,7 @@ impl SettingsState {
         let mut event = debug_event;
         let validation = validate_draft(&draft.proposed);
         let dirty = draft.is_dirty();
+        let previous_section = self.section;
 
         egui::Panel::top("settings_header").show(ui, |ui| {
             ui.add_space(10.0);
@@ -1580,6 +1692,7 @@ impl SettingsState {
                 });
             });
             ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.section, SettingsSection::General, "General");
                 ui.selectable_value(&mut self.section, SettingsSection::Binding, "Activation");
                 ui.selectable_value(&mut self.section, SettingsSection::Appearance, "Appearance");
                 ui.selectable_value(&mut self.section, SettingsSection::Menu, "Menu");
@@ -1591,7 +1704,7 @@ impl SettingsState {
                     "Diagnostics",
                 );
             });
-            if self.section != SettingsSection::Diagnostics {
+            if self.section.edits_configuration() {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Import settings\u{2026}").clicked() {
@@ -1654,13 +1767,20 @@ impl SettingsState {
             }
             ui.add_space(8.0);
         });
+        if previous_section != SettingsSection::General
+            && self.section == SettingsSection::General
+            && event.is_none()
+        {
+            self.start_at_login_feedback = None;
+            event = Some(SettingsEvent::RefreshStartAtLogin);
+        }
         if self.section != SettingsSection::Binding
             && !matches!(self.binding_test, BindingTestState::Idle)
         {
             self.cancel_binding_test();
         }
 
-        if self.section != SettingsSection::Diagnostics {
+        if self.section.edits_configuration() {
             egui::Panel::bottom("settings_actions").show(ui, |ui| {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -1714,6 +1834,12 @@ impl SettingsState {
         }
 
         match self.section {
+            SettingsSection::General => {
+                let start_at_login_event = self.render_general_section(ui);
+                if event.is_none() {
+                    event = start_at_login_event;
+                }
+            }
             SettingsSection::Binding => self.render_binding_section(ui, &mut draft),
             SettingsSection::Appearance => self.render_appearance_section(ui, &mut draft),
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
@@ -1816,6 +1942,104 @@ impl SettingsState {
         }
 
         self.draft = Some(draft);
+        event
+    }
+
+    fn render_general_section(&mut self, ui: &mut egui::Ui) -> Option<SettingsEvent> {
+        let mut event = None;
+        egui::CentralPanel::default().show(ui, |ui| {
+            ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(18.0);
+                ui.heading("General");
+                ui.label("Choose how Gradial starts for this Windows account.");
+                ui.add_space(18.0);
+
+                ui.group(|ui| {
+                    ui.set_min_width(520.0);
+                    ui.label(RichText::new("Start at login").strong());
+                    match self.start_at_login_status {
+                        None => {
+                            ui.label("Checking the Windows startup setting\u{2026}");
+                        }
+                        Some(Err(error)) => {
+                            ui.colored_label(
+                                Color32::from_rgb(239, 113, 113),
+                                "Status unavailable",
+                            );
+                            ui.label(start_at_login_error_message(error));
+                            if ui.button("Try again").clicked() {
+                                self.start_at_login_feedback = None;
+                                event = Some(SettingsEvent::RefreshStartAtLogin);
+                            }
+                        }
+                        Some(Ok(StartAtLoginStatus::Disabled)) => {
+                            ui.label("Status: Off");
+                            let mut enabled = false;
+                            if ui.checkbox(&mut enabled, "Start Gradial when I sign in").changed() {
+                                self.start_at_login_feedback = None;
+                                event = Some(SettingsEvent::ChangeStartAtLogin(
+                                    StartAtLoginAction::Enable,
+                                ));
+                            }
+                        }
+                        Some(Ok(StartAtLoginStatus::Enabled)) => {
+                            ui.label("Status: On");
+                            let mut enabled = true;
+                            if ui.checkbox(&mut enabled, "Start Gradial when I sign in").changed() {
+                                self.start_at_login_feedback = None;
+                                event = Some(SettingsEvent::ChangeStartAtLogin(
+                                    StartAtLoginAction::Disable,
+                                ));
+                            }
+                        }
+                        Some(Ok(StartAtLoginStatus::NeedsRepair)) => {
+                            ui.colored_label(
+                                Color32::from_rgb(245, 188, 78),
+                                "Status: Needs repair",
+                            );
+                            ui.label(
+                                "Windows has a Gradial startup entry, but it does not point exactly \
+                                 to this Gradial application.",
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Repair").clicked() {
+                                    self.start_at_login_feedback = None;
+                                    event = Some(SettingsEvent::ChangeStartAtLogin(
+                                        StartAtLoginAction::Repair,
+                                    ));
+                                }
+                                if ui.button("Turn off").clicked() {
+                                    self.start_at_login_feedback = None;
+                                    event = Some(SettingsEvent::ChangeStartAtLogin(
+                                        StartAtLoginAction::Disable,
+                                    ));
+                                }
+                            });
+                        }
+                    }
+                    ui.add_space(6.0);
+                    if ui.small_button("Refresh status").clicked() {
+                        self.start_at_login_feedback = None;
+                        event = Some(SettingsEvent::RefreshStartAtLogin);
+                    }
+                    render_start_at_login_feedback(ui, self.start_at_login_feedback.as_ref());
+                });
+
+                ui.add_space(12.0);
+                ui.weak(
+                    "This setting applies only to your Windows account and does not require \
+                     administrator access.",
+                );
+                ui.weak(
+                    "It is separate from Gradial menu settings, so configuration import and \
+                     export never change it.",
+                );
+                ui.weak(
+                    "Gradial registers only its current application path, with no startup \
+                     arguments.",
+                );
+            });
+        });
         event
     }
 
@@ -4145,6 +4369,21 @@ fn render_diagnostic_feedback(ui: &mut egui::Ui, feedback: Option<&DiagnosticFee
     }
 }
 
+fn render_start_at_login_feedback(ui: &mut egui::Ui, feedback: Option<&StartAtLoginFeedback>) {
+    let Some(feedback) = feedback else {
+        return;
+    };
+    ui.add_space(8.0);
+    match feedback {
+        StartAtLoginFeedback::Info(message) => {
+            ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+        }
+        StartAtLoginFeedback::Error(message) => {
+            ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+        }
+    }
+}
+
 fn display_byte_count(bytes: usize) -> String {
     if bytes < 1_024 {
         return format!("{bytes} B");
@@ -4170,6 +4409,26 @@ const fn diagnostic_error_message(error: DiagnosticBundleError) -> &'static str 
         }
         DiagnosticBundleError::Write => {
             "Gradial could not write the diagnostic bundle. The preview is still available."
+        }
+    }
+}
+
+const fn start_at_login_error_message(error: StartAtLoginError) -> &'static str {
+    match error {
+        StartAtLoginError::ExecutableUnavailable => {
+            "Gradial could not identify its current application file."
+        }
+        StartAtLoginError::RegistryRead(_) => {
+            "Windows did not allow Gradial to read the startup setting."
+        }
+        StartAtLoginError::RegistryWrite(_) => {
+            "Windows did not allow Gradial to enable start at login."
+        }
+        StartAtLoginError::RegistryDelete(_) => {
+            "Windows did not allow Gradial to turn off start at login."
+        }
+        StartAtLoginError::Verification => {
+            "Windows did not retain the requested startup setting. Try again."
         }
     }
 }
@@ -4412,7 +4671,7 @@ mod tests {
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
         NewActionTemplate, PayloadEditOutcome, PortableIconSummary, PrivatePath, ProfileTestState,
         SequenceEditorContext, SequenceMetrics, SequenceMove, SettingsDraft, SettingsEvent,
-        SettingsSection, SettingsState, TransferFeedback, action_references,
+        SettingsSection, SettingsState, StartAtLoginFeedback, TransferFeedback, action_references,
         activation_binding_display, add_executable_argument, add_sequence_step,
         apply_dialog_outcome, binding_test_selection, countdown_seconds_remaining, create_action,
         create_application_profile, delete_action, delete_application_profile, duplicate_action,
@@ -4427,6 +4686,7 @@ mod tests {
         input::ActivationBindingTestResult,
         native_file_dialog::PathDialogOutcome,
         platform::ProfileTestTarget,
+        start_at_login::{StartAtLoginAction, StartAtLoginError, StartAtLoginStatus},
     };
 
     #[test]
@@ -4667,6 +4927,31 @@ mod tests {
     }
 
     #[test]
+    fn start_at_login_status_and_changes_stay_outside_the_configuration_draft() {
+        let configuration = Configuration::default();
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
+        editor.open(&configuration);
+
+        editor.update_start_at_login_status(Ok(StartAtLoginStatus::NeedsRepair));
+        assert_eq!(editor.start_at_login_status, Some(Ok(StartAtLoginStatus::NeedsRepair)));
+        assert!(!editor.draft.as_ref().expect("open draft").is_dirty());
+
+        editor
+            .accept_start_at_login_changed(StartAtLoginAction::Repair, StartAtLoginStatus::Enabled);
+        assert_eq!(editor.start_at_login_status, Some(Ok(StartAtLoginStatus::Enabled)));
+        assert!(matches!(editor.start_at_login_feedback, Some(StartAtLoginFeedback::Info(_))));
+        assert!(!editor.draft.as_ref().expect("open draft").is_dirty());
+
+        editor.start_at_login_failed(
+            StartAtLoginAction::Disable,
+            StartAtLoginError::RegistryDelete(5),
+        );
+        assert_eq!(editor.start_at_login_status, Some(Err(StartAtLoginError::RegistryDelete(5))));
+        assert!(matches!(editor.start_at_login_feedback, Some(StartAtLoginFeedback::Error(_))));
+        assert!(!editor.draft.as_ref().expect("open draft").is_dirty());
+    }
+
+    #[test]
     fn activation_binding_edits_stay_in_the_draft_until_accept_or_discard() {
         let configuration = Configuration::default();
         let mut draft = SettingsDraft::new(&configuration);
@@ -4828,6 +5113,11 @@ mod tests {
         assert!(!diagnostic_debug.contains("Target.exe"));
         assert!(!diagnostic_debug.contains("Diagnostics.zip"));
         assert!(diagnostic_debug.contains("include_process_paths: true"));
+
+        assert_eq!(
+            format!("{:?}", SettingsEvent::ChangeStartAtLogin(StartAtLoginAction::Repair)),
+            "ChangeStartAtLogin(Repair)"
+        );
     }
 
     #[test]

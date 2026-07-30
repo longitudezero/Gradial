@@ -3,7 +3,7 @@
 ## Current milestone scope
 
 The foundation, Milestone 0 interaction spike, completed bounded Milestone 1
-and Milestone 2 slices, and the first bounded Milestone 3 slice establish:
+and Milestone 2 slices, and the first two bounded Milestone 3 slices establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -104,6 +104,9 @@ and Milestone 2 slices, and the first bounded Milestone 3 slice establish:
 - A frozen diagnostic-bundle preview with sanitized bounded logs,
   app/input/display metadata, explicit configured-process-path inclusion, and
   atomic local ZIP export.
+- A default-off, per-user Windows start-at-login control with exact
+  registration inspection, stale-entry repair, and no administrator
+  requirement.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -137,6 +140,7 @@ Gradial APP\
         window-smoke-target.ps1 Observe isolated window messages and states
         smoke-action-feedback.ps1 Verify failure activity, notification, focus, and privacy
         smoke-settings-editor.ps1 Verify native draft, diagnostic ZIP, save, and live reload
+        smoke-start-at-login.ps1 Verify isolated Windows startup registration and repair
         smoke-onboarding.ps1 Verify required first run and safe production-menu practice
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
@@ -265,6 +269,33 @@ classes/titles, clipboard data, icons, and a unique installation identifier
 are always absent. ZIP creation is local, uses no network behavior, writes a
 flushed adjacent temporary file, and atomically replaces the chosen `.zip`.
 Every path inside `%LOCALAPPDATA%\Gradial` is a protected destination.
+
+## Start at login
+
+Start at login is Windows account state, not portable Gradial configuration.
+The Settings **General** page inspects only:
+
+```text
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
+    Gradial
+```
+
+An absent value is **Off**. **On** requires a `REG_SZ` value that exactly
+matches the current absolute executable path enclosed in quotes, with no
+arguments. Any other type, path, quoting, or appended text is **Needs repair**;
+Gradial does not silently accept or execute it.
+
+Gradial never creates the value automatically. Enable and repair set only the
+`Gradial` value, then immediately read it back before reporting success. Turn
+off deletes only that value and verifies its absence. Gradial never deletes
+the shared Run key, enumerates another application's values, or requests
+elevation. Import, export, configuration save, onboarding, and app startup
+never enable the option.
+
+The current executable command and stored stale value are excluded from log
+records and error messages. Logs contain only the requested operation, the
+resulting state, a stable error code, and a native numeric error code when
+Windows provides one.
 
 ## Required first-run onboarding
 
@@ -1103,6 +1134,15 @@ restarts Gradial against the same isolated data, and requires onboarding to
 remain closed. Optional screenshots capture the binding and completed-practice
 pages; cleanup closes only the process it started and removes the temporary
 tree.
+
+`smoke-start-at-login.ps1` uses a debug-only, unique
+`GradialSmoke-<UUID>` value in the real current-user Run key. It drives the
+native Settings window through Off, On, externally stale, repaired, and Off
+again; requires one quoted argument-free executable command; checks that
+logs contain neither the command nor the isolated value name; and confirms
+that the production `Gradial` value is unchanged. Cleanup removes only that
+unique test value and its disposable local-data tree, including after
+failure. The release build ignores the test-name environment hook.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

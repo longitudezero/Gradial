@@ -21,6 +21,7 @@ use crate::{
     overlay::{AnimationMode, OverlayPool},
     platform,
     settings::{SettingsEditor, SettingsEvent, settings_viewport_id},
+    start_at_login::{StartAtLoginAction, StartAtLoginService},
     tray::{TrayCommand, TrayHealth, TrayIcon},
 };
 
@@ -28,14 +29,19 @@ use crate::{
 pub(crate) struct ApplicationServices {
     config_store: ConfigStore,
     diagnostic_bundles: DiagnosticBundleService,
+    start_at_login: StartAtLoginService,
 }
 
 impl ApplicationServices {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         config_store: ConfigStore,
         diagnostic_bundles: DiagnosticBundleService,
     ) -> Self {
-        Self { config_store, diagnostic_bundles }
+        Self {
+            config_store,
+            diagnostic_bundles,
+            start_at_login: StartAtLoginService::for_current_executable(),
+        }
     }
 }
 
@@ -57,6 +63,7 @@ pub(crate) struct GradialApp {
     configuration: Configuration,
     config_store: ConfigStore,
     diagnostic_bundles: DiagnosticBundleService,
+    start_at_login: StartAtLoginService,
     icons: Arc<IconManager>,
     settings: SettingsEditor,
     onboarding_store: OnboardingStore,
@@ -77,7 +84,7 @@ impl GradialApp {
         configuration: Configuration,
         recovery_warning: bool,
     ) -> Result<Self> {
-        let ApplicationServices { config_store, diagnostic_bundles } = services;
+        let ApplicationServices { config_store, diagnostic_bundles, start_at_login } = services;
         let config_revision = configuration.config_revision;
         let icons = Arc::new(IconManager::new(config_store.icon_directory()));
         let icon_protection = config_store.icon_protection_snapshot(&configuration, None);
@@ -139,6 +146,7 @@ impl GradialApp {
         );
         creation_context.egui_ctx.request_repaint();
         let settings = SettingsEditor::new(recovery_warning, Arc::clone(&icons));
+        settings.update_start_at_login_status(start_at_login.inspect());
         let onboarding =
             OnboardingEditor::new(onboarding_startup.required, configuration.activation_binding);
         if startup_options.debug_open_settings {
@@ -163,6 +171,7 @@ impl GradialApp {
             configuration,
             config_store,
             diagnostic_bundles,
+            start_at_login,
             icons,
             settings,
             onboarding_store: onboarding_startup.store,
@@ -340,6 +349,7 @@ impl GradialApp {
             return;
         }
         let newly_opened = self.settings.open(&self.configuration);
+        self.refresh_start_at_login_status(context);
         if newly_opened {
             context.request_repaint();
         } else {
@@ -590,8 +600,71 @@ impl GradialApp {
                 }
                 context.request_repaint_of(settings_viewport_id());
             }
+            SettingsEvent::RefreshStartAtLogin => self.refresh_start_at_login_status(context),
+            SettingsEvent::ChangeStartAtLogin(action) => {
+                self.change_start_at_login(context, action);
+            }
             SettingsEvent::Closed => self.reconcile_icon_storage(None),
         }
+    }
+
+    fn refresh_start_at_login_status(&self, context: &eframe::egui::Context) {
+        let status = self.start_at_login.inspect();
+        match status {
+            Ok(status) => {
+                self.settings.update_start_at_login_status(Ok(status));
+                log::info!(
+                    target: "startup",
+                    "component=start_at_login event_code=start_at_login_status_read \
+                     result_code=ok config_revision={} status={}",
+                    self.config_revision,
+                    status.log_name()
+                );
+            }
+            Err(error) => {
+                self.settings.update_start_at_login_status(Err(error));
+                log::warn!(
+                    target: "startup",
+                    "component=start_at_login event_code=start_at_login_status_read \
+                     result_code=failure error_code={} native_error_code={} \
+                     config_revision={}",
+                    error.code(),
+                    error.native_error_code(),
+                    self.config_revision
+                );
+            }
+        }
+        context.request_repaint_of(settings_viewport_id());
+    }
+
+    fn change_start_at_login(&self, context: &eframe::egui::Context, action: StartAtLoginAction) {
+        match self.start_at_login.apply(action) {
+            Ok(status) => {
+                self.settings.accept_start_at_login_changed(action, status);
+                log::info!(
+                    target: "startup",
+                    "component=start_at_login event_code=start_at_login_changed \
+                     result_code=ok config_revision={} action={} status={}",
+                    self.config_revision,
+                    action.log_name(),
+                    status.log_name()
+                );
+            }
+            Err(error) => {
+                self.settings.start_at_login_failed(action, error);
+                log::error!(
+                    target: "startup",
+                    "component=start_at_login event_code=start_at_login_changed \
+                     result_code=failure error_code={} native_error_code={} \
+                     config_revision={} action={}",
+                    error.code(),
+                    error.native_error_code(),
+                    self.config_revision,
+                    action.log_name()
+                );
+            }
+        }
+        context.request_repaint_of(settings_viewport_id());
     }
 
     fn refresh_diagnostic_preview(&self, context: &eframe::egui::Context) {

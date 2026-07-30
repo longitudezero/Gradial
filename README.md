@@ -55,10 +55,11 @@ and compact/standard/large visual sizing through the same production preview.
 Each Global or application-profile direction can now import, replace, or
 remove a bounded PNG/SVG icon, rendered by that same production path. Settings
 exports carry referenced icons in an adjacent `icons` directory for portable
-round trips. The first Milestone 3 slice adds a dedicated Diagnostics page
-that previews a frozen local ZIP before export, sanitizes the bounded Gradial
-logs, records app/input/display metadata, and excludes configured application
-paths unless the user explicitly includes them.
+round trips. The first Milestone 3 slices add a dedicated Diagnostics page
+that previews a frozen local ZIP before export plus a per-user start-at-login
+control that detects and repairs stale Windows registration. Configured
+application paths remain excluded from diagnostics unless the user explicitly
+includes them.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -237,6 +238,14 @@ Missing adjacent assets do not block a JSON-only import: Settings reports the
 count and the affected directions use placeholders. Imported/exported action
 paths, arguments, labels, and text stay literal and are not rewritten for
 portability.
+The **General** tab keeps **Start at login** outside portable menu
+configuration. Gradial never enables it automatically, and it uses only the
+current Windows account, so it does not require administrator access. Gradial reports
+whether the entry is off, on, or needs repair because it no longer points
+exactly to the running application. Repair replaces only Gradial's named
+entry. Turning the option off removes only that entry; neither operation
+touches another application's startup value. Importing or exporting settings
+never changes this preference.
 The **Diagnostics** tab prepares a frozen preview listing every ZIP entry,
 current hook-thread status, and physical display/DPI record. The default
 bundle contains `manifest.json` and sanitized copies of Gradial's bounded
@@ -262,6 +271,7 @@ can also capture the editor and close-confirmation surfaces:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-settings-editor.ps1 -CaptureScreenshot
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-onboarding.ps1 -CaptureScreenshot
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-start-at-login.ps1 -CaptureScreenshot
 ```
 
 Run the standard live interaction matrix after building the debug executable:
@@ -337,3 +347,6 @@ Recoverable managed-icon quarantine results are recorded in
 [`Documentation/milestone-2-icon-quarantine-results.md`](Documentation/milestone-2-icon-quarantine-results.md).
 Release logging and diagnostic-bundle preview/export results are recorded in
 [`Documentation/milestone-3-diagnostic-bundle-results.md`](Documentation/milestone-3-diagnostic-bundle-results.md).
+Per-user start-at-login ownership, repair, and native registry results are
+recorded in
+[`Documentation/milestone-3-start-at-login-results.md`](Documentation/milestone-3-start-at-login-results.md).
