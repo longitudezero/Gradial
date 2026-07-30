@@ -18,6 +18,7 @@ flexi_logger.workspace = true
 gradial-core = { path = "../gradial-core" }
 log.workspace = true
 raw-window-handle.workspace = true
+regex.workspace = true
 rtrb.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

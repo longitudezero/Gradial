@@ -80,16 +80,19 @@ slices, and the current bounded Milestone 2 slices establish:
 - An application-profile catalog with exact executable selection, explicit
   priority, complete-menu duplication, lifecycle controls, and independent
   four/eight-slice editing through the production preview.
+- Optional exact window-class and title-regex rule controls plus a private
+  countdown tester that uses the production resolver to explain matches,
+  winner, and tie-break.
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
 
 Configuration editing currently covers the global menu and the complete action
 catalog, including sequences, plus exact-executable application profiles and
-their independent menus. Optional window-class/title rules and the
-current-window tester, activation binding, appearance, icons, import/export,
-and onboarding are not exposed yet. A release logs the chosen slice, compiles
-its assigned plan, and submits it to the coordinator. Every schema-two action
-family can execute through its bounded backend.
+their independent menus and complete matching rules. Activation binding,
+appearance, icons, import/export, and onboarding are not exposed yet. A
+release logs the chosen slice, compiles its assigned plan, and submits it to
+the coordinator. Every schema-two action family can execute through its
+bounded backend.
 
 ## Workspace layout
 
@@ -310,9 +313,24 @@ through 100.
 **Duplicate selected** copies the complete profile rule and menu under a new
 UUID and unique name. **Delete selected** removes only that private draft
 profile; normal discard and guarded-close behavior can still recover the
-saved configuration. Existing optional window-class and title-regex predicates
-are preserved by edits and duplication, with a visible boundary notice, but
-their controls remain deferred to the advanced matching slice.
+saved configuration. Optional window-class matching is an exact,
+case-insensitive predicate. Optional window-title matching is a
+case-sensitive Rust regular expression. Enabling either rule exposes its
+field; an empty class, empty pattern, or invalid pattern has an inline error
+and disables save. Disabling the checkbox removes that predicate.
+
+**Test profiles** starts a three-second countdown so the user can switch to a
+target application. At the deadline, Gradial privately captures the foreground
+executable path, window class, and title, compiles the current complete draft
+through `ProfileResolver`, and displays every match in resolver order with
+priority, specificity, and immutable UUID. It shows the winning profile and
+whether the decision came from sole eligibility, highest priority, highest
+specificity, the UUID tie-break, unavailable executable identity, or Global
+fallback. Rule edits re-resolve the retained target immediately.
+
+Captured target values remain only in settings memory: they are neither added
+to the draft nor written to diagnostics. **Clear captured details** purges them
+explicitly, and every clean or discarded settings close also clears them.
 
 Each application profile can independently switch between four and eight
 directions, edit labels, assign or clear any catalog action, and select a slice
@@ -320,8 +338,8 @@ in its own production-renderer preview. A per-profile diagonal stash preserves
 eight-slice edits while that profile temporarily uses four slices. Creating,
 resizing, duplicating, or deleting a profile never mutates the Global menu or
 another profile. Empty profile names, required paths, out-of-range priorities,
-empty profile-menu labels, and invalid preserved advanced predicates receive
-field-specific save messages.
+empty profile-menu labels, empty optional predicates, and invalid title
+patterns receive field-specific save messages.
 
 The **Actions** tab lists the complete catalog. Its **New action** menu creates
 every leaf type: keyboard shortcut, Unicode text, website, file/folder,
@@ -818,19 +836,23 @@ duplication, unreferenced deletion, sequence addition/removal/reordering, and
 records an exact left-Ctrl+F14 combination through native key messages. It
 also creates, duplicates, and deletes application profiles, round-trips one
 profile through four/eight geometry, and retains an eight-slice menu with its
-own nested-sequence assignment while Global later becomes four slices. The
-application fixture includes three exact argument rows—one containing spaces
-and one empty—plus a working folder. The harness opens the real native
-application chooser, observes its window, and cancels it without changing the
-draft. It then selects the nested sequence and observes four expanded steps,
-depth two, and 275 ms total Delay before converting the Global draft to four
-slices. After the guarded close it requires revision 2 on disk with the exact
-profile path, priority, independent menu, action payloads, and ordered sequence
-UUIDs, the old profile-free eight-slice revision in `config.json.bak`,
-preserved cardinal assignments, and a fresh M4 action using the reloaded
-Global menu. Optional screenshots cover the menu, profile, payload, sequence,
-shortcut-recorder, Windows-chooser, and confirmation surfaces. The fixture
-never reads or writes the user's Gradial configuration.
+own nested-sequence assignment while Global later becomes four slices. That
+profile enables exact window-class and title-regex predicates. The harness
+runs the real three-second tester countdown, injects a deterministic private
+target for resolver display, and verifies that its path, class, and title are
+absent from the local log. The application fixture includes three exact
+argument rows—one containing spaces and one empty—plus a working folder. The
+harness opens the real native application chooser, observes its window, and
+cancels it without changing the draft. It then selects the nested sequence and
+observes four expanded steps, depth two, and 275 ms total Delay before
+converting the Global draft to four slices. After the guarded close it requires
+revision 2 on disk with the exact complete profile rule, priority, independent
+menu, action payloads, and ordered sequence UUIDs, the old profile-free
+eight-slice revision in `config.json.bak`, preserved cardinal assignments, and
+a fresh M4 action using the reloaded Global menu. Optional screenshots cover
+the menu, advanced profile tester, payload, sequence, shortcut-recorder,
+Windows-chooser, and confirmation surfaces. The fixture never reads or writes
+the user's Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

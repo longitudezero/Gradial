@@ -948,6 +948,7 @@ dependencies = [
  "gradial-core",
  "log",
  "raw-window-handle",
+ "regex",
  "rtrb",
  "serde_json",
  "tempfile",

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{
@@ -15,20 +15,23 @@ use gradial_core::{
     ActionDefinition, ActionKind, ActionPlanCompiler, ApplicationProfile, Configuration,
     ConfigurationError, ExecutionOperation, MAX_ACTION_SEQUENCE_DEPTH,
     MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu,
-    MenuSlice, Profile, ProfileResolver, ProfileRule, ResolvedMenu, ShortcutKey, SliceCount,
-    WindowCommand,
+    MenuSlice, Profile, ProfileResolver, ProfileRule, ProfileTarget, ResolutionDecision,
+    ResolvedMenu, ShortcutKey, SliceCount, WindowCommand,
 };
+use regex::Regex;
 use uuid::Uuid;
 
 use crate::{
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
     overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
+    platform::{self, ProfileTestTarget},
     shortcut_recorder::{CaptureOutcome, ShortcutRecorder, shortcut_display},
 };
 
 const SETTINGS_SIZE: [f32; 2] = [940.0, 680.0];
 const SETTINGS_MIN_SIZE: [f32; 2] = [820.0, 580.0];
 const PREVIEW_SIZE: f32 = 288.0;
+const PROFILE_TEST_COUNTDOWN: Duration = Duration::from_secs(3);
 const PREVIEW_INVOCATION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0901);
 #[cfg(debug_assertions)]
 const DEBUG_SHORTCUT_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0902);
@@ -56,6 +59,8 @@ const DEBUG_APPLICATION_PROFILE_ID: Uuid =
     Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0920);
 #[cfg(debug_assertions)]
 const DEBUG_DUPLICATE_PROFILE_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0921);
+#[cfg(debug_assertions)]
+const DEBUG_PROFILE_TEST_TITLE: &str = "Profile test title private 7F3C";
 pub(crate) fn settings_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("gradial-settings")
 }
@@ -215,7 +220,9 @@ enum DraftValidationError {
     EmptyApplicationProfileName { profile: usize },
     EmptyApplicationProfilePath { profile: usize },
     InvalidApplicationProfilePriority { profile: usize, priority: u8 },
-    InvalidApplicationProfileRule { profile: usize },
+    EmptyApplicationWindowClass { profile: usize },
+    EmptyApplicationTitleRegex { profile: usize },
+    InvalidApplicationTitleRegex { profile: usize },
     EmptyActionName { index: usize },
     TypedTextTooLong { index: usize, bytes: usize },
     InvalidUrl { index: usize },
@@ -258,9 +265,21 @@ impl DraftValidationError {
                     profile + 1
                 )
             }
-            Self::InvalidApplicationProfileRule { profile } => {
+            Self::EmptyApplicationWindowClass { profile } => {
                 format!(
-                    "Review the preserved window-specific rule in application profile {}.",
+                    "Enter a window class or turn off that match for application profile {}.",
+                    profile + 1
+                )
+            }
+            Self::EmptyApplicationTitleRegex { profile } => {
+                format!(
+                    "Enter a title pattern or turn off that match for application profile {}.",
+                    profile + 1
+                )
+            }
+            Self::InvalidApplicationTitleRegex { profile } => {
+                format!(
+                    "Fix the title pattern in application profile {} before saving.",
                     profile + 1
                 )
             }
@@ -350,6 +369,16 @@ enum ActionEditorFeedback {
 enum ProfileEditorFeedback {
     Info(String),
     Error(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum ProfileTestState {
+    #[default]
+    Idle,
+    CountingDown {
+        deadline: Instant,
+    },
+    Captured(ProfileTestTarget),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -454,6 +483,7 @@ struct SettingsState {
     selected_profile: Option<Uuid>,
     selected_action: Option<Uuid>,
     profile_feedback: Option<ProfileEditorFeedback>,
+    profile_test: ProfileTestState,
     action_feedback: Option<ActionEditorFeedback>,
     shortcut_recorder: ShortcutRecorder,
     recording_action_id: Option<Uuid>,
@@ -473,6 +503,7 @@ impl SettingsState {
             selected_profile: None,
             selected_action: None,
             profile_feedback: None,
+            profile_test: ProfileTestState::Idle,
             action_feedback: None,
             shortcut_recorder: ShortcutRecorder::default(),
             recording_action_id: None,
@@ -496,6 +527,7 @@ impl SettingsState {
                 .map(|application| application.profile.id);
             self.selected_action = configuration.actions.first().map(|action| action.id);
             self.profile_feedback = None;
+            self.profile_test = ProfileTestState::Idle;
             self.action_feedback = None;
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
@@ -687,6 +719,8 @@ impl SettingsState {
             {
                 "Editor Notepad".clone_into(&mut application.profile.name);
                 application.rule.priority = 72;
+                application.rule.window_class = Some("Notepad".to_owned());
+                application.rule.title_regex = Some("^Profile test title".to_owned());
             }
             draft.set_profile_slice_count(DEBUG_APPLICATION_PROFILE_ID, SliceCount::Four);
             if let Some(application) =
@@ -717,6 +751,45 @@ impl SettingsState {
             draft.original.config_revision,
             draft.proposed.application_profiles.len()
         );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_show_profile_test(&mut self) -> bool {
+        if !self.draft.as_ref().is_some_and(|draft| {
+            draft
+                .proposed
+                .application_profiles
+                .iter()
+                .any(|application| application.profile.id == DEBUG_APPLICATION_PROFILE_ID)
+        }) {
+            return false;
+        }
+        self.section = SettingsSection::Profiles;
+        self.selected_profile = Some(DEBUG_APPLICATION_PROFILE_ID);
+        self.profile_test = ProfileTestState::Captured(ProfileTestTarget {
+            executable_path: Some(PathBuf::from(r"C:\Windows\System32\notepad.exe")),
+            window_class: "Notepad".to_owned(),
+            window_title: DEBUG_PROFILE_TEST_TITLE.to_owned(),
+        });
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_profile_test_shown result_code=ok \
+             config_revision={} executable_path_available=true window_class_available=true \
+             window_title_available=true",
+            self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_begin_profile_test_capture(&mut self) -> bool {
+        if self.lifecycle != EditorLifecycle::Editing {
+            return false;
+        }
+        self.section = SettingsSection::Profiles;
+        self.profile_test =
+            ProfileTestState::CountingDown { deadline: Instant::now() + PROFILE_TEST_COUNTDOWN };
         true
     }
 
@@ -840,6 +913,18 @@ impl SettingsState {
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F4))
         {
             let _edited = self.debug_apply_profile_fixture_edit();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F3))
+        {
+            let _shown = self.debug_show_profile_test();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F2))
+        {
+            let _started = self.debug_begin_profile_test_capture();
             None
         } else if ui
             .ctx()
@@ -996,6 +1081,7 @@ impl SettingsState {
                 });
             if discard {
                 draft.discard();
+                self.profile_test = ProfileTestState::Idle;
                 self.lifecycle = EditorLifecycle::Closed;
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                 log::info!(
@@ -1142,11 +1228,8 @@ impl SettingsState {
             .unwrap_or_default();
         self.selected_slice = self.selected_slice.min(profile_slice_count.get().saturating_sub(1));
 
-        egui::Panel::left("profile_editor")
-            .resizable(false)
-            .exact_size(340.0)
-            .show(ui, |ui| {
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::Panel::left("profile_editor").resizable(false).exact_size(340.0).show(ui, |ui| {
+            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(12.0);
                 ui.heading("Profile");
 
@@ -1190,24 +1273,61 @@ impl SettingsState {
                     ui.add_space(10.0);
                     ui.label("Priority");
                     if ui
-                        .add(
-                            DragValue::new(&mut application.rule.priority)
-                                .range(0..=100)
-                                .speed(1),
-                        )
+                        .add(DragValue::new(&mut application.rule.priority).range(0..=100).speed(1))
                         .changed()
                     {
                         self.profile_feedback = None;
                         self.save_feedback = SaveFeedback::None;
                     }
                     ui.weak("Higher priority wins when more than one profile matches.");
-                    if application.rule.window_class.is_some()
-                        || application.rule.title_regex.is_some()
-                    {
-                        ui.add_space(6.0);
-                        ui.weak(
-                            "Existing window-specific matching is preserved. Its editor is coming in the next profile step.",
-                        );
+
+                    ui.add_space(10.0);
+                    let mut class_enabled = application.rule.window_class.is_some();
+                    if ui.checkbox(&mut class_enabled, "Match window class").changed() {
+                        application.rule.window_class = class_enabled.then(String::new);
+                        self.profile_feedback = None;
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    if let Some(window_class) = &mut application.rule.window_class {
+                        if ui.text_edit_singleline(window_class).changed() {
+                            self.profile_feedback = None;
+                            self.save_feedback = SaveFeedback::None;
+                        }
+                        if window_class.trim().is_empty() {
+                            ui.colored_label(
+                                Color32::from_rgb(239, 113, 113),
+                                "Enter a window class or turn off this match.",
+                            );
+                        } else {
+                            ui.weak("Exact match; letter case is ignored.");
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    let mut title_enabled = application.rule.title_regex.is_some();
+                    if ui.checkbox(&mut title_enabled, "Match window title pattern").changed() {
+                        application.rule.title_regex = title_enabled.then(String::new);
+                        self.profile_feedback = None;
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    if let Some(pattern) = &mut application.rule.title_regex {
+                        if ui.text_edit_singleline(pattern).changed() {
+                            self.profile_feedback = None;
+                            self.save_feedback = SaveFeedback::None;
+                        }
+                        if pattern.is_empty() {
+                            ui.colored_label(
+                                Color32::from_rgb(239, 113, 113),
+                                "Enter a title pattern or turn off this match.",
+                            );
+                        } else if Regex::new(pattern).is_err() {
+                            ui.colored_label(
+                                Color32::from_rgb(239, 113, 113),
+                                "This title pattern is not valid.",
+                            );
+                        } else {
+                            ui.weak("Regular expression; letter case is significant.");
+                        }
                     }
                 }
 
@@ -1248,31 +1368,28 @@ impl SettingsState {
                         self.save_feedback = SaveFeedback::None;
                     }
                     ui.label("Action");
-                    ComboBox::from_id_salt(("profile_slice_action", profile_id, self.selected_slice))
-                        .width(310.0)
-                        .selected_text(action_option_text(slice.action_id, &action_options))
-                        .show_ui(ui, |ui| {
+                    ComboBox::from_id_salt((
+                        "profile_slice_action",
+                        profile_id,
+                        self.selected_slice,
+                    ))
+                    .width(310.0)
+                    .selected_text(action_option_text(slice.action_id, &action_options))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_value(&mut slice.action_id, None, "No action").changed() {
+                            self.profile_feedback = None;
+                            self.save_feedback = SaveFeedback::None;
+                        }
+                        for (action_id, label) in &action_options {
                             if ui
-                                .selectable_value(&mut slice.action_id, None, "No action")
+                                .selectable_value(&mut slice.action_id, Some(*action_id), label)
                                 .changed()
                             {
                                 self.profile_feedback = None;
                                 self.save_feedback = SaveFeedback::None;
                             }
-                            for (action_id, label) in &action_options {
-                                if ui
-                                    .selectable_value(
-                                        &mut slice.action_id,
-                                        Some(*action_id),
-                                        label,
-                                    )
-                                    .changed()
-                                {
-                                    self.profile_feedback = None;
-                                    self.save_feedback = SaveFeedback::None;
-                                }
-                            }
-                        });
+                        }
+                    });
                 }
                 if action_catalog_empty && ui.link("Create an action first.").clicked() {
                     self.section = SettingsSection::Actions;
@@ -1288,17 +1405,24 @@ impl SettingsState {
                         }
                     }
                 }
-                });
             });
+        });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(12.0);
-            ui.heading("Profile preview");
-            ui.label("This is a complete menu, independent from Global.");
-            ui.add_space(18.0);
-            if let Some(menu) = profile_menu(&draft.proposed, profile_id) {
-                ui.vertical_centered(|ui| self.render_preview(ui, menu));
-            }
+            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(12.0);
+                self.render_profile_tester(ui, &draft.proposed);
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.heading("Profile preview");
+                ui.label("This is a complete menu, independent from Global.");
+                ui.add_space(18.0);
+                if let Some(menu) = profile_menu(&draft.proposed, profile_id) {
+                    ui.vertical_centered(|ui| self.render_preview(ui, menu));
+                }
+                ui.add_space(16.0);
+            });
         });
     }
 
@@ -1379,11 +1503,84 @@ impl SettingsState {
             {
                 self.selected_profile = delete_application_profile(configuration, profile_id);
                 self.selected_slice = 0;
+                if self.selected_profile.is_none() {
+                    self.profile_test = ProfileTestState::Idle;
+                }
                 self.profile_feedback =
                     Some(ProfileEditorFeedback::Info("Profile deleted.".to_owned()));
                 self.save_feedback = SaveFeedback::None;
             }
         });
+    }
+
+    fn render_profile_tester(&mut self, ui: &mut egui::Ui, configuration: &Configuration) {
+        let now = Instant::now();
+        let capture_due = match self.profile_test {
+            ProfileTestState::CountingDown { deadline } => (now >= deadline).then_some(deadline),
+            _ => None,
+        };
+        if capture_due.is_some() {
+            let target = platform::capture_profile_test_target();
+            #[cfg(debug_assertions)]
+            log::info!(
+                target: "settings",
+                "component=settings event_code=settings_debug_profile_test_capture_completed \
+                 result_code=ok config_revision={} executable_path_available={} \
+                 window_class_available={} window_title_available={}",
+                configuration.config_revision,
+                target.executable_path.is_some(),
+                !target.window_class.is_empty(),
+                !target.window_title.is_empty()
+            );
+            self.profile_test = ProfileTestState::Captured(target);
+        }
+
+        ui.heading("Test profiles");
+        ui.label("Capture another app, then test every current draft rule.");
+        ui.weak(
+            "Captured path, class, and title stay only in this window and are cleared when settings closes.",
+        );
+        ui.add_space(8.0);
+
+        let mut start_capture = false;
+        let mut cancel_capture = false;
+        match &self.profile_test {
+            ProfileTestState::Idle => {
+                start_capture = ui.button("Capture target in 3 seconds").clicked();
+            }
+            ProfileTestState::CountingDown { deadline } => {
+                ui.label(
+                    RichText::new(format!(
+                        "Switch to the target app — capturing in {}…",
+                        countdown_seconds_remaining(*deadline, now)
+                    ))
+                    .strong(),
+                );
+                cancel_capture = ui.button("Cancel capture").clicked();
+                ui.ctx().request_repaint_after(Duration::from_millis(50));
+            }
+            ProfileTestState::Captured(_) => {
+                start_capture = ui.button("Capture another target in 3 seconds").clicked();
+            }
+        }
+        if start_capture {
+            self.profile_test =
+                ProfileTestState::CountingDown { deadline: now + PROFILE_TEST_COUNTDOWN };
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        } else if cancel_capture {
+            self.profile_test = ProfileTestState::Idle;
+        }
+
+        let mut clear_capture = false;
+        if let ProfileTestState::Captured(target) = &self.profile_test {
+            ui.add_space(12.0);
+            render_profile_test_result(ui, configuration, target);
+            ui.add_space(8.0);
+            clear_capture = ui.button("Clear captured details").clicked();
+        }
+        if clear_capture {
+            self.profile_test = ProfileTestState::Idle;
+        }
     }
 
     fn render_actions_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
@@ -1719,6 +1916,9 @@ impl SettingsState {
     }
 
     fn request_close(&mut self) -> CloseOutcome {
+        if matches!(self.profile_test, ProfileTestState::CountingDown { .. }) {
+            self.profile_test = ProfileTestState::Idle;
+        }
         if self.draft.as_ref().is_some_and(SettingsDraft::is_dirty) {
             self.lifecycle = EditorLifecycle::ConfirmingClose;
             log::info!(
@@ -1729,6 +1929,7 @@ impl SettingsState {
             );
             CloseOutcome::ConfirmationShown
         } else {
+            self.profile_test = ProfileTestState::Idle;
             self.lifecycle = EditorLifecycle::Closed;
             log::info!(
                 target: "settings",
@@ -2338,6 +2539,98 @@ fn unique_profile_name(configuration: &Configuration, preferred_name: &str) -> S
     unreachable!("the finite profile catalog cannot exhaust every u32 name suffix")
 }
 
+fn countdown_seconds_remaining(deadline: Instant, now: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(now);
+    remaining.as_secs().saturating_add(u64::from(remaining.subsec_nanos() > 0))
+}
+
+fn render_profile_test_result(
+    ui: &mut egui::Ui,
+    configuration: &Configuration,
+    target: &ProfileTestTarget,
+) {
+    ui.label(RichText::new("Captured target").strong());
+    ui.label("Application");
+    ui.label(
+        RichText::new(
+            target.executable_path.as_ref().map_or_else(
+                || "Unavailable".to_owned(),
+                |path| path.to_string_lossy().into_owned(),
+            ),
+        )
+        .monospace(),
+    );
+    ui.label("Window class");
+    ui.label(RichText::new(display_captured_value(&target.window_class)).monospace());
+    ui.label("Window title");
+    ui.label(RichText::new(display_captured_value(&target.window_title)).monospace());
+
+    ui.add_space(10.0);
+    let Ok(resolver) = ProfileResolver::compile(configuration) else {
+        ui.colored_label(
+            Color32::from_rgb(239, 113, 113),
+            "Fix the highlighted settings before testing these draft rules.",
+        );
+        return;
+    };
+    let resolution = resolver.resolve(ProfileTarget {
+        executable_path: target.executable_path.as_deref(),
+        window_class: &target.window_class,
+        window_title: &target.window_title,
+    });
+
+    ui.label(RichText::new("Matching profiles").strong());
+    if resolution.matching_profiles.is_empty() {
+        ui.label("No application profile matched every enabled rule.");
+    } else {
+        for matched in &resolution.matching_profiles {
+            ui.label(format!(
+                "{} — priority {}, {} of 3 match fields",
+                profile_name(configuration, matched.profile_id),
+                matched.priority,
+                matched.specificity
+            ));
+            ui.weak(format!("ID {}", matched.profile_id));
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("Winner").strong());
+    ui.label(profile_name(configuration, resolution.profile_id));
+    ui.label(resolution_decision_text(resolution.decision));
+}
+
+fn display_captured_value(value: &str) -> &str {
+    if value.is_empty() { "(empty)" } else { value }
+}
+
+fn profile_name(configuration: &Configuration, profile_id: Uuid) -> &str {
+    configuration.profile(profile_id).map_or("Unavailable profile", |profile| profile.name.as_str())
+}
+
+const fn resolution_decision_text(decision: ResolutionDecision) -> &'static str {
+    match decision {
+        ResolutionDecision::ExecutablePathUnavailable => {
+            "Global won because the executable path was unavailable."
+        }
+        ResolutionDecision::NoApplicationProfileMatched => {
+            "Global won because no application profile matched every enabled rule."
+        }
+        ResolutionDecision::OnlyApplicationProfileMatched => {
+            "This was the only matching application profile."
+        }
+        ResolutionDecision::HighestPriority => {
+            "This profile won at the highest configured priority."
+        }
+        ResolutionDecision::HighestSpecificity => {
+            "Priorities tied; this profile enabled more matching fields."
+        }
+        ResolutionDecision::LexicographicallySmallestUuid => {
+            "Priority and specificity tied; the smallest immutable profile ID won."
+        }
+    }
+}
+
 fn map_selected_slice(selected_slice: usize, from: SliceCount, to: SliceCount) -> usize {
     match (from, to) {
         (SliceCount::Eight, SliceCount::Four) => selected_slice.div_ceil(2) % 4,
@@ -2651,11 +2944,17 @@ fn draft_validation_error(
                     priority: *priority,
                 }
             }),
-        ConfigurationError::EmptyWindowClass { profile_id }
-        | ConfigurationError::EmptyTitleRegex { profile_id }
-        | ConfigurationError::InvalidTitleRegex { profile_id, .. } => profile_index(*profile_id)
+        ConfigurationError::EmptyWindowClass { profile_id } => profile_index(*profile_id)
             .map_or(DraftValidationError::InvalidConfiguration, |profile| {
-                DraftValidationError::InvalidApplicationProfileRule { profile }
+                DraftValidationError::EmptyApplicationWindowClass { profile }
+            }),
+        ConfigurationError::EmptyTitleRegex { profile_id } => profile_index(*profile_id)
+            .map_or(DraftValidationError::InvalidConfiguration, |profile| {
+                DraftValidationError::EmptyApplicationTitleRegex { profile }
+            }),
+        ConfigurationError::InvalidTitleRegex { profile_id, .. } => profile_index(*profile_id)
+            .map_or(DraftValidationError::InvalidConfiguration, |profile| {
+                DraftValidationError::InvalidApplicationTitleRegex { profile }
             }),
         ConfigurationError::InvalidActionUrl { action_id } => {
             DraftValidationError::InvalidUrl { index: action_index(*action_id) }
@@ -2712,25 +3011,29 @@ fn draft_validation_error(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     use eframe::egui::Vec2;
     use gradial_core::{
-        ActionDefinition, ActionKind, Configuration, MAX_TYPED_TEXT_BYTES, MenuSlice, ShortcutKey,
-        ShortcutModifier, SliceCount, WindowCommand,
+        ActionDefinition, ActionKind, Configuration, MAX_TYPED_TEXT_BYTES, MenuSlice,
+        ResolutionDecision, ShortcutKey, ShortcutModifier, SliceCount, WindowCommand,
     };
     use uuid::Uuid;
 
     use super::{
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
-        NewActionTemplate, PayloadEditOutcome, SequenceEditorContext, SequenceMetrics,
-        SequenceMove, SettingsDraft, SettingsState, action_references, add_executable_argument,
-        add_sequence_step, apply_dialog_outcome, create_action, create_application_profile,
-        delete_action, delete_application_profile, duplicate_action, duplicate_application_profile,
+        NewActionTemplate, PayloadEditOutcome, ProfileTestState, SequenceEditorContext,
+        SequenceMetrics, SequenceMove, SettingsDraft, SettingsState, action_references,
+        add_executable_argument, add_sequence_step, apply_dialog_outcome,
+        countdown_seconds_remaining, create_action, create_application_profile, delete_action,
+        delete_application_profile, duplicate_action, duplicate_application_profile,
         map_selected_slice, move_sequence_step, preview_slice_at, remove_executable_argument,
-        remove_sequence_step, resize_menu, validate_draft,
+        remove_sequence_step, resize_menu, resolution_decision_text, validate_draft,
     };
-    use crate::native_file_dialog::PathDialogOutcome;
+    use crate::{native_file_dialog::PathDialogOutcome, platform::ProfileTestTarget};
 
     #[test]
     fn switching_slice_counts_preserves_cardinals_and_restores_diagonals_within_the_draft() {
@@ -2886,6 +3189,23 @@ mod tests {
             })
         );
         configuration.application_profiles[0].rule.priority = 50;
+        configuration.application_profiles[0].rule.window_class = Some(" ".to_owned());
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::EmptyApplicationWindowClass { profile: 0 })
+        );
+        configuration.application_profiles[0].rule.window_class = None;
+        configuration.application_profiles[0].rule.title_regex = Some(String::new());
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::EmptyApplicationTitleRegex { profile: 0 })
+        );
+        configuration.application_profiles[0].rule.title_regex = Some("(".to_owned());
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidApplicationTitleRegex { profile: 0 })
+        );
+        configuration.application_profiles[0].rule.title_regex = Some("^Profile".to_owned());
         configuration.application_profiles[0].profile.menu.slices[2].label = String::new();
         assert_eq!(
             validate_draft(&configuration),
@@ -2921,9 +3241,38 @@ mod tests {
         let configuration = Configuration::default();
         let mut editor = SettingsState::new(false);
         editor.open(&configuration);
+        let private_target = ProfileTestTarget {
+            executable_path: Some(PathBuf::from(r"C:\Private\Target.exe")),
+            window_class: "PrivateClass".to_owned(),
+            window_title: "Private title".to_owned(),
+        };
+        let debug_output = format!("{private_target:?}");
+        assert!(!debug_output.contains("Private"));
+        assert!(!debug_output.contains("Target.exe"));
+        editor.profile_test = ProfileTestState::Captured(private_target);
 
         assert_eq!(editor.request_close(), CloseOutcome::Closed);
         assert_eq!(editor.lifecycle, EditorLifecycle::Closed);
+        assert_eq!(editor.profile_test, ProfileTestState::Idle);
+    }
+
+    #[test]
+    fn profile_capture_countdown_rounds_up_and_decision_text_explains_every_tie_break() {
+        let now = Instant::now();
+        assert_eq!(countdown_seconds_remaining(now + Duration::from_millis(2_001), now), 3);
+        assert_eq!(countdown_seconds_remaining(now + Duration::from_secs(2), now), 2);
+        assert_eq!(countdown_seconds_remaining(now, now), 0);
+
+        for decision in [
+            ResolutionDecision::ExecutablePathUnavailable,
+            ResolutionDecision::NoApplicationProfileMatched,
+            ResolutionDecision::OnlyApplicationProfileMatched,
+            ResolutionDecision::HighestPriority,
+            ResolutionDecision::HighestSpecificity,
+            ResolutionDecision::LexicographicallySmallestUuid,
+        ] {
+            assert!(!resolution_decision_text(decision).is_empty());
+        }
     }
 
     #[test]

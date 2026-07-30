@@ -42,7 +42,9 @@ is still referenced. Reusable sequences can now be created and edited as
 ordered, safely nested action lists with live expansion limits. The application
 profile editor creates, duplicates, and deletes exact-executable profiles,
 sets deterministic priority, and gives each profile an independent
-four/eight-direction menu.
+four/eight-direction menu. Optional exact window-class and title-regex rules
+are editable, and a private countdown tester explains every matching profile,
+winner, and deterministic tie-break.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -162,7 +164,12 @@ in the live radial preview. The **Profiles** tab creates an application profile
 by choosing an `.exe`, copies the current Global menu as an independent
 starting point, and supports rename, priority, duplication, deletion, complete
 four/eight-direction editing, action assignment, and a production preview.
-Existing window-class or title rules are preserved but are not editable yet.
+Optional window-class matching is exact and case-insensitive; optional window
+title matching uses a case-sensitive regular expression. **Test profiles**
+provides three seconds to switch applications, captures that foreground
+window, and displays its path, class, title, all matching profiles, the winner,
+and the precise priority/specificity/UUID decision. Captured details remain
+only in editor memory and are cleared when settings closes.
 The **Actions** tab creates and edits keyboard shortcuts, Unicode text,
 websites, files/folders, applications, Delay, and invocation-window commands.
 Application arguments are separate literal rows, and native Windows choosers
@@ -173,9 +180,8 @@ additions that avoid cycles and stay within nested depth, executed-step, and
 Delay limits are offered. Closing a dirty draft requires **Discard changes**
 or **Keep editing**. A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
-reloads new M4 invocations without restarting Gradial. Advanced profile
-predicates and the current-window tester, activation binding, import/export,
-icons, and onboarding remain future slices.
+reloads new M4 invocations without restarting Gradial. Activation binding,
+import/export, icons, and onboarding remain future slices.
 
 Run all local checks with:
 
@@ -243,3 +249,5 @@ Reusable-sequence editor results are recorded in
 [`Documentation/milestone-2-sequence-editor-results.md`](Documentation/milestone-2-sequence-editor-results.md).
 Application-profile editor results are recorded in
 [`Documentation/milestone-2-application-profile-editor-results.md`](Documentation/milestone-2-application-profile-editor-results.md).
+Advanced profile matching and private tester results are recorded in
+[`Documentation/milestone-2-profile-matching-editor-results.md`](Documentation/milestone-2-profile-matching-editor-results.md).

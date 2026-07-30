@@ -1,5 +1,6 @@
 use std::{
     ffi::OsString,
+    fmt,
     mem::size_of,
     os::windows::ffi::OsStringExt,
     path::PathBuf,
@@ -85,6 +86,24 @@ pub(crate) struct ForegroundWindowIdentity {
     pub(crate) process_id: u32,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ProfileTestTarget {
+    pub(crate) executable_path: Option<PathBuf>,
+    pub(crate) window_class: String,
+    pub(crate) window_title: String,
+}
+
+impl fmt::Debug for ProfileTestTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProfileTestTarget")
+            .field("executable_path_available", &self.executable_path.is_some())
+            .field("window_class_available", &!self.window_class.is_empty())
+            .field("window_title_available", &!self.window_title.is_empty())
+            .finish()
+    }
+}
+
 pub(crate) fn foreground_window_identity() -> ForegroundWindowIdentity {
     // SAFETY: GetForegroundWindow has no preconditions and the optional
     // process-ID output refers to a live local value.
@@ -98,6 +117,17 @@ pub(crate) fn foreground_window_identity() -> ForegroundWindowIdentity {
         GetWindowThreadProcessId(window, Some(&raw mut process_id));
     }
     ForegroundWindowIdentity { window: window.0.addr(), process_id }
+}
+
+pub(crate) fn capture_profile_test_target() -> ProfileTestTarget {
+    let foreground = foreground_window_identity();
+    let window = HWND(std::ptr::with_exposed_provenance_mut(foreground.window));
+    let (_process_start_time, executable_path) = process_identity(foreground.process_id, 0);
+    ProfileTestTarget {
+        executable_path,
+        window_class: window_class(window),
+        window_title: window_title(window),
+    }
 }
 
 pub(crate) fn capture_invocation_context(

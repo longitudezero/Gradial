@@ -306,6 +306,7 @@ $windowActionId = "67726164-6961-4c00-8000-000000000909"
 $sequenceActionId = "67726164-6961-4c00-8000-000000000910"
 $nestedSequenceActionId = "67726164-6961-4c00-8000-000000000911"
 $applicationProfileId = "67726164-6961-4c00-8000-000000000920"
+$profileTestTitle = "Profile test title private 7F3C"
 $profileId = "67726164-6961-4c00-8000-000000000001"
 $labels = @("North old", "NE old", "East old", "SE old", "South old", "SW old", "West old", "NW old")
 $gradial = $null
@@ -409,6 +410,23 @@ try {
         -Path $logPath `
         -Pattern "event_code=settings_debug_profile_draft_edited .*profile_count=1 .*profile_id=$applicationProfileId .*priority=72 .*slice_count=8" `
         -Failure "The application-profile editor did not preserve its isolated profile." |
+        Out-Null
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x71)) {
+        throw "Could not start the profile-test countdown."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_profile_test_capture_completed .*executable_path_available=true .*window_class_available=true .*window_title_available=true" `
+        -Failure "The profile tester did not capture the foreground window after its countdown." |
+        Out-Null
+    Start-Sleep -Milliseconds 100
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x72)) {
+        throw "Could not show the private profile-test result."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_profile_test_shown .*executable_path_available=true .*window_class_available=true .*window_title_available=true" `
+        -Failure "The profile tester did not resolve its private captured target." |
         Out-Null
     if ($CaptureScreenshot) {
         Start-Sleep -Milliseconds 200
@@ -684,8 +702,8 @@ try {
         $applicationProfile.profile.name -ne "Editor Notepad" -or
         $applicationProfile.rule.executable_path -ne "C:\Windows\System32\notepad.exe" -or
         $applicationProfile.rule.priority -ne 72 -or
-        $null -ne $applicationProfile.rule.window_class -or
-        $null -ne $applicationProfile.rule.title_regex -or
+        $applicationProfile.rule.window_class -ne "Notepad" -or
+        $applicationProfile.rule.title_regex -ne "^Profile test title" -or
         $applicationProfile.profile.menu.slice_count -ne 8 -or
         @($applicationProfile.profile.menu.slices).Count -ne 8 -or
         $applicationProfile.profile.menu.slices[1].label -ne "NE old" -or
@@ -738,9 +756,20 @@ try {
         -Pattern "event_code=action_execution_completed .*result_code=ok .*config_revision=2" `
         -Failure "The preserved cardinal action did not execute from the reloaded menu." | Out-Null
 
+    $logText = Get-Content -LiteralPath $logPath -Raw
+    foreach ($privateValue in @(
+        $profileTestTitle,
+        "C:\Windows\System32\notepad.exe",
+        "Notepad"
+    )) {
+        if ($logText.Contains($privateValue)) {
+            throw "The profile tester wrote a private captured value to Gradial's log."
+        }
+    }
+
     Write-Host (
-        "Settings editor smoke check passed: application-profile lifecycle and independent menu, " +
-        "all action editors, guarded dirty close, atomic revision 2 save, and live reload."
+        "Settings editor smoke check passed: advanced profile rules and private tester, " +
+        "independent menus, all action editors, atomic revision 2 save, and live reload."
     )
 }
 catch {
