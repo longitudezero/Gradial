@@ -6,7 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use gradial_core::{AppPaths, CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION};
+use gradial_core::{
+    ACTION_CONFIG_SCHEMA_VERSION, AppPaths, CONFIG_SCHEMA_VERSION, Configuration,
+    LEGACY_CONFIG_SCHEMA_VERSION,
+};
 use windows::{
     Win32::Storage::FileSystem::{
         MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
@@ -208,8 +211,8 @@ enum ConfigurationFileError {
         source: gradial_core::ConfigurationError,
     },
 
-    #[error("configuration file {path} cannot migrate from schema one: {reason}")]
-    InvalidMigration { path: PathBuf, reason: &'static str },
+    #[error("configuration file {path} cannot migrate from schema {from_schema}: {reason}")]
+    InvalidMigration { path: PathBuf, from_schema: u32, reason: &'static str },
 }
 
 #[derive(Debug)]
@@ -226,13 +229,16 @@ fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFil
             ConfigurationFileError::Read { path: path.to_path_buf(), source }
         }
     })?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|source| ConfigurationFileError::Parse { path: path.to_path_buf(), source })?;
     let schema_version = value.get("schema_version").and_then(serde_json::Value::as_u64);
-    let migrating_schema_one = schema_version == Some(u64::from(LEGACY_CONFIG_SCHEMA_VERSION));
+    let migration_from =
+        schema_version.and_then(|schema| u32::try_from(schema).ok()).filter(|schema| {
+            matches!(*schema, LEGACY_CONFIG_SCHEMA_VERSION | ACTION_CONFIG_SCHEMA_VERSION)
+        });
     if let Some(schema_version) = schema_version
         && schema_version != u64::from(CONFIG_SCHEMA_VERSION)
-        && !migrating_schema_one
+        && migration_from.is_none()
     {
         return Err(ConfigurationFileError::UnsupportedSchema {
             path: path.to_path_buf(),
@@ -240,19 +246,42 @@ fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFil
             supported: CONFIG_SCHEMA_VERSION,
         });
     }
-    if migrating_schema_one && schema_one_contains_action_fields(&value) {
+    if migration_from == Some(LEGACY_CONFIG_SCHEMA_VERSION)
+        && schema_one_contains_action_fields(&value)
+    {
         return Err(ConfigurationFileError::InvalidMigration {
             path: path.to_path_buf(),
+            from_schema: LEGACY_CONFIG_SCHEMA_VERSION,
             reason: "schema-one files cannot contain actions or action references",
         });
     }
+    if let Some(from_schema) = migration_from {
+        let root =
+            value.as_object_mut().ok_or_else(|| ConfigurationFileError::InvalidMigration {
+                path: path.to_path_buf(),
+                from_schema,
+                reason: "the root must be a JSON object",
+            })?;
+        if root.contains_key("activation_binding") {
+            return Err(ConfigurationFileError::InvalidMigration {
+                path: path.to_path_buf(),
+                from_schema,
+                reason: "older schemas cannot contain an activation binding",
+            });
+        }
+        root.insert(
+            "activation_binding".to_owned(),
+            serde_json::to_value(gradial_core::ActivationBinding::default())
+                .expect("the built-in activation binding is serializable"),
+        );
+    }
     let mut configuration: Configuration = serde_json::from_value(value)
         .map_err(|source| ConfigurationFileError::Parse { path: path.to_path_buf(), source })?;
-    let migration = migrating_schema_one.then_some(ConfigurationMigration {
-        from_schema: LEGACY_CONFIG_SCHEMA_VERSION,
+    let migration = migration_from.map(|from_schema| ConfigurationMigration {
+        from_schema,
         to_schema: CONFIG_SCHEMA_VERSION,
     });
-    if migrating_schema_one {
+    if migration.is_some() {
         configuration.schema_version = CONFIG_SCHEMA_VERSION;
     }
     configuration
@@ -368,7 +397,8 @@ mod tests {
     use std::fs;
 
     use gradial_core::{
-        AppPaths, CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION,
+        ACTION_CONFIG_SCHEMA_VERSION, ActivationBinding, AppPaths, CONFIG_SCHEMA_VERSION,
+        Configuration, LEGACY_CONFIG_SCHEMA_VERSION,
     };
 
     use super::{
@@ -396,6 +426,7 @@ mod tests {
             "schema_version".to_owned(),
             serde_json::Value::from(LEGACY_CONFIG_SCHEMA_VERSION),
         );
+        root.remove("activation_binding");
         root.remove("actions");
         let slices = root
             .get_mut("global_profile")
@@ -409,8 +440,20 @@ mod tests {
         serde_json::to_vec_pretty(&value).expect("legacy bytes")
     }
 
+    fn schema_two_bytes() -> Vec<u8> {
+        let mut value =
+            serde_json::to_value(Configuration::default()).expect("configuration value");
+        let root = value.as_object_mut().expect("configuration object");
+        root.insert(
+            "schema_version".to_owned(),
+            serde_json::Value::from(ACTION_CONFIG_SCHEMA_VERSION),
+        );
+        root.remove("activation_binding");
+        serde_json::to_vec_pretty(&value).expect("schema-two bytes")
+    }
+
     #[test]
-    fn first_load_atomically_initializes_schema_two() {
+    fn first_load_atomically_initializes_schema_three() {
         let (_temporary_directory, paths, store) = store();
         let loaded = store.load_or_initialize().expect("initialize configuration");
 
@@ -537,6 +580,7 @@ mod tests {
             })
         );
         assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(loaded.configuration.activation_binding, ActivationBinding::default());
         assert!(loaded.configuration.actions.is_empty());
         assert!(
             loaded
@@ -548,6 +592,27 @@ mod tests {
                 .all(|slice| slice.action_id.is_none())
         );
         assert_eq!(fs::read(&paths.config).expect("legacy retained"), legacy);
+    }
+
+    #[test]
+    fn schema_two_gains_the_default_binding_only_in_memory() {
+        let (_temporary_directory, paths, store) = store();
+        let schema_two = schema_two_bytes();
+        fs::write(&paths.config, &schema_two).expect("schema-two configuration");
+
+        let loaded = store.load_or_initialize().expect("migrated configuration");
+
+        assert_eq!(loaded.source, ConfigurationSource::Primary);
+        assert_eq!(
+            loaded.migration,
+            Some(ConfigurationMigration {
+                from_schema: ACTION_CONFIG_SCHEMA_VERSION,
+                to_schema: CONFIG_SCHEMA_VERSION,
+            })
+        );
+        assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(loaded.configuration.activation_binding, ActivationBinding::default());
+        assert_eq!(fs::read(&paths.config).expect("schema two retained"), schema_two);
     }
 
     #[test]
@@ -568,7 +633,30 @@ mod tests {
                 .warning
                 .expect("migration warning")
                 .primary_error
-                .contains("cannot migrate from schema one")
+                .contains("cannot migrate from schema 1")
+        );
+    }
+
+    #[test]
+    fn older_schemas_cannot_smuggle_an_activation_binding() {
+        let (_temporary_directory, paths, store) = store();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&schema_two_bytes()).expect("schema-two value");
+        value["activation_binding"] =
+            serde_json::to_value(ActivationBinding::default()).expect("binding");
+        fs::write(&paths.config, serde_json::to_vec_pretty(&value).expect("schema-two bytes"))
+            .expect("schema-two configuration");
+
+        let loaded = store.load_or_initialize().expect("recovery configuration");
+
+        assert_eq!(loaded.source, ConfigurationSource::InMemoryRecoveryDefault);
+        assert!(loaded.migration.is_none());
+        assert!(
+            loaded
+                .warning
+                .expect("migration warning")
+                .primary_error
+                .contains("older schemas cannot contain an activation binding")
         );
     }
 }

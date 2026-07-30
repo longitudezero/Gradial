@@ -14,16 +14,16 @@ pub use actions::{
     MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
 };
 pub use configuration::{
-    ApplicationProfile, CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError,
-    LEGACY_CONFIG_SCHEMA_VERSION, Menu, MenuSlice, Profile, ProfileRule,
+    ACTION_CONFIG_SCHEMA_VERSION, ApplicationProfile, CONFIG_SCHEMA_VERSION, Configuration,
+    ConfigurationError, LEGACY_CONFIG_SCHEMA_VERSION, Menu, MenuSlice, Profile, ProfileRule,
 };
 pub use geometry::{Point, SliceCount};
 pub use interaction::{
-    ActivationBindingId, CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode,
-    GestureConfig, InputEvent, InputEventKind, InteractionController, InteractionEffect,
-    InteractionOutcome, InteractionState, InvocationContext, InvocationGeometry,
+    ActivationBinding, ActivationBindingId, CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP,
+    GeometryMode, GestureConfig, InputEvent, InputEventKind, InteractionController,
+    InteractionEffect, InteractionOutcome, InteractionState, InvocationContext, InvocationGeometry,
     InvocationSnapshot, MonitorGeometry, PhysicalModifiers, ResolvedGeometry, ScreenPoint,
-    ScreenRect, monitor_index_for_point, resolve_invocation_geometry,
+    ScreenRect, monitor_index_for_point, resolve_invocation_geometry, slice_for_delta,
 };
 pub use paths::{AppPaths, AppPathsError};
 pub use profiles::{

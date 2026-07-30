@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::SliceCount;
@@ -171,9 +172,16 @@ impl InputEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEventKind {
-    ActivationDown { geometry: InvocationGeometry, physical_modifiers: PhysicalModifiers },
+    ActivationDown {
+        geometry: InvocationGeometry,
+        physical_modifiers: PhysicalModifiers,
+        activation_binding: ActivationBindingId,
+    },
     PointerMoved,
-    RawPointerDelta { dx: i32, dy: i32 },
+    RawPointerDelta {
+        dx: i32,
+        dy: i32,
+    },
     ActivationUp,
     Cancel(CancelReason),
 }
@@ -218,18 +226,52 @@ pub struct InvocationContext {
     pub config_revision: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhysicalModifiers {
     pub control: bool,
     pub alt: bool,
     pub shift: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ActivationBindingId {
+    #[serde(rename = "m4")]
     #[default]
     MouseButton4,
+    #[serde(rename = "m5")]
     MouseButton5,
+}
+
+impl ActivationBindingId {
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::MouseButton4 => "M4",
+            Self::MouseButton5 => "M5",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationBinding {
+    pub button: ActivationBindingId,
+    pub modifiers: PhysicalModifiers,
+}
+
+impl ActivationBinding {
+    #[must_use]
+    pub fn matches(
+        self,
+        button: ActivationBindingId,
+        physical_modifiers: PhysicalModifiers,
+    ) -> bool {
+        self.button == button
+            && self.modifiers.control == physical_modifiers.control
+            && self.modifiers.alt == physical_modifiers.alt
+            && self.modifiers.shift == physical_modifiers.shift
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -601,9 +643,10 @@ fn shortest_angular_distance(left: f64, right: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, GeometryMode, GestureConfig, InteractionController, InteractionEffect,
-        InteractionOutcome, InteractionState, InvocationGeometry, InvocationSnapshot,
-        MonitorGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, monitor_index_for_point,
+        ActivationBinding, ActivationBindingId, CancelReason, GeometryMode, GestureConfig,
+        InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
+        InvocationGeometry, InvocationSnapshot, MonitorGeometry, PhysicalModifiers,
+        ResolvedGeometry, ScreenPoint, ScreenRect, monitor_index_for_point,
         resolve_invocation_geometry, slice_for_angle, slice_for_delta,
     };
     use crate::SliceCount;
@@ -647,6 +690,27 @@ mod tests {
             })
         );
         assert_eq!(controller.state(), InteractionState::Idle);
+    }
+
+    #[test]
+    fn activation_binding_requires_the_exact_generic_modifier_set() {
+        let binding = ActivationBinding {
+            button: ActivationBindingId::MouseButton5,
+            modifiers: PhysicalModifiers { control: true, alt: false, shift: true },
+        };
+
+        assert!(binding.matches(
+            ActivationBindingId::MouseButton5,
+            PhysicalModifiers { control: true, alt: false, shift: true },
+        ));
+        assert!(!binding.matches(
+            ActivationBindingId::MouseButton4,
+            PhysicalModifiers { control: true, alt: false, shift: true },
+        ));
+        assert!(!binding.matches(
+            ActivationBindingId::MouseButton5,
+            PhysicalModifiers { control: true, alt: true, shift: true },
+        ));
     }
 
     #[test]

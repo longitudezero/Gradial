@@ -612,6 +612,12 @@ fn prepare_overlay_frame(
         render: OverlayRenderFrame {
             invocation_id: state.snapshot.as_ref().map(|snapshot| snapshot.invocation_id),
             menu: state.menu.clone(),
+            activation_button: state
+                .snapshot
+                .as_ref()
+                .map_or(gradial_core::ActivationBindingId::default(), |snapshot| {
+                    snapshot.context.activation_binding
+                }),
             selected_slice: state.selected_slice,
             selection_changed_at: state.selection_changed_at,
             opacity: presence.opacity,

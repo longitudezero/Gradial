@@ -416,12 +416,13 @@ fn handle_input_event(
 ) {
     let source_qpc = event.qpc_timestamp;
     let effect = match event.kind {
-        InputEventKind::ActivationDown { geometry, physical_modifiers } => {
+        InputEventKind::ActivationDown { geometry, physical_modifiers, activation_binding } => {
             counters.activation_down = counters.activation_down.saturating_add(1);
             begin_invocation(
                 event,
                 geometry,
                 physical_modifiers,
+                activation_binding,
                 controller,
                 active,
                 dispatcher,
@@ -507,14 +508,20 @@ fn begin_invocation(
     event: InputEvent,
     geometry: gradial_core::InvocationGeometry,
     physical_modifiers: gradial_core::PhysicalModifiers,
+    activation_binding: gradial_core::ActivationBindingId,
     controller: &mut InteractionController,
     active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
     profile_resolver: &ProfileResolver,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
 ) -> Option<InteractionEffect> {
-    let snapshot =
-        capture_snapshot(event, geometry, physical_modifiers, dispatcher.config_revision);
+    let snapshot = capture_snapshot(
+        event,
+        geometry,
+        physical_modifiers,
+        activation_binding,
+        dispatcher.config_revision,
+    );
     log::info!(
         target: "interaction",
         "component=interaction event_code=invocation_snapshot_captured result_code=ok \
@@ -581,6 +588,7 @@ fn capture_snapshot(
     event: InputEvent,
     geometry: gradial_core::InvocationGeometry,
     physical_modifiers: gradial_core::PhysicalModifiers,
+    activation_binding: gradial_core::ActivationBindingId,
     config_revision: u64,
 ) -> InvocationSnapshot {
     InvocationSnapshot {
@@ -592,6 +600,7 @@ fn capture_snapshot(
         context: Arc::new(platform::capture_invocation_context(
             event.point,
             physical_modifiers,
+            activation_binding,
             config_revision,
         )),
     }

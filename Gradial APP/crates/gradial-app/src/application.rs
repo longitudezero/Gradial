@@ -332,10 +332,15 @@ impl GradialApp {
         log::info!(
             target: "settings",
             "component=settings event_code=settings_saved result_code=ok \
-             config_revision={} slice_count={} action_count={}",
+             config_revision={} slice_count={} action_count={} activation_button={} \
+             activation_control={} activation_alt={} activation_shift={}",
             saved.config_revision,
             saved.global_profile.menu.slice_count,
-            saved.actions.len()
+            saved.actions.len(),
+            saved.activation_binding.button.short_label(),
+            saved.activation_binding.modifiers.control,
+            saved.activation_binding.modifiers.alt,
+            saved.activation_binding.modifiers.shift
         );
         context.request_repaint();
         Ok(saved)
@@ -390,8 +395,11 @@ impl GradialApp {
             return;
         }
 
-        let input_configuration =
-            InputConfiguration { geometry_mode: self.geometry_mode, monitors: current_monitors };
+        let input_configuration = InputConfiguration {
+            geometry_mode: self.geometry_mode,
+            monitors: current_monitors,
+            activation_binding: self.configuration.activation_binding,
+        };
         let interaction = match InteractionRuntime::start(
             context.clone(),
             input_configuration,

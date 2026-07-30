@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::bounded;
 use gradial_core::{
-    CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, InputEvent, InputEventKind, PhysicalModifiers,
-    ResolvedGeometry, ScreenPoint, resolve_invocation_geometry,
+    ActivationBindingId, CancelReason, DEFAULT_OVERLAY_HALF_EXTENT_DIP, InputEvent, InputEventKind,
+    PhysicalModifiers, ResolvedGeometry, ScreenPoint, resolve_invocation_geometry,
 };
 use rtrb::Producer;
 use windows::Win32::{
@@ -31,7 +31,7 @@ use windows::Win32::{
     },
 };
 
-use super::{GRADIAL_INJECTED_MARKER, InputConfiguration, raw_input::RawInputWindow};
+use super::{GRADIAL_INJECTED_MARKER, InputConfiguration, binding_test, raw_input::RawInputWindow};
 
 const HEARTBEAT_INTERVAL_MS: u32 = 250;
 const HEARTBEAT_TIMER_ID: usize = 0x4752_4842;
@@ -289,7 +289,7 @@ fn install_hooks() -> Result<InstalledHooks> {
     // SAFETY: low-level hooks with a null module handle and thread ID zero are
     // delivered back to this installing thread, which owns a message loop.
     let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
-        .context("could not install the M4 low-level mouse hook")?;
+        .context("could not install the activation-button low-level mouse hook")?;
 
     // SAFETY: same contract as the mouse hook above.
     let keyboard =
@@ -433,6 +433,28 @@ impl HookCallbackState {
     }
 
     fn handle_mouse(&mut self, message: u32, mouse: &MSLLHOOKSTRUCT, timestamp: i64) -> bool {
+        let physical_modifiers = if message == WM_XBUTTONDOWN {
+            #[cfg(not(test))]
+            {
+                capture_physical_modifiers()
+            }
+            #[cfg(test)]
+            {
+                PhysicalModifiers::default()
+            }
+        } else {
+            PhysicalModifiers::default()
+        };
+        self.handle_mouse_with_modifiers(message, mouse, timestamp, physical_modifiers)
+    }
+
+    fn handle_mouse_with_modifiers(
+        &mut self,
+        message: u32,
+        mouse: &MSLLHOOKSTRUCT,
+        timestamp: i64,
+        physical_modifiers: PhysicalModifiers,
+    ) -> bool {
         #[cfg(debug_assertions)]
         self.debug.record_mouse(message, mouse.mouseData);
 
@@ -441,32 +463,56 @@ impl HookCallbackState {
         }
 
         let point = ScreenPoint::new(mouse.pt.x, mouse.pt.y);
+        let xbutton = activation_button(high_word(mouse.mouseData));
+        if message == WM_XBUTTONDOWN
+            && xbutton
+                .is_some_and(|button| binding_test::button_down(button, physical_modifiers, point))
+        {
+            return true;
+        }
+        if message == WM_MOUSEMOVE {
+            binding_test::pointer_moved(point);
+        }
+        if message == WM_XBUTTONUP
+            && xbutton.is_some_and(|button| binding_test::button_up(button, point))
+        {
+            return true;
+        }
+
+        let configured_button = self.configuration.activation_binding.button;
         match message {
-            WM_XBUTTONDOWN if high_word(mouse.mouseData) == XBUTTON1 => {
-                if self.suppression.geometry.is_none() {
-                    if !self.accepting_input.load(Ordering::Acquire) {
-                        return false;
-                    }
-                    let geometry = resolve_invocation_geometry(
-                        self.configuration.geometry_mode,
-                        point,
-                        &self.configuration.monitors,
-                        DEFAULT_OVERLAY_HALF_EXTENT_DIP,
-                    );
-                    self.suppression.geometry = Some(geometry.behavior);
-                    self.suppression.cancel_sent = false;
-                    self.push(InputEvent::new(
-                        timestamp,
-                        point,
-                        InputEventKind::ActivationDown {
-                            geometry,
-                            physical_modifiers: capture_physical_modifiers(),
-                        },
-                    ));
+            WM_XBUTTONDOWN if xbutton == Some(configured_button) => {
+                if self.suppression.geometry.is_some() {
+                    return true;
                 }
+                if !self
+                    .configuration
+                    .activation_binding
+                    .matches(configured_button, physical_modifiers)
+                    || !self.accepting_input.load(Ordering::Acquire)
+                {
+                    return false;
+                }
+                let geometry = resolve_invocation_geometry(
+                    self.configuration.geometry_mode,
+                    point,
+                    &self.configuration.monitors,
+                    DEFAULT_OVERLAY_HALF_EXTENT_DIP,
+                );
+                self.suppression.geometry = Some(geometry.behavior);
+                self.suppression.cancel_sent = false;
+                self.push(InputEvent::new(
+                    timestamp,
+                    point,
+                    InputEventKind::ActivationDown {
+                        geometry,
+                        physical_modifiers,
+                        activation_binding: configured_button,
+                    },
+                ));
                 true
             }
-            WM_XBUTTONUP if high_word(mouse.mouseData) == XBUTTON1 => {
+            WM_XBUTTONUP if xbutton == Some(configured_button) => {
                 if self.suppression.geometry.is_some() {
                     self.suppression.geometry = None;
                     self.suppression.cancel_sent = false;
@@ -495,7 +541,8 @@ impl HookCallbackState {
             }
             WM_XBUTTONDOWN
                 if self.suppression.geometry.is_some()
-                    && high_word(mouse.mouseData) == XBUTTON2 =>
+                    && xbutton.is_some()
+                    && xbutton != Some(configured_button) =>
             {
                 self.cancel_from_mouse(point, timestamp, SUPPRESSED_XBUTTON2)
             }
@@ -503,7 +550,8 @@ impl HookCallbackState {
             WM_RBUTTONUP if self.suppression.take_suppressed(SUPPRESSED_RIGHT) => true,
             WM_MBUTTONUP if self.suppression.take_suppressed(SUPPRESSED_MIDDLE) => true,
             WM_XBUTTONUP
-                if high_word(mouse.mouseData) == XBUTTON2
+                if xbutton.is_some()
+                    && xbutton != Some(configured_button)
                     && self.suppression.take_suppressed(SUPPRESSED_XBUTTON2) =>
             {
                 true
@@ -573,6 +621,7 @@ impl HookCallbackState {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn capture_physical_modifiers() -> PhysicalModifiers {
     // SAFETY: GetAsyncKeyState has no memory-safety preconditions and performs
     // no allocation or blocking work in the hook callback.
@@ -605,6 +654,14 @@ fn high_word(value: u32) -> u16 {
     u16::try_from(value >> 16).expect("the high word always fits u16")
 }
 
+const fn activation_button(xbutton: u16) -> Option<ActivationBindingId> {
+    match xbutton {
+        XBUTTON1 => Some(ActivationBindingId::MouseButton4),
+        XBUTTON2 => Some(ActivationBindingId::MouseButton5),
+        _ => None,
+    }
+}
+
 fn query_qpc() -> i64 {
     let mut timestamp = 0_i64;
     // SAFETY: the pointer refers to a valid local i64 for the duration of the
@@ -620,8 +677,9 @@ mod tests {
     };
 
     use gradial_core::{
-        CancelReason, GeometryMode, InputEvent, InputEventKind, InvocationGeometry,
-        MonitorGeometry, PhysicalModifiers, ResolvedGeometry, ScreenPoint, ScreenRect,
+        ActivationBinding, ActivationBindingId, CancelReason, GeometryMode, InputEvent,
+        InputEventKind, InvocationGeometry, MonitorGeometry, PhysicalModifiers, ResolvedGeometry,
+        ScreenPoint, ScreenRect,
     };
     use rtrb::{Consumer, RingBuffer};
     use windows::Win32::{
@@ -635,7 +693,9 @@ mod tests {
         },
     };
 
-    use super::{GRADIAL_INJECTED_MARKER, HookCallbackState, InputConfiguration, XBUTTON1};
+    use super::{
+        GRADIAL_INJECTED_MARKER, HookCallbackState, InputConfiguration, XBUTTON1, XBUTTON2,
+    };
 
     fn callback_state() -> (HookCallbackState, Consumer<InputEvent>) {
         callback_state_for(GeometryMode::Auto)
@@ -653,6 +713,7 @@ mod tests {
                 work_area: virtual_screen,
                 dpi: 96,
             }],
+            activation_binding: ActivationBinding::default(),
         };
         (
             HookCallbackState::new(
@@ -688,6 +749,7 @@ mod tests {
                 InputEventKind::ActivationDown {
                     geometry: InvocationGeometry::fixed(origin, 96),
                     physical_modifiers: PhysicalModifiers::default(),
+                    activation_binding: ActivationBindingId::MouseButton4,
                 },
             ))
         );
@@ -729,6 +791,7 @@ mod tests {
                         monitor_dpi: 96,
                     },
                     physical_modifiers: PhysicalModifiers::default(),
+                    activation_binding: ActivationBindingId::MouseButton4,
                 },
             ))
         );
@@ -825,5 +888,63 @@ mod tests {
         );
         assert!(state.handle_mouse(WM_LBUTTONUP, &mouse(origin, 0), 12));
         assert!(!state.handle_mouse(WM_LBUTTONUP, &mouse(origin, 0), 13));
+    }
+
+    #[test]
+    fn m5_with_exact_generic_modifiers_can_replace_m4() {
+        let (mut state, mut consumer) = callback_state();
+        state.configuration.activation_binding = ActivationBinding {
+            button: ActivationBindingId::MouseButton5,
+            modifiers: PhysicalModifiers { control: true, alt: false, shift: true },
+        };
+        let origin = ScreenPoint::new(80, 90);
+        let required = PhysicalModifiers { control: true, alt: false, shift: true };
+
+        assert!(!state.handle_mouse_with_modifiers(
+            WM_XBUTTONDOWN,
+            &mouse(origin, XBUTTON1),
+            9,
+            required,
+        ));
+        assert!(!state.handle_mouse_with_modifiers(
+            WM_XBUTTONDOWN,
+            &mouse(origin, XBUTTON2),
+            10,
+            PhysicalModifiers { control: true, alt: false, shift: false },
+        ));
+        assert!(consumer.pop().is_err());
+
+        assert!(state.handle_mouse_with_modifiers(
+            WM_XBUTTONDOWN,
+            &mouse(origin, XBUTTON2),
+            11,
+            required,
+        ));
+        assert_eq!(
+            consumer.pop(),
+            Ok(InputEvent::new(
+                11,
+                origin,
+                InputEventKind::ActivationDown {
+                    geometry: InvocationGeometry::fixed(origin, 96),
+                    physical_modifiers: required,
+                    activation_binding: ActivationBindingId::MouseButton5,
+                },
+            ))
+        );
+        assert!(state.handle_mouse_with_modifiers(
+            WM_XBUTTONDOWN,
+            &mouse(origin, XBUTTON2),
+            12,
+            PhysicalModifiers::default(),
+        ));
+        assert!(consumer.pop().is_err(), "a second activation down is ignored");
+        assert!(state.handle_mouse_with_modifiers(
+            WM_XBUTTONUP,
+            &mouse(origin, XBUTTON2),
+            13,
+            PhysicalModifiers::default(),
+        ));
+        assert_eq!(consumer.pop(), Ok(InputEvent::new(13, origin, InputEventKind::ActivationUp)));
     }
 }

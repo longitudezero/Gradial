@@ -133,6 +133,7 @@ pub(crate) fn capture_profile_test_target() -> ProfileTestTarget {
 pub(crate) fn capture_invocation_context(
     point: ScreenPoint,
     physical_modifiers: PhysicalModifiers,
+    activation_binding: ActivationBindingId,
     config_revision: u64,
 ) -> InvocationContext {
     let foreground = foreground_window_identity();
@@ -153,7 +154,7 @@ pub(crate) fn capture_invocation_context(
         monitor_rect_physical_px,
         work_area_physical_px,
         physical_modifiers,
-        activation_binding: ActivationBindingId::MouseButton4,
+        activation_binding,
         config_revision,
     }
 }

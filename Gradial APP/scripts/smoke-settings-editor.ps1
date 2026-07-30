@@ -90,6 +90,14 @@ public static class GradialSettingsSmokeNative
     private static extern uint SendInput(uint count, Input[] inputs, int size);
 
     [DllImport("user32.dll")]
+    private static extern void keybd_event(
+        byte virtualKey,
+        byte scanCode,
+        uint flags,
+        UIntPtr extraInfo
+    );
+
+    [DllImport("user32.dll")]
     public static extern bool SetCursorPos(int x, int y);
 
     [DllImport("shell32.dll")]
@@ -196,6 +204,16 @@ public static class GradialSettingsSmokeNative
     public static void SendM4(bool down)
     {
         SendMouse(0, 0, 1, down ? 0x0080u : 0x0100u);
+    }
+
+    public static void SendM5(bool down)
+    {
+        SendMouse(0, 0, 2, down ? 0x0080u : 0x0100u);
+    }
+
+    public static void SetControl(bool down)
+    {
+        keybd_event(0xA2, 0x1D, down ? 0u : 0x0002u, UIntPtr.Zero);
     }
 
     public static void SendRelativeMove(int dx, int dy)
@@ -311,6 +329,8 @@ $profileId = "67726164-6961-4c00-8000-000000000001"
 $labels = @("North old", "NE old", "East old", "SE old", "South old", "SW old", "West old", "NW old")
 $gradial = $null
 $m4IsDown = $false
+$m5IsDown = $false
+$controlIsDown = $false
 
 try {
     New-Item -ItemType Directory -Path $gradialDirectory -Force | Out-Null
@@ -392,6 +412,37 @@ try {
         Save-WindowScreenshot `
             -Window $settingsWindow `
             -Path (Join-Path $captureDirectory "settings-editor-smoke.png")
+    }
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x70)) {
+        throw "Could not configure and arm the activation-binding tester."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_binding_draft_edited .*activation_button=M5 .*activation_control=true .*tester_armed=true" `
+        -Failure "The activation editor did not retain the M5 plus Ctrl draft." |
+        Out-Null
+    [GradialSettingsSmokeNative]::SetControl($true)
+    $controlIsDown = $true
+    [GradialSettingsSmokeNative]::SendM5($true)
+    $m5IsDown = $true
+    Start-Sleep -Milliseconds 100
+    [GradialSettingsSmokeNative]::SendRelativeMove(116, 0)
+    Start-Sleep -Milliseconds 100
+    [GradialSettingsSmokeNative]::SendM5($false)
+    $m5IsDown = $false
+    [GradialSettingsSmokeNative]::SetControl($false)
+    $controlIsDown = $false
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_binding_test_completed .*result_code=ok .*matched=true .*activation_button=M5 .*activation_control=true .*selection=E" `
+        -Failure "The safe tester did not recognize the complete Ctrl plus M5 east flick." |
+        Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-binding-editor-smoke.png")
     }
 
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x78)) {
@@ -579,8 +630,20 @@ try {
         -Failure "The live interaction runtime did not reload the saved revision." | Out-Null
 
     $saved = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-    if ($saved.config_revision -ne 2 -or $saved.global_profile.menu.slice_count -ne 4) {
-        throw "The saved configuration has the wrong revision or slice count."
+    if (
+        $saved.schema_version -ne 3 -or
+        $saved.config_revision -ne 2 -or
+        $saved.global_profile.menu.slice_count -ne 4
+    ) {
+        throw "The saved configuration has the wrong schema, revision, or slice count."
+    }
+    if (
+        $saved.activation_binding.button -ne "m5" -or
+        $saved.activation_binding.modifiers.control -ne $true -or
+        $saved.activation_binding.modifiers.alt -ne $false -or
+        $saved.activation_binding.modifiers.shift -ne $false
+    ) {
+        throw "The exact Ctrl plus M5 activation binding was not saved."
     }
     $expectedEditedLabels = @(
         "North edited",
@@ -714,11 +777,13 @@ try {
     }
     $backup = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
     if (
+        $backup.schema_version -ne 2 -or
         $backup.config_revision -ne 1 -or
         $backup.global_profile.menu.slice_count -ne 8 -or
-        @($backup.actions).Count -ne 1
+        @($backup.actions).Count -ne 1 -or
+        $null -ne $backup.activation_binding
     ) {
-        throw "The atomic save did not preserve the previous eight-slice configuration."
+        throw "The atomic save did not preserve the previous schema-two configuration."
     }
 
     if (-not [GradialSettingsSmokeNative]::CloseWindow($settingsWindow)) {
@@ -739,18 +804,28 @@ try {
     }
 
     [GradialSettingsSmokeNative]::SetCursorPos(600, 500) | Out-Null
-    [GradialSettingsSmokeNative]::SendM4($true)
-    $m4IsDown = $true
+    [GradialSettingsSmokeNative]::SetControl($true)
+    $controlIsDown = $true
+    [GradialSettingsSmokeNative]::SendM5($true)
+    $m5IsDown = $true
     Start-Sleep -Milliseconds 180
     [GradialSettingsSmokeNative]::SendRelativeMove(116, 0)
     Start-Sleep -Milliseconds 180
-    [GradialSettingsSmokeNative]::SendM4($false)
-    $m4IsDown = $false
+    [GradialSettingsSmokeNative]::SendM5($false)
+    $m5IsDown = $false
+    [GradialSettingsSmokeNative]::SetControl($false)
+    $controlIsDown = $false
 
     Wait-LogPattern `
         -Path $logPath `
+        -Pattern "event_code=invocation_snapshot_captured .*config_revision=2 .*modifier_control=true .*modifier_alt=false .*modifier_shift=false .*activation_binding=MouseButton5" `
+        -Failure "The fresh invocation did not freeze the saved Ctrl plus M5 binding." |
+        Out-Null
+    Wait-LogPattern `
+        -Path $logPath `
         -Pattern "event_code=profile_resolved .*config_revision=2 .*menu_slice_count=4 .*menu_label_count=4" `
-        -Failure "A fresh invocation did not use the saved four-slice menu." | Out-Null
+        -Failure "A fresh Ctrl plus M5 invocation did not use the saved four-slice menu." |
+        Out-Null
     Wait-LogPattern `
         -Path $logPath `
         -Pattern "event_code=action_execution_completed .*result_code=ok .*config_revision=2" `
@@ -768,8 +843,8 @@ try {
     }
 
     Write-Host (
-        "Settings editor smoke check passed: advanced profile rules and private tester, " +
-        "independent menus, all action editors, atomic revision 2 save, and live reload."
+        "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
+        "advanced profiles, all action editors, schema-three save, and live reload."
     )
 }
 catch {
@@ -788,6 +863,12 @@ finally {
     $env:LOCALAPPDATA = $originalLocalAppData
     if ($m4IsDown) {
         [GradialSettingsSmokeNative]::SendM4($false)
+    }
+    if ($m5IsDown) {
+        [GradialSettingsSmokeNative]::SendM5($false)
+    }
+    if ($controlIsDown) {
+        [GradialSettingsSmokeNative]::SetControl($false)
     }
     if ($gradial -and -not $gradial.HasExited) {
         if (

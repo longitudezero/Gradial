@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Stroke, Vec2, epaint::CircleShape};
-use gradial_core::{ResolvedMenu, SliceCount};
+use gradial_core::{ActivationBindingId, ResolvedMenu, SliceCount};
 use uuid::Uuid;
 
 use super::animation::{AnimationMode, selection_progress};
@@ -20,6 +20,7 @@ const MAX_SLICE_COUNT: usize = 8;
 pub(crate) struct OverlayRenderFrame {
     pub(crate) invocation_id: Option<Uuid>,
     pub(crate) menu: Option<Arc<ResolvedMenu>>,
+    pub(crate) activation_button: ActivationBindingId,
     pub(crate) selected_slice: Option<usize>,
     pub(crate) selection_changed_at: Option<Instant>,
     pub(crate) opacity: f32,
@@ -122,7 +123,7 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         painter.text(
             center,
             Align2::CENTER_CENTER,
-            "M4",
+            frame.activation_button.short_label(),
             FontId::proportional(11.0 * scale),
             faded(Color32::from_rgba_unmultiplied(225, 232, 255, 245), opacity),
         );

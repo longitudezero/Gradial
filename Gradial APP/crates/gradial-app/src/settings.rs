@@ -12,16 +12,18 @@ use eframe::egui::{
 #[cfg(debug_assertions)]
 use gradial_core::ShortcutModifier;
 use gradial_core::{
-    ActionDefinition, ActionKind, ActionPlanCompiler, ApplicationProfile, Configuration,
-    ConfigurationError, ExecutionOperation, MAX_ACTION_SEQUENCE_DEPTH,
-    MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu,
-    MenuSlice, Profile, ProfileResolver, ProfileRule, ProfileTarget, ResolutionDecision,
-    ResolvedMenu, ShortcutKey, SliceCount, WindowCommand,
+    ActionDefinition, ActionKind, ActionPlanCompiler, ActivationBinding, ActivationBindingId,
+    ApplicationProfile, Configuration, ConfigurationError, ExecutionOperation,
+    MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
+    MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, PhysicalModifiers, Profile, ProfileResolver,
+    ProfileRule, ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey, SliceCount,
+    WindowCommand, slice_for_delta,
 };
 use regex::Regex;
 use uuid::Uuid;
 
 use crate::{
+    input::{self, ActivationBindingTestResult},
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
     overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
     platform::{self, ProfileTestTarget},
@@ -130,6 +132,7 @@ enum EditorLifecycle {
 enum SettingsSection {
     #[default]
     Menu,
+    Binding,
     Profiles,
     Actions,
 }
@@ -382,6 +385,16 @@ enum ProfileTestState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BindingTestState {
+    #[default]
+    Idle,
+    Waiting {
+        expected: ActivationBinding,
+    },
+    Complete(ActivationBindingTestResult),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ActionReferenceSummary {
     menu_slices: usize,
     sequences: usize,
@@ -484,6 +497,7 @@ struct SettingsState {
     selected_action: Option<Uuid>,
     profile_feedback: Option<ProfileEditorFeedback>,
     profile_test: ProfileTestState,
+    binding_test: BindingTestState,
     action_feedback: Option<ActionEditorFeedback>,
     shortcut_recorder: ShortcutRecorder,
     recording_action_id: Option<Uuid>,
@@ -504,6 +518,7 @@ impl SettingsState {
             selected_action: None,
             profile_feedback: None,
             profile_test: ProfileTestState::Idle,
+            binding_test: BindingTestState::Idle,
             action_feedback: None,
             shortcut_recorder: ShortcutRecorder::default(),
             recording_action_id: None,
@@ -528,6 +543,7 @@ impl SettingsState {
             self.selected_action = configuration.actions.first().map(|action| action.id);
             self.profile_feedback = None;
             self.profile_test = ProfileTestState::Idle;
+            self.cancel_binding_test();
             self.action_feedback = None;
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
@@ -549,6 +565,7 @@ impl SettingsState {
         self.save_feedback = SaveFeedback::Saved;
         self.profile_feedback = None;
         self.action_feedback = None;
+        self.cancel_binding_test();
         self.recovery_warning = false;
     }
 
@@ -579,6 +596,31 @@ impl SettingsState {
             "component=settings event_code=settings_debug_draft_edited result_code=ok \
              config_revision={} slice_count=4",
             draft.original.config_revision
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_apply_binding_fixture_edit(&mut self) -> bool {
+        let Some(draft) = &mut self.draft else {
+            return false;
+        };
+        let binding = ActivationBinding {
+            button: ActivationBindingId::MouseButton5,
+            modifiers: PhysicalModifiers { control: true, alt: false, shift: false },
+        };
+        draft.proposed.activation_binding = binding;
+        self.section = SettingsSection::Binding;
+        self.binding_test = BindingTestState::Waiting { expected: binding };
+        input::begin_activation_binding_test(binding);
+        self.save_feedback = SaveFeedback::None;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_binding_draft_edited result_code=ok \
+             config_revision={} activation_button={} activation_control=true \
+             activation_alt=false activation_shift=false tester_armed=true",
+            draft.original.config_revision,
+            binding.button.short_label()
         );
         true
     }
@@ -893,10 +935,48 @@ impl SettingsState {
         .then(|| SettingsEvent::SaveRequested(draft.proposed.clone()))
     }
 
+    fn cancel_binding_test(&mut self) {
+        input::cancel_activation_binding_test();
+        self.binding_test = BindingTestState::Idle;
+    }
+
+    fn poll_binding_test(&mut self, context: &egui::Context) {
+        if !matches!(self.binding_test, BindingTestState::Waiting { .. }) {
+            return;
+        }
+        if let Some(result) = input::take_activation_binding_test_result() {
+            let selection = binding_test_selection(result);
+            log::info!(
+                target: "settings",
+                "component=settings event_code=settings_binding_test_completed result_code={} \
+                 config_revision={} matched={} activation_button={} activation_control={} \
+                 activation_alt={} activation_shift={} selection={}",
+                if result.matched { "ok" } else { "mismatch" },
+                self.draft.as_ref().map_or(0, |draft| draft.original.config_revision),
+                result.matched,
+                result.actual.button.short_label(),
+                result.actual.modifiers.control,
+                result.actual.modifiers.alt,
+                result.actual.modifiers.shift,
+                selection.map_or("none", |index| direction_name(index, SliceCount::Eight))
+            );
+            self.binding_test = BindingTestState::Complete(result);
+            context.request_repaint();
+        } else {
+            context.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, ui: &mut egui::Ui) -> Option<SettingsEvent> {
         #[cfg(debug_assertions)]
         let debug_event = if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F1))
+        {
+            let _edited = self.debug_apply_binding_fixture_edit();
+            None
+        } else if ui
             .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5))
         {
@@ -967,8 +1047,10 @@ impl SettingsState {
         #[cfg(not(debug_assertions))]
         let debug_event = None;
 
+        self.poll_binding_test(ui.ctx());
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
         if close_requested {
+            self.cancel_binding_test();
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
             match self.request_close() {
@@ -996,6 +1078,7 @@ impl SettingsState {
                 });
             });
             ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.section, SettingsSection::Binding, "Activation");
                 ui.selectable_value(&mut self.section, SettingsSection::Menu, "Menu");
                 ui.selectable_value(&mut self.section, SettingsSection::Profiles, "Profiles");
                 ui.selectable_value(&mut self.section, SettingsSection::Actions, "Actions");
@@ -1009,6 +1092,11 @@ impl SettingsState {
             }
             ui.add_space(8.0);
         });
+        if self.section != SettingsSection::Binding
+            && !matches!(self.binding_test, BindingTestState::Idle)
+        {
+            self.cancel_binding_test();
+        }
 
         egui::Panel::bottom("settings_actions").show(ui, |ui| {
             ui.add_space(8.0);
@@ -1031,6 +1119,7 @@ impl SettingsState {
                     self.selected_action = draft.proposed.actions.first().map(|action| action.id);
                     self.profile_feedback = None;
                     self.action_feedback = None;
+                    self.cancel_binding_test();
                     self.shortcut_recorder.cancel();
                     self.recording_action_id = None;
                     self.save_feedback = SaveFeedback::None;
@@ -1053,6 +1142,7 @@ impl SettingsState {
         });
 
         match self.section {
+            SettingsSection::Binding => self.render_binding_section(ui, &mut draft),
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
             SettingsSection::Profiles => self.render_profiles_section(ui, &mut draft),
             SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
@@ -1082,6 +1172,7 @@ impl SettingsState {
             if discard {
                 draft.discard();
                 self.profile_test = ProfileTestState::Idle;
+                self.cancel_binding_test();
                 self.lifecycle = EditorLifecycle::Closed;
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                 log::info!(
@@ -1103,6 +1194,147 @@ impl SettingsState {
 
         self.draft = Some(draft);
         event
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_binding_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
+        let original_binding = draft.proposed.activation_binding;
+        let mut binding = original_binding;
+        let mut start_test = false;
+        let mut cancel_test = false;
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(18.0);
+                ui.heading("Activation");
+                ui.label("Choose the mouse chord that opens Gradial.");
+                ui.add_space(18.0);
+
+                ui.label(RichText::new("Side button").strong());
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut binding.button,
+                        ActivationBindingId::MouseButton4,
+                        "Mouse button 4 (M4)",
+                    );
+                    ui.selectable_value(
+                        &mut binding.button,
+                        ActivationBindingId::MouseButton5,
+                        "Mouse button 5 (M5)",
+                    );
+                });
+                ui.weak("Only M4 and M5 can activate Gradial.");
+
+                ui.add_space(18.0);
+                ui.label(RichText::new("Required keyboard keys").strong());
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut binding.modifiers.control, "Ctrl");
+                    ui.checkbox(&mut binding.modifiers.alt, "Alt");
+                    ui.checkbox(&mut binding.modifiers.shift, "Shift");
+                });
+                ui.weak(
+                    "The chord is exact. Extra Ctrl, Alt, or Shift keys will not activate Gradial.",
+                );
+
+                ui.add_space(18.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.label(RichText::new("Test this draft safely").strong());
+                    ui.label(format!(
+                        "Test chord: {}",
+                        activation_binding_display(binding)
+                    ));
+                    ui.weak(
+                        "The next side-button attempt is consumed once. It cannot launch an action or navigate another app.",
+                    );
+                    ui.add_space(10.0);
+
+                    match self.binding_test {
+                        BindingTestState::Idle => {
+                            if ui.button("Start hold–flick–release test").clicked() {
+                                start_test = true;
+                            }
+                        }
+                        BindingTestState::Waiting { expected } => {
+                            ui.colored_label(
+                                Color32::from_rgb(124, 154, 255),
+                                if input::activation_test_gesture_active() {
+                                    "Chord recognized. Flick in any direction, then release."
+                                        .to_owned()
+                                } else {
+                                    format!(
+                                        "Waiting for {}. Hold it, flick, then release.",
+                                        activation_binding_display(expected)
+                                    )
+                                },
+                            );
+                            if ui.button("Cancel test").clicked() {
+                                cancel_test = true;
+                            }
+                        }
+                        BindingTestState::Complete(result) if result.matched => {
+                            let message = binding_test_selection(result).map_or_else(
+                                || {
+                                    "Chord recognized. The release stayed in the center, so the gesture cancelled safely."
+                                        .to_owned()
+                                },
+                                |selection| {
+                                    format!(
+                                        "Chord recognized with a {} flick. No action was launched.",
+                                        direction_name(selection, SliceCount::Eight)
+                                    )
+                                },
+                            );
+                            ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+                            if ui.button("Test again").clicked() {
+                                start_test = true;
+                            }
+                        }
+                        BindingTestState::Complete(result) => {
+                            ui.colored_label(
+                                Color32::from_rgb(239, 113, 113),
+                                format!(
+                                    "That was {}. Try {}.",
+                                    activation_binding_display(result.actual),
+                                    activation_binding_display(binding)
+                                ),
+                            );
+                            if ui.button("Try again").clicked() {
+                                start_test = true;
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(18.0);
+                ui.label(RichText::new("When it takes effect").strong());
+                ui.label(
+                    "This is still a draft. Gradial keeps using the saved activation chord until you choose Save changes.",
+                );
+                ui.add_space(8.0);
+                ui.weak(match binding.modifiers {
+                    PhysicalModifiers { control: false, alt: false, shift: false } => {
+                        "Without modifiers, the chosen side button is dedicated to Gradial while input is healthy."
+                    }
+                    _ => {
+                        "With required modifiers, only the complete chord is dedicated; the side button alone continues to work normally."
+                    }
+                });
+            });
+        });
+
+        if binding != original_binding {
+            draft.proposed.activation_binding = binding;
+            self.cancel_binding_test();
+            self.save_feedback = SaveFeedback::None;
+        }
+        if cancel_test {
+            self.cancel_binding_test();
+        } else if start_test {
+            input::begin_activation_binding_test(binding);
+            self.binding_test = BindingTestState::Waiting { expected: binding };
+            self.save_feedback = SaveFeedback::None;
+        }
     }
 
     fn render_menu_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
@@ -1180,7 +1412,11 @@ impl SettingsState {
             ui.label("Click a direction to select it.");
             ui.add_space(18.0);
             ui.vertical_centered(|ui| {
-                self.render_preview(ui, &draft.proposed.global_profile.menu);
+                self.render_preview(
+                    ui,
+                    &draft.proposed.global_profile.menu,
+                    draft.proposed.activation_binding.button,
+                );
             });
         });
     }
@@ -1419,7 +1655,9 @@ impl SettingsState {
                 ui.label("This is a complete menu, independent from Global.");
                 ui.add_space(18.0);
                 if let Some(menu) = profile_menu(&draft.proposed, profile_id) {
-                    ui.vertical_centered(|ui| self.render_preview(ui, menu));
+                    ui.vertical_centered(|ui| {
+                        self.render_preview(ui, menu, draft.proposed.activation_binding.button);
+                    });
                 }
                 ui.add_space(16.0);
             });
@@ -1881,7 +2119,12 @@ impl SettingsState {
         }
     }
 
-    fn render_preview(&mut self, ui: &mut egui::Ui, configured_menu: &Menu) {
+    fn render_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        configured_menu: &Menu,
+        activation_button: ActivationBindingId,
+    ) {
         let Some(menu) = resolved_menu(configured_menu) else {
             ui.colored_label(Color32::from_rgb(239, 113, 113), "Preview unavailable.");
             return;
@@ -1896,6 +2139,7 @@ impl SettingsState {
             OverlayRenderFrame {
                 invocation_id: Some(PREVIEW_INVOCATION_ID),
                 menu: Some(menu),
+                activation_button,
                 selected_slice: Some(self.selected_slice),
                 selection_changed_at: Some(now),
                 opacity: 1.0,
@@ -1916,6 +2160,7 @@ impl SettingsState {
     }
 
     fn request_close(&mut self) -> CloseOutcome {
+        self.cancel_binding_test();
         if matches!(self.profile_test, ProfileTestState::CountingDown { .. }) {
             self.profile_test = ProfileTestState::Idle;
         }
@@ -2812,6 +3057,33 @@ fn resolved_menu(menu: &Menu) -> Option<Arc<ResolvedMenu>> {
     .map(Arc::new)
 }
 
+fn activation_binding_display(binding: ActivationBinding) -> String {
+    let mut parts = Vec::with_capacity(4);
+    if binding.modifiers.control {
+        parts.push("Ctrl");
+    }
+    if binding.modifiers.alt {
+        parts.push("Alt");
+    }
+    if binding.modifiers.shift {
+        parts.push("Shift");
+    }
+    parts.push(binding.button.short_label());
+    parts.join(" + ")
+}
+
+fn binding_test_selection(result: ActivationBindingTestResult) -> Option<usize> {
+    if !result.matched {
+        return None;
+    }
+    let dx = result.release.x.saturating_sub(result.origin.x);
+    let dy = result.release.y.saturating_sub(result.origin.y);
+    if f64::from(dx).hypot(f64::from(dy)) < 36.0 {
+        return None;
+    }
+    Some(slice_for_delta(dx, dy, SliceCount::Eight))
+}
+
 fn preview_slice_at(offset: Vec2, slice_count: SliceCount) -> Option<usize> {
     let radius = offset.length();
     if !(28.0..=116.0).contains(&radius) {
@@ -3018,8 +3290,9 @@ mod tests {
 
     use eframe::egui::Vec2;
     use gradial_core::{
-        ActionDefinition, ActionKind, Configuration, MAX_TYPED_TEXT_BYTES, MenuSlice,
-        ResolutionDecision, ShortcutKey, ShortcutModifier, SliceCount, WindowCommand,
+        ActionDefinition, ActionKind, ActivationBinding, ActivationBindingId, Configuration,
+        MAX_TYPED_TEXT_BYTES, MenuSlice, PhysicalModifiers, ResolutionDecision, ScreenPoint,
+        ShortcutKey, ShortcutModifier, SliceCount, WindowCommand,
     };
     use uuid::Uuid;
 
@@ -3027,13 +3300,17 @@ mod tests {
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
         NewActionTemplate, PayloadEditOutcome, ProfileTestState, SequenceEditorContext,
         SequenceMetrics, SequenceMove, SettingsDraft, SettingsState, action_references,
-        add_executable_argument, add_sequence_step, apply_dialog_outcome,
-        countdown_seconds_remaining, create_action, create_application_profile, delete_action,
-        delete_application_profile, duplicate_action, duplicate_application_profile,
-        map_selected_slice, move_sequence_step, preview_slice_at, remove_executable_argument,
-        remove_sequence_step, resize_menu, resolution_decision_text, validate_draft,
+        activation_binding_display, add_executable_argument, add_sequence_step,
+        apply_dialog_outcome, binding_test_selection, countdown_seconds_remaining, create_action,
+        create_application_profile, delete_action, delete_application_profile, duplicate_action,
+        duplicate_application_profile, map_selected_slice, move_sequence_step, preview_slice_at,
+        remove_executable_argument, remove_sequence_step, resize_menu, resolution_decision_text,
+        validate_draft,
     };
-    use crate::{native_file_dialog::PathDialogOutcome, platform::ProfileTestTarget};
+    use crate::{
+        input::ActivationBindingTestResult, native_file_dialog::PathDialogOutcome,
+        platform::ProfileTestTarget,
+    };
 
     #[test]
     fn switching_slice_counts_preserves_cardinals_and_restores_diagonals_within_the_draft() {
@@ -3254,6 +3531,47 @@ mod tests {
         assert_eq!(editor.request_close(), CloseOutcome::Closed);
         assert_eq!(editor.lifecycle, EditorLifecycle::Closed);
         assert_eq!(editor.profile_test, ProfileTestState::Idle);
+    }
+
+    #[test]
+    fn activation_binding_edits_stay_in_the_draft_until_accept_or_discard() {
+        let configuration = Configuration::default();
+        let mut draft = SettingsDraft::new(&configuration);
+        let edited = ActivationBinding {
+            button: ActivationBindingId::MouseButton5,
+            modifiers: PhysicalModifiers { control: true, alt: false, shift: false },
+        };
+
+        draft.proposed.activation_binding = edited;
+        assert!(draft.is_dirty());
+        assert_eq!(draft.original.activation_binding, ActivationBinding::default());
+
+        draft.discard();
+        assert_eq!(draft.proposed.activation_binding, ActivationBinding::default());
+        assert!(!draft.is_dirty());
+    }
+
+    #[test]
+    fn binding_test_reports_exact_chords_and_eight_way_flicks() {
+        let actual = ActivationBinding {
+            button: ActivationBindingId::MouseButton5,
+            modifiers: PhysicalModifiers { control: true, alt: true, shift: false },
+        };
+        assert_eq!(activation_binding_display(actual), "Ctrl + Alt + M5");
+
+        let east = ActivationBindingTestResult {
+            actual,
+            matched: true,
+            origin: ScreenPoint::new(100, 100),
+            release: ScreenPoint::new(180, 100),
+        };
+        assert_eq!(binding_test_selection(east), Some(2));
+
+        let centered = ActivationBindingTestResult { release: ScreenPoint::new(120, 100), ..east };
+        assert_eq!(binding_test_selection(centered), None);
+
+        let mismatch = ActivationBindingTestResult { matched: false, ..east };
+        assert_eq!(binding_test_selection(mismatch), None);
     }
 
     #[test]

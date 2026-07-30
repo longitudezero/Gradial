@@ -6,21 +6,23 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    SliceCount,
+    ActivationBinding, SliceCount,
     actions::{ActionDefinition, ShortcutModifier, validate_actions},
 };
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const ACTION_CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_GLOBAL_PROFILE_ID: Uuid =
     Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0001);
 
-/// The complete schema-two configuration model.
+/// The complete schema-three configuration model.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub schema_version: u32,
     pub config_revision: u64,
+    pub activation_binding: ActivationBinding,
     pub global_profile: Profile,
     pub application_profiles: Vec<ApplicationProfile>,
     #[serde(default)]
@@ -75,6 +77,7 @@ impl Default for Configuration {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             config_revision: 0,
+            activation_binding: ActivationBinding::default(),
             global_profile: Profile {
                 id: DEFAULT_GLOBAL_PROFILE_ID,
                 name: "Global".to_owned(),
@@ -297,7 +300,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ApplicationProfile, Configuration, ConfigurationError, Menu, Profile, ProfileRule,
+        ActivationBinding, ApplicationProfile, CONFIG_SCHEMA_VERSION, Configuration,
+        ConfigurationError, Menu, Profile, ProfileRule,
     };
 
     fn application_profile(id: u128) -> ApplicationProfile {
@@ -317,10 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn default_schema_two_configuration_is_valid_and_action_free() {
+    fn default_schema_three_configuration_is_valid_and_action_free() {
         let configuration = Configuration::default();
         configuration.validate().expect("default configuration");
-        assert_eq!(configuration.schema_version, 2);
+        assert_eq!(configuration.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(configuration.activation_binding, ActivationBinding::default());
         assert_eq!(configuration.global_profile.menu.slices.len(), 8);
         assert!(configuration.application_profiles.is_empty());
         assert!(configuration.actions.is_empty());

@@ -15,7 +15,8 @@ slices, and the current bounded Milestone 2 slices establish:
   local logs.
 - Formatting, Clippy, unit-test, and build checks.
 - A dedicated Win32 low-level mouse/keyboard hook thread.
-- M4 as a suppressed development trigger and Escape as cancellation.
+- A saved M4/M5 activation chord with optional exact Ctrl/Alt/Shift
+  requirements, plus Escape as cancellation.
 - A fixed-capacity, single-producer/single-consumer input queue.
 - An explicit, pure gesture state machine with four/eight slices and
   hysteresis.
@@ -36,8 +37,8 @@ slices, and the current bounded Milestone 2 slices establish:
   Explorer restart.
 - Persistent per-monitor geometry caches and bounded 60/35/50 ms
   open/selection/close animation state.
-- A validated schema-two configuration with safe in-memory schema-one migration
-  and atomic primary/backup replacement.
+- A validated schema-three configuration with safe in-memory schema-one and
+  schema-two migration plus atomic primary/backup replacement.
 - Complete immutable target/display/modifier identity for every invocation.
 - A compiled, deterministic application-profile resolver with explanation
   data.
@@ -83,16 +84,17 @@ slices, and the current bounded Milestone 2 slices establish:
 - Optional exact window-class and title-regex rule controls plus a private
   countdown tester that uses the production resolver to explain matches,
   winner, and tie-break.
+- A draft-only activation editor for M4/M5 and generic Ctrl/Alt/Shift, with a
+  one-shot hold/flick/release tester that cannot dispatch an action.
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
 
-Configuration editing currently covers the global menu and the complete action
-catalog, including sequences, plus exact-executable application profiles and
-their independent menus and complete matching rules. Activation binding,
-appearance, icons, import/export, and onboarding are not exposed yet. A
-release logs the chosen slice, compiles its assigned plan, and submits it to
-the coordinator. Every schema-two action family can execute through its
-bounded backend.
+Configuration editing currently covers activation, the global menu, the
+complete action catalog including sequences, and exact-executable application
+profiles with their independent menus and complete matching rules. Appearance,
+icons, import/export, and onboarding are not exposed yet. A release logs the
+chosen slice, compiles its assigned plan, and submits it to the coordinator.
+Every schema-two action family can execute through its bounded backend.
 
 ## Workspace layout
 
@@ -141,18 +143,19 @@ On first run, Gradial creates:
     logs\
 ```
 
-`config.json` starts at schema 2 and revision 1 with the stable global profile,
-an eight-slice menu, and an empty action catalog. Each menu slice has an
-optional action UUID. A successful later replacement preserves the previous
-valid primary as `config.json.bak`; `config.json.tmp` exists only during a
-save.
+`config.json` starts at schema 3 and revision 1 with the default unmodified M4
+binding, stable global profile, eight-slice menu, and empty action catalog.
+Each menu slice has an optional action UUID. A successful later replacement
+preserves the previous valid primary as `config.json.bak`; `config.json.tmp`
+exists only during a save.
 
 Existing schema-one files are accepted only when they contain no schema-two
-action fields. Gradial adds the empty action catalog and empty slice references
-in memory, validates the complete schema-two model, and leaves the original
-bytes untouched. Migration is persisted only through a later explicit,
-successful save. This prevents startup from silently rewriting either a valid
-legacy file or a file containing ambiguous fields.
+action fields. Gradial adds the action and binding defaults in memory.
+Schema-two files gain only the default binding in memory. Both paths validate
+the complete schema-three model and leave the original bytes untouched.
+Migration is persisted only through a later explicit, successful save. This
+prevents startup from silently rewriting either a valid legacy file or a file
+containing ambiguous fields.
 
 Configuration is parsed and completely validated before input starts. Profile
 regular expressions are compiled into the retained resolver at load rather
@@ -175,7 +178,7 @@ Gradial uses four execution contexts:
 
 | Context | Responsibility | May block or allocate? |
 | --- | --- | --- |
-| Win32 input thread | Classify M4, raw deltas, movement, Escape, and cancellation input | No, inside callbacks |
+| Win32 input thread | Classify the saved M4/M5 chord, tester input, raw deltas, movement, Escape, and cancellation | No, inside callbacks |
 | Interaction thread | Snapshot invocation state and advance the pure gesture controller | Yes, outside callbacks |
 | eframe UI thread | Maintain the hidden controller and paint independent per-display viewports | Yes |
 | Action worker | Execute one admitted immutable plan and observe cancellation/timeouts | Yes |
@@ -186,15 +189,15 @@ that one thread and feed one producer. The hook callback copies fixed-size
 events into an `rtrb` SPSC ring buffer with a capacity of 4,096. It never logs,
 waits, paints, takes a contended lock, enumerates displays, or calls action
 code. Display work areas are immutable for the lifetime of one hook runtime.
-When topology changes, an atomic gate first makes new M4 presses pass through,
-then the interaction thread closes any active invocation, the old hook runtime
-stops, and a replacement starts with the newly enumerated displays. Overflow
+When topology changes, an atomic gate first makes new activation attempts pass
+through, then the interaction thread closes any active invocation, the old
+hook runtime stops, and a replacement starts with the newly enumerated displays. Overflow
 sets an atomic fault flag. The interaction thread then closes any active
 invocation, closes the complete input runtime, and enters a fail-safe fault
-state. M4 passes through while faulted; recovery requires **Retry input** from
-the tray menu.
+state. The configured chord passes through while faulted; recovery requires
+**Retry input** from the tray menu.
 
-At M4-down, the interaction thread maps the signed physical cursor coordinate
+At activation-down, the interaction thread maps the signed physical cursor coordinate
 to the same monitor ordering used by the overlay pool. It updates only that
 viewport's small shared presentation state and requests that child viewport's
 independent repaint. Open and close also post private native messages directly
@@ -203,7 +206,7 @@ throttled repaint cycle. None of this work occurs in a low-level hook callback.
 
 The hook thread owns a 250 ms message-loop heartbeat. The interaction thread
 checks it whether or not a gesture is active. Once it is more than 750 ms old
-(three missed intervals), new M4 presses are immediately passed through, any
+(three missed intervals), new activation attempts are immediately passed through, any
 active invocation is cancelled, and the entire hook/raw-input/queue/consumer
 runtime is replaced. If replacement cannot start, Gradial remains faulted until
 manual retry. On graceful shutdown, Gradial logs the maximum observed
@@ -218,10 +221,11 @@ Explorer's `TaskbarCreated` message restores the icon and re-registers input.
 Power-resume and current-session unlock notifications also re-register the
 complete runtime. These signals do not silently clear a queue-overflow fault.
 
-M4 down and its matching release are suppressed while Gradial runs. In
-fixed-origin mode, pointer movement passes through normally and absolute cursor
+The configured exact chord's button-down and matching release are suppressed.
+A button or Ctrl/Alt/Shift state that does not exactly match passes through.
+In fixed-origin mode, pointer movement passes through normally and absolute cursor
 positions drive the gesture. In edge-assist mode, low-level movement is
-suppressed so the system cursor remains at M4-down; raw mouse deltas accumulate
+suppressed so the system cursor remains at activation-down; raw mouse deltas accumulate
 into a virtual gesture pointer instead. During an invocation, Escape and
 another mouse-button click cancel the gesture; their matching releases are
 suppressed to avoid leaking half of a click. Events stamped with Gradial's
@@ -239,16 +243,18 @@ the invocation monitor's effective DPI:
 - four or eight slices, with north at index 0 and indices increasing
   clockwise;
 - release in the center/no-selection zone cancels;
-- Escape closes once, then waits for M4 release before returning to idle.
+- Escape closes once, then waits for the activation-button release before
+  returning to idle.
 
 Each invocation captures a UUID and source QPC timestamp plus immutable target,
 display, input, and configuration identity. The target fields are foreground
 window handle/PID, process creation time, optional full executable path, window
 class, and window title. Display fields are signed cursor coordinate, monitor
 device name, monitor rectangle, work area, effective DPI, resolved geometry,
-and visual origin. Ctrl/Alt/Shift state is captured in the low-level
-button-down event along with the fixed development binding ID. The
-configuration revision is frozen before profile selection.
+and visual origin. Generic Ctrl/Alt/Shift state and the triggering M4/M5
+identity are captured in the low-level button-down event. They must exactly
+match the saved binding before the event is consumed. The configuration
+revision is frozen before profile selection.
 
 Only the fixed-size modifier bits are added by the hook callback. Process,
 window, monitor, configuration, and profile work remains on the interaction
@@ -288,6 +294,23 @@ decorated, resizable taskbar window. Repeating the command focuses that same
 window and preserves its draft. The editor begins from the running
 configuration and modifies a private full-configuration copy; an unfinished
 edit cannot affect an open gesture or a later invocation.
+
+The **Activation** tab chooses M4 or M5 and generic Ctrl, Alt, and Shift
+requirements. Matching is exact: a required key may be pressed on either
+physical side, while an additional generic modifier prevents activation. The
+draft displays the same M4/M5 center label used by the production overlay.
+Changing these controls marks only the editor copy; the live hook retains the
+saved binding until atomic save succeeds and the interaction runtime restarts.
+
+**Start hold–flick–release test** arms a one-shot atomic path in the existing
+low-level hook. The next physical M4 or M5 attempt is consumed before
+production activation. The hook compares fixed-size button/modifier bits,
+tracks signed origin and latest cursor coordinates, suppresses the matching
+release, and reports either a chord mismatch, centered cancellation, or one of
+eight flick directions. It does not enter the interaction controller or action
+executor, and it never logs target-window data. Leaving the tab, discarding,
+saving, or closing disarms the tester; a release already paired with a
+consumed down remains suppressed.
 
 The **Menu** tab can switch between four and eight clockwise directions, edit
 each label, and assign or clear any action in the validated catalog.
@@ -407,8 +430,8 @@ disk mutation, performs the existing atomic save/backup procedure, and updates
 the retained resolver, action compiler, overlay revision, executor revision,
 and interaction runtime only after replacement succeeds. A failed save keeps
 the draft open and leaves the running configuration unchanged. A successful
-save increments `config_revision`; fresh M4 invocations immediately use that
-revision.
+save increments `config_revision`; fresh invocations immediately use that
+revision and its saved M4/M5 chord.
 
 A normal close with a clean draft closes immediately. A dirty close displays
 exactly **Discard changes** and **Keep editing**. The former abandons the
@@ -537,7 +560,7 @@ respect; the call does not activate or focus Gradial. A Windows notification
 submission failure remains in recent activity and is recorded locally without
 retry. There is no success notification and no persisted activity database.
 
-Window actions use the exact HWND captured at M4-down. Immediately before
+Window actions use the exact HWND captured at activation-down. Immediately before
 dispatch, the worker checks that the HWND still exists, still belongs to the
 captured PID, and still represents the same process start time. It also
 requires that window to remain foreground and checks target integrity against
@@ -556,7 +579,7 @@ from action logs; only the fixed command name is recorded.
 ## Edge behavior
 
 The default `--geometry=auto` mode uses fixed origin whenever a 288 DIP square
-centered at M4-down fits in the monitor work area. Otherwise it selects edge
+centered at activation-down fits in the monitor work area. Otherwise it selects edge
 assist and clamps the visual origin far enough inward for the complete overlay
 to fit. Work-area coordinates remain signed, so monitors above or left of the
 primary display are handled without unsigned conversion.
@@ -830,7 +853,10 @@ the foreground application after notification submission, while the wrapper
 confirms that neither its private path sentinel nor its configured argument
 appears in the local log. The isolated configuration is always removed.
 `smoke-settings-editor.ps1` starts the debug executable with a private
-eight-slice configuration and opens its real settings viewport. It creates and
+schema-two eight-slice configuration and opens its real settings viewport. It
+edits the activation draft to exact Ctrl+M5, arms the safe tester, submits a
+native hold/east-flick/release gesture, and requires that no production action
+run during the test. It creates and
 persists every leaf-action type plus a base and nested sequence, exercises
 duplication, unreferenced deletion, sequence addition/removal/reordering, and
 records an exact left-Ctrl+F14 combination through native key messages. It
@@ -847,12 +873,13 @@ cancels it without changing the draft. It then selects the nested sequence and
 observes four expanded steps, depth two, and 275 ms total Delay before
 converting the Global draft to four slices. After the guarded close it requires
 revision 2 on disk with the exact complete profile rule, priority, independent
-menu, action payloads, and ordered sequence UUIDs, the old profile-free
-eight-slice revision in `config.json.bak`, preserved cardinal assignments, and
-a fresh M4 action using the reloaded Global menu. Optional screenshots cover
-the menu, advanced profile tester, payload, sequence, shortcut-recorder,
-Windows-chooser, and confirmation surfaces. The fixture never reads or writes
-the user's Gradial configuration.
+menu, action payloads, ordered sequence UUIDs, and Ctrl+M5 schema-three binding;
+the old profile-free schema-two revision remains in `config.json.bak`. It then
+requires a fresh Ctrl+M5 invocation to freeze the saved binding and use the
+reloaded Global menu. Optional screenshots cover activation, the menu,
+advanced profile tester, payload, sequence, shortcut-recorder, Windows chooser,
+and confirmation surfaces. The fixture never reads or writes the user's
+Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

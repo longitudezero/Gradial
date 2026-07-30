@@ -28,7 +28,7 @@ payload logging. Direct executable actions now launch existing absolute
 `.exe` files with exact argument-array preservation, an optional validated
 working directory, no shell, and no wait for child exit. Invocation-window
 actions now send one asynchronous minimize, maximize, restore, or polite close
-request only to the window frozen at M4-down after revalidating its identity
+request only to the window frozen at activation-down after revalidating its identity
 and integrity. Action failures and cancellations now enter a session-only,
 20-item recent-activity tray panel. Failures also request a native,
 non-focus-stealing Windows notification; successful actions remain silent.
@@ -45,6 +45,9 @@ sets deterministic priority, and gives each profile an independent
 four/eight-direction menu. Optional exact window-class and title-regex rules
 are editable, and a private countdown tester explains every matching profile,
 winner, and deterministic tie-break.
+The activation editor now configures M4 or M5 with an exact optional
+Ctrl/Alt/Shift requirement and includes a safe one-shot hold/flick/release
+tester.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -65,14 +68,14 @@ From `Gradial APP`:
 cargo run --package gradial-app
 ```
 
-The app starts hidden. While this development build is running:
+The app starts hidden. With the default binding:
 
 - Hold mouse button 4 (M4) to open the menu at the cursor.
 - Move beyond the center zone to highlight a slice.
 - Release M4 to log the selected slice and close the menu.
 - Press Escape, or press another mouse button, to cancel.
 
-Gradial normally keeps the gesture fixed at M4-down. If the complete ring would
+Gradial normally keeps the gesture fixed at activation-down. If the complete ring would
 clip the current monitor's work area, it automatically insets the ring and uses
 raw mouse deltas as a virtual pointer. The system cursor stays at the invocation
 point during that edge-assisted gesture.
@@ -104,8 +107,10 @@ interpolation while preserving the same lifecycle timing:
 cargo run --package gradial-app -- --reduced-motion
 ```
 
-**M4 is dedicated to Gradial while the app runs.** Its normal browser
-back/navigation behavior is suppressed. An assigned slice is compiled into an
+**The saved activation chord is dedicated to Gradial while the app runs.**
+With the default unmodified M4 chord, normal browser back/navigation behavior
+is suppressed. If modifiers are required, the side button without that exact
+Ctrl/Alt/Shift combination continues to pass through. An assigned slice is compiled into an
 immutable, bounded plan at release. Delay, keyboard-shortcut, Unicode-text,
 URL-open, path-open, direct executable, and invocation-window steps execute on
 one worker; another dispatch while it is busy fails immediately instead of
@@ -127,15 +132,15 @@ Close sends a normal close request and never terminates the target process.
 Unassigned slices cancel as `EmptySlice`; reusable sequences stop on the first
 failure or cancellation.
 
-The display under the M4-down cursor selects the prewarmed overlay window.
+The display under the activation-down cursor selects the prewarmed overlay window.
 Display, work-area, or DPI changes cancel an active gesture and rebuild the
-window pool before M4 is accepted again. Every overlay is click-through and
+window pool before the configured chord is accepted again. Every overlay is click-through and
 never intentionally takes focus.
 
 Gradial keeps a notification-area icon visible while it runs. Its icon and
 first menu line show `Healthy`, `Recovering input`, or `Input faulted`. A missed
 input heartbeat triggers automatic recovery after 750 ms. Queue overflow and
-startup failures remain faulted with M4 passed through until **Retry input** is
+startup failures remain faulted with the activation chord passed through until **Retry input** is
 chosen. The same menu provides **Open settings**, **Cancel current action**
 while a plan is running, a **Recent activity** submenu with **Clear activity**,
 and **Exit Gradial**. Activity is never written to disk. It contains only fixed
@@ -143,10 +148,11 @@ public messages derived from stable error codes, not action text, URLs, paths,
 arguments, or target titles. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
-First startup now creates `%LOCALAPPDATA%\Gradial\config.json` with schema 2,
-revision 1, a global eight-slice profile, and an empty action catalog. Existing
-schema-one files are migrated to schema two in memory without being rewritten;
-the next explicit successful save will persist schema two. Configuration
+First startup now creates `%LOCALAPPDATA%\Gradial\config.json` with schema 3,
+revision 1, the default M4 binding, a global eight-slice profile, and an empty
+action catalog. Existing schema-one and schema-two files are migrated to
+schema three in memory without being rewritten; the next explicit successful
+save persists schema three. Configuration
 replacement is validated and atomic, preserves the previous valid primary as
 `config.json.bak`, and recovers from that backup without overwriting a broken
 primary. Application-profile rules are resolved at every activation. The
@@ -158,7 +164,12 @@ direct `.exe` launch are enabled together with close, minimize, maximize, and
 restore for the invocation window.
 
 Choose **Open settings** from the notification-area menu to edit the global
-menu. The window can switch between four and eight directions, edit every
+menu. The **Activation** tab selects M4 or M5 and optional generic Ctrl, Alt,
+and Shift requirements. Matching is exact. Its one-shot tester consumes the
+next side-button attempt, reports the recognized eight-way flick or centered
+cancel, and never opens the production menu, launches an action, or navigates
+another application. Edits remain a private draft until **Save changes**.
+The window can switch between four and eight directions, edit every
 visible label, assign or clear catalog actions, and select directions directly
 in the live radial preview. The **Profiles** tab creates an application profile
 by choosing an `.exe`, copies the current Global menu as an independent
@@ -180,8 +191,8 @@ additions that avoid cycles and stay within nested depth, executed-step, and
 Delay limits are offered. Closing a dirty draft requires **Discard changes**
 or **Keep editing**. A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
-reloads new M4 invocations without restarting Gradial. Activation binding,
-import/export, icons, and onboarding remain future slices.
+reloads new invocations without restarting Gradial. Import/export, icons,
+appearance, and onboarding remain future slices.
 
 Run all local checks with:
 
@@ -251,3 +262,5 @@ Application-profile editor results are recorded in
 [`Documentation/milestone-2-application-profile-editor-results.md`](Documentation/milestone-2-application-profile-editor-results.md).
 Advanced profile matching and private tester results are recorded in
 [`Documentation/milestone-2-profile-matching-editor-results.md`](Documentation/milestone-2-profile-matching-editor-results.md).
+Activation binding and safe gesture-tester results are recorded in
+[`Documentation/milestone-2-activation-binding-editor-results.md`](Documentation/milestone-2-activation-binding-editor-results.md).
