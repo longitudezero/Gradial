@@ -12,8 +12,9 @@ use eframe::egui::{
 use gradial_core::ShortcutModifier;
 use gradial_core::{
     ActionDefinition, ActionKind, ActionPlanCompiler, Configuration, ConfigurationError,
-    MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, ProfileResolver, ResolvedMenu, ShortcutKey, SliceCount,
-    WindowCommand,
+    ExecutionOperation, MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS,
+    MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, ProfileResolver,
+    ResolvedMenu, ShortcutKey, SliceCount, WindowCommand,
 };
 use uuid::Uuid;
 
@@ -43,6 +44,11 @@ const DEBUG_EXECUTABLE_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8
 const DEBUG_DELAY_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0908);
 #[cfg(debug_assertions)]
 const DEBUG_WINDOW_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0909);
+#[cfg(debug_assertions)]
+const DEBUG_SEQUENCE_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0910);
+#[cfg(debug_assertions)]
+const DEBUG_NESTED_SEQUENCE_ACTION_ID: Uuid =
+    Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0911);
 pub(crate) fn settings_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("gradial-settings")
 }
@@ -117,10 +123,11 @@ enum NewActionTemplate {
     Application,
     Delay,
     Window,
+    Sequence,
 }
 
 impl NewActionTemplate {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Shortcut,
         Self::Text,
         Self::Website,
@@ -128,6 +135,7 @@ impl NewActionTemplate {
         Self::Application,
         Self::Delay,
         Self::Window,
+        Self::Sequence,
     ];
 
     const fn label(self) -> &'static str {
@@ -139,6 +147,7 @@ impl NewActionTemplate {
             Self::Application => "Application",
             Self::Delay => "Delay",
             Self::Window => "Window command",
+            Self::Sequence => "Sequence",
         }
     }
 
@@ -151,11 +160,12 @@ impl NewActionTemplate {
             Self::Application => "Run application",
             Self::Delay => "Delay",
             Self::Window => "Window command",
+            Self::Sequence => "Sequence",
         }
     }
 
-    fn action_kind(self) -> ActionKind {
-        match self {
+    fn initial_kind(self, initial_sequence_child: Option<Uuid>) -> Option<ActionKind> {
+        Some(match self {
             Self::Shortcut => ActionKind::SendShortcut {
                 modifiers: Vec::new(),
                 key: ShortcutKey { scan_code: 0x64, extended: false },
@@ -170,7 +180,8 @@ impl NewActionTemplate {
             },
             Self::Delay => ActionKind::Delay { milliseconds: 250 },
             Self::Window => ActionKind::Window { command: WindowCommand::Minimize },
-        }
+            Self::Sequence => ActionKind::Sequence { actions: vec![initial_sequence_child?] },
+        })
     }
 }
 
@@ -192,6 +203,12 @@ enum DraftValidationError {
     InvalidExecutable { index: usize },
     InvalidArgument { index: usize, argument: usize },
     InvalidDelay { index: usize, milliseconds: u32 },
+    InvalidSequenceLength { index: usize, found: usize },
+    SequenceCycle { index: usize },
+    SequenceDepth { index: usize, depth: u8 },
+    SequenceSteps { index: usize, steps: usize },
+    SequenceDelay { index: usize, milliseconds: u32 },
+    MissingSequenceStep { index: usize, step: usize },
     InvalidConfiguration,
 }
 
@@ -233,6 +250,40 @@ impl DraftValidationError {
             Self::InvalidDelay { index, milliseconds } => {
                 format!(
                     "Set action {} to a delay from 10 through 10000 ms; it currently uses {milliseconds} ms.",
+                    index + 1
+                )
+            }
+            Self::InvalidSequenceLength { index, found } => {
+                format!(
+                    "Give sequence action {} from 1 through {MAX_ACTION_SEQUENCE_STEPS} direct steps; it currently has {found}.",
+                    index + 1
+                )
+            }
+            Self::SequenceCycle { index } => {
+                format!("Remove the circular reference from sequence action {}.", index + 1)
+            }
+            Self::SequenceDepth { index, depth } => {
+                format!(
+                    "Reduce sequence action {} to at most {MAX_ACTION_SEQUENCE_DEPTH} nested levels; it currently reaches {depth}.",
+                    index + 1
+                )
+            }
+            Self::SequenceSteps { index, steps } => {
+                format!(
+                    "Reduce sequence action {} to at most {MAX_ACTION_SEQUENCE_STEPS} executed steps; it currently expands to {steps}.",
+                    index + 1
+                )
+            }
+            Self::SequenceDelay { index, milliseconds } => {
+                format!(
+                    "Reduce sequence action {} to at most {MAX_ACTION_SEQUENCE_DURATION_MS} ms of Delay; it currently totals {milliseconds} ms.",
+                    index + 1
+                )
+            }
+            Self::MissingSequenceStep { index, step } => {
+                format!(
+                    "Choose an available action for step {} of sequence action {}.",
+                    step + 1,
                     index + 1
                 )
             }
@@ -439,6 +490,7 @@ impl SettingsState {
     }
 
     #[cfg(debug_assertions)]
+    #[allow(clippy::too_many_lines)]
     fn debug_apply_action_fixture_edit(&mut self) -> bool {
         let Some(draft) = &mut self.draft else {
             return false;
@@ -495,6 +547,41 @@ impl SettingsState {
         ] {
             if !draft.proposed.actions.iter().any(|action| action.id == action_id) {
                 let _created = create_action(&mut draft.proposed, action_id, name, kind);
+            }
+        }
+        if !draft.proposed.actions.iter().any(|action| action.id == DEBUG_SEQUENCE_ACTION_ID) {
+            let _created = create_action(
+                &mut draft.proposed,
+                DEBUG_SEQUENCE_ACTION_ID,
+                "Editor sequence",
+                ActionKind::Sequence {
+                    actions: vec![
+                        DEBUG_SHORTCUT_ACTION_ID,
+                        DEBUG_TEXT_ACTION_ID,
+                        DEBUG_DELAY_ACTION_ID,
+                    ],
+                },
+            );
+        }
+        if !draft.proposed.actions.iter().any(|action| action.id == DEBUG_NESTED_SEQUENCE_ACTION_ID)
+        {
+            let _created = create_action(
+                &mut draft.proposed,
+                DEBUG_NESTED_SEQUENCE_ACTION_ID,
+                "Editor nested sequence",
+                ActionKind::Sequence {
+                    actions: vec![DEBUG_SEQUENCE_ACTION_ID, DEBUG_WINDOW_ACTION_ID],
+                },
+            );
+            if let Some(ActionDefinition { kind: ActionKind::Sequence { actions }, .. }) = draft
+                .proposed
+                .actions
+                .iter_mut()
+                .find(|action| action.id == DEBUG_NESTED_SEQUENCE_ACTION_ID)
+            {
+                let _added = add_sequence_step(actions, DEBUG_DELAY_ACTION_ID);
+                let _removed = remove_sequence_step(actions, 2);
+                let _moved = move_sequence_step(actions, 0, SequenceMove::Down);
             }
         }
         let _duplicated =
@@ -575,6 +662,25 @@ impl SettingsState {
     }
 
     #[cfg(debug_assertions)]
+    fn debug_select_sequence_action(&mut self) -> bool {
+        if !self.draft.as_ref().is_some_and(|draft| {
+            draft.proposed.actions.iter().any(|action| action.id == DEBUG_NESTED_SEQUENCE_ACTION_ID)
+        }) {
+            return false;
+        }
+        self.section = SettingsSection::Actions;
+        self.selected_action = Some(DEBUG_NESTED_SEQUENCE_ACTION_ID);
+        self.action_feedback = None;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_sequence_editor_selected result_code=ok \
+             config_revision={} action_id={DEBUG_NESTED_SEQUENCE_ACTION_ID}",
+            self.draft.as_ref().map_or(0, |draft| draft.original.config_revision)
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
     fn debug_keep_editing(&mut self) -> bool {
         if self.lifecycle != EditorLifecycle::ConfirmingClose {
             return false;
@@ -630,6 +736,12 @@ impl SettingsState {
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F11))
         {
             self.debug_open_native_application_picker();
+            None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F12))
+        {
+            let _selected = self.debug_select_sequence_action();
             None
         } else if ui
             .ctx()
@@ -887,22 +999,30 @@ impl SettingsState {
             });
             ui.separator();
             let mut new_action = None;
+            let initial_sequence_child = configuration
+                .actions
+                .iter()
+                .find(|action| !matches!(action.kind, ActionKind::Sequence { .. }))
+                .map(|action| action.id);
             ui.menu_button("+ New action", |ui| {
                 for template in NewActionTemplate::ALL {
-                    if ui.button(template.label()).clicked() {
+                    let enabled =
+                        template != NewActionTemplate::Sequence || initial_sequence_child.is_some();
+                    if ui.add_enabled(enabled, egui::Button::new(template.label())).clicked() {
                         new_action = Some(template);
                         ui.close();
                     }
                 }
+                if initial_sequence_child.is_none() {
+                    ui.weak("Create a regular action before creating a sequence.");
+                }
             });
             if let Some(template) = new_action {
                 let action_id = Uuid::new_v4();
-                create_action(
-                    configuration,
-                    action_id,
-                    template.preferred_name(),
-                    template.action_kind(),
-                );
+                let Some(kind) = template.initial_kind(initial_sequence_child) else {
+                    return;
+                };
+                create_action(configuration, action_id, template.preferred_name(), kind);
                 self.selected_action = Some(action_id);
                 self.action_feedback = Some(ActionEditorFeedback::Info(format!(
                     "{} action created.",
@@ -952,6 +1072,14 @@ impl SettingsState {
                 return;
             };
             let references = action_references(configuration, action_id);
+            let sequence_context = configuration
+                .actions
+                .iter()
+                .find(|action| action.id == action_id)
+                .and_then(|action| {
+                    matches!(action.kind, ActionKind::Sequence { .. })
+                        .then(|| SequenceEditorContext::new(configuration.clone(), action_id))
+                });
             let Some(action) = configuration.actions.iter_mut().find(|action| action.id == action_id)
             else {
                 ui.label("Select an available action.");
@@ -1029,9 +1157,15 @@ impl SettingsState {
                 ActionKind::Delay { milliseconds } => {
                     payload_changed = render_delay_editor(ui, milliseconds);
                 }
-                ActionKind::Sequence { .. } => {
-                    ui.label("Sequence steps will be editable in a later action-editor step.");
-                    ui.weak("You can rename, duplicate, assign, or safely delete this action now.");
+                ActionKind::Sequence { actions } => {
+                    let Some(context) = sequence_context.as_ref() else {
+                        ui.colored_label(
+                            Color32::from_rgb(239, 113, 113),
+                            "The sequence editor is unavailable.",
+                        );
+                        return;
+                    };
+                    payload_changed = render_sequence_editor(ui, actions, context);
                 }
             }
             if payload_changed {
@@ -1191,6 +1325,235 @@ impl SettingsState {
 struct PayloadEditOutcome {
     changed: bool,
     feedback: Option<ActionEditorFeedback>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceMove {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceRowEdit {
+    Move { index: usize, direction: SequenceMove },
+    Remove { index: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SequenceMetrics {
+    direct_steps: usize,
+    expanded_steps: usize,
+    depth: u8,
+    delay_ms: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SequenceEditorContext {
+    configuration: Configuration,
+    sequence_id: Uuid,
+}
+
+impl SequenceEditorContext {
+    fn new(configuration: Configuration, sequence_id: Uuid) -> Self {
+        Self { configuration, sequence_id }
+    }
+
+    fn action_label(&self, action_id: Uuid) -> String {
+        self.configuration.actions.iter().find(|action| action.id == action_id).map_or_else(
+            || "Unavailable action".to_owned(),
+            |action| format!("{} — {}", action.name, action_kind_name(&action.kind)),
+        )
+    }
+
+    fn valid_append_candidates(&self, current_steps: &[Uuid]) -> Vec<(Uuid, String)> {
+        if current_steps.len() >= MAX_ACTION_SEQUENCE_STEPS {
+            return Vec::new();
+        }
+        self.configuration
+            .actions
+            .iter()
+            .filter(|action| action.id != self.sequence_id)
+            .filter_map(|action| {
+                let mut proposed = current_steps.to_vec();
+                proposed.push(action.id);
+                self.configuration_with_steps(&proposed)
+                    .is_some_and(|configuration| configuration.validate().is_ok())
+                    .then(|| (action.id, self.action_label(action.id)))
+            })
+            .collect()
+    }
+
+    fn metrics(&self, steps: &[Uuid]) -> Option<SequenceMetrics> {
+        let configuration = self.configuration_with_steps(steps)?;
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).ok()?;
+        let plan = compiler.compile_plan(self.sequence_id, configuration.config_revision).ok()?;
+        let delay_ms = plan.steps().iter().fold(0_u32, |total, step| {
+            total.saturating_add(match step.operation() {
+                ExecutionOperation::Delay { milliseconds } => *milliseconds,
+                _ => 0,
+            })
+        });
+        Some(SequenceMetrics {
+            direct_steps: steps.len(),
+            expanded_steps: plan.steps().len(),
+            depth: sequence_depth(&configuration, self.sequence_id, &mut Vec::new())?,
+            delay_ms,
+        })
+    }
+
+    fn configuration_with_steps(&self, steps: &[Uuid]) -> Option<Configuration> {
+        let mut configuration = self.configuration.clone();
+        let sequence =
+            configuration.actions.iter_mut().find(|action| action.id == self.sequence_id)?;
+        let ActionKind::Sequence { actions } = &mut sequence.kind else {
+            return None;
+        };
+        *actions = steps.to_vec();
+        Some(configuration)
+    }
+}
+
+fn render_sequence_editor(
+    ui: &mut egui::Ui,
+    actions: &mut Vec<Uuid>,
+    context: &SequenceEditorContext,
+) -> bool {
+    let mut changed = false;
+    let mut row_edit = None;
+    ui.label("Steps");
+    ScrollArea::vertical()
+        .id_salt("sequence_steps")
+        .max_height(230.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for (index, action_id) in actions.iter().copied().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}.", index + 1));
+                    ui.label(context.action_label(action_id));
+                    if ui.add_enabled(index > 0, egui::Button::new("Up").small()).clicked() {
+                        row_edit =
+                            Some(SequenceRowEdit::Move { index, direction: SequenceMove::Up });
+                    }
+                    if ui
+                        .add_enabled(index + 1 < actions.len(), egui::Button::new("Down").small())
+                        .clicked()
+                    {
+                        row_edit =
+                            Some(SequenceRowEdit::Move { index, direction: SequenceMove::Down });
+                    }
+                    if ui
+                        .add_enabled(actions.len() > 1, egui::Button::new("Remove").small())
+                        .clicked()
+                    {
+                        row_edit = Some(SequenceRowEdit::Remove { index });
+                    }
+                });
+            }
+        });
+    if let Some(edit) = row_edit {
+        changed = match edit {
+            SequenceRowEdit::Move { index, direction } => {
+                move_sequence_step(actions, index, direction)
+            }
+            SequenceRowEdit::Remove { index } => remove_sequence_step(actions, index),
+        };
+    }
+
+    let candidates = context.valid_append_candidates(actions);
+    let mut added_action = None;
+    ui.add_enabled_ui(!candidates.is_empty(), |ui| {
+        ui.menu_button("+ Add step", |ui| {
+            for (action_id, label) in &candidates {
+                if ui.button(label).clicked() {
+                    added_action = Some(*action_id);
+                    ui.close();
+                }
+            }
+        });
+    });
+    if let Some(action_id) = added_action {
+        changed |= add_sequence_step(actions, action_id);
+    }
+    if candidates.is_empty() {
+        ui.weak("No additional action fits the current sequence limits.");
+    } else {
+        ui.weak(
+            "Only actions that avoid cycles and stay within depth, step, and Delay limits are listed.",
+        );
+    }
+
+    ui.add_space(10.0);
+    if let Some(metrics) = context.metrics(actions) {
+        ui.label(RichText::new("Expanded plan").strong());
+        ui.label(format!(
+            "{} direct steps · {} executed steps · depth {} / {}",
+            metrics.direct_steps, metrics.expanded_steps, metrics.depth, MAX_ACTION_SEQUENCE_DEPTH
+        ));
+        ui.label(format!(
+            "Delay total: {} / {} ms",
+            metrics.delay_ms, MAX_ACTION_SEQUENCE_DURATION_MS
+        ));
+    } else {
+        ui.colored_label(
+            Color32::from_rgb(239, 113, 113),
+            "This sequence exceeds a safety limit. Remove or reorder a step.",
+        );
+    }
+    changed
+}
+
+fn add_sequence_step(actions: &mut Vec<Uuid>, action_id: Uuid) -> bool {
+    if actions.len() >= MAX_ACTION_SEQUENCE_STEPS {
+        return false;
+    }
+    actions.push(action_id);
+    true
+}
+
+fn remove_sequence_step(actions: &mut Vec<Uuid>, index: usize) -> bool {
+    if actions.len() <= 1 || index >= actions.len() {
+        return false;
+    }
+    actions.remove(index);
+    true
+}
+
+fn move_sequence_step(actions: &mut [Uuid], index: usize, direction: SequenceMove) -> bool {
+    let destination = match direction {
+        SequenceMove::Up => index.checked_sub(1),
+        SequenceMove::Down => {
+            index.checked_add(1).filter(|destination| *destination < actions.len())
+        }
+    };
+    let Some(destination) = destination else {
+        return false;
+    };
+    actions.swap(index, destination);
+    true
+}
+
+fn sequence_depth(
+    configuration: &Configuration,
+    action_id: Uuid,
+    stack: &mut Vec<Uuid>,
+) -> Option<u8> {
+    let action = configuration.actions.iter().find(|action| action.id == action_id)?;
+    let ActionKind::Sequence { actions } = &action.kind else {
+        return Some(0);
+    };
+    if stack.contains(&action_id) {
+        return None;
+    }
+    stack.push(action_id);
+    let child_depth = (|| {
+        let mut maximum = 0;
+        for child in actions {
+            maximum = maximum.max(sequence_depth(configuration, *child, stack)?);
+        }
+        Some(maximum)
+    })();
+    stack.pop();
+    child_depth.map(|depth| depth.saturating_add(1))
 }
 
 fn render_url_editor(ui: &mut egui::Ui, url: &mut String) -> bool {
@@ -1742,6 +2105,33 @@ fn draft_validation_error(
                 milliseconds: *milliseconds,
             }
         }
+        ConfigurationError::InvalidSequenceLength { action_id, found, .. } => {
+            DraftValidationError::InvalidSequenceLength {
+                index: action_index(*action_id),
+                found: *found,
+            }
+        }
+        ConfigurationError::SequenceCycle { action_id } => {
+            DraftValidationError::SequenceCycle { index: action_index(*action_id) }
+        }
+        ConfigurationError::SequenceDepthLimitExceeded { action_id, depth, .. } => {
+            DraftValidationError::SequenceDepth { index: action_index(*action_id), depth: *depth }
+        }
+        ConfigurationError::SequenceStepLimitExceeded { action_id, steps, .. } => {
+            DraftValidationError::SequenceSteps { index: action_index(*action_id), steps: *steps }
+        }
+        ConfigurationError::SequenceDelayLimitExceeded { action_id, milliseconds, .. } => {
+            DraftValidationError::SequenceDelay {
+                index: action_index(*action_id),
+                milliseconds: *milliseconds,
+            }
+        }
+        ConfigurationError::MissingSequenceActionReference { sequence_id, index, .. } => {
+            DraftValidationError::MissingSequenceStep {
+                index: action_index(*sequence_id),
+                step: *index,
+            }
+        }
         _ => DraftValidationError::InvalidConfiguration,
     }
 }
@@ -1759,10 +2149,11 @@ mod tests {
 
     use super::{
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
-        NewActionTemplate, PayloadEditOutcome, SettingsDraft, SettingsState, action_references,
-        add_executable_argument, apply_dialog_outcome, create_action, delete_action,
-        duplicate_action, map_selected_slice, preview_slice_at, remove_executable_argument,
-        resize_menu, validate_draft,
+        NewActionTemplate, PayloadEditOutcome, SequenceEditorContext, SequenceMetrics,
+        SequenceMove, SettingsDraft, SettingsState, action_references, add_executable_argument,
+        add_sequence_step, apply_dialog_outcome, create_action, delete_action, duplicate_action,
+        map_selected_slice, move_sequence_step, preview_slice_at, remove_executable_argument,
+        remove_sequence_step, resize_menu, validate_draft,
     };
     use crate::native_file_dialog::PathDialogOutcome;
 
@@ -2008,14 +2399,17 @@ mod tests {
     }
 
     #[test]
-    fn every_leaf_action_template_creates_a_valid_payload() {
+    fn every_action_template_creates_a_valid_payload() {
         let mut configuration = Configuration::default();
         for (index, template) in NewActionTemplate::ALL.into_iter().enumerate() {
+            let initial_sequence_child = configuration.actions.first().map(|action| action.id);
             assert!(create_action(
                 &mut configuration,
                 Uuid::from_u128(500 + index as u128),
                 template.preferred_name(),
-                template.action_kind(),
+                template
+                    .initial_kind(initial_sequence_child)
+                    .expect("regular action exists before the sequence template"),
             ));
         }
 
@@ -2026,6 +2420,132 @@ mod tests {
             configuration.actions[6].kind,
             ActionKind::Window { command: WindowCommand::Minimize }
         ));
+        assert!(matches!(
+            configuration.actions[7].kind,
+            ActionKind::Sequence { ref actions } if actions == &[Uuid::from_u128(500)]
+        ));
+    }
+
+    #[test]
+    fn sequence_rows_preserve_order_and_never_remove_the_last_step() {
+        let first = Uuid::from_u128(701);
+        let second = Uuid::from_u128(702);
+        let third = Uuid::from_u128(703);
+        let mut actions = vec![first, second];
+
+        assert!(add_sequence_step(&mut actions, third));
+        assert!(move_sequence_step(&mut actions, 2, SequenceMove::Up));
+        assert_eq!(actions, [first, third, second]);
+        assert!(move_sequence_step(&mut actions, 0, SequenceMove::Down));
+        assert_eq!(actions, [third, first, second]);
+        assert!(remove_sequence_step(&mut actions, 1));
+        assert!(remove_sequence_step(&mut actions, 1));
+        assert_eq!(actions, [third]);
+        assert!(!remove_sequence_step(&mut actions, 0));
+        assert!(!move_sequence_step(&mut actions, 0, SequenceMove::Up));
+    }
+
+    #[test]
+    fn sequence_metrics_expand_nested_steps_depth_and_delay() {
+        let text_id = Uuid::from_u128(711);
+        let delay_id = Uuid::from_u128(712);
+        let inner_id = Uuid::from_u128(713);
+        let outer_id = Uuid::from_u128(714);
+        let configuration = Configuration {
+            actions: vec![
+                ActionDefinition {
+                    id: text_id,
+                    name: "Text".to_owned(),
+                    kind: ActionKind::TypeText { text: "ok".to_owned() },
+                },
+                ActionDefinition {
+                    id: delay_id,
+                    name: "Delay".to_owned(),
+                    kind: ActionKind::Delay { milliseconds: 200 },
+                },
+                ActionDefinition {
+                    id: inner_id,
+                    name: "Inner".to_owned(),
+                    kind: ActionKind::Sequence { actions: vec![text_id, delay_id] },
+                },
+                ActionDefinition {
+                    id: outer_id,
+                    name: "Outer".to_owned(),
+                    kind: ActionKind::Sequence { actions: vec![inner_id, delay_id] },
+                },
+            ],
+            ..Configuration::default()
+        };
+        let context = SequenceEditorContext::new(configuration, outer_id);
+
+        assert_eq!(
+            context.metrics(&[inner_id, delay_id]),
+            Some(SequenceMetrics { direct_steps: 2, expanded_steps: 3, depth: 2, delay_ms: 400 })
+        );
+    }
+
+    #[test]
+    fn sequence_candidates_hide_cycles_and_limit_overflows() {
+        let text_id = Uuid::from_u128(721);
+        let delay_id = Uuid::from_u128(722);
+        let inner_id = Uuid::from_u128(723);
+        let outer_id = Uuid::from_u128(724);
+        let configuration = Configuration {
+            actions: vec![
+                ActionDefinition {
+                    id: text_id,
+                    name: "Text".to_owned(),
+                    kind: ActionKind::TypeText { text: String::new() },
+                },
+                ActionDefinition {
+                    id: delay_id,
+                    name: "Delay".to_owned(),
+                    kind: ActionKind::Delay { milliseconds: 10_000 },
+                },
+                ActionDefinition {
+                    id: inner_id,
+                    name: "Inner".to_owned(),
+                    kind: ActionKind::Sequence { actions: vec![delay_id, delay_id, delay_id] },
+                },
+                ActionDefinition {
+                    id: outer_id,
+                    name: "Outer".to_owned(),
+                    kind: ActionKind::Sequence { actions: vec![inner_id] },
+                },
+            ],
+            ..Configuration::default()
+        };
+
+        let inner_context = SequenceEditorContext::new(configuration, inner_id);
+        let candidates = inner_context.valid_append_candidates(&[delay_id, delay_id, delay_id]);
+        let candidate_ids = candidates.iter().map(|(action_id, _)| *action_id).collect::<Vec<_>>();
+        assert!(candidate_ids.contains(&text_id));
+        assert!(!candidate_ids.contains(&delay_id));
+        assert!(!candidate_ids.contains(&inner_id));
+        assert!(!candidate_ids.contains(&outer_id));
+    }
+
+    #[test]
+    fn sequence_validation_reports_empty_and_circular_steps() {
+        let sequence_id = Uuid::from_u128(731);
+        let mut configuration = Configuration {
+            actions: vec![ActionDefinition {
+                id: sequence_id,
+                name: "Sequence".to_owned(),
+                kind: ActionKind::Sequence { actions: Vec::new() },
+            }],
+            ..Configuration::default()
+        };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidSequenceLength { index: 0, found: 0 })
+        );
+
+        configuration.actions[0].kind = ActionKind::Sequence { actions: vec![sequence_id] };
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::SequenceCycle { index: 0 })
+        );
     }
 
     #[test]

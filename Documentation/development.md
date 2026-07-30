@@ -74,15 +74,18 @@ slices, and the current bounded Milestone 2 slices establish:
 - Leaf-action editors for websites, files/folders, direct applications, Delay,
   and invocation-window commands, with native Windows path choosers and
   literal application-argument rows.
+- An ordered reusable-sequence editor with nested-sequence support,
+  validator-backed candidate filtering, and live depth, expanded-step, and
+  Delay metrics.
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
 
-Configuration editing currently covers the global menu and every leaf-action
-payload. Sequence steps, application-profile rules, activation binding,
-appearance, icons, import/export, and onboarding are not exposed yet. A
-release logs the chosen slice, compiles its assigned plan, and submits it to
-the coordinator. Every schema-two leaf action family can execute through its
-bounded backend.
+Configuration editing currently covers the global menu and the complete action
+catalog, including sequences. Application-profile rules, activation binding,
+appearance, icons, import/export, and onboarding are not exposed yet. A release
+logs the chosen slice, compiles its assigned plan, and submits it to the
+coordinator. Every schema-two action family can execute through its bounded
+backend.
 
 ## Workspace layout
 
@@ -294,10 +297,11 @@ layout implementation.
 
 The **Actions** tab lists the complete catalog. Its **New action** menu creates
 every leaf type: keyboard shortcut, Unicode text, website, file/folder,
-application, Delay, and invocation-window command. It can rename or duplicate
-every action type. Sequence payloads remain read-only until the dedicated
-sequence slice. Creation and duplication generate new UUIDs and readable
-unique names.
+application, Delay, and invocation-window command, plus reusable sequences. It
+can rename or duplicate every action type. Creation and duplication generate
+new UUIDs and readable unique names. A sequence can be created after at least
+one regular action exists, and begins with one valid step so it never creates
+an invalid empty draft node.
 
 The shortcut recorder accepts one supported non-modifier physical key plus the
 exact left/right Ctrl, Alt, Shift, and Windows modifiers held for it. It stores
@@ -329,6 +333,21 @@ Draft validation translates invalid URLs, non-absolute paths, non-`.exe`
 applications, null-containing arguments, and out-of-range Delay values into
 field-specific messages. Complete configuration validation and plan
 compilation remain authoritative before save.
+
+Sequence actions display their ordered direct steps with **Up**, **Down**, and
+**Remove** controls. The final step cannot be removed. **Add step** lists leaf
+or nested-sequence candidates only when replacing the edited sequence with the
+proposed list keeps the complete configuration valid. This automatically hides
+the sequence itself, ancestors that would introduce cycles, and additions that
+would make this sequence or any containing sequence exceed four nested
+sequence levels, 32 executed leaf steps, or 30 seconds of total Delay.
+Repeated safe actions remain allowed.
+
+The sequence editor compiles the proposed list after each change and displays
+direct-step count, expanded executed-step count, nested depth, and total Delay.
+Invalid sequence shapes, missing references, cycles, excessive depth, expanded
+steps, and Delay totals also have field-specific save messages as a defensive
+boundary.
 
 Deletion first scans global and application-profile menu slices plus sequence
 steps. A referenced action is never removed; the editor reports the number and
@@ -766,18 +785,19 @@ confirms that neither its private path sentinel nor its configured argument
 appears in the local log. The isolated configuration is always removed.
 `smoke-settings-editor.ps1` starts the debug executable with a private
 eight-slice configuration and opens its real settings viewport. It creates and
-persists every leaf-action type, exercises duplication and unreferenced
-deletion, records an exact left-Ctrl+F14 combination through native key
-messages, and assigns it to a menu slice. The application fixture includes
-three exact argument rows—one containing spaces and one empty—plus a working
-folder. The harness opens the real native application chooser, observes its
-window, and cancels it without changing the draft. It then converts the draft
-to four slices, sends a normal window-close request, observes the unsaved
-confirmation, keeps editing, saves, and closes the clean editor. It requires
-revision 2 on disk with all exact leaf payloads, the old eight-slice revision
-in `config.json.bak`, preserved cardinal assignments, and a fresh M4 action
-using the reloaded four-slice menu. Optional screenshots cover the menu,
-payload editor, shortcut recorder, Windows chooser, and confirmation. The
+persists every leaf-action type plus a base and nested sequence, exercises
+duplication, unreferenced deletion, sequence addition/removal/reordering, and
+records an exact left-Ctrl+F14 combination through native key messages. The
+application fixture includes three exact argument rows—one containing spaces
+and one empty—plus a working folder. The harness opens the real native
+application chooser, observes its window, and cancels it without changing the
+draft. It then selects the nested sequence and observes four expanded steps,
+depth two, and 275 ms total Delay before converting the draft to four slices.
+After the guarded close it requires revision 2 on disk with all exact action
+payloads and ordered sequence UUIDs, the old eight-slice revision in
+`config.json.bak`, preserved cardinal assignments, and a fresh M4 action using
+the reloaded four-slice menu. Optional screenshots cover the menu, payload and
+sequence editors, shortcut recorder, Windows chooser, and confirmation. The
 fixture never reads or writes the user's Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of

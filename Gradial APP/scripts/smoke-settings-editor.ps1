@@ -303,6 +303,8 @@ $pathActionId = "67726164-6961-4c00-8000-000000000906"
 $executableActionId = "67726164-6961-4c00-8000-000000000907"
 $delayActionId = "67726164-6961-4c00-8000-000000000908"
 $windowActionId = "67726164-6961-4c00-8000-000000000909"
+$sequenceActionId = "67726164-6961-4c00-8000-000000000910"
+$nestedSequenceActionId = "67726164-6961-4c00-8000-000000000911"
 $profileId = "67726164-6961-4c00-8000-000000000001"
 $labels = @("North old", "NE old", "East old", "SE old", "South old", "SW old", "West old", "NW old")
 $gradial = $null
@@ -395,7 +397,7 @@ try {
     }
     Wait-LogPattern `
         -Path $logPath `
-        -Pattern "event_code=settings_debug_action_draft_edited .*action_count=8" `
+        -Pattern "event_code=settings_debug_action_draft_edited .*action_count=10" `
         -Failure "The action catalog did not accept all isolated leaf-action payloads." |
         Out-Null
 
@@ -473,6 +475,20 @@ try {
         -Pattern "event_code=settings_debug_native_picker .*result_code=cancelled .*picker_kind=application" `
         -Failure "The native application chooser did not report safe cancellation." | Out-Null
 
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x7B)) {
+        throw "Could not select the nested sequence editor."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_sequence_editor_selected .*action_id=$nestedSequenceActionId" `
+        -Failure "The nested sequence editor did not become active." | Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-sequence-editor-smoke.png")
+    }
+
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x74)) {
         throw "Could not send the isolated edit command to the settings window."
     }
@@ -545,8 +561,8 @@ try {
     ) {
         throw "The new shortcut and preserved cardinal action assignments are incorrect."
     }
-    if (@($saved.actions).Count -ne 8) {
-        throw "The settings save did not preserve all eight catalog actions."
+    if (@($saved.actions).Count -ne 10) {
+        throw "The settings save did not preserve all ten catalog actions."
     }
     $shortcutAction = $saved.actions | Where-Object { $_.id -eq $shortcutActionId }
     if (
@@ -618,6 +634,27 @@ try {
     ) {
         throw "The invocation-window action was not saved exactly."
     }
+    $sequenceAction = $saved.actions | Where-Object { $_.id -eq $sequenceActionId }
+    $expectedSequenceSteps = @($shortcutActionId, $textActionId, $delayActionId)
+    if (
+        -not $sequenceAction -or
+        $sequenceAction.name -ne "Editor sequence" -or
+        $sequenceAction.kind.type -ne "sequence" -or
+        (Compare-Object $expectedSequenceSteps @($sequenceAction.kind.actions) -SyncWindow 0).Count -ne 0
+    ) {
+        throw "The ordered base sequence was not saved exactly."
+    }
+    $nestedSequenceAction = $saved.actions |
+        Where-Object { $_.id -eq $nestedSequenceActionId }
+    $expectedNestedSteps = @($windowActionId, $sequenceActionId)
+    if (
+        -not $nestedSequenceAction -or
+        $nestedSequenceAction.name -ne "Editor nested sequence" -or
+        $nestedSequenceAction.kind.type -ne "sequence" -or
+        (Compare-Object $expectedNestedSteps @($nestedSequenceAction.kind.actions) -SyncWindow 0).Count -ne 0
+    ) {
+        throw "The reordered nested sequence was not saved exactly."
+    }
     $backup = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
     if (
         $backup.config_revision -ne 1 -or
@@ -663,8 +700,8 @@ try {
         -Failure "The preserved cardinal action did not execute from the reloaded menu." | Out-Null
 
     Write-Host (
-        "Settings editor smoke check passed: all leaf editors, exact Ctrl+F14 recording, " +
-        "literal arguments, guarded dirty close, atomic revision 2 save, and live reload."
+        "Settings editor smoke check passed: all action editors, nested sequence ordering, " +
+        "cycle-safe metrics, guarded dirty close, atomic revision 2 save, and live reload."
     )
 }
 catch {

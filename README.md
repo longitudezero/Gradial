@@ -38,7 +38,8 @@ assignment, a production-renderer preview, guarded unsaved changes, atomic
 saves, and immediate runtime reload. The action-catalog editor now creates and
 edits every leaf action, supports rename and duplication across every action
 type, opens native Windows path choosers, and prevents deletion while an action
-is still referenced.
+is still referenced. Reusable sequences can now be created and edited as
+ordered, safely nested action lists with live expansion limits.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -159,12 +160,14 @@ shortcuts, Unicode text, websites, files/folders, applications, Delay, and
 invocation-window commands. Application arguments are separate literal rows,
 and native Windows choosers select files, folders, applications, and working
 folders. The catalog can rename or duplicate every action and safely delete
-unreferenced actions. Closing a dirty draft requires **Discard changes** or
-**Keep editing**. A successful save validates and compiles the complete
-proposed configuration before atomic replacement, advances its revision, and
-reloads new M4 invocations without restarting Gradial. Sequence editing,
-application profiles, activation binding, import/export, icons, and onboarding
-remain future slices.
+unreferenced actions. Sequences provide ordered add, remove, move-up, and
+move-down controls; only additions that avoid cycles and stay within nested
+depth, executed-step, and Delay limits are offered. Closing a dirty draft
+requires **Discard changes** or **Keep editing**. A successful save validates
+and compiles the complete proposed configuration before atomic replacement,
+advances its revision, and reloads new M4 invocations without restarting
+Gradial. Application profiles, activation binding, import/export, icons, and
+onboarding remain future slices.
 
 Run all local checks with:
 
@@ -228,3 +231,5 @@ Action-catalog and shortcut-recorder results are recorded in
 [`Documentation/milestone-2-action-editor-results.md`](Documentation/milestone-2-action-editor-results.md).
 Remaining leaf-action editor and native-picker results are recorded in
 [`Documentation/milestone-2-leaf-action-editor-results.md`](Documentation/milestone-2-leaf-action-editor-results.md).
+Reusable-sequence editor results are recorded in
+[`Documentation/milestone-2-sequence-editor-results.md`](Documentation/milestone-2-sequence-editor-results.md).
