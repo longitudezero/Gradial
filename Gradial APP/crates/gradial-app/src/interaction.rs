@@ -220,8 +220,12 @@ impl Drop for InteractionRuntime {
 
         let frequency = query_qpc_frequency();
         let maximum_qpc = self.hook_thread.metrics.maximum_callback_qpc.load(Ordering::Acquire);
-        let maximum_microseconds =
-            if frequency > 0 { maximum_qpc.saturating_mul(1_000_000) / frequency } else { 0 };
+        let maximum_microseconds = if frequency > 0 {
+            maximum_qpc.saturating_mul(1_000_000).saturating_add(frequency - 1) / frequency
+        } else {
+            0
+        };
+        let callback_summary = self.hook_thread.metrics.callback_histogram.summary();
         #[cfg(debug_assertions)]
         log::info!(
             target: "input",
@@ -235,8 +239,10 @@ impl Drop for InteractionRuntime {
         log::info!(
             target: "input",
             "component=input event_code=hook_thread_stopped result_code=ok config_revision={} \
-             maximum_callback_us={maximum_microseconds}",
-            self.config_revision
+             callback_count={} p99_callback_us={} maximum_callback_us={maximum_microseconds}",
+            self.config_revision,
+            callback_summary.count,
+            callback_summary.p99_microseconds,
         );
     }
 }
@@ -709,6 +715,10 @@ fn dispatch_effect(
                             active_execution_plan,
                             active_snapshot.map(|snapshot| &snapshot.context),
                             dispatcher.action_executor,
+                            ActionDispatchTrace {
+                                timing_markers: dispatcher.timing_markers,
+                                release_qpc: source_qpc,
+                            },
                             active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
                                 snapshot.context.config_revision
                             }),
@@ -736,12 +746,19 @@ fn dispatch_effect(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ActionDispatchTrace<'a> {
+    timing_markers: &'a TimingMarkers,
+    release_qpc: i64,
+}
+
 fn log_selected_action_outcome(
     invocation_id: uuid::Uuid,
     action_id: Option<uuid::Uuid>,
     execution_plan: Option<&Arc<ExecutionPlan>>,
     target: Option<&Arc<gradial_core::InvocationContext>>,
     action_executor: &ActionExecutorHandle,
+    trace: ActionDispatchTrace<'_>,
     config_revision: u64,
 ) {
     match (action_id, execution_plan, target) {
@@ -760,6 +777,12 @@ fn log_selected_action_outcome(
             match action_executor.try_dispatch(invocation_id, Arc::clone(plan), Arc::clone(target))
             {
                 ActionDispatch::Accepted => {
+                    trace.timing_markers.emit(
+                        "action_dispatched",
+                        Some(invocation_id),
+                        trace.release_qpc,
+                        &format!("step_count={}", plan.steps().len()),
+                    );
                     log::info!(
                         target: "actions",
                         "component=actions event_code=action_dispatched result_code=ok \
@@ -960,10 +983,11 @@ mod tests {
     use uuid::Uuid;
 
     use crate::action_executor::ActionExecutor;
+    use crate::diagnostics::TimingMarkers;
 
     use super::{
-        ActiveInvocation, heartbeat_is_unresponsive, log_selected_action_outcome,
-        prepare_selected_action,
+        ActionDispatchTrace, ActiveInvocation, heartbeat_is_unresponsive,
+        log_selected_action_outcome, prepare_selected_action,
     };
 
     #[test]
@@ -1033,6 +1057,7 @@ mod tests {
         assert_eq!(plan.steps().len(), 1);
 
         let executor = ActionExecutor::start(9).expect("executor");
+        let timing_markers = TimingMarkers::register().expect("timing markers");
         let target = active.snapshot.as_ref().map(|snapshot| &snapshot.context);
         log_selected_action_outcome(
             invocation_id,
@@ -1040,6 +1065,7 @@ mod tests {
             Some(&plan),
             target,
             &executor.handle(),
+            ActionDispatchTrace { timing_markers: &timing_markers, release_qpc: 1 },
             9,
         );
         for _ in 0..100 {

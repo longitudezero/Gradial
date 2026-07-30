@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -17,7 +17,10 @@ use gradial_core::{
 use rtrb::Producer;
 use windows::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
-    System::{Performance::QueryPerformanceCounter, Threading::GetCurrentThreadId},
+    System::{
+        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+        Threading::GetCurrentThreadId,
+    },
     UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT},
         WindowsAndMessaging::{
@@ -41,6 +44,9 @@ const SUPPRESSED_LEFT: u8 = 1 << 0;
 const SUPPRESSED_RIGHT: u8 = 1 << 1;
 const SUPPRESSED_MIDDLE: u8 = 1 << 2;
 const SUPPRESSED_XBUTTON2: u8 = 1 << 3;
+const CALLBACK_HISTOGRAM_MAX_US: usize = 1_000;
+const CALLBACK_HISTOGRAM_OVERFLOW: usize = CALLBACK_HISTOGRAM_MAX_US + 1;
+const CALLBACK_HISTOGRAM_BUCKETS: usize = CALLBACK_HISTOGRAM_OVERFLOW + 1;
 
 thread_local! {
     static CALLBACK_STATE: RefCell<Option<HookCallbackState>> = const { RefCell::new(None) };
@@ -51,6 +57,7 @@ pub(crate) struct HookThreadMetrics {
     pub(crate) heartbeat_qpc: Arc<AtomicI64>,
     pub(crate) queue_overflow: Arc<AtomicBool>,
     pub(crate) maximum_callback_qpc: Arc<AtomicI64>,
+    pub(crate) callback_histogram: Arc<HookCallbackHistogram>,
     #[cfg(debug_assertions)]
     pub(crate) debug: DebugHookMetrics,
 }
@@ -62,10 +69,72 @@ impl HookThreadMetrics {
             heartbeat_qpc: Arc::new(AtomicI64::new(0)),
             queue_overflow: Arc::new(AtomicBool::new(false)),
             maximum_callback_qpc: Arc::new(AtomicI64::new(0)),
+            callback_histogram: Arc::new(HookCallbackHistogram::new()),
             #[cfg(debug_assertions)]
             debug: DebugHookMetrics::new(),
         }
     }
+}
+
+pub(crate) struct HookCallbackHistogram {
+    buckets: [AtomicU64; CALLBACK_HISTOGRAM_BUCKETS],
+}
+
+impl std::fmt::Debug for HookCallbackHistogram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HookCallbackHistogram").field("summary", &self.summary()).finish()
+    }
+}
+
+impl HookCallbackHistogram {
+    fn new() -> Self {
+        Self { buckets: std::array::from_fn(|_| AtomicU64::new(0)) }
+    }
+
+    fn record(&self, duration_qpc: i64, qpc_frequency: i64) {
+        let microseconds = qpc_to_microseconds_ceil(duration_qpc, qpc_frequency);
+        let bucket = usize::try_from(microseconds)
+            .unwrap_or(CALLBACK_HISTOGRAM_OVERFLOW)
+            .min(CALLBACK_HISTOGRAM_OVERFLOW);
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn summary(&self) -> HookCallbackSummary {
+        let counts =
+            self.buckets.iter().map(|bucket| bucket.load(Ordering::Acquire)).collect::<Vec<_>>();
+        let count = counts.iter().copied().sum();
+        HookCallbackSummary { count, p99_microseconds: percentile_bucket(&counts, count, 99) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HookCallbackSummary {
+    pub(crate) count: u64,
+    pub(crate) p99_microseconds: u64,
+}
+
+fn percentile_bucket(counts: &[u64], count: u64, percentile: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let rank = count.saturating_mul(percentile).saturating_add(99) / 100;
+    let mut cumulative = 0_u64;
+    for (index, bucket_count) in counts.iter().copied().enumerate() {
+        cumulative = cumulative.saturating_add(bucket_count);
+        if cumulative >= rank {
+            return u64::try_from(index).unwrap_or(u64::MAX);
+        }
+    }
+    u64::try_from(CALLBACK_HISTOGRAM_OVERFLOW).unwrap_or(u64::MAX)
+}
+
+fn qpc_to_microseconds_ceil(duration_qpc: i64, qpc_frequency: i64) -> u64 {
+    if duration_qpc <= 0 || qpc_frequency <= 0 {
+        return 0;
+    }
+    let duration = u64::try_from(duration_qpc).unwrap_or(u64::MAX);
+    let frequency = u64::try_from(qpc_frequency).unwrap_or(u64::MAX);
+    duration.saturating_mul(1_000_000).saturating_add(frequency - 1) / frequency
 }
 
 #[cfg(debug_assertions)]
@@ -389,6 +458,7 @@ fn record_callback_duration(started: i64) {
     CALLBACK_STATE.with(|slot| {
         if let Some(state) = slot.borrow().as_ref() {
             state.maximum_callback_qpc.fetch_max(duration, Ordering::Relaxed);
+            state.callback_histogram.record(duration, state.qpc_frequency);
         }
     });
 }
@@ -406,6 +476,8 @@ struct HookCallbackState {
     producer: Producer<InputEvent>,
     queue_overflow: Arc<AtomicBool>,
     maximum_callback_qpc: Arc<AtomicI64>,
+    callback_histogram: Arc<HookCallbackHistogram>,
+    qpc_frequency: i64,
     #[cfg(debug_assertions)]
     debug: DebugHookMetrics,
     configuration: InputConfiguration,
@@ -424,6 +496,8 @@ impl HookCallbackState {
             producer,
             queue_overflow: Arc::clone(&metrics.queue_overflow),
             maximum_callback_qpc: Arc::clone(&metrics.maximum_callback_qpc),
+            callback_histogram: Arc::clone(&metrics.callback_histogram),
+            qpc_frequency: query_qpc_frequency(),
             #[cfg(debug_assertions)]
             debug: metrics.debug.clone(),
             configuration,
@@ -669,6 +743,13 @@ fn query_qpc() -> i64 {
     if unsafe { QueryPerformanceCounter(&raw mut timestamp) }.is_ok() { timestamp } else { 0 }
 }
 
+fn query_qpc_frequency() -> i64 {
+    let mut frequency = 0_i64;
+    // SAFETY: the pointer refers to a valid local i64 for the duration of the
+    // call.
+    if unsafe { QueryPerformanceFrequency(&raw mut frequency) }.is_ok() { frequency } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -694,8 +775,24 @@ mod tests {
     };
 
     use super::{
-        GRADIAL_INJECTED_MARKER, HookCallbackState, InputConfiguration, XBUTTON1, XBUTTON2,
+        GRADIAL_INJECTED_MARKER, HookCallbackHistogram, HookCallbackState, InputConfiguration,
+        XBUTTON1, XBUTTON2,
     };
+
+    #[test]
+    fn callback_histogram_reports_nearest_rank_p99_without_allocating_in_the_hook() {
+        let histogram = HookCallbackHistogram::new();
+        for _ in 0..98 {
+            histogram.record(10, 1_000_000);
+        }
+        histogram.record(249, 1_000_000);
+        histogram.record(1_500, 1_000_000);
+
+        assert_eq!(
+            histogram.summary(),
+            super::HookCallbackSummary { count: 100, p99_microseconds: 249 }
+        );
+    }
 
     fn callback_state() -> (HookCallbackState, Consumer<InputEvent>) {
         callback_state_for(GeometryMode::Auto)

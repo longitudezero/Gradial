@@ -1,10 +1,13 @@
 param(
-    [ValidateRange(1, 300)]
+    [ValidateRange(1, 600)]
     [int]$DurationSeconds = 15,
 
     [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\captures"),
 
     [string]$PresentMonPath,
+
+    [ValidateRange(0, 4294967295)]
+    [long]$ProcessId = 0,
 
     [switch]$MarkersOnly
 )
@@ -58,13 +61,18 @@ try {
     }
     else {
         $arguments = @(
-            "--process_name", "gradial.exe",
             "--timed", $DurationSeconds,
             "--terminate_after_timed",
             "--qpc_time",
             "--output_file", "`"$presentCsv`"",
             "--no_console_stats"
         )
+        if ($ProcessId -gt 0) {
+            $arguments = @("--process_id", $ProcessId) + $arguments
+        }
+        else {
+            $arguments = @("--process_name", "gradial.exe") + $arguments
+        }
         $presentMon = Start-Process -FilePath $PresentMonPath `
             -ArgumentList $arguments `
             -PassThru `

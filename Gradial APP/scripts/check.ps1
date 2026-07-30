@@ -15,6 +15,8 @@ try {
         }
     }
 
+    & (Join-Path $PSScriptRoot "run-performance-report.ps1") -SelfTest
+
     cargo fmt --all --check
     if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed" }
 

@@ -3,7 +3,7 @@
 ## Current milestone scope
 
 The foundation, Milestone 0 interaction spike, completed bounded Milestone 1
-and Milestone 2 slices, and the first two bounded Milestone 3 slices establish:
+and Milestone 2 slices, and the first three bounded Milestone 3 slices establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -107,6 +107,9 @@ and Milestone 2 slices, and the first two bounded Milestone 3 slices establish:
 - A default-off, per-user Windows start-at-login control with exact
   registration inspection, stale-entry repair, and no administrator
   requirement.
+- A versioned performance-report harness with QPC hook/dispatch timing,
+  PresentMon displayed-frame correlation, phased resource sampling, and
+  explicit evidence-status reporting.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -127,6 +130,7 @@ Gradial APP\
         check.ps1          Complete local code verification
         check-focus.ps1    Validate the latest completed focus trace
         capture-timing.ps1 Capture ETW markers and presented-frame timings
+        run-performance-report.ps1 Run development or release performance protocol
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
         smoke-delay-executor.ps1 Run an isolated Delay action fixture
         smoke-input-executor.ps1 Shared isolated input-action fixture
@@ -938,6 +942,38 @@ writes ignored `.csv` and `.etl` diagnostics under `Gradial APP\captures`.
 Run the full display-event capture from an elevated PowerShell. Pass
 `-MarkersOnly` when only the Gradial ETW stream is needed.
 
+For a complete machine-readable report, first build the release executable and
+run:
+
+```powershell
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Development -MarkersOnly
+```
+
+Development mode is deliberately short: a two-second warmup, 20 invocations,
+eight seconds of idle sampling, and three cold launches. It validates the
+harness but marks every release gate `not_evaluated`.
+
+From an elevated, otherwise idle PowerShell, the full protocol is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Release
+```
+
+Release mode fixes the warmup at five minutes, performs 1,000 real synthetic
+M4 invocations against an isolated 10 ms Delay fixture, retains a 30-minute
+idle phase, and measures 100 cold launches. It writes Markdown,
+schema-versioned JSON, flat CSV, raw ETW/PresentMon tables, application log,
+resource samples, and helper output below `captures\performance`.
+
+Renderer checkpoints are reported only as application diagnostics. The
+displayed usable-frame and displayed-highlight gates remain `unavailable`
+unless PresentMon produces correlatable displayed events. The shortcut
+completion gate remains `not_run` because the Delay fixture does not synthesize
+keys. Any foreground change or power-plan change invalidates a release run.
+The complete protocol and current-machine development numbers are recorded in
+`Documentation\milestone-3-performance-harness-results.md`.
+
 ## Manual interaction check
 
 1. Start `cargo run --package gradial-app`. Complete required onboarding if it
@@ -1174,10 +1210,11 @@ long-run campaigns that were not performed are reported as `not_run`.
 `scripts\check.ps1` runs, in order:
 
 1. PowerShell syntax checks for every script in `scripts`.
-2. `cargo fmt --all --check`
-3. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-4. `cargo test --workspace --all-features`
-5. `cargo build --workspace --all-features`
+2. The deterministic performance-report percentile/QPC analyzer self-test.
+3. `cargo fmt --all --check`
+4. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+5. `cargo test --workspace --all-features`
+6. `cargo build --workspace --all-features`
 
 The script stops on the first failure.
 

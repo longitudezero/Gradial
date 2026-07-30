@@ -56,10 +56,12 @@ Each Global or application-profile direction can now import, replace, or
 remove a bounded PNG/SVG icon, rendered by that same production path. Settings
 exports carry referenced icons in an adjacent `icons` directory for portable
 round trips. The first Milestone 3 slices add a dedicated Diagnostics page
-that previews a frozen local ZIP before export plus a per-user start-at-login
-control that detects and repairs stale Windows registration. Configured
-application paths remain excluded from diagnostics unless the user explicitly
-includes them.
+that previews a frozen local ZIP before export, a per-user start-at-login
+control that detects and repairs stale Windows registration, and a versioned
+performance-report harness with QPC hook/dispatch timing, PresentMon
+correlation, resource sampling, and explicit unavailable/not-run evidence.
+Configured application paths remain excluded from diagnostics unless the user
+explicitly includes them.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -283,6 +285,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-interaction-matr
 It writes ignored, versioned JSON and CSV results under
 `Gradial APP\captures\interaction-matrix`.
 
+Run a short, non-qualifying local performance baseline after building the
+release executable:
+
+```powershell
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Development -MarkersOnly
+```
+
+An elevated `-Mode Release` run enables PresentMon and uses the complete
+five-minute warmup, 1,000-invocation, and 30-minute idle protocol.
+
 See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
@@ -350,3 +363,6 @@ Release logging and diagnostic-bundle preview/export results are recorded in
 Per-user start-at-login ownership, repair, and native registry results are
 recorded in
 [`Documentation/milestone-3-start-at-login-results.md`](Documentation/milestone-3-start-at-login-results.md).
+Performance protocol, report semantics, and the current non-qualifying
+development baseline are recorded in
+[`Documentation/milestone-3-performance-harness-results.md`](Documentation/milestone-3-performance-harness-results.md).

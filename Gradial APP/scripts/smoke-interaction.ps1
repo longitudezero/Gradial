@@ -12,8 +12,24 @@ param(
 
     [switch]$TimingMarkersOnly,
 
-    [ValidateRange(1, 30)]
+    [ValidateRange(1, 600)]
     [int]$CaptureDurationSeconds = 4,
+
+    [ValidateRange(0, 600)]
+    [int]$WarmupSeconds = 0,
+
+    [ValidateRange(0, 3600)]
+    [int]$PostInvocationIdleSeconds = 0,
+
+    [string]$ProcessIdFile,
+
+    [string]$PhaseFile,
+
+    [string]$ForegroundProcessFile,
+
+    [string]$TimingOutputDirectory,
+
+    [string]$PresentMonPath,
 
     [ValidateRange(0, 15)]
     [int]$MonitorIndex = 0,
@@ -329,6 +345,14 @@ $m4IsDown = $false
 $gradial = $null
 $timingCapture = $null
 
+function Set-PerformancePhase {
+    param([string]$Name)
+
+    if ($PhaseFile) {
+        Set-Content -LiteralPath $PhaseFile -Value $Name -Encoding utf8
+    }
+}
+
 try {
     $screens = [System.Windows.Forms.Screen]::AllScreens
     if ($MonitorIndex -ge $screens.Count) {
@@ -429,6 +453,10 @@ try {
     if (-not [GradialSmokeNative]::HasTrayIcon([uint32]$gradial.Id)) {
         throw "Gradial did not register its notification-area icon."
     }
+    if ($ProcessIdFile) {
+        Set-Content -LiteralPath $ProcessIdFile -Value $gradial.Id -Encoding ascii
+    }
+    Set-PerformancePhase "startup"
     $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
     $startupLog = Get-Content -Raw -LiteralPath $logPath
     $responsiveBeforeRecovery = (
@@ -597,12 +625,23 @@ try {
         $m4IsDown = $false
         Start-Sleep -Milliseconds 100
     }
+    Set-PerformancePhase "warmup"
+    if ($WarmupSeconds -gt 0) {
+        Start-Sleep -Seconds $WarmupSeconds
+    }
+    Set-PerformancePhase "invocations"
     if ($CaptureTiming) {
         $captureScript = Join-Path $PSScriptRoot "capture-timing.ps1"
         $captureArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$captureScript`" " +
-            "-DurationSeconds $CaptureDurationSeconds"
+            "-DurationSeconds $CaptureDurationSeconds -ProcessId $($gradial.Id)"
         if ($TimingMarkersOnly) {
             $captureArguments += " -MarkersOnly"
+        }
+        if ($TimingOutputDirectory) {
+            $captureArguments += " -OutputDirectory `"$TimingOutputDirectory`""
+        }
+        if ($PresentMonPath) {
+            $captureArguments += " -PresentMonPath `"$PresentMonPath`""
         }
         $timingCapture = Start-Process -FilePath "powershell.exe" `
             -ArgumentList $captureArguments `
@@ -620,6 +659,12 @@ try {
     # the measured Gradial invocation set so only Gradial-caused changes fail.
     $foregroundWindow = [GradialSmokeNative]::GetForegroundWindow()
     $foregroundProcess = [GradialSmokeNative]::ForegroundProcessId()
+    if ($ForegroundProcessFile) {
+        Set-Content `
+            -LiteralPath $ForegroundProcessFile `
+            -Value $foregroundProcess `
+            -Encoding ascii
+    }
     $gestureDelay = if ($QuickFlick) { 0 } else { $GestureDelayMilliseconds }
     $maxCursorDistance = 0.0
     $completedInvocations = 0
@@ -689,6 +734,11 @@ try {
             throw "The timing capture helper exited with code $($timingCapture.ExitCode)."
         }
     }
+    Set-PerformancePhase "idle"
+    if ($PostInvocationIdleSeconds -gt 0) {
+        Start-Sleep -Seconds $PostInvocationIdleSeconds
+    }
+    Set-PerformancePhase "complete"
 }
 finally {
     if ($m4IsDown) {

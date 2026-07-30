@@ -1,8 +1,9 @@
 use anyhow::{Result, bail};
 use uuid::Uuid;
 use windows::{
-    Win32::System::Diagnostics::Etw::{
-        EventRegister, EventUnregister, EventWriteString, REGHANDLE,
+    Win32::System::{
+        Diagnostics::Etw::{EventRegister, EventUnregister, EventWriteString, REGHANDLE},
+        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     },
     core::{GUID, PCWSTR},
 };
@@ -18,6 +19,7 @@ const TIMING_KEYWORD: u64 = 1;
 #[derive(Debug)]
 pub(crate) struct TimingMarkers {
     registration: REGHANDLE,
+    qpc_frequency: i64,
 }
 
 impl TimingMarkers {
@@ -35,7 +37,7 @@ impl TimingMarkers {
              config_revision=0 provider_guid={PROVIDER_GUID_TEXT}"
         );
 
-        Ok(Self { registration })
+        Ok(Self { registration, qpc_frequency: query_qpc_frequency() })
     }
 
     pub(crate) fn emit(
@@ -46,8 +48,12 @@ impl TimingMarkers {
         fields: &str,
     ) {
         let invocation = invocation_id.map_or_else(|| "none".to_owned(), |id| id.to_string());
-        let message =
-            format!("marker={marker} invocation_id={invocation} source_qpc={source_qpc} {fields}");
+        let marker_qpc = query_qpc();
+        let message = format!(
+            "marker={marker} invocation_id={invocation} source_qpc={source_qpc} \
+             marker_qpc={marker_qpc} qpc_frequency={} {fields}",
+            self.qpc_frequency
+        );
         let wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
 
         // SAFETY: `wide` is null-terminated and remains live for the call.
@@ -67,6 +73,18 @@ impl TimingMarkers {
             );
         }
     }
+}
+
+fn query_qpc() -> i64 {
+    let mut timestamp = 0_i64;
+    // SAFETY: the output pointer refers to a live local i64.
+    if unsafe { QueryPerformanceCounter(&raw mut timestamp) }.is_ok() { timestamp } else { 0 }
+}
+
+fn query_qpc_frequency() -> i64 {
+    let mut frequency = 0_i64;
+    // SAFETY: the output pointer refers to a live local i64.
+    if unsafe { QueryPerformanceFrequency(&raw mut frequency) }.is_ok() { frequency } else { 0 }
 }
 
 impl Drop for TimingMarkers {
