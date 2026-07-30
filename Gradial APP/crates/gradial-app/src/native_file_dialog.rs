@@ -25,6 +25,7 @@ pub(crate) enum PathDialogKind {
     Icon,
     ConfigurationImport,
     ConfigurationExport,
+    DiagnosticBundleExport,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -59,8 +60,9 @@ fn choose_path_on_sta_thread(kind: PathDialogKind) -> PathDialogOutcome {
 }
 
 fn show_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
-    if kind == PathDialogKind::ConfigurationExport {
-        return show_save_dialog();
+    if matches!(kind, PathDialogKind::ConfigurationExport | PathDialogKind::DiagnosticBundleExport)
+    {
+        return show_save_dialog(kind);
     }
     show_open_dialog(kind)
 }
@@ -118,7 +120,7 @@ fn show_open_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
     Ok(path_result?)
 }
 
-fn show_save_dialog() -> windows::core::Result<PathBuf> {
+fn show_save_dialog(kind: PathDialogKind) -> windows::core::Result<PathBuf> {
     // SAFETY: COM is initialized for this dedicated STA thread. The returned
     // interface and all derived shell items remain on this thread.
     let dialog: IFileSaveDialog =
@@ -134,10 +136,20 @@ fn show_save_dialog() -> windows::core::Result<PathBuf> {
     // strings and filter specifications live through their synchronous calls.
     unsafe {
         file_dialog.SetOptions(options)?;
-        file_dialog.SetTitle(dialog_title(PathDialogKind::ConfigurationExport))?;
-        set_configuration_filter(file_dialog)?;
-        file_dialog.SetDefaultExtension(w!("json"))?;
-        file_dialog.SetFileName(w!("gradial-settings.json"))?;
+        file_dialog.SetTitle(dialog_title(kind))?;
+        if kind == PathDialogKind::DiagnosticBundleExport {
+            file_dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("Gradial diagnostic bundle"),
+                pszSpec: w!("*.zip"),
+            }])?;
+            file_dialog.SetFileTypeIndex(1)?;
+            file_dialog.SetDefaultExtension(w!("zip"))?;
+            file_dialog.SetFileName(w!("gradial-diagnostics.zip"))?;
+        } else {
+            set_configuration_filter(file_dialog)?;
+            file_dialog.SetDefaultExtension(w!("json"))?;
+            file_dialog.SetFileName(w!("gradial-settings.json"))?;
+        }
         dialog.Show(None)?;
     }
 
@@ -172,6 +184,7 @@ const fn dialog_title(kind: PathDialogKind) -> PCWSTR {
         PathDialogKind::Icon => w!("Gradial: choose an icon"),
         PathDialogKind::ConfigurationImport => w!("Gradial: import settings"),
         PathDialogKind::ConfigurationExport => w!("Gradial: export settings"),
+        PathDialogKind::DiagnosticBundleExport => w!("Gradial: export diagnostic bundle"),
     }
 }
 
@@ -221,6 +234,7 @@ mod tests {
             PathDialogKind::Icon,
             PathDialogKind::ConfigurationImport,
             PathDialogKind::ConfigurationExport,
+            PathDialogKind::DiagnosticBundleExport,
         ] {
             assert!(!dialog_title(kind).is_null());
         }

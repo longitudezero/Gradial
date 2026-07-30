@@ -26,6 +26,9 @@ use uuid::Uuid;
 
 use crate::{
     configuration::{ConfigurationMigration, ConfigurationTransferError, PortableIconSummary},
+    diagnostic_bundle::{
+        DiagnosticBundleError, DiagnosticBundleRequest, DiagnosticBundleSummary, DiagnosticSnapshot,
+    },
     icons::{IconImportError, IconManager},
     input::{self, ActivationBindingTestResult},
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
@@ -146,6 +149,7 @@ enum SettingsSection {
     Appearance,
     Profiles,
     Actions,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,6 +233,12 @@ enum SaveFeedback {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TransferFeedback {
+    Info(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DiagnosticFeedback {
     Info(String),
     Error(String),
 }
@@ -497,6 +507,8 @@ pub(crate) enum SettingsEvent {
     Import(PrivatePath),
     Export { path: PrivatePath, configuration: Configuration },
     ImportIcon { path: PrivatePath, profile_id: Uuid, slice_index: usize },
+    RefreshDiagnostics,
+    ExportDiagnostics { path: PrivatePath, request: DiagnosticBundleRequest },
     Closed,
 }
 
@@ -511,6 +523,12 @@ impl std::fmt::Debug for SettingsEvent {
                 .field("path", &"<redacted>")
                 .field("profile_id", profile_id)
                 .field("slice_index", slice_index)
+                .finish(),
+            Self::RefreshDiagnostics => formatter.write_str("RefreshDiagnostics"),
+            Self::ExportDiagnostics { request, .. } => formatter
+                .debug_struct("ExportDiagnostics")
+                .field("path", &"<redacted>")
+                .field("request", request)
                 .finish(),
             Self::Closed => formatter.write_str("Closed"),
         }
@@ -622,6 +640,22 @@ impl SettingsEditor {
         self.state().icon_import_failed(profile_id, slice_index, error);
     }
 
+    pub(crate) fn accept_diagnostic_preview(&self, snapshot: DiagnosticSnapshot) {
+        self.state().accept_diagnostic_preview(snapshot);
+    }
+
+    pub(crate) fn diagnostic_preview_failed(&self, error: DiagnosticBundleError) {
+        self.state().diagnostic_failed(error);
+    }
+
+    pub(crate) fn accept_diagnostic_exported(&self, summary: DiagnosticBundleSummary) {
+        self.state().accept_diagnostic_exported(summary);
+    }
+
+    pub(crate) fn diagnostic_export_failed(&self, error: DiagnosticBundleError) {
+        self.state().diagnostic_failed(error);
+    }
+
     fn state(&self) -> MutexGuard<'_, SettingsState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -646,6 +680,9 @@ struct SettingsState {
     icon_feedback: Option<IconEditorFeedback>,
     pending_icon_import: Option<PendingIconImport>,
     pending_import_path: Option<PrivatePath>,
+    diagnostic_snapshot: Option<Arc<DiagnosticSnapshot>>,
+    diagnostic_include_process_paths: bool,
+    diagnostic_feedback: Option<DiagnosticFeedback>,
     recovery_warning: bool,
     preview_renderer: FoundationOverlayRenderer,
     pending_event: Option<SettingsEvent>,
@@ -671,6 +708,9 @@ impl SettingsState {
             icon_feedback: None,
             pending_icon_import: None,
             pending_import_path: None,
+            diagnostic_snapshot: None,
+            diagnostic_include_process_paths: false,
+            diagnostic_feedback: None,
             recovery_warning,
             preview_renderer: FoundationOverlayRenderer::new(icons),
             pending_event: None,
@@ -700,6 +740,9 @@ impl SettingsState {
             self.icon_feedback = None;
             self.pending_icon_import = None;
             self.pending_import_path = None;
+            self.diagnostic_snapshot = None;
+            self.diagnostic_include_process_paths = false;
+            self.diagnostic_feedback = None;
             log::info!(
                 target: "settings",
                 "component=settings event_code=settings_opened result_code=ok \
@@ -722,6 +765,9 @@ impl SettingsState {
         self.action_feedback = None;
         self.cancel_binding_test();
         self.recovery_warning = false;
+        self.diagnostic_snapshot = None;
+        self.diagnostic_include_process_paths = false;
+        self.diagnostic_feedback = None;
     }
 
     fn save_failed(&mut self) {
@@ -805,6 +851,36 @@ impl SettingsState {
         self.pending_import_path = None;
         self.transfer_feedback =
             Some(TransferFeedback::Error(transfer_error_message(operation, error).to_owned()));
+    }
+
+    fn accept_diagnostic_preview(&mut self, snapshot: DiagnosticSnapshot) {
+        let log_count = snapshot.logs().len();
+        let display_count = snapshot.displays().len();
+        self.section = SettingsSection::Diagnostics;
+        self.diagnostic_snapshot = Some(Arc::new(snapshot));
+        self.diagnostic_include_process_paths = false;
+        self.diagnostic_feedback = Some(DiagnosticFeedback::Info(format!(
+            "Preview ready with {log_count} log {} and {display_count} display {}.",
+            if log_count == 1 { "file" } else { "files" },
+            if display_count == 1 { "record" } else { "records" }
+        )));
+    }
+
+    fn accept_diagnostic_exported(&mut self, summary: DiagnosticBundleSummary) {
+        self.diagnostic_feedback = Some(DiagnosticFeedback::Info(format!(
+            "Diagnostic bundle exported with {} archive {}, {} log {}, and {} configured application {}.",
+            summary.archive_entries,
+            if summary.archive_entries == 1 { "entry" } else { "entries" },
+            summary.logs,
+            if summary.logs == 1 { "file" } else { "files" },
+            summary.process_paths,
+            if summary.process_paths == 1 { "path" } else { "paths" }
+        )));
+    }
+
+    fn diagnostic_failed(&mut self, error: DiagnosticBundleError) {
+        self.diagnostic_feedback =
+            Some(DiagnosticFeedback::Error(diagnostic_error_message(error).to_owned()));
     }
 
     fn accept_icon_import(&mut self, profile_id: Uuid, slice_index: usize, icon: IconReference) {
@@ -1187,6 +1263,7 @@ impl SettingsState {
         let picker_kind = match kind {
             PathDialogKind::ConfigurationImport => "config_import",
             PathDialogKind::ConfigurationExport => "config_export",
+            PathDialogKind::DiagnosticBundleExport => "diagnostic_export",
             _ => "unsupported",
         };
         log::info!(
@@ -1214,6 +1291,36 @@ impl SettingsState {
                 path: PrivatePath::new(path),
                 configuration: draft.proposed.clone(),
             })
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_refresh_diagnostics_event(&mut self) -> Option<SettingsEvent> {
+        self.section = SettingsSection::Diagnostics;
+        self.diagnostic_snapshot = None;
+        self.diagnostic_include_process_paths = false;
+        self.diagnostic_feedback = None;
+        (self.lifecycle == EditorLifecycle::Editing).then_some(SettingsEvent::RefreshDiagnostics)
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_export_diagnostics_event(
+        &mut self,
+        include_process_paths: bool,
+    ) -> Option<SettingsEvent> {
+        let snapshot = self.diagnostic_snapshot.clone()?;
+        let root = AppPaths::discover().ok()?.root;
+        let parent = root.parent()?;
+        let name = if include_process_paths {
+            "gradial-diagnostics-paths-smoke.zip"
+        } else {
+            "gradial-diagnostics-default-smoke.zip"
+        };
+        self.section = SettingsSection::Diagnostics;
+        self.diagnostic_include_process_paths = include_process_paths;
+        Some(SettingsEvent::ExportDiagnostics {
+            path: PrivatePath::new(parent.join(name)),
+            request: DiagnosticBundleRequest { snapshot, include_process_paths },
+        })
     }
 
     #[cfg(debug_assertions)]
@@ -1413,6 +1520,27 @@ impl SettingsState {
         {
             self.debug_open_native_configuration_picker(PathDialogKind::ConfigurationExport);
             None
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F19))
+        {
+            self.debug_refresh_diagnostics_event()
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F20))
+        {
+            self.debug_export_diagnostics_event(false)
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F21))
+        {
+            self.debug_export_diagnostics_event(true)
+        } else if ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F22))
+        {
+            self.debug_open_native_configuration_picker(PathDialogKind::DiagnosticBundleExport);
+            None
         } else {
             None
         };
@@ -1457,65 +1585,72 @@ impl SettingsState {
                 ui.selectable_value(&mut self.section, SettingsSection::Menu, "Menu");
                 ui.selectable_value(&mut self.section, SettingsSection::Profiles, "Profiles");
                 ui.selectable_value(&mut self.section, SettingsSection::Actions, "Actions");
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Import settings\u{2026}").clicked() {
-                    self.transfer_feedback = None;
-                    match choose_path(PathDialogKind::ConfigurationImport) {
-                        PathDialogOutcome::Selected(path) if dirty => {
-                            self.pending_import_path = Some(PrivatePath::new(path));
-                        }
-                        PathDialogOutcome::Selected(path) => {
-                            event = Some(SettingsEvent::Import(PrivatePath::new(path)));
-                        }
-                        PathDialogOutcome::Cancelled => {}
-                        PathDialogOutcome::Failed => {
-                            self.transfer_feedback = Some(TransferFeedback::Error(
-                                "Gradial could not open the import picker.".to_owned(),
-                            ));
-                        }
-                    }
-                }
-                let export = ui.add_enabled(
-                    validation.is_ok(),
-                    egui::Button::new("Export current draft\u{2026}"),
+                ui.selectable_value(
+                    &mut self.section,
+                    SettingsSection::Diagnostics,
+                    "Diagnostics",
                 );
-                if export.clicked() {
-                    self.transfer_feedback = None;
-                    match choose_path(PathDialogKind::ConfigurationExport) {
-                        PathDialogOutcome::Selected(path) => {
-                            event = Some(SettingsEvent::Export {
-                                path: PrivatePath::new(path),
-                                configuration: draft.proposed.clone(),
-                            });
-                        }
-                        PathDialogOutcome::Cancelled => {}
-                        PathDialogOutcome::Failed => {
-                            self.transfer_feedback = Some(TransferFeedback::Error(
-                                "Gradial could not open the export picker.".to_owned(),
-                            ));
-                        }
-                    }
-                }
-                ui.weak("Import replaces only this draft. Export includes unsaved edits.");
             });
-            if let Some(feedback) = &self.transfer_feedback {
-                match feedback {
-                    TransferFeedback::Info(message) => {
-                        ui.colored_label(Color32::from_rgb(112, 205, 151), message);
-                    }
-                    TransferFeedback::Error(message) => {
-                        ui.colored_label(Color32::from_rgb(239, 113, 113), message);
-                    }
-                }
-            }
-            if self.recovery_warning {
+            if self.section != SettingsSection::Diagnostics {
                 ui.add_space(6.0);
-                ui.colored_label(
-                    Color32::from_rgb(245, 188, 78),
-                    "Gradial recovered a previous configuration. Saving will replace the broken file.",
-                );
+                ui.horizontal(|ui| {
+                    if ui.button("Import settings\u{2026}").clicked() {
+                        self.transfer_feedback = None;
+                        match choose_path(PathDialogKind::ConfigurationImport) {
+                            PathDialogOutcome::Selected(path) if dirty => {
+                                self.pending_import_path = Some(PrivatePath::new(path));
+                            }
+                            PathDialogOutcome::Selected(path) => {
+                                event = Some(SettingsEvent::Import(PrivatePath::new(path)));
+                            }
+                            PathDialogOutcome::Cancelled => {}
+                            PathDialogOutcome::Failed => {
+                                self.transfer_feedback = Some(TransferFeedback::Error(
+                                    "Gradial could not open the import picker.".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    let export = ui.add_enabled(
+                        validation.is_ok(),
+                        egui::Button::new("Export current draft\u{2026}"),
+                    );
+                    if export.clicked() {
+                        self.transfer_feedback = None;
+                        match choose_path(PathDialogKind::ConfigurationExport) {
+                            PathDialogOutcome::Selected(path) => {
+                                event = Some(SettingsEvent::Export {
+                                    path: PrivatePath::new(path),
+                                    configuration: draft.proposed.clone(),
+                                });
+                            }
+                            PathDialogOutcome::Cancelled => {}
+                            PathDialogOutcome::Failed => {
+                                self.transfer_feedback = Some(TransferFeedback::Error(
+                                    "Gradial could not open the export picker.".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    ui.weak("Import replaces only this draft. Export includes unsaved edits.");
+                });
+                if let Some(feedback) = &self.transfer_feedback {
+                    match feedback {
+                        TransferFeedback::Info(message) => {
+                            ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+                        }
+                        TransferFeedback::Error(message) => {
+                            ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+                        }
+                    }
+                }
+                if self.recovery_warning {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        Color32::from_rgb(245, 188, 78),
+                        "Gradial recovered a previous configuration. Saving will replace the broken file.",
+                    );
+                }
             }
             ui.add_space(8.0);
         });
@@ -1525,52 +1660,58 @@ impl SettingsState {
             self.cancel_binding_test();
         }
 
-        egui::Panel::bottom("settings_actions").show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let save_enabled = dirty && validation.is_ok();
-                if ui.add_enabled(save_enabled, egui::Button::new("Save changes")).clicked() {
-                    event = Some(SettingsEvent::Save(draft.proposed.clone()));
-                    self.save_feedback = SaveFeedback::None;
-                }
-                if ui.add_enabled(dirty, egui::Button::new("Discard edits")).clicked() {
-                    draft.discard();
-                    self.selected_slice = self
-                        .selected_slice
-                        .min(draft.proposed.global_profile.menu.slices.len() - 1);
-                    self.selected_profile = draft
-                        .proposed
-                        .application_profiles
-                        .first()
-                        .map(|application| application.profile.id);
-                    self.selected_action = draft.proposed.actions.first().map(|action| action.id);
-                    self.profile_feedback = None;
-                    self.action_feedback = None;
-                    self.cancel_binding_test();
-                    self.shortcut_recorder.cancel();
-                    self.recording_action_id = None;
-                    self.save_feedback = SaveFeedback::None;
-                    self.transfer_feedback = None;
-                    self.icon_feedback = None;
-                    self.pending_icon_import = None;
-                    self.pending_import_path = None;
-                }
-                if let Err(error) = &validation {
-                    ui.colored_label(Color32::from_rgb(239, 113, 113), error.message());
-                } else {
-                    match &self.save_feedback {
-                        SaveFeedback::None => {}
-                        SaveFeedback::Saved => {
-                            ui.colored_label(Color32::from_rgb(112, 205, 151), "Changes saved.");
-                        }
-                        SaveFeedback::Error(error) => {
-                            ui.colored_label(Color32::from_rgb(239, 113, 113), error);
+        if self.section != SettingsSection::Diagnostics {
+            egui::Panel::bottom("settings_actions").show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let save_enabled = dirty && validation.is_ok();
+                    if ui.add_enabled(save_enabled, egui::Button::new("Save changes")).clicked() {
+                        event = Some(SettingsEvent::Save(draft.proposed.clone()));
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    if ui.add_enabled(dirty, egui::Button::new("Discard edits")).clicked() {
+                        draft.discard();
+                        self.selected_slice = self
+                            .selected_slice
+                            .min(draft.proposed.global_profile.menu.slices.len() - 1);
+                        self.selected_profile = draft
+                            .proposed
+                            .application_profiles
+                            .first()
+                            .map(|application| application.profile.id);
+                        self.selected_action =
+                            draft.proposed.actions.first().map(|action| action.id);
+                        self.profile_feedback = None;
+                        self.action_feedback = None;
+                        self.cancel_binding_test();
+                        self.shortcut_recorder.cancel();
+                        self.recording_action_id = None;
+                        self.save_feedback = SaveFeedback::None;
+                        self.transfer_feedback = None;
+                        self.icon_feedback = None;
+                        self.pending_icon_import = None;
+                        self.pending_import_path = None;
+                    }
+                    if let Err(error) = &validation {
+                        ui.colored_label(Color32::from_rgb(239, 113, 113), error.message());
+                    } else {
+                        match &self.save_feedback {
+                            SaveFeedback::None => {}
+                            SaveFeedback::Saved => {
+                                ui.colored_label(
+                                    Color32::from_rgb(112, 205, 151),
+                                    "Changes saved.",
+                                );
+                            }
+                            SaveFeedback::Error(error) => {
+                                ui.colored_label(Color32::from_rgb(239, 113, 113), error);
+                            }
                         }
                     }
-                }
+                });
+                ui.add_space(8.0);
             });
-            ui.add_space(8.0);
-        });
+        }
 
         match self.section {
             SettingsSection::Binding => self.render_binding_section(ui, &mut draft),
@@ -1578,6 +1719,12 @@ impl SettingsState {
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
             SettingsSection::Profiles => self.render_profiles_section(ui, &mut draft),
             SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
+            SettingsSection::Diagnostics => {
+                let diagnostic_event = self.render_diagnostics_section(ui);
+                if event.is_none() {
+                    event = diagnostic_event;
+                }
+            }
         }
         if event.is_none()
             && let Some(pending) = self.pending_icon_import.take()
@@ -1647,6 +1794,7 @@ impl SettingsState {
                 draft.discard();
                 self.profile_test = ProfileTestState::Idle;
                 self.cancel_binding_test();
+                self.clear_diagnostic_preview();
                 self.lifecycle = EditorLifecycle::Closed;
                 event = Some(SettingsEvent::Closed);
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
@@ -1668,6 +1816,171 @@ impl SettingsState {
         }
 
         self.draft = Some(draft);
+        event
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_diagnostics_section(&mut self, ui: &mut egui::Ui) -> Option<SettingsEvent> {
+        let mut event = None;
+        let snapshot = self.diagnostic_snapshot.clone();
+        egui::CentralPanel::default().show(ui, |ui| {
+            ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Diagnostic bundle");
+                ui.label(
+                    "Create a local ZIP you can inspect before sharing. Gradial never uploads it.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label =
+                        if snapshot.is_some() { "Refresh preview" } else { "Prepare preview" };
+                    if ui.button(label).clicked() {
+                        self.diagnostic_feedback = None;
+                        event = Some(SettingsEvent::RefreshDiagnostics);
+                    }
+                    if let Some(snapshot) = snapshot.as_deref() {
+                        ui.weak(format!(
+                            "Frozen preview · configuration revision {}",
+                            snapshot.config_revision(),
+                        ));
+                    }
+                });
+
+                let Some(snapshot) = snapshot.as_deref() else {
+                    ui.add_space(12.0);
+                    ui.label(
+                        "Prepare a preview to see every archive entry and choose whether configured application paths are included.",
+                    );
+                    render_diagnostic_feedback(ui, self.diagnostic_feedback.as_ref());
+                    return;
+                };
+
+                ui.add_space(12.0);
+                ui.group(|ui| {
+                    ui.heading("Privacy choice");
+                    ui.checkbox(
+                        &mut self.diagnostic_include_process_paths,
+                        "Include configured application paths",
+                    );
+                    if self.diagnostic_include_process_paths {
+                        ui.colored_label(
+                            Color32::from_rgb(245, 188, 78),
+                            "Explicitly included: the following paths will appear in configured-process-paths.json.",
+                        );
+                        if snapshot.process_paths().is_empty() {
+                            ui.weak("No configured application paths are present.");
+                        } else {
+                            for path in snapshot.process_paths() {
+                                ui.monospace(path.as_os_str().to_string_lossy());
+                            }
+                        }
+                    } else {
+                        ui.label(format!(
+                            "Excluded by default: {} configured application {}.",
+                            snapshot.process_paths().len(),
+                            if snapshot.process_paths().len() == 1 { "path" } else { "paths" }
+                        ));
+                    }
+                    ui.weak(
+                        "Arguments, working folders, typed text, URLs, file/folder paths, window titles, clipboard data, settings, and icons are always excluded.",
+                    );
+                });
+
+                ui.add_space(12.0);
+                ui.heading("Archive preview");
+                ui.label(format!(
+                    "{} entries · about {}",
+                    snapshot.archive_entry_count(self.diagnostic_include_process_paths),
+                    display_byte_count(
+                        snapshot.estimated_size_bytes(self.diagnostic_include_process_paths)
+                    )
+                ));
+                ui.monospace("manifest.json");
+                for log in snapshot.logs() {
+                    ui.monospace(format!(
+                        "logs/{} ({})",
+                        log.name,
+                        display_byte_count(log.size_bytes)
+                    ));
+                }
+                if self.diagnostic_include_process_paths {
+                    ui.monospace("configured-process-paths.json");
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Included status");
+                ui.label(snapshot.input_status().user_text());
+                let windows = snapshot.windows_version().map_or_else(
+                    || format!("Windows {}", std::env::consts::ARCH),
+                    |version| {
+                        format!(
+                            "Windows {}.{} build {} · {}",
+                            version.major,
+                            version.minor,
+                            version.build,
+                            std::env::consts::ARCH
+                        )
+                    },
+                );
+                ui.label(format!(
+                    "Gradial {} · {} · configuration revision {}",
+                    env!("CARGO_PKG_VERSION"),
+                    windows,
+                    snapshot.config_revision()
+                ));
+                ui.label(format!(
+                    "{} display {}:",
+                    snapshot.displays().len(),
+                    if snapshot.displays().len() == 1 { "record" } else { "records" }
+                ));
+                for (index, display) in snapshot.displays().iter().enumerate() {
+                    ui.monospace(format!(
+                        "{}. bounds ({}, {})–({}, {}), work area ({}, {})–({}, {}), {} DPI",
+                        index + 1,
+                        display.left,
+                        display.top,
+                        display.right,
+                        display.bottom,
+                        display.work_left,
+                        display.work_top,
+                        display.work_right,
+                        display.work_bottom,
+                        display.dpi
+                    ));
+                }
+                ui.weak(
+                    "“Hook thread responsive” reports the thread heartbeat; it does not claim Windows has retained the hook.",
+                );
+
+                ui.add_space(12.0);
+                if ui.button("Export this preview\u{2026}").clicked() {
+                    self.diagnostic_feedback = None;
+                    match choose_path(PathDialogKind::DiagnosticBundleExport) {
+                        PathDialogOutcome::Selected(path) => {
+                            event = Some(SettingsEvent::ExportDiagnostics {
+                                path: PrivatePath::new(path),
+                                request: DiagnosticBundleRequest {
+                                    snapshot: Arc::clone(
+                                        self.diagnostic_snapshot
+                                            .as_ref()
+                                            .expect("preview is present"),
+                                    ),
+                                    include_process_paths: self
+                                        .diagnostic_include_process_paths,
+                                },
+                            });
+                        }
+                        PathDialogOutcome::Cancelled => {}
+                        PathDialogOutcome::Failed => {
+                            self.diagnostic_feedback = Some(DiagnosticFeedback::Error(
+                                "Gradial could not open the diagnostic export picker.".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                ui.weak("Export uses exactly this frozen preview.");
+                render_diagnostic_feedback(ui, self.diagnostic_feedback.as_ref());
+            });
+        });
         event
     }
 
@@ -2793,6 +3106,7 @@ impl SettingsState {
             CloseOutcome::ConfirmationShown
         } else {
             self.profile_test = ProfileTestState::Idle;
+            self.clear_diagnostic_preview();
             self.lifecycle = EditorLifecycle::Closed;
             log::info!(
                 target: "settings",
@@ -2802,6 +3116,12 @@ impl SettingsState {
             );
             CloseOutcome::Closed
         }
+    }
+
+    fn clear_diagnostic_preview(&mut self) {
+        self.diagnostic_snapshot = None;
+        self.diagnostic_include_process_paths = false;
+        self.diagnostic_feedback = None;
     }
 }
 
@@ -3810,6 +4130,50 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
     Ok(())
 }
 
+fn render_diagnostic_feedback(ui: &mut egui::Ui, feedback: Option<&DiagnosticFeedback>) {
+    let Some(feedback) = feedback else {
+        return;
+    };
+    ui.add_space(8.0);
+    match feedback {
+        DiagnosticFeedback::Info(message) => {
+            ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+        }
+        DiagnosticFeedback::Error(message) => {
+            ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+        }
+    }
+}
+
+fn display_byte_count(bytes: usize) -> String {
+    if bytes < 1_024 {
+        return format!("{bytes} B");
+    }
+    let scaled = bytes.saturating_mul(10).saturating_add(512) / 1_024;
+    if scaled < 10_240 {
+        return format!("{}.{:01} KiB", scaled / 10, scaled % 10);
+    }
+    let scaled = bytes.saturating_mul(10).saturating_add(524_288) / 1_048_576;
+    format!("{}.{:01} MiB", scaled / 10, scaled % 10)
+}
+
+const fn diagnostic_error_message(error: DiagnosticBundleError) -> &'static str {
+    match error {
+        DiagnosticBundleError::Preview => {
+            "Gradial could not prepare the diagnostic preview. The previous preview is unchanged."
+        }
+        DiagnosticBundleError::InvalidPath => {
+            "Choose an available folder and a file name ending in .zip."
+        }
+        DiagnosticBundleError::ProtectedDestination => {
+            "Choose another location. Diagnostic export cannot replace Gradial's active files."
+        }
+        DiagnosticBundleError::Write => {
+            "Gradial could not write the diagnostic bundle. The preview is still available."
+        }
+    }
+}
+
 const fn transfer_error_message(
     operation: TransferOperation,
     error: ConfigurationTransferError,
@@ -4058,6 +4422,7 @@ mod tests {
     };
     use crate::{
         configuration::ConfigurationMigration,
+        diagnostic_bundle::{DiagnosticBundleRequest, DiagnosticSnapshot},
         icons::{IconImportError, IconManager},
         input::ActivationBindingTestResult,
         native_file_dialog::PathDialogOutcome,
@@ -4286,6 +4651,22 @@ mod tests {
     }
 
     #[test]
+    fn clean_close_clears_the_private_diagnostic_preview_and_path_opt_in() {
+        let configuration = Configuration::default();
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
+        editor.open(&configuration);
+        editor.accept_diagnostic_preview(DiagnosticSnapshot::test_fixture(PathBuf::from(
+            r"C:\Private\Target.exe",
+        )));
+        editor.diagnostic_include_process_paths = true;
+
+        assert_eq!(editor.request_close(), CloseOutcome::Closed);
+        assert!(editor.diagnostic_snapshot.is_none());
+        assert!(!editor.diagnostic_include_process_paths);
+        assert!(editor.diagnostic_feedback.is_none());
+    }
+
+    #[test]
     fn activation_binding_edits_stay_in_the_draft_until_accept_or_discard() {
         let configuration = Configuration::default();
         let mut draft = SettingsDraft::new(&configuration);
@@ -4432,6 +4813,21 @@ mod tests {
         assert!(!icon_debug.contains(r"C:\Private"));
         assert!(!icon_debug.contains("Icon.png"));
         assert!(icon_debug.contains("slice_index: 3"));
+
+        let diagnostic_event = SettingsEvent::ExportDiagnostics {
+            path: PrivatePath::new(PathBuf::from(r"C:\Private\Diagnostics.zip")),
+            request: DiagnosticBundleRequest {
+                snapshot: Arc::new(DiagnosticSnapshot::test_fixture(PathBuf::from(
+                    r"C:\Private\Target.exe",
+                ))),
+                include_process_paths: true,
+            },
+        };
+        let diagnostic_debug = format!("{diagnostic_event:?}");
+        assert!(!diagnostic_debug.contains(r"C:\Private"));
+        assert!(!diagnostic_debug.contains("Target.exe"));
+        assert!(!diagnostic_debug.contains("Diagnostics.zip"));
+        assert!(diagnostic_debug.contains("include_process_paths: true"));
     }
 
     #[test]

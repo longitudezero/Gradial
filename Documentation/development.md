@@ -3,7 +3,7 @@
 ## Current milestone scope
 
 The foundation, Milestone 0 interaction spike, completed bounded Milestone 1
-slices, and the current bounded Milestone 2 slices establish:
+and Milestone 2 slices, and the first bounded Milestone 3 slice establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -101,6 +101,9 @@ slices, and the current bounded Milestone 2 slices establish:
   texture caching, production-preview rendering, and non-fatal placeholders.
 - Reference-aware managed-icon restoration and recoverable quarantine across
   active, backup, and open-draft settings.
+- A frozen diagnostic-bundle preview with sanitized bounded logs,
+  app/input/display metadata, explicit configured-process-path inclusion, and
+  atomic local ZIP export.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -133,7 +136,7 @@ Gradial APP\
         smoke-window-executor.ps1 Verify all invocation-window commands
         window-smoke-target.ps1 Observe isolated window messages and states
         smoke-action-feedback.ps1 Verify failure activity, notification, focus, and privacy
-        smoke-settings-editor.ps1 Verify native draft, save, and live-reload behavior
+        smoke-settings-editor.ps1 Verify native draft, diagnostic ZIP, save, and live reload
         smoke-onboarding.ps1 Verify required first run and safe production-menu practice
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
@@ -235,6 +238,33 @@ codes; dependency warnings may also appear. Action records contain UUIDs,
 step counts, and bounded timing metadata only. They do not contain
 window titles, typed text, executable arguments, clipboard contents, URLs, or
 selected files.
+
+The Settings **Diagnostics** page flushes the asynchronous logger and freezes
+only exact regular files named `gradial_rCURRENT.log` or
+`gradial_rNNNNN.log`. Unknown files, directories, links/reparse entries, and
+more than five or unexpectedly oversized owned logs fail or remain outside the
+snapshot rather than broadening ownership. The frozen snapshot is what the
+preview and later export use; new log records, display changes, and
+configuration changes do not silently alter it. **Refresh preview** creates a
+new snapshot.
+
+Every ZIP contains `manifest.json` plus the previewed sanitized log copies.
+The manifest records only the bundle format, creation time, Gradial version,
+schema/revision, Windows version/build and architecture, hook-thread heartbeat status, display
+bounds/work areas/DPI, log entry names/sizes, and the privacy decisions. The
+page deliberately says **Hook thread responsive** rather than claiming that
+Windows has retained the hook. Sanitization removes the current user/local
+app-data roots and every configured application path from copied logs.
+
+**Include configured application paths** starts off for every preview. When
+selected, the page displays the exact case-insensitively deduplicated
+application-profile and Run-application executable paths and adds only
+`configured-process-paths.json`. It never adds arguments or working folders.
+Configuration JSON, typed text, URLs, file/folder action paths, labels, window
+classes/titles, clipboard data, icons, and a unique installation identifier
+are always absent. ZIP creation is local, uses no network behavior, writes a
+flushed adjacent temporary file, and atomically replaces the chosen `.zip`.
+Every path inside `%LOCALAPPDATA%\Gradial` is a protected destination.
 
 ## Required first-run onboarding
 
@@ -1016,7 +1046,7 @@ schema-two eight-slice configuration and opens its real settings viewport. It
 seeds one canonical unreferenced PNG in managed storage, requires startup to
 move it into quarantine, and compares SHA-256 hashes to prove the recoverable
 move preserved its bytes. It opens and safely cancels the real native JSON
-import/export choosers, migrates
+import/export and diagnostic-ZIP choosers, migrates
 a schema-two fixture into the private draft, and confirms that neither the
 source nor active `config.json` changes. It edits the activation draft to exact
 Ctrl+M5, arms the safe tester, submits a
@@ -1050,6 +1080,10 @@ revision 2 on disk with the exact complete profile rule, priority, independent
 menu, action payloads, ordered sequence UUIDs, Ctrl+M5 binding, appearance, and
 the one shared managed icon source;
 the old profile-free schema-two revision remains in `config.json.bak`. It then
+previews a frozen diagnostic snapshot, reads a default ZIP to prove configured
+application paths remain excluded, and reads an explicitly opted-in ZIP to
+prove exactly one deduplicated executable path is included without arguments
+or a working folder. It requires no diagnostic temporary debris. Finally, it
 requires the renderer appearance update and a fresh Ctrl+M5 invocation to
 freeze the saved binding and use the reloaded Global menu. Optional screenshots
 cover appearance, icons, activation, the menu,

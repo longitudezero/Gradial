@@ -8,6 +8,7 @@ use gradial_core::{
 use crate::{
     action_executor::ActionExecutor,
     configuration::ConfigStore,
+    diagnostic_bundle::{DiagnosticBundleService, DiagnosticInputStatus},
     diagnostics::TimingMarkers,
     icons::IconManager,
     input::InputConfiguration,
@@ -22,6 +23,21 @@ use crate::{
     settings::{SettingsEditor, SettingsEvent, settings_viewport_id},
     tray::{TrayCommand, TrayHealth, TrayIcon},
 };
+
+#[derive(Debug)]
+pub(crate) struct ApplicationServices {
+    config_store: ConfigStore,
+    diagnostic_bundles: DiagnosticBundleService,
+}
+
+impl ApplicationServices {
+    pub(crate) const fn new(
+        config_store: ConfigStore,
+        diagnostic_bundles: DiagnosticBundleService,
+    ) -> Self {
+        Self { config_store, diagnostic_bundles }
+    }
+}
 
 pub(crate) struct GradialApp {
     geometry_mode: GeometryMode,
@@ -40,6 +56,7 @@ pub(crate) struct GradialApp {
     action_plan_compiler: Arc<ActionPlanCompiler>,
     configuration: Configuration,
     config_store: ConfigStore,
+    diagnostic_bundles: DiagnosticBundleService,
     icons: Arc<IconManager>,
     settings: SettingsEditor,
     onboarding_store: OnboardingStore,
@@ -55,11 +72,12 @@ impl GradialApp {
         creation_context: &eframe::CreationContext<'_>,
         startup_options: StartupOptions,
         timing_markers: Arc<TimingMarkers>,
-        config_store: ConfigStore,
+        services: ApplicationServices,
         onboarding_startup: OnboardingStartup,
         configuration: Configuration,
         recovery_warning: bool,
     ) -> Result<Self> {
+        let ApplicationServices { config_store, diagnostic_bundles } = services;
         let config_revision = configuration.config_revision;
         let icons = Arc::new(IconManager::new(config_store.icon_directory()));
         let icon_protection = config_store.icon_protection_snapshot(&configuration, None);
@@ -144,6 +162,7 @@ impl GradialApp {
             action_plan_compiler,
             configuration,
             config_store,
+            diagnostic_bundles,
             icons,
             settings,
             onboarding_store: onboarding_startup.store,
@@ -538,8 +557,82 @@ impl GradialApp {
             SettingsEvent::Export { path, configuration } => {
                 self.export_settings_draft(context, path.as_path(), &configuration);
             }
+            SettingsEvent::RefreshDiagnostics => self.refresh_diagnostic_preview(context),
+            SettingsEvent::ExportDiagnostics { path, request } => {
+                match self.diagnostic_bundles.export(path.as_path(), &request) {
+                    Ok(summary) => {
+                        self.settings.accept_diagnostic_exported(summary);
+                        log::info!(
+                            target: "diagnostics",
+                            "component=diagnostics event_code=diagnostic_bundle_exported \
+                             result_code=ok config_revision={} log_count={} \
+                             process_path_count={} archive_entry_count={} \
+                             configured_process_paths_included={}",
+                            self.config_revision,
+                            summary.logs,
+                            summary.process_paths,
+                            summary.archive_entries,
+                            request.include_process_paths
+                        );
+                    }
+                    Err(error) => {
+                        self.settings.diagnostic_export_failed(error);
+                        log::error!(
+                            target: "diagnostics",
+                            "component=diagnostics event_code=diagnostic_bundle_export_failed \
+                             result_code=failure error_code={} config_revision={} \
+                             configured_process_paths_included={}",
+                            error.code(),
+                            self.config_revision,
+                            request.include_process_paths
+                        );
+                    }
+                }
+                context.request_repaint_of(settings_viewport_id());
+            }
             SettingsEvent::Closed => self.reconcile_icon_storage(None),
         }
+    }
+
+    fn refresh_diagnostic_preview(&self, context: &eframe::egui::Context) {
+        let input_status = match self.tray_icon.health() {
+            TrayHealth::Healthy => DiagnosticInputStatus::Responsive,
+            TrayHealth::Recovering => DiagnosticInputStatus::Recovering,
+            TrayHealth::Faulted => DiagnosticInputStatus::Faulted,
+        };
+        match self.diagnostic_bundles.capture(
+            &self.configuration,
+            self.overlay_pool.monitors(),
+            input_status,
+        ) {
+            Ok(snapshot) => {
+                let log_count = snapshot.logs().len();
+                let display_count = snapshot.displays().len();
+                let process_path_count = snapshot.process_paths().len();
+                self.settings.accept_diagnostic_preview(snapshot);
+                log::info!(
+                    target: "diagnostics",
+                    "component=diagnostics event_code=diagnostic_preview_ready result_code=ok \
+                     config_revision={} log_count={} display_count={} process_path_count={} \
+                     configured_process_paths_included=false",
+                    self.config_revision,
+                    log_count,
+                    display_count,
+                    process_path_count
+                );
+            }
+            Err(error) => {
+                self.settings.diagnostic_preview_failed(error);
+                log::error!(
+                    target: "diagnostics",
+                    "component=diagnostics event_code=diagnostic_preview_failed \
+                     result_code=failure error_code={} config_revision={}",
+                    error.code(),
+                    self.config_revision
+                );
+            }
+        }
+        context.request_repaint_of(settings_viewport_id());
     }
 
     fn reconcile_icon_storage(&self, draft: Option<&Configuration>) {

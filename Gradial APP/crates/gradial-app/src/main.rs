@@ -4,6 +4,7 @@ mod action_executor;
 mod action_target;
 mod application;
 mod configuration;
+mod diagnostic_bundle;
 mod diagnostics;
 mod focus;
 mod icons;
@@ -79,7 +80,10 @@ fn main() -> Result<()> {
 
     let options = overlay::native_options();
     let app_timing_markers = Arc::clone(&timing_markers);
-    let app_config_store = configuration::ConfigStore::new(paths.clone());
+    let app_services = application::ApplicationServices::new(
+        configuration::ConfigStore::new(paths.clone()),
+        diagnostic_bundle::DiagnosticBundleService::new(paths.clone(), logger.clone()),
+    );
     let onboarding_store = onboarding::OnboardingStore::new(&paths);
     let onboarding_bypassed = startup_options.debug_skip_onboarding;
     let onboarding_required =
@@ -100,7 +104,7 @@ fn main() -> Result<()> {
                 creation_context,
                 startup_options,
                 app_timing_markers,
-                app_config_store,
+                app_services,
                 onboarding::OnboardingStartup::new(onboarding_store, onboarding_required),
                 app_configuration,
                 app_recovery_warning,

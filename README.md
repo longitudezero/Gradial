@@ -55,7 +55,10 @@ and compact/standard/large visual sizing through the same production preview.
 Each Global or application-profile direction can now import, replace, or
 remove a bounded PNG/SVG icon, rendered by that same production path. Settings
 exports carry referenced icons in an adjacent `icons` directory for portable
-round trips.
+round trips. The first Milestone 3 slice adds a dedicated Diagnostics page
+that previews a frozen local ZIP before export, sanitizes the bounded Gradial
+logs, records app/input/display metadata, and excludes configured application
+paths unless the user explicitly includes them.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -234,6 +237,15 @@ Missing adjacent assets do not block a JSON-only import: Settings reports the
 count and the affected directions use placeholders. Imported/exported action
 paths, arguments, labels, and text stay literal and are not rewritten for
 portability.
+The **Diagnostics** tab prepares a frozen preview listing every ZIP entry,
+current hook-thread status, and physical display/DPI record. The default
+bundle contains `manifest.json` and sanitized copies of Gradial's bounded
+logs. **Include configured application paths** is off for every new preview;
+turning it on displays the exact deduplicated paths and adds only
+`configured-process-paths.json`. Settings, typed text, URLs, executable
+arguments, working folders, file/folder paths, window titles, clipboard data,
+and custom icons are always excluded. Export writes an atomic local `.zip`;
+Gradial never uploads it.
 A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
 reloads new invocations without restarting Gradial.
@@ -323,3 +335,5 @@ Portable icon export/import and collision-handling results are recorded in
 [`Documentation/milestone-2-portable-icon-transfer-results.md`](Documentation/milestone-2-portable-icon-transfer-results.md).
 Recoverable managed-icon quarantine results are recorded in
 [`Documentation/milestone-2-icon-quarantine-results.md`](Documentation/milestone-2-icon-quarantine-results.md).
+Release logging and diagnostic-bundle preview/export results are recorded in
+[`Documentation/milestone-3-diagnostic-bundle-results.md`](Documentation/milestone-3-diagnostic-bundle-results.md).

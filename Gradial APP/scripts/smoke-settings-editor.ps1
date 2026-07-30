@@ -14,6 +14,7 @@ if (Get-Process gradial -ErrorAction SilentlyContinue) {
 }
 
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -320,6 +321,8 @@ $orphanManagedPath = Join-Path $managedIconDirectory ($orphanIconId + ".png")
 $orphanQuarantinePath = Join-Path (
     Join-Path $managedIconDirectory "quarantine"
 ) ($orphanIconId + ".png")
+$diagnosticDefaultPath = Join-Path $temporaryRoot "gradial-diagnostics-default-smoke.zip"
+$diagnosticPathsPath = Join-Path $temporaryRoot "gradial-diagnostics-paths-smoke.zip"
 $logPath = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
 $standardOutputPath = Join-Path $temporaryRoot "gradial.stdout.log"
 $standardErrorPath = Join-Path $temporaryRoot "gradial.stderr.log"
@@ -535,6 +538,39 @@ try {
         -Path $logPath `
         -Pattern "event_code=settings_debug_native_picker .*result_code=cancelled .*picker_kind=config_export" `
         -Failure "The native settings export chooser did not report safe cancellation." |
+        Out-Null
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x85)) {
+        throw "Could not open the native diagnostic bundle chooser."
+    }
+    $pickerWindow = [IntPtr]::Zero
+    $pickerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 100
+        $pickerWindow = [GradialSettingsSmokeNative]::FindVisibleWindow(
+            [uint32]$gradial.Id,
+            "Gradial: export diagnostic bundle"
+        )
+    } while (
+        $pickerWindow -eq [IntPtr]::Zero -and
+        [DateTime]::UtcNow -lt $pickerDeadline
+    )
+    if ($pickerWindow -eq [IntPtr]::Zero) {
+        throw "The native Windows diagnostic bundle chooser was not visible."
+    }
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 500
+        Save-WindowScreenshot `
+            -Window $pickerWindow `
+            -Path (Join-Path $workspace "captures\settings-native-diagnostic-chooser-smoke.png")
+    }
+    if (-not [GradialSettingsSmokeNative]::CloseWindow($pickerWindow)) {
+        throw "Could not cancel the native diagnostic bundle chooser."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_native_picker .*result_code=cancelled .*picker_kind=diagnostic_export" `
+        -Failure "The native diagnostic bundle chooser did not report safe cancellation." |
         Out-Null
 
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x7C)) {
@@ -1058,6 +1094,157 @@ try {
         throw "The atomic save did not preserve the previous schema-two configuration."
     }
 
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x82)) {
+        throw "Could not prepare the diagnostic bundle preview."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=diagnostic_preview_ready .*result_code=ok .*config_revision=2 .*log_count=1 .*display_count=[1-9][0-9]* .*process_path_count=1 .*configured_process_paths_included=false" `
+        -Failure "The diagnostic preview did not freeze the expected private-safe snapshot." |
+        Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-diagnostics-preview-smoke.png")
+    }
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x83)) {
+        throw "Could not export the default diagnostic bundle."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=diagnostic_bundle_exported .*result_code=ok .*config_revision=2 .*log_count=1 .*process_path_count=0 .*configured_process_paths_included=false" `
+        -Failure "The default diagnostic bundle did not export with paths excluded." |
+        Out-Null
+    if (-not (Test-Path -LiteralPath $diagnosticDefaultPath -PathType Leaf)) {
+        throw "The default diagnostic ZIP was not created."
+    }
+    $defaultArchive = [System.IO.Compression.ZipFile]::OpenRead($diagnosticDefaultPath)
+    try {
+        $defaultEntryNames = @($defaultArchive.Entries | ForEach-Object { $_.FullName })
+        if (
+            "manifest.json" -notin $defaultEntryNames -or
+            @($defaultEntryNames | Where-Object { $_ -like "logs/gradial_r*.log" }).Count -ne 1 -or
+            "configured-process-paths.json" -in $defaultEntryNames
+        ) {
+            throw "The default diagnostic ZIP contains the wrong entries."
+        }
+        $manifestEntry = $defaultArchive.GetEntry("manifest.json")
+        $manifestReader = [System.IO.StreamReader]::new(
+            $manifestEntry.Open(),
+            [System.Text.Encoding]::UTF8
+        )
+        try {
+            $defaultManifestText = $manifestReader.ReadToEnd()
+        }
+        finally {
+            $manifestReader.Dispose()
+        }
+        $defaultManifest = $defaultManifestText | ConvertFrom-Json
+        if (
+            $defaultManifest.bundle_format_version -ne 1 -or
+            $defaultManifest.gradial.config_revision -ne 2 -or
+            $defaultManifest.system.windows_version.build -le 0 -or
+            $defaultManifest.privacy.logs_sanitized -ne $true -or
+            $defaultManifest.privacy.configured_process_paths_included -ne $false -or
+            $defaultManifest.privacy.configured_process_path_count -ne 0
+        ) {
+            throw "The default diagnostic manifest does not match the preview."
+        }
+        $defaultLogEntry = @(
+            $defaultArchive.Entries | Where-Object { $_.FullName -like "logs/gradial_r*.log" }
+        )[0]
+        $defaultLogReader = [System.IO.StreamReader]::new(
+            $defaultLogEntry.Open(),
+            [System.Text.Encoding]::UTF8
+        )
+        try {
+            $defaultBundleLog = $defaultLogReader.ReadToEnd()
+        }
+        finally {
+            $defaultLogReader.Dispose()
+        }
+        if (
+            $defaultManifestText.Contains("C:\Windows\System32\notepad.exe") -or
+            $defaultBundleLog.Contains("C:\Windows\System32\notepad.exe")
+        ) {
+            throw "The default diagnostic bundle exposed an excluded configured process path."
+        }
+    }
+    finally {
+        $defaultArchive.Dispose()
+    }
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x84)) {
+        throw "Could not export the explicitly opted-in diagnostic bundle."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=diagnostic_bundle_exported .*result_code=ok .*config_revision=2 .*log_count=1 .*process_path_count=1 .*configured_process_paths_included=true" `
+        -Failure "The opted-in diagnostic bundle did not export the configured path." |
+        Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-diagnostics-path-opt-in-smoke.png")
+    }
+    if (-not (Test-Path -LiteralPath $diagnosticPathsPath -PathType Leaf)) {
+        throw "The opted-in diagnostic ZIP was not created."
+    }
+    $pathsArchive = [System.IO.Compression.ZipFile]::OpenRead($diagnosticPathsPath)
+    try {
+        $pathsEntry = $pathsArchive.GetEntry("configured-process-paths.json")
+        if (-not $pathsEntry) {
+            throw "The opted-in diagnostic ZIP omitted its process-path document."
+        }
+        $pathsReader = [System.IO.StreamReader]::new(
+            $pathsEntry.Open(),
+            [System.Text.Encoding]::UTF8
+        )
+        try {
+            $pathsDocumentText = $pathsReader.ReadToEnd()
+        }
+        finally {
+            $pathsReader.Dispose()
+        }
+        $pathsDocument = $pathsDocumentText | ConvertFrom-Json
+        if (
+            @($pathsDocument.paths).Count -ne 1 -or
+            $pathsDocument.paths[0] -ne "C:\Windows\System32\notepad.exe" -or
+            $pathsDocumentText.Contains("--editor-smoke") -or
+            $pathsDocumentText.Contains("literal argument with spaces")
+        ) {
+            throw "The opted-in document did not preserve only the deduplicated application path."
+        }
+        $pathsManifestEntry = $pathsArchive.GetEntry("manifest.json")
+        $pathsManifestReader = [System.IO.StreamReader]::new(
+            $pathsManifestEntry.Open(),
+            [System.Text.Encoding]::UTF8
+        )
+        try {
+            $pathsManifest = $pathsManifestReader.ReadToEnd() | ConvertFrom-Json
+        }
+        finally {
+            $pathsManifestReader.Dispose()
+        }
+        if (
+            $pathsManifest.privacy.configured_process_paths_included -ne $true -or
+            $pathsManifest.privacy.configured_process_path_count -ne 1
+        ) {
+            throw "The opted-in diagnostic manifest did not record explicit inclusion."
+        }
+    }
+    finally {
+        $pathsArchive.Dispose()
+    }
+    if (
+        @(Get-ChildItem -LiteralPath $temporaryRoot -Filter ".gradial-diagnostics-*.tmp").Count -ne 0
+    ) {
+        throw "Diagnostic export left temporary ZIP files behind."
+    }
+
     if (-not [GradialSettingsSmokeNative]::CloseWindow($settingsWindow)) {
         throw "Could not request a native close of the clean settings window."
     }
@@ -1122,8 +1309,8 @@ try {
     Write-Host (
         "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
         "recoverable orphan quarantine, private import, appearance and icon previews, " +
-        "managed PNG import, portable draft export, advanced profiles, all action editors, " +
-        "schema-five save, and live reload."
+        "managed PNG import, portable draft export, private-safe diagnostic bundles, advanced " +
+        "profiles, all action editors, schema-five save, and live reload."
     )
 }
 catch {
