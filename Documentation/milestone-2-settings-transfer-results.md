@@ -116,4 +116,5 @@ paths are inside the disposable test tree and are removed during cleanup.
 JSON configuration transfer is complete for this slice. Icon assets are not
 copied beside exports or imported from adjacent directories, and configured
 paths are intentionally not rewritten for portability. Appearance, icons, and
-onboarding remain separate future slices.
+onboarding were separate at this checkpoint; onboarding is covered by the
+later `milestone-2-onboarding-results.md` slice.

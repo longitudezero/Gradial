@@ -16,6 +16,8 @@ pub struct AppPaths {
     pub config: PathBuf,
     pub config_backup: PathBuf,
     pub config_temporary: PathBuf,
+    pub onboarding: PathBuf,
+    pub onboarding_temporary: PathBuf,
     pub icons: PathBuf,
     pub logs: PathBuf,
 }
@@ -41,6 +43,8 @@ impl AppPaths {
             config: root.join("config.json"),
             config_backup: root.join("config.json.bak"),
             config_temporary: root.join("config.json.tmp"),
+            onboarding: root.join("onboarding-v1.json"),
+            onboarding_temporary: root.join("onboarding-v1.json.tmp"),
             icons: root.join("icons"),
             logs: root.join("logs"),
             root,
@@ -92,6 +96,8 @@ mod tests {
         assert_eq!(paths.config, paths.root.join("config.json"));
         assert_eq!(paths.config_backup, paths.root.join("config.json.bak"));
         assert_eq!(paths.config_temporary, paths.root.join("config.json.tmp"));
+        assert_eq!(paths.onboarding, paths.root.join("onboarding-v1.json"));
+        assert_eq!(paths.onboarding_temporary, paths.root.join("onboarding-v1.json.tmp"));
         assert_eq!(paths.icons, paths.root.join("icons"));
         assert_eq!(paths.logs, paths.root.join("logs"));
     }

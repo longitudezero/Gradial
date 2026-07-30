@@ -90,11 +90,14 @@ slices, and the current bounded Milestone 2 slices establish:
   replacement, and immediate live configuration reload.
 - Native JSON import into the private settings draft and atomic export of the
   current valid draft, including unsaved edits.
+- Required, versioned first-run onboarding that chooses the exact activation
+  chord, requires the dedicated-button acknowledgment, and practices selection
+  and cancellation through an action-free production interaction.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
-profiles with their independent menus and complete matching rules. Appearance,
-icons, and onboarding are not exposed yet. A release logs the
+profiles with their independent menus and complete matching rules. Required
+onboarding is complete; appearance and icons are not exposed yet. A release logs the
 chosen slice, compiles its assigned plan, and submits it to the coordinator.
 Every schema-two action family can execute through its bounded backend.
 
@@ -123,6 +126,7 @@ Gradial APP\
         window-smoke-target.ps1 Observe isolated window messages and states
         smoke-action-feedback.ps1 Verify failure activity, notification, focus, and privacy
         smoke-settings-editor.ps1 Verify native draft, save, and live-reload behavior
+        smoke-onboarding.ps1 Verify required first run and safe production-menu practice
         run-interaction-matrix.ps1 Run the versioned validation suites
 ```
 
@@ -141,6 +145,7 @@ On first run, Gradial creates:
 ```text
 %LOCALAPPDATA%\Gradial\
     config.json
+    onboarding-v1.json
     icons\
     logs\
 ```
@@ -150,6 +155,12 @@ binding, stable global profile, eight-slice menu, and empty action catalog.
 Each menu slice has an optional action UUID. A successful later replacement
 preserves the previous valid primary as `config.json.bak`; `config.json.tmp`
 exists only during a save.
+
+`onboarding-v1.json` is separate from user configuration. Only a valid
+schema-one marker with `completed: true` suppresses onboarding at startup;
+missing, invalid, unsupported, or incomplete marker content safely requires
+the flow again. `onboarding-v1.json.tmp` is used only while atomically writing
+successful completion.
 
 Existing schema-one files are accepted only when they contain no schema-two
 action fields. Gradial adds the action and binding defaults in memory.
@@ -169,9 +180,9 @@ replaced.
 Settings export validates the current proposed draft, serializes schema-three
 JSON beside a uniquely named temporary file in the selected directory, flushes
 it, and atomically moves it over the selected destination. It may include
-unsaved edits but never changes the active revision. The three active
-configuration paths (`config.json`, its backup, and its save temporary file)
-are protected export destinations. Import and export preserve literal action
+unsaved edits but never changes the active revision. Gradial's three active
+configuration paths and both onboarding-marker paths are protected export
+destinations. Import and export preserve literal action
 paths, arguments, labels, and text; diagnostics expose only fixed result
 categories rather than selected paths or configuration values.
 
@@ -189,6 +200,42 @@ codes; dependency warnings may also appear. Action records contain UUIDs,
 step counts, and bounded timing metadata only. They do not contain
 window titles, typed text, executable arguments, clipboard contents, URLs, or
 selected files.
+
+## Required first-run onboarding
+
+The normal decorated **Welcome to Gradial** window opens automatically unless
+the versioned completion marker is valid. Its first page chooses M4 or M5 and
+optional generic Ctrl, Alt, and Shift requirements. It states that both edges
+of that exact chord are consumed while Gradial runs, including a quick
+centered cancellation, and requires an explicit acknowledgment before
+practice can begin.
+
+Beginning practice saves a changed chord through the same complete validation,
+atomic replacement, and live input-runtime restart used by Settings. An
+unchanged chord does not create a needless configuration revision. A save or
+runtime-reload failure leaves onboarding open with fixed recovery guidance.
+Settings cannot open while onboarding is active, so the binding under
+instruction cannot diverge from the live hook.
+
+Practice still enters through the production low-level hook, invocation
+snapshot, gesture controller, edge-assist geometry, cached renderer, and
+per-display overlay pool. The resolver runs normally, then an immutable
+eight-slice sample menu without action UUIDs replaces the resolved menu for
+that invocation. The invocation is explicitly tagged as practice before
+release, so action-plan compilation and executor submission return without
+dispatch even if every underlying production slice has an action.
+
+Onboarding records three bounded bridge events: menu opened, sample selected,
+and centered/Escape cancellation. Completion requires a cancellation after a
+successful selection. Other cancellation causes do not satisfy the teaching
+step. Only after all steps complete does Gradial atomically write the marker
+and close the window. Its close button cannot bypass an incomplete required
+flow; **Exit Gradial** remains available from the tray.
+
+The tray's **Restart onboarding** command reopens the chooser with the live
+binding. Restart is an immediate replay and deliberately retains an existing
+completion marker, so exiting partway through an optional replay does not
+turn the next startup into a required flow.
 
 ## Input and interaction architecture
 
@@ -233,8 +280,9 @@ hook-callback duration.
 The tray health state is `Recovering input` during startup, input replacement,
 and display rebuild; `Healthy` only after a new hook thread reports responsive;
 and `Input faulted` after queue overflow or a failed start. Its menu contains
-the non-interactive current state, **Retry input**, **Cancel current action**,
-and **Exit Gradial**.
+the non-interactive current state, **Open settings**, **Restart onboarding**,
+**Retry input**, **Cancel current action**, recent activity, and
+**Exit Gradial**.
 Explorer's `TaskbarCreated` message restores the icon and re-registers input.
 Power-resume and current-session unlock notifications also re-register the
 complete runtime. These signals do not silently clear a queue-overflow fault.
@@ -746,8 +794,9 @@ Run the full display-event capture from an elevated PowerShell. Pass
 
 ## Manual interaction check
 
-1. Start `cargo run --package gradial-app`. No overlay should be visible; the
-   Gradial notification-area icon should report Healthy.
+1. Start `cargo run --package gradial-app`. Complete required onboarding if it
+   is presented. Afterward no overlay should be visible, and the Gradial
+   notification-area icon should report Healthy.
 2. Put another application in the foreground and note that it has keyboard
    focus.
 3. Hold M4. The menu should appear centered on the cursor without changing
@@ -768,9 +817,9 @@ Run the full display-event capture from an elevated PowerShell. Pass
    `hook_thread_responsive`, `invocation_started`, three
    `focus_checkpoint` records, `slice_selected` or `invocation_cancelled`, and
    `hook_thread_stopped`.
-10. Open the tray icon and confirm its status line, **Open settings**, **Retry
-    input**, **Cancel current action**, and **Exit Gradial** commands are
-    present.
+10. Open the tray icon and confirm its status line, **Open settings**,
+    **Restart onboarding**, **Retry input**, **Cancel current action**, and
+    **Exit Gradial** commands are present.
 11. Repeat once with `--reduced-motion`; selection and close behavior should be
     identical without interpolated visuals.
 
@@ -803,7 +852,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-open-executor.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-process-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-window-executor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-settings-editor.ps1 -CaptureScreenshot
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-onboarding.ps1 -CaptureScreenshot
 ```
+
+Debug `smoke-interaction.ps1` runs append the development-only
+`--skip-onboarding` option so a fresh test machine reaches the interaction
+under test without changing the user's completion marker. Release builds
+reject that option; isolated release action fixtures create their own valid
+marker inside their disposable `LOCALAPPDATA` trees.
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
 PresentMon capture around the synthetic gesture. In a non-elevated development
@@ -904,6 +960,19 @@ reloaded Global menu. Optional screenshots cover activation, the menu,
 advanced profile tester, payload, sequence, shortcut-recorder, Windows chooser,
 JSON import/export choosers, and confirmation surfaces. The fixture never reads or writes the user's
 Gradial configuration.
+`smoke-onboarding.ps1` starts the debug executable in a disposable
+`LOCALAPPDATA` tree without a completion marker and requires the welcome
+window. Its configuration assigns a real Delay action to every production
+direction. The harness chooses and acknowledges exact Ctrl+M5, confirms the
+atomic revision-2 binding reload, then sends native side-button gestures
+through the live hook to select the east sample and cancel through the center.
+It requires the onboarding progress events while rejecting every action
+dispatch/completion record, proving that practice cannot reach the configured
+actions beneath it. It completes the flow, validates the schema-one marker,
+restarts Gradial against the same isolated data, and requires onboarding to
+remain closed. Optional screenshots capture the binding and completed-practice
+pages; cleanup closes only the process it started and removes the temporary
+tree.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

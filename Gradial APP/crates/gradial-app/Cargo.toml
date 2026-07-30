@@ -20,6 +20,7 @@ log.workspace = true
 raw-window-handle.workspace = true
 regex.workspace = true
 rtrb.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

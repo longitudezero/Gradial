@@ -11,6 +11,10 @@ use crate::{
     diagnostics::TimingMarkers,
     input::InputConfiguration,
     interaction::{InteractionRuntime, RuntimeEvent},
+    onboarding::{
+        OnboardingEditor, OnboardingEvent, OnboardingStartError, OnboardingStartup,
+        OnboardingStore, onboarding_viewport_id,
+    },
     options::StartupOptions,
     overlay::{AnimationMode, OverlayPool},
     platform,
@@ -36,6 +40,8 @@ pub(crate) struct GradialApp {
     configuration: Configuration,
     config_store: ConfigStore,
     settings: SettingsEditor,
+    onboarding_store: OnboardingStore,
+    onboarding: OnboardingEditor,
     config_revision: u64,
     tray_icon: TrayIcon,
 }
@@ -48,6 +54,7 @@ impl GradialApp {
         startup_options: StartupOptions,
         timing_markers: Arc<TimingMarkers>,
         config_store: ConfigStore,
+        onboarding_startup: OnboardingStartup,
         configuration: Configuration,
         recovery_warning: bool,
     ) -> Result<Self> {
@@ -102,6 +109,8 @@ impl GradialApp {
         );
         creation_context.egui_ctx.request_repaint();
         let settings = SettingsEditor::new(recovery_warning);
+        let onboarding =
+            OnboardingEditor::new(onboarding_startup.required, configuration.activation_binding);
         if startup_options.debug_open_settings {
             settings.open(&configuration);
         }
@@ -124,6 +133,8 @@ impl GradialApp {
             configuration,
             config_store,
             settings,
+            onboarding_store: onboarding_startup.store,
+            onboarding,
             config_revision,
             tray_icon,
         })
@@ -285,6 +296,15 @@ impl GradialApp {
     }
 
     fn open_settings(&mut self, context: &eframe::egui::Context) {
+        if self.onboarding.is_open() {
+            self.onboarding.settings_open_blocked();
+            context.request_repaint_of(onboarding_viewport_id());
+            context.send_viewport_cmd_to(
+                onboarding_viewport_id(),
+                eframe::egui::ViewportCommand::Focus,
+            );
+            return;
+        }
         let newly_opened = self.settings.open(&self.configuration);
         if newly_opened {
             context.request_repaint();
@@ -294,7 +314,7 @@ impl GradialApp {
         }
     }
 
-    fn save_settings(
+    fn persist_configuration(
         &mut self,
         context: &eframe::egui::Context,
         proposed: &Configuration,
@@ -329,6 +349,16 @@ impl GradialApp {
         self.configuration = saved.clone();
         self.overlay_pool.set_config_revision(saved.config_revision);
         self.action_executor.set_config_revision(saved.config_revision);
+        context.request_repaint();
+        Ok(saved)
+    }
+
+    fn save_settings(
+        &mut self,
+        context: &eframe::egui::Context,
+        proposed: &Configuration,
+    ) -> Result<Configuration> {
+        let saved = self.persist_configuration(context, proposed)?;
         log::info!(
             target: "settings",
             "component=settings event_code=settings_saved result_code=ok \
@@ -342,8 +372,91 @@ impl GradialApp {
             saved.activation_binding.modifiers.alt,
             saved.activation_binding.modifiers.shift
         );
-        context.request_repaint();
         Ok(saved)
+    }
+
+    fn handle_onboarding_event(&mut self, context: &eframe::egui::Context, event: OnboardingEvent) {
+        match event {
+            OnboardingEvent::BeginPractice(binding) => {
+                if self.settings.is_open() {
+                    self.onboarding.practice_start_failed(OnboardingStartError::SettingsOpen);
+                    context.request_repaint_of(onboarding_viewport_id());
+                    return;
+                }
+                let mut proposed = self.configuration.clone();
+                proposed.activation_binding = binding;
+                let binding_changed = binding != self.configuration.activation_binding;
+                let result = if binding_changed {
+                    self.persist_configuration(context, &proposed)
+                } else {
+                    Ok(self.configuration.clone())
+                };
+                match result {
+                    Ok(saved) => {
+                        self.onboarding.practice_started(saved.activation_binding);
+                        log::info!(
+                            target: "onboarding",
+                            "component=onboarding event_code=onboarding_practice_started \
+                             result_code=ok config_revision={} binding_changed={} \
+                             activation_button={} activation_control={} activation_alt={} \
+                             activation_shift={}",
+                            saved.config_revision,
+                            binding_changed,
+                            saved.activation_binding.button.short_label(),
+                            saved.activation_binding.modifiers.control,
+                            saved.activation_binding.modifiers.alt,
+                            saved.activation_binding.modifiers.shift
+                        );
+                    }
+                    Err(error) => {
+                        self.onboarding.practice_start_failed(OnboardingStartError::SaveFailed);
+                        log::error!(
+                            target: "onboarding",
+                            "component=onboarding event_code=onboarding_binding_save_failed \
+                             result_code=failure error_code=config_write_failed \
+                             config_revision={} error={error}",
+                            self.config_revision
+                        );
+                    }
+                }
+                context.request_repaint_of(onboarding_viewport_id());
+            }
+            OnboardingEvent::Complete => match self.onboarding_store.set_completed(true) {
+                Ok(()) => {
+                    self.onboarding.completion_saved(context);
+                    log::info!(
+                        target: "onboarding",
+                        "component=onboarding event_code=onboarding_completed result_code=ok \
+                         config_revision={}",
+                        self.config_revision
+                    );
+                }
+                Err(error) => {
+                    self.onboarding.completion_failed();
+                    log::error!(
+                        target: "onboarding",
+                        "component=onboarding event_code=onboarding_completion_save_failed \
+                         result_code=failure error_code=state_write_failed \
+                         config_revision={} error={error}",
+                        self.config_revision
+                    );
+                    context.request_repaint_of(onboarding_viewport_id());
+                }
+            },
+        }
+    }
+
+    fn restart_onboarding(&mut self, context: &eframe::egui::Context) {
+        self.onboarding.restart(self.configuration.activation_binding);
+        context.request_repaint_of(onboarding_viewport_id());
+        context
+            .send_viewport_cmd_to(onboarding_viewport_id(), eframe::egui::ViewportCommand::Focus);
+        log::info!(
+            target: "onboarding",
+            "component=onboarding event_code=onboarding_restarted result_code=ok \
+             config_revision={} source=tray",
+            self.config_revision
+        );
     }
 
     fn handle_settings_event(&mut self, context: &eframe::egui::Context, event: SettingsEvent) {
@@ -467,6 +580,7 @@ impl GradialApp {
             Arc::clone(&self.profile_resolver),
             Arc::clone(&self.action_plan_compiler),
             self.action_executor.handle(),
+            self.onboarding.practice(),
             self.debug_menu_override.clone(),
             self.config_revision,
         ) {
@@ -534,6 +648,7 @@ impl eframe::App for GradialApp {
         if let Some(command) = crate::tray::try_command() {
             match command {
                 TrayCommand::OpenSettings => self.open_settings(context),
+                TrayCommand::RestartOnboarding => self.restart_onboarding(context),
                 TrayCommand::RetryInput => self.retry_input(),
                 TrayCommand::CancelCurrentAction => {
                     let cancellation_requested = self.action_executor.cancel_current();
@@ -602,11 +717,17 @@ impl eframe::App for GradialApp {
             self.handle_settings_event(context, event);
         }
 
+        self.onboarding.poll_practice_events(context);
+        if let Some(event) = self.onboarding.try_event() {
+            self.handle_onboarding_event(context, event);
+        }
+
         self.start_interaction_if_ready(context);
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         self.overlay_pool.show(ui.ctx());
         self.settings.show(ui.ctx());
+        self.onboarding.show(ui.ctx());
     }
 }

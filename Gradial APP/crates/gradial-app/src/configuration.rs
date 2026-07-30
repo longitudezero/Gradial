@@ -207,9 +207,15 @@ impl ConfigStore {
     }
 
     fn is_protected_destination(&self, path: &Path) -> bool {
-        [&self.paths.config, &self.paths.config_backup, &self.paths.config_temporary]
-            .into_iter()
-            .any(|protected| windows_paths_equal(path, protected))
+        [
+            &self.paths.config,
+            &self.paths.config_backup,
+            &self.paths.config_temporary,
+            &self.paths.onboarding,
+            &self.paths.onboarding_temporary,
+        ]
+        .into_iter()
+        .any(|protected| windows_paths_equal(path, protected))
     }
 
     fn save_internal(
@@ -952,11 +958,17 @@ mod tests {
     }
 
     #[test]
-    fn export_cannot_replace_any_active_configuration_path() {
+    fn export_cannot_replace_any_gradial_owned_state_path() {
         let (_temporary_directory, paths, store) = store();
         let draft = Configuration::default();
 
-        for protected in [&paths.config, &paths.config_backup, &paths.config_temporary] {
+        for protected in [
+            &paths.config,
+            &paths.config_backup,
+            &paths.config_temporary,
+            &paths.onboarding,
+            &paths.onboarding_temporary,
+        ] {
             assert_eq!(
                 store.export_draft(&draft, protected, &draft),
                 Err(ConfigurationTransferError::ProtectedDestination)

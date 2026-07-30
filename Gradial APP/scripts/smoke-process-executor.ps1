@@ -53,6 +53,11 @@ function ConvertFrom-Base64Utf8 {
 
 try {
     New-Item -ItemType Directory -Path $gradialDirectory -Force | Out-Null
+    [System.IO.File]::WriteAllText(
+        (Join-Path $gradialDirectory "onboarding-v1.json"),
+        '{"schema_version":1,"completed":true}',
+        [System.Text.UTF8Encoding]::new($false)
+    )
     New-Item -ItemType Directory -Path $workingDirectory -Force | Out-Null
 
     $receiverSource = @"

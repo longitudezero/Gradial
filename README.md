@@ -47,7 +47,9 @@ are editable, and a private countdown tester explains every matching profile,
 winner, and deterministic tie-break.
 The activation editor now configures M4 or M5 with an exact optional
 Ctrl/Alt/Shift requirement and includes a safe one-shot hold/flick/release
-tester.
+tester. Required first-run onboarding now guides the user through choosing and
+acknowledging that dedicated chord, opening the production radial interaction,
+selecting an inert sample slice, and cancelling once before completion.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -143,14 +145,22 @@ input heartbeat triggers automatic recovery after 750 ms. Queue overflow and
 startup failures remain faulted with the activation chord passed through until **Retry input** is
 chosen. The same menu provides **Open settings**, **Cancel current action**
 while a plan is running, a **Recent activity** submenu with **Clear activity**,
-and **Exit Gradial**. Activity is never written to disk. It contains only fixed
+**Restart onboarding**, and **Exit Gradial**. Activity is never written to disk. It contains only fixed
 public messages derived from stable error codes, not action text, URLs, paths,
 arguments, or target titles. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
-First startup now creates `%LOCALAPPDATA%\Gradial\config.json` with schema 3,
-revision 1, the default M4 binding, a global eight-slice profile, and an empty
-action catalog. Existing schema-one and schema-two files are migrated to
+First startup opens required onboarding and creates
+`%LOCALAPPDATA%\Gradial\config.json` with schema 3, revision 1, the default M4
+binding, a global eight-slice profile, and an empty action catalog. Onboarding
+does not finish until the user acknowledges that the exact activation chord is
+dedicated while Gradial runs, opens the real radial interaction, selects one
+inert sample slice, and cancels once through the center or Escape. Practice
+uses the production hook, controller, geometry, and overlay but cannot compile
+or dispatch a configured action. Successful completion is saved separately in
+`onboarding-v1.json`; the tray's **Restart onboarding** command replays the
+flow without making a previously completed installation incomplete.
+Existing schema-one and schema-two files are migrated to
 schema three in memory without being rewritten; the next explicit successful
 save persists schema three. Configuration
 replacement is validated and atomic, preserves the previous valid primary as
@@ -198,8 +208,8 @@ JSON file through an atomic adjacent temporary file. Imported/exported paths,
 arguments, labels, and text stay literal; export does not attempt to make them
 portable. A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
-reloads new invocations without restarting Gradial. Icons, appearance, and
-onboarding remain future slices.
+reloads new invocations without restarting Gradial. Icons and appearance
+remain future slices.
 
 Run all local checks with:
 
@@ -212,6 +222,7 @@ can also capture the editor and close-confirmation surfaces:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-settings-editor.ps1 -CaptureScreenshot
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-onboarding.ps1 -CaptureScreenshot
 ```
 
 Run the standard live interaction matrix after building the debug executable:
@@ -273,3 +284,6 @@ Activation binding and safe gesture-tester results are recorded in
 [`Documentation/milestone-2-activation-binding-editor-results.md`](Documentation/milestone-2-activation-binding-editor-results.md).
 Settings import/export and atomic draft-transfer results are recorded in
 [`Documentation/milestone-2-settings-transfer-results.md`](Documentation/milestone-2-settings-transfer-results.md).
+Required onboarding and safe production-interaction practice results are
+recorded in
+[`Documentation/milestone-2-onboarding-results.md`](Documentation/milestone-2-onboarding-results.md).

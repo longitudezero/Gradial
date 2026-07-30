@@ -412,6 +412,7 @@ try {
     $startupArguments = @("--geometry=$Geometry")
     if ($Configuration -eq "debug") {
         $startupArguments += "--slices=$Slices"
+        $startupArguments += "--skip-onboarding"
     }
     if ($ReducedMotion) {
         $startupArguments += "--reduced-motion"

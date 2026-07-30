@@ -24,6 +24,7 @@ use crate::{
     action_executor::{ActionDispatch, ActionExecutorHandle},
     diagnostics::TimingMarkers,
     input::{HookThread, HookThreadMetrics, InputConfiguration},
+    onboarding::OnboardingPractice,
     overlay::OverlayRoute,
     platform, tray,
 };
@@ -50,6 +51,7 @@ struct ActiveInvocation {
     action_id: Option<uuid::Uuid>,
     execution_plan: Option<Arc<ExecutionPlan>>,
     route: Option<usize>,
+    practice: bool,
 }
 
 impl ActiveInvocation {
@@ -60,6 +62,7 @@ impl ActiveInvocation {
         self.action_id = None;
         self.execution_plan = None;
         self.route = None;
+        self.practice = false;
     }
 }
 
@@ -70,6 +73,7 @@ struct EffectDispatcher<'a> {
     routes: &'a [OverlayRoute],
     action_plan_compiler: &'a ActionPlanCompiler,
     action_executor: &'a ActionExecutorHandle,
+    onboarding_practice: &'a OnboardingPractice,
     config_revision: u64,
 }
 
@@ -109,6 +113,7 @@ impl InteractionRuntime {
         profile_resolver: Arc<ProfileResolver>,
         action_plan_compiler: Arc<ActionPlanCompiler>,
         action_executor: ActionExecutorHandle,
+        onboarding_practice: OnboardingPractice,
         debug_menu_override: Option<Arc<ResolvedMenu>>,
         config_revision: u64,
     ) -> Result<Self> {
@@ -145,6 +150,7 @@ impl InteractionRuntime {
                     &profile_resolver,
                     &action_plan_compiler,
                     &action_executor,
+                    &onboarding_practice,
                     debug_menu_override.as_ref(),
                     config_revision,
                 );
@@ -250,6 +256,7 @@ fn run_interaction_thread(
     profile_resolver: &ProfileResolver,
     action_plan_compiler: &ActionPlanCompiler,
     action_executor: &ActionExecutorHandle,
+    onboarding_practice: &OnboardingPractice,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
     config_revision: u64,
 ) {
@@ -262,6 +269,7 @@ fn run_interaction_thread(
         routes,
         action_plan_compiler,
         action_executor,
+        onboarding_practice,
         config_revision,
     };
     let qpc_frequency = query_qpc_frequency();
@@ -475,6 +483,9 @@ fn prepare_selected_action(
     action_plan_compiler: &ActionPlanCompiler,
     active_config_revision: u64,
 ) {
+    if active.practice {
+        return;
+    }
     let Some(InteractionEffect::Close {
         outcome: InteractionOutcome::Selected { slice_index },
         ..
@@ -548,16 +559,24 @@ fn begin_invocation(
         window_class: &snapshot.context.window_class,
         window_title: &snapshot.context.window_title,
     });
-    let (menu, menu_source) = debug_menu_override.map_or_else(
-        || (Arc::clone(&resolution.menu), "configuration"),
-        |menu| (Arc::clone(menu), "debug_override"),
+    let practice_menu = dispatcher.onboarding_practice.menu_if_enabled();
+    let practice_active = practice_menu.is_some();
+    let (menu, menu_source) = practice_menu.map_or_else(
+        || {
+            debug_menu_override.map_or_else(
+                || (Arc::clone(&resolution.menu), "configuration"),
+                |menu| (Arc::clone(menu), "debug_override"),
+            )
+        },
+        |menu| (menu, "onboarding_practice"),
     );
     log::info!(
         target: "profiles",
         "component=profiles event_code=profile_resolved result_code=ok \
          config_revision={} invocation_id={} profile_id={} used_global={} \
          decision={} matching_profile_count={} configured_slice_count={} \
-         menu_slice_count={} menu_label_count={} menu_source={menu_source}",
+         menu_slice_count={} menu_label_count={} menu_source={menu_source} \
+         onboarding_practice={practice_active}",
         snapshot.context.config_revision,
         snapshot.invocation_id,
         resolution.profile_id,
@@ -580,6 +599,7 @@ fn begin_invocation(
         active.route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
         active.snapshot = Some(snapshot);
         active.menu = Some(menu);
+        active.practice = practice_active;
     }
     effect
 }
@@ -640,6 +660,10 @@ fn dispatch_effect(
                 route,
                 dispatcher,
             );
+            if active.practice {
+                dispatcher.onboarding_practice.opened();
+                platform::request_controller_repaint();
+            }
         }
         InteractionEffect::SelectionChanged { invocation_id, selected_slice } => {
             log::debug!(
@@ -675,16 +699,21 @@ fn dispatch_effect(
                         }),
                         active_profile_id.unwrap_or_default()
                     );
-                    log_selected_action_outcome(
-                        invocation_id,
-                        active_action_id,
-                        active_execution_plan,
-                        active_snapshot.map(|snapshot| &snapshot.context),
-                        dispatcher.action_executor,
-                        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
-                            snapshot.context.config_revision
-                        }),
-                    );
+                    if active.practice {
+                        dispatcher.onboarding_practice.selected(slice_index);
+                        platform::request_controller_repaint();
+                    } else {
+                        log_selected_action_outcome(
+                            invocation_id,
+                            active_action_id,
+                            active_execution_plan,
+                            active_snapshot.map(|snapshot| &snapshot.context),
+                            dispatcher.action_executor,
+                            active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
+                                snapshot.context.config_revision
+                            }),
+                        );
+                    }
                 }
                 InteractionOutcome::Cancelled { reason } => {
                     log::info!(
@@ -695,6 +724,10 @@ fn dispatch_effect(
                             snapshot.context.config_revision
                         })
                     );
+                    if active.practice {
+                        dispatcher.onboarding_practice.cancelled(reason);
+                        platform::request_controller_repaint();
+                    }
                 }
             }
             dispatcher.timing_markers.emit("close_requested", Some(invocation_id), source_qpc, "");

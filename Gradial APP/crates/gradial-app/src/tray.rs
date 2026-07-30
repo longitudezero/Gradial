@@ -36,6 +36,7 @@ const CANCEL_ACTION_COMMAND_ID: usize = 2;
 const EXIT_COMMAND_ID: usize = 3;
 const CLEAR_ACTIVITY_COMMAND_ID: usize = 4;
 const OPEN_SETTINGS_COMMAND_ID: usize = 5;
+const RESTART_ONBOARDING_COMMAND_ID: usize = 6;
 const ACTIVITY_CAPACITY: usize = 20;
 const NOTIFICATION_CAPACITY: usize = 20;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -136,6 +137,7 @@ impl TrayHealth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrayCommand {
     OpenSettings,
+    RestartOnboarding,
     RetryInput,
     CancelCurrentAction,
     ClearActivity,
@@ -286,12 +288,17 @@ pub(crate) fn handle_callback(window: HWND, lparam: isize) -> bool {
 }
 
 pub(crate) fn try_command() -> Option<TrayCommand> {
-    match PENDING_COMMAND.swap(0, Ordering::AcqRel) {
+    command_from_code(PENDING_COMMAND.swap(0, Ordering::AcqRel))
+}
+
+fn command_from_code(code: u8) -> Option<TrayCommand> {
+    match code {
         1 => Some(TrayCommand::RetryInput),
         2 => Some(TrayCommand::CancelCurrentAction),
         3 => Some(TrayCommand::Exit),
         4 => Some(TrayCommand::ClearActivity),
         5 => Some(TrayCommand::OpenSettings),
+        6 => Some(TrayCommand::RestartOnboarding),
         _ => None,
     }
 }
@@ -368,7 +375,6 @@ fn show_menu(window: HWND) -> Result<()> {
     let mut activity_menu_attached = false;
     let result = (|| {
         let status = wide(health.status_text());
-        let open_settings = wide("Open settings");
         let retry = wide("Retry input");
         let cancel_action = wide("Cancel current action");
         let exit = wide("Exit Gradial");
@@ -379,15 +385,11 @@ fn show_menu(window: HWND) -> Result<()> {
                 .context("could not add tray status")?;
             AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
                 .context("could not add tray separator")?;
-            AppendMenuW(
-                menu,
-                MF_STRING | MF_ENABLED,
-                OPEN_SETTINGS_COMMAND_ID,
-                PCWSTR(open_settings.as_ptr()),
-            )
-            .context("could not add Open settings")?;
-            AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
-                .context("could not add tray separator")?;
+        }
+        append_window_commands(menu)?;
+        // SAFETY: the menu is live and both strings remain null-terminated for
+        // the duration of each call.
+        unsafe {
             let retry_flags = if health == TrayHealth::Recovering {
                 MF_STRING | MF_GRAYED
             } else {
@@ -445,6 +447,7 @@ fn show_menu(window: HWND) -> Result<()> {
             EXIT_COMMAND_ID => PENDING_COMMAND.store(3, Ordering::Release),
             CLEAR_ACTIVITY_COMMAND_ID => PENDING_COMMAND.store(4, Ordering::Release),
             OPEN_SETTINGS_COMMAND_ID => PENDING_COMMAND.store(5, Ordering::Release),
+            RESTART_ONBOARDING_COMMAND_ID => PENDING_COMMAND.store(6, Ordering::Release),
             _ => {}
         }
         Ok(())
@@ -465,6 +468,30 @@ fn show_menu(window: HWND) -> Result<()> {
         );
     }
     result
+}
+
+fn append_window_commands(menu: HMENU) -> Result<()> {
+    let open_settings = wide("Open settings");
+    let restart_onboarding = wide("Restart onboarding");
+    // SAFETY: the menu is live and Windows copies both null-terminated labels
+    // during their calls.
+    unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_ENABLED,
+            OPEN_SETTINGS_COMMAND_ID,
+            PCWSTR(open_settings.as_ptr()),
+        )
+        .context("could not add Open settings")?;
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_ENABLED,
+            RESTART_ONBOARDING_COMMAND_ID,
+            PCWSTR(restart_onboarding.as_ptr()),
+        )
+        .context("could not add Restart onboarding")?;
+        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()).context("could not add tray separator")
+    }
 }
 
 fn append_activity_submenu(
@@ -591,8 +618,8 @@ mod tests {
 
     use super::{
         ACTIVITY_CAPACITY, ActivityRecord, ActivityStore, CLEAR_ACTIVITY_COMMAND_ID,
-        FailureNotification, TrayHealth, append_activity_submenu, failure_notification_data,
-        health_from_atomic, write_wide_buffer,
+        FailureNotification, TrayCommand, TrayHealth, append_activity_submenu, command_from_code,
+        failure_notification_data, health_from_atomic, write_wide_buffer,
     };
 
     #[test]
@@ -606,6 +633,18 @@ mod tests {
     fn unknown_atomic_health_is_recovering() {
         super::CURRENT_HEALTH.store(255, std::sync::atomic::Ordering::Release);
         assert_eq!(health_from_atomic(), TrayHealth::Recovering);
+    }
+
+    #[test]
+    fn tray_command_codes_include_restart_onboarding() {
+        assert_eq!(command_from_code(1), Some(TrayCommand::RetryInput));
+        assert_eq!(command_from_code(2), Some(TrayCommand::CancelCurrentAction));
+        assert_eq!(command_from_code(3), Some(TrayCommand::Exit));
+        assert_eq!(command_from_code(4), Some(TrayCommand::ClearActivity));
+        assert_eq!(command_from_code(5), Some(TrayCommand::OpenSettings));
+        assert_eq!(command_from_code(6), Some(TrayCommand::RestartOnboarding));
+        assert_eq!(command_from_code(0), None);
+        assert_eq!(command_from_code(u8::MAX), None);
     }
 
     #[test]

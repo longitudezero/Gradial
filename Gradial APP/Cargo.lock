@@ -950,6 +950,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "rtrb",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

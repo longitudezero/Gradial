@@ -524,6 +524,10 @@ impl SettingsEditor {
         self.state().pending_event.take()
     }
 
+    pub(crate) fn is_open(&self) -> bool {
+        self.state().lifecycle != EditorLifecycle::Closed
+    }
+
     pub(crate) fn accept_saved(&self, configuration: &Configuration) {
         self.state().accept_saved(configuration);
     }
@@ -3488,7 +3492,7 @@ const fn transfer_error_message(
             "Choose an available folder and file name for the export."
         }
         (TransferOperation::Export, ConfigurationTransferError::ProtectedDestination) => {
-            "Choose another file name. Export cannot replace Gradial's active settings files."
+            "Choose another file name. Export cannot replace Gradial's active files."
         }
         (TransferOperation::Export, ConfigurationTransferError::Invalid) => {
             "Fix the current draft before exporting it."

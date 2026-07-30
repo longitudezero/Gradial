@@ -9,6 +9,7 @@ mod focus;
 mod input;
 mod interaction;
 mod native_file_dialog;
+mod onboarding;
 mod options;
 mod overlay;
 mod platform;
@@ -78,6 +79,16 @@ fn main() -> Result<()> {
     let options = overlay::native_options();
     let app_timing_markers = Arc::clone(&timing_markers);
     let app_config_store = configuration::ConfigStore::new(paths.clone());
+    let onboarding_store = onboarding::OnboardingStore::new(&paths);
+    let onboarding_bypassed = startup_options.debug_skip_onboarding;
+    let onboarding_required =
+        !onboarding_bypassed && onboarding_store.load() == onboarding::OnboardingLoad::Required;
+    log::info!(
+        target: "onboarding",
+        "component=onboarding event_code=onboarding_state_loaded result_code=ok \
+         config_revision={config_revision} required={onboarding_required} \
+         development_bypass={onboarding_bypassed}"
+    );
     let app_configuration = loaded_configuration.configuration;
     let app_recovery_warning = loaded_configuration.warning.is_some();
     let run_result = eframe::run_native(
@@ -89,6 +100,7 @@ fn main() -> Result<()> {
                 startup_options,
                 app_timing_markers,
                 app_config_store,
+                onboarding::OnboardingStartup::new(onboarding_store, onboarding_required),
                 app_configuration,
                 app_recovery_warning,
             )?;

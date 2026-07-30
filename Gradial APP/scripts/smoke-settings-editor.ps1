@@ -336,6 +336,11 @@ $controlIsDown = $false
 
 try {
     New-Item -ItemType Directory -Path $gradialDirectory -Force | Out-Null
+    [System.IO.File]::WriteAllText(
+        (Join-Path $gradialDirectory "onboarding-v1.json"),
+        '{"schema_version":1,"completed":true}',
+        [System.Text.UTF8Encoding]::new($false)
+    )
     $slices = for ($index = 0; $index -lt $labels.Count; $index++) {
         [ordered]@{
             label = $labels[$index]

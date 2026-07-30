@@ -51,6 +51,11 @@ $labels = @("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 try {
     New-Item -ItemType Directory -Path $gradialDirectory -Force | Out-Null
     [System.IO.File]::WriteAllText(
+        (Join-Path $gradialDirectory "onboarding-v1.json"),
+        '{"schema_version":1,"completed":true}',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllText(
         $payloadPath,
         "Gradial isolated shell-association fixture",
         [System.Text.UTF8Encoding]::new($false)

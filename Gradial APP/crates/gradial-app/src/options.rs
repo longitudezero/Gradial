@@ -8,7 +8,7 @@ pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
 Usage:
-  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--reduced-motion] [--open-settings]
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--reduced-motion] [--open-settings] [--skip-onboarding]
 
 Geometry modes:
   auto          Use edge assist only when the complete ring would clip.
@@ -24,6 +24,9 @@ Animation:
 
 Settings:
   --open-settings   Open the settings window at startup for development checks.
+
+Onboarding:
+  --skip-onboarding Skip the first-run window for isolated development harnesses.
 ";
 
 #[cfg(not(debug_assertions))]
@@ -49,6 +52,7 @@ pub(crate) struct StartupOptions {
     pub(crate) geometry_mode: GeometryMode,
     pub(crate) debug_slice_override: Option<gradial_core::SliceCount>,
     pub(crate) debug_open_settings: bool,
+    pub(crate) debug_skip_onboarding: bool,
     pub(crate) reduced_motion: bool,
 }
 
@@ -64,6 +68,10 @@ impl StartupOptions {
         let mut debug_open_settings = false;
         #[cfg(not(debug_assertions))]
         let debug_open_settings = false;
+        #[cfg(debug_assertions)]
+        let mut debug_skip_onboarding = false;
+        #[cfg(not(debug_assertions))]
+        let debug_skip_onboarding = false;
         let mut arguments = arguments.into_iter();
 
         while let Some(argument) = arguments.next() {
@@ -94,12 +102,22 @@ impl StartupOptions {
                         debug_open_settings = true;
                         continue;
                     }
+                    if argument == "--skip-onboarding" {
+                        debug_skip_onboarding = true;
+                        continue;
+                    }
                 }
                 bail!("unknown Gradial argument: {argument}");
             }
         }
 
-        Ok(Self { geometry_mode, debug_slice_override, debug_open_settings, reduced_motion })
+        Ok(Self {
+            geometry_mode,
+            debug_slice_override,
+            debug_open_settings,
+            debug_skip_onboarding,
+            reduced_motion,
+        })
     }
 }
 
@@ -135,6 +153,7 @@ mod tests {
         assert_eq!(options.geometry_mode, GeometryMode::Auto);
         assert_eq!(options.debug_slice_override, None);
         assert!(!options.debug_open_settings);
+        assert!(!options.debug_skip_onboarding);
         assert!(!options.reduced_motion);
     }
 
@@ -194,18 +213,20 @@ mod tests {
             "--slices=4".to_owned(),
             "--reduced-motion".to_owned(),
             "--open-settings".to_owned(),
+            "--skip-onboarding".to_owned(),
         ])
         .expect("reduced-motion options");
         assert_eq!(options.geometry_mode, GeometryMode::EdgeAssist);
         assert_eq!(options.debug_slice_override, Some(SliceCount::Four));
         assert!(options.debug_open_settings);
+        assert!(options.debug_skip_onboarding);
         assert!(options.reduced_motion);
     }
 
     #[test]
     #[cfg(not(debug_assertions))]
     fn release_build_rejects_development_only_options() {
-        for argument in ["--slices=4", "--open-settings"] {
+        for argument in ["--slices=4", "--open-settings", "--skip-onboarding"] {
             let error =
                 StartupOptions::parse([argument.to_owned()]).expect_err("debug-only option");
             assert!(error.to_string().contains("unknown Gradial argument"));
