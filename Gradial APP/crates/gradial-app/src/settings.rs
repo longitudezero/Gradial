@@ -10,12 +10,12 @@ use eframe::egui::{
     TextEdit, UiBuilder, Vec2, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 use gradial_core::{
-    ActionDefinition, ActionKind, ActionPlanCompiler, ActivationBinding, ActivationBindingId,
-    ApplicationProfile, Configuration, ConfigurationError, ExecutionOperation,
-    MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
-    MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, PhysicalModifiers, Profile, ProfileResolver,
-    ProfileRule, ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey, SliceCount,
-    WindowCommand, slice_for_delta,
+    AccentColor, ActionDefinition, ActionKind, ActionPlanCompiler, ActivationBinding,
+    ActivationBindingId, Appearance, ApplicationProfile, Configuration, ConfigurationError,
+    ExecutionOperation, LabelTheme, MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS,
+    MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, PhysicalModifiers, Profile,
+    ProfileResolver, ProfileRule, ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey,
+    SizePreset, SliceCount, WindowCommand, slice_for_delta,
 };
 #[cfg(debug_assertions)]
 use gradial_core::{AppPaths, ShortcutModifier};
@@ -140,6 +140,7 @@ enum SettingsSection {
     #[default]
     Menu,
     Binding,
+    Appearance,
     Profiles,
     Actions,
 }
@@ -756,6 +757,28 @@ impl SettingsState {
     }
 
     #[cfg(debug_assertions)]
+    fn debug_apply_appearance_fixture_edit(&mut self) -> bool {
+        let Some(draft) = &mut self.draft else {
+            return false;
+        };
+        draft.proposed.appearance = Appearance {
+            accent_color: AccentColor { red: 224, green: 96, blue: 72 },
+            label_theme: LabelTheme::Dark,
+            size_preset: SizePreset::Large,
+        };
+        self.section = SettingsSection::Appearance;
+        self.save_feedback = SaveFeedback::None;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_appearance_draft_edited \
+             result_code=ok config_revision={} accent_red=224 accent_green=96 \
+             accent_blue=72 label_theme=dark size_preset=large",
+            draft.original.config_revision
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
     #[allow(clippy::too_many_lines)]
     fn debug_apply_action_fixture_edit(&mut self) -> bool {
         let Some(draft) = &mut self.draft else {
@@ -1152,6 +1175,12 @@ impl SettingsState {
             None
         } else if ui
             .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F17))
+        {
+            let _edited = self.debug_apply_appearance_fixture_edit();
+            None
+        } else if ui
+            .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F9))
         {
             let _edited = self.debug_apply_action_fixture_edit();
@@ -1269,6 +1298,7 @@ impl SettingsState {
             });
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.section, SettingsSection::Binding, "Activation");
+                ui.selectable_value(&mut self.section, SettingsSection::Appearance, "Appearance");
                 ui.selectable_value(&mut self.section, SettingsSection::Menu, "Menu");
                 ui.selectable_value(&mut self.section, SettingsSection::Profiles, "Profiles");
                 ui.selectable_value(&mut self.section, SettingsSection::Actions, "Actions");
@@ -1387,6 +1417,7 @@ impl SettingsState {
 
         match self.section {
             SettingsSection::Binding => self.render_binding_section(ui, &mut draft),
+            SettingsSection::Appearance => self.render_appearance_section(ui, &mut draft),
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
             SettingsSection::Profiles => self.render_profiles_section(ui, &mut draft),
             SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
@@ -1614,6 +1645,74 @@ impl SettingsState {
         }
     }
 
+    fn render_appearance_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
+        let original = draft.proposed.appearance;
+        let mut appearance = original;
+
+        egui::Panel::left("appearance_editor").resizable(false).exact_size(350.0).show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Appearance");
+            ui.label("Customize the radial menu without changing how flicks are recognized.");
+
+            ui.add_space(18.0);
+            ui.label(RichText::new("Accent color").strong());
+            let mut accent = appearance.accent_color.components();
+            ui.horizontal(|ui| {
+                if ui.color_edit_button_srgb(&mut accent).changed() {
+                    appearance.accent_color =
+                        AccentColor { red: accent[0], green: accent[1], blue: accent[2] };
+                }
+                ui.monospace(format!("#{:02X}{:02X}{:02X}", accent[0], accent[1], accent[2]));
+            });
+            ui.weak("Used for outlines, dividers, and the selected direction.");
+
+            ui.add_space(18.0);
+            ui.label(RichText::new("Labels").strong());
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut appearance.label_theme, LabelTheme::Light, "Light labels");
+                ui.selectable_value(&mut appearance.label_theme, LabelTheme::Dark, "Dark labels");
+            });
+            ui.weak(match appearance.label_theme {
+                LabelTheme::Light => "Light labels use the original dark ring.",
+                LabelTheme::Dark => "Dark labels use a light ring for readable contrast.",
+            });
+
+            ui.add_space(18.0);
+            ui.label(RichText::new("Menu size").strong());
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut appearance.size_preset, SizePreset::Compact, "Compact");
+                ui.selectable_value(&mut appearance.size_preset, SizePreset::Standard, "Standard");
+                ui.selectable_value(&mut appearance.size_preset, SizePreset::Large, "Large");
+            });
+            ui.weak("Size affects only visuals. Gesture thresholds stay consistent.");
+
+            ui.add_space(20.0);
+            if ui.button("Restore original appearance").clicked() {
+                appearance = Appearance::default();
+            }
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Live preview");
+            ui.label("Appearance applies to Global and every application profile.");
+            ui.add_space(18.0);
+            ui.vertical_centered(|ui| {
+                self.render_preview(
+                    ui,
+                    &draft.proposed.global_profile.menu,
+                    draft.proposed.activation_binding.button,
+                    appearance,
+                );
+            });
+        });
+
+        if appearance != original {
+            draft.proposed.appearance = appearance;
+            self.save_feedback = SaveFeedback::None;
+        }
+    }
+
     fn render_menu_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
         let global_slice_count =
             draft.proposed.global_profile.menu.resolved_slice_count().unwrap_or_default();
@@ -1693,6 +1792,7 @@ impl SettingsState {
                     ui,
                     &draft.proposed.global_profile.menu,
                     draft.proposed.activation_binding.button,
+                    draft.proposed.appearance,
                 );
             });
         });
@@ -1933,7 +2033,12 @@ impl SettingsState {
                 ui.add_space(18.0);
                 if let Some(menu) = profile_menu(&draft.proposed, profile_id) {
                     ui.vertical_centered(|ui| {
-                        self.render_preview(ui, menu, draft.proposed.activation_binding.button);
+                        self.render_preview(
+                            ui,
+                            menu,
+                            draft.proposed.activation_binding.button,
+                            draft.proposed.appearance,
+                        );
                     });
                 }
                 ui.add_space(16.0);
@@ -2401,6 +2506,7 @@ impl SettingsState {
         ui: &mut egui::Ui,
         configured_menu: &Menu,
         activation_button: ActivationBindingId,
+        appearance: Appearance,
     ) {
         let Some(menu) = resolved_menu(configured_menu) else {
             ui.colored_label(Color32::from_rgb(239, 113, 113), "Preview unavailable.");
@@ -2417,6 +2523,7 @@ impl SettingsState {
                 invocation_id: Some(PREVIEW_INVOCATION_ID),
                 menu: Some(menu),
                 activation_button,
+                appearance,
                 selected_slice: Some(self.selected_slice),
                 selection_changed_at: Some(now),
                 opacity: 1.0,
@@ -2428,7 +2535,7 @@ impl SettingsState {
         if response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
             && let Some(slice) = preview_slice_at(
-                pointer - rect.center(),
+                normalize_preview_offset(pointer - rect.center(), appearance),
                 configured_menu.resolved_slice_count().unwrap_or_default(),
             )
         {
@@ -3378,6 +3485,10 @@ fn preview_slice_at(offset: Vec2, slice_count: SliceCount) -> Option<usize> {
     })
 }
 
+fn normalize_preview_offset(offset: Vec2, appearance: Appearance) -> Vec2 {
+    offset / appearance.size_preset.visual_scale()
+}
+
 fn sector_index<const N: usize>(angle: f32) -> usize {
     let width = std::f32::consts::TAU
         / match N {
@@ -3642,9 +3753,10 @@ mod tests {
 
     use eframe::egui::Vec2;
     use gradial_core::{
-        ActionDefinition, ActionKind, ActivationBinding, ActivationBindingId, Configuration,
-        MAX_TYPED_TEXT_BYTES, MenuSlice, PhysicalModifiers, ResolutionDecision, ScreenPoint,
-        ShortcutKey, ShortcutModifier, SliceCount, WindowCommand,
+        AccentColor, ActionDefinition, ActionKind, ActivationBinding, ActivationBindingId,
+        Appearance, Configuration, LabelTheme, MAX_TYPED_TEXT_BYTES, MenuSlice, PhysicalModifiers,
+        ResolutionDecision, ScreenPoint, ShortcutKey, ShortcutModifier, SizePreset, SliceCount,
+        WindowCommand,
     };
     use uuid::Uuid;
 
@@ -3656,9 +3768,9 @@ mod tests {
         activation_binding_display, add_executable_argument, add_sequence_step,
         apply_dialog_outcome, binding_test_selection, countdown_seconds_remaining, create_action,
         create_application_profile, delete_action, delete_application_profile, duplicate_action,
-        duplicate_application_profile, map_selected_slice, move_sequence_step, preview_slice_at,
-        remove_executable_argument, remove_sequence_step, resize_menu, resolution_decision_text,
-        validate_draft,
+        duplicate_application_profile, map_selected_slice, move_sequence_step,
+        normalize_preview_offset, preview_slice_at, remove_executable_argument,
+        remove_sequence_step, resize_menu, resolution_decision_text, validate_draft,
     };
     use crate::{
         configuration::ConfigurationMigration, input::ActivationBindingTestResult,
@@ -3901,6 +4013,32 @@ mod tests {
 
         draft.discard();
         assert_eq!(draft.proposed.activation_binding, ActivationBinding::default());
+        assert!(!draft.is_dirty());
+    }
+
+    #[test]
+    fn appearance_edits_are_draft_only_and_size_normalizes_preview_hits() {
+        let configuration = Configuration::default();
+        let mut draft = SettingsDraft::new(&configuration);
+        let edited = Appearance {
+            accent_color: AccentColor { red: 224, green: 96, blue: 72 },
+            label_theme: LabelTheme::Dark,
+            size_preset: SizePreset::Large,
+        };
+
+        draft.proposed.appearance = edited;
+        assert!(draft.is_dirty());
+        assert_eq!(draft.original.appearance, Appearance::default());
+        assert_eq!(
+            preview_slice_at(
+                normalize_preview_offset(Vec2::new(96.6, 0.0), edited),
+                SliceCount::Eight,
+            ),
+            Some(2)
+        );
+
+        draft.discard();
+        assert_eq!(draft.proposed.appearance, Appearance::default());
         assert!(!draft.is_dirty());
     }
 

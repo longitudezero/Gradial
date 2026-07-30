@@ -24,7 +24,8 @@ completion boolean. The marker is written as formatted JSON with a final
 newline through `onboarding-v1.json.tmp`, flushed, and atomically moved into
 place. It is written only after every practice requirement succeeds.
 
-The selected activation chord remains part of schema-three `config.json`.
+The selected activation chord remains part of the versioned `config.json`
+(schema four after the appearance slice).
 Beginning practice persists a changed chord through the existing complete
 configuration validation, compilation, atomic backup/replacement, and live
 input-runtime restart. An unchanged chord does not advance the configuration
@@ -99,7 +100,7 @@ check passes.
 1. starts Gradial without an onboarding marker and requires the welcome window;
 2. assigns a real Delay action to every production-menu direction;
 3. chooses and acknowledges exact Ctrl+M5;
-4. observes the atomic schema-three revision-2 binding save and live runtime
+4. observes the atomic schema-four revision-2 binding save and live runtime
    reload;
 5. sends native Ctrl+M5 input through the production hook to open the sample
    menu and select east;

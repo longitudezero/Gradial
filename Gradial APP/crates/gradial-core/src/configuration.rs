@@ -10,19 +10,21 @@ use crate::{
     actions::{ActionDefinition, ShortcutModifier, validate_actions},
 };
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 4;
 pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const ACTION_CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const ACTIVATION_CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_GLOBAL_PROFILE_ID: Uuid =
     Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0001);
 
-/// The complete schema-three configuration model.
+/// The complete schema-four configuration model.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub schema_version: u32,
     pub config_revision: u64,
     pub activation_binding: ActivationBinding,
+    pub appearance: Appearance,
     pub global_profile: Profile,
     pub application_profiles: Vec<ApplicationProfile>,
     #[serde(default)]
@@ -78,6 +80,7 @@ impl Default for Configuration {
             schema_version: CONFIG_SCHEMA_VERSION,
             config_revision: 0,
             activation_binding: ActivationBinding::default(),
+            appearance: Appearance::default(),
             global_profile: Profile {
                 id: DEFAULT_GLOBAL_PROFILE_ID,
                 name: "Global".to_owned(),
@@ -85,6 +88,92 @@ impl Default for Configuration {
             },
             application_profiles: Vec::new(),
             actions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Appearance {
+    pub accent_color: AccentColor,
+    pub label_theme: LabelTheme,
+    pub size_preset: SizePreset,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            accent_color: AccentColor::default(),
+            label_theme: LabelTheme::Light,
+            size_preset: SizePreset::Standard,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccentColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl AccentColor {
+    #[must_use]
+    pub const fn components(self) -> [u8; 3] {
+        [self.red, self.green, self.blue]
+    }
+}
+
+impl Default for AccentColor {
+    fn default() -> Self {
+        Self { red: 124, green: 154, blue: 255 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelTheme {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl LabelTheme {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizePreset {
+    Compact,
+    #[default]
+    Standard,
+    Large,
+}
+
+impl SizePreset {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Standard => "standard",
+            Self::Large => "large",
+        }
+    }
+
+    #[must_use]
+    pub const fn visual_scale(self) -> f32 {
+        match self {
+            Self::Compact => 0.85,
+            Self::Standard => 1.0,
+            Self::Large => 1.15,
         }
     }
 }
@@ -308,8 +397,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ActivationBinding, ApplicationProfile, CONFIG_SCHEMA_VERSION, Configuration,
-        ConfigurationError, Menu, Profile, ProfileRule,
+        AccentColor, ActivationBinding, Appearance, ApplicationProfile, CONFIG_SCHEMA_VERSION,
+        Configuration, ConfigurationError, LabelTheme, Menu, Profile, ProfileRule, SizePreset,
     };
 
     fn application_profile(id: u128) -> ApplicationProfile {
@@ -329,14 +418,31 @@ mod tests {
     }
 
     #[test]
-    fn default_schema_three_configuration_is_valid_and_action_free() {
+    fn default_schema_four_configuration_preserves_the_foundation_appearance() {
         let configuration = Configuration::default();
         configuration.validate().expect("default configuration");
         assert_eq!(configuration.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(configuration.activation_binding, ActivationBinding::default());
+        assert_eq!(
+            configuration.appearance,
+            Appearance {
+                accent_color: AccentColor { red: 124, green: 154, blue: 255 },
+                label_theme: LabelTheme::Light,
+                size_preset: SizePreset::Standard,
+            }
+        );
         assert_eq!(configuration.global_profile.menu.slices.len(), 8);
         assert!(configuration.application_profiles.is_empty());
         assert!(configuration.actions.is_empty());
+    }
+
+    #[test]
+    fn appearance_enums_use_closed_names_and_bounded_visual_scales() {
+        assert!((SizePreset::Compact.visual_scale() - 0.85).abs() < f32::EPSILON);
+        assert!((SizePreset::Standard.visual_scale() - 1.0).abs() < f32::EPSILON);
+        assert!((SizePreset::Large.visual_scale() - 1.15).abs() < f32::EPSILON);
+        assert!(serde_json::from_str::<LabelTheme>("\"automatic\"").is_err());
+        assert!(serde_json::from_str::<SizePreset>("\"custom\"").is_err());
     }
 
     #[test]

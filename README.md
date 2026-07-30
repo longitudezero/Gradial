@@ -49,7 +49,9 @@ The activation editor now configures M4 or M5 with an exact optional
 Ctrl/Alt/Shift requirement and includes a safe one-shot hold/flick/release
 tester. Required first-run onboarding now guides the user through choosing and
 acknowledging that dedicated chord, opening the production radial interaction,
-selecting an inert sample slice, and cancelling once before completion.
+selecting an inert sample slice, and cancelling once before completion. The
+appearance editor adds an accent color, contrasting light/dark label themes,
+and compact/standard/large visual sizing through the same production preview.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -102,7 +104,8 @@ reject this override and always use the resolved profile configuration.
 
 The overlay opens from 96% scale and 85% opacity over 60 ms, changes selection
 color over 35 ms, and fades out over 50 ms. Gesture recognition and release do
-not wait for those animations. A temporary development override removes visual
+not wait for those animations. Appearance presets change only drawing size;
+gesture thresholds remain consistent. A temporary development override removes visual
 interpolation while preserving the same lifecycle timing:
 
 ```powershell
@@ -151,8 +154,9 @@ arguments, or target titles. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
 First startup opens required onboarding and creates
-`%LOCALAPPDATA%\Gradial\config.json` with schema 3, revision 1, the default M4
-binding, a global eight-slice profile, and an empty action catalog. Onboarding
+`%LOCALAPPDATA%\Gradial\config.json` with schema 4, revision 1, the default M4
+binding, original blue/light/standard appearance, a global eight-slice profile,
+and an empty action catalog. Onboarding
 does not finish until the user acknowledges that the exact activation chord is
 dedicated while Gradial runs, opens the real radial interaction, selects one
 inert sample slice, and cancels once through the center or Escape. Practice
@@ -160,9 +164,9 @@ uses the production hook, controller, geometry, and overlay but cannot compile
 or dispatch a configured action. Successful completion is saved separately in
 `onboarding-v1.json`; the tray's **Restart onboarding** command replays the
 flow without making a previously completed installation incomplete.
-Existing schema-one and schema-two files are migrated to
-schema three in memory without being rewritten; the next explicit successful
-save persists schema three. Configuration
+Existing schema-one, schema-two, and schema-three files are migrated to
+schema four in memory without being rewritten; the next explicit successful
+save persists schema four. Configuration
 replacement is validated and atomic, preserves the previous valid primary as
 `config.json.bak`, and recovers from that backup without overwriting a broken
 primary. Application-profile rules are resolved at every activation. The
@@ -179,6 +183,11 @@ and Shift requirements. Matching is exact. Its one-shot tester consumes the
 next side-button attempt, reports the recognized eight-way flick or centered
 cancel, and never opens the production menu, launches an action, or navigates
 another application. Edits remain a private draft until **Save changes**.
+The **Appearance** tab provides an RGB accent picker, light or dark labels, and
+compact, standard, or large rendering. Dark labels automatically receive a
+light surface and backing for contrast. The live preview updates from the
+draft, while production keeps the saved appearance until the complete draft
+is atomically saved.
 The window can switch between four and eight directions, edit every
 visible label, assign or clear catalog actions, and select directions directly
 in the live radial preview. The **Profiles** tab creates an application profile
@@ -199,17 +208,17 @@ rename or duplicate every action and safely delete unreferenced actions.
 Sequences provide ordered add, remove, move-up, and move-down controls; only
 additions that avoid cycles and stay within nested depth, executed-step, and
 Delay limits are offered. Closing a dirty draft requires **Discard changes**
-or **Keep editing**. **Import settings…** reads schema-one, schema-two, or
-schema-three JSON into the private editor draft, fully validates it, and asks
+or **Keep editing**. **Import settings…** reads schema-one through schema-four
+JSON into the private editor draft, fully validates it, and asks
 before replacing existing unsaved edits. It does not change the running app or
 `config.json` until **Save changes**. **Export current draft…** writes the
-complete valid draft—including unsaved edits—to a self-contained schema-three
+complete valid draft—including unsaved edits—to a self-contained schema-four
 JSON file through an atomic adjacent temporary file. Imported/exported paths,
 arguments, labels, and text stay literal; export does not attempt to make them
 portable. A successful save validates and compiles the complete
 proposed configuration before atomic replacement, advances its revision, and
-reloads new invocations without restarting Gradial. Icons and appearance
-remain future slices.
+reloads new invocations without restarting Gradial. Custom icons remain a
+future slice.
 
 Run all local checks with:
 
@@ -287,3 +296,5 @@ Settings import/export and atomic draft-transfer results are recorded in
 Required onboarding and safe production-interaction practice results are
 recorded in
 [`Documentation/milestone-2-onboarding-results.md`](Documentation/milestone-2-onboarding-results.md).
+Appearance configuration and production-renderer results are recorded in
+[`Documentation/milestone-2-appearance-results.md`](Documentation/milestone-2-appearance-results.md).

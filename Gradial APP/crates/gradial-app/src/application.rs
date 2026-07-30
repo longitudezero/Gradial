@@ -104,6 +104,7 @@ impl GradialApp {
             0,
             monitors,
             animation_mode,
+            configuration.appearance,
             config_revision,
             Arc::clone(&timing_markers),
         );
@@ -182,6 +183,7 @@ impl GradialApp {
             self.pool_generation,
             monitors,
             self.animation_mode,
+            self.configuration.appearance,
             self.config_revision,
             Arc::clone(&self.timing_markers),
         );
@@ -347,7 +349,7 @@ impl GradialApp {
         self.action_plan_compiler = action_plan_compiler;
         self.config_revision = saved.config_revision;
         self.configuration = saved.clone();
-        self.overlay_pool.set_config_revision(saved.config_revision);
+        self.overlay_pool.set_configuration(saved.config_revision, saved.appearance);
         self.action_executor.set_config_revision(saved.config_revision);
         context.request_repaint();
         Ok(saved)
@@ -363,14 +365,20 @@ impl GradialApp {
             target: "settings",
             "component=settings event_code=settings_saved result_code=ok \
              config_revision={} slice_count={} action_count={} activation_button={} \
-             activation_control={} activation_alt={} activation_shift={}",
+             activation_control={} activation_alt={} activation_shift={} \
+             accent_red={} accent_green={} accent_blue={} label_theme={} size_preset={}",
             saved.config_revision,
             saved.global_profile.menu.slice_count,
             saved.actions.len(),
             saved.activation_binding.button.short_label(),
             saved.activation_binding.modifiers.control,
             saved.activation_binding.modifiers.alt,
-            saved.activation_binding.modifiers.shift
+            saved.activation_binding.modifiers.shift,
+            saved.appearance.accent_color.red,
+            saved.appearance.accent_color.green,
+            saved.appearance.accent_color.blue,
+            saved.appearance.label_theme.as_str(),
+            saved.appearance.size_preset.as_str()
         );
         Ok(saved)
     }
@@ -560,6 +568,7 @@ impl GradialApp {
                 self.pool_generation,
                 current_monitors,
                 self.animation_mode,
+                self.configuration.appearance,
                 self.config_revision,
                 Arc::clone(&self.timing_markers),
             );

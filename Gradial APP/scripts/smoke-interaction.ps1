@@ -718,11 +718,11 @@ $log = Get-Content -LiteralPath $logPath -Raw
 $configurationRecord = [regex]::Match(
     $log,
     "event_code=config_loaded .*config_revision=(?<revision>[1-9][0-9]*) " +
-    "schema_version=3 source=(?<source>[a-z_]+) " +
-    "migrated_from_schema=(?<migration>none|1|2) action_count=(?<actions>[0-9]+)"
+    "schema_version=4 source=(?<source>[a-z_]+) " +
+    "migrated_from_schema=(?<migration>none|1|2|3) action_count=(?<actions>[0-9]+)"
 )
 if (-not $configurationRecord.Success) {
-    throw "The live check did not load a validated schema-three configuration."
+    throw "The live check did not load a validated schema-four configuration."
 }
 $activeConfigRevision = $configurationRecord.Groups["revision"].Value
 if (

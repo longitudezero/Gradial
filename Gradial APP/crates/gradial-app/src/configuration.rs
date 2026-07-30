@@ -7,8 +7,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use gradial_core::{
-    ACTION_CONFIG_SCHEMA_VERSION, ActionPlanCompiler, AppPaths, CONFIG_SCHEMA_VERSION,
-    Configuration, LEGACY_CONFIG_SCHEMA_VERSION, ProfileResolver,
+    ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION, ActionPlanCompiler, AppPaths,
+    Appearance, CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION,
+    ProfileResolver,
 };
 use uuid::Uuid;
 use windows::{
@@ -342,7 +343,12 @@ fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFil
     let schema_version = value.get("schema_version").and_then(serde_json::Value::as_u64);
     let migration_from =
         schema_version.and_then(|schema| u32::try_from(schema).ok()).filter(|schema| {
-            matches!(*schema, LEGACY_CONFIG_SCHEMA_VERSION | ACTION_CONFIG_SCHEMA_VERSION)
+            matches!(
+                *schema,
+                LEGACY_CONFIG_SCHEMA_VERSION
+                    | ACTION_CONFIG_SCHEMA_VERSION
+                    | ACTIVATION_CONFIG_SCHEMA_VERSION
+            )
         });
     if let Some(schema_version) = schema_version
         && schema_version != u64::from(CONFIG_SCHEMA_VERSION)
@@ -370,17 +376,32 @@ fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFil
                 from_schema,
                 reason: "the root must be a JSON object",
             })?;
-        if root.contains_key("activation_binding") {
+        if from_schema < ACTIVATION_CONFIG_SCHEMA_VERSION && root.contains_key("activation_binding")
+        {
             return Err(ConfigurationFileError::InvalidMigration {
                 path: path.to_path_buf(),
                 from_schema,
                 reason: "older schemas cannot contain an activation binding",
             });
         }
+        if root.contains_key("appearance") {
+            return Err(ConfigurationFileError::InvalidMigration {
+                path: path.to_path_buf(),
+                from_schema,
+                reason: "older schemas cannot contain appearance settings",
+            });
+        }
+        if from_schema < ACTIVATION_CONFIG_SCHEMA_VERSION {
+            root.insert(
+                "activation_binding".to_owned(),
+                serde_json::to_value(gradial_core::ActivationBinding::default())
+                    .expect("the built-in activation binding is serializable"),
+            );
+        }
         root.insert(
-            "activation_binding".to_owned(),
-            serde_json::to_value(gradial_core::ActivationBinding::default())
-                .expect("the built-in activation binding is serializable"),
+            "appearance".to_owned(),
+            serde_json::to_value(Appearance::default())
+                .expect("the built-in appearance is serializable"),
         );
     }
     let mut configuration: Configuration = serde_json::from_value(value)
@@ -575,8 +596,9 @@ mod tests {
     use std::fs;
 
     use gradial_core::{
-        ACTION_CONFIG_SCHEMA_VERSION, ActionDefinition, ActionKind, ActivationBinding, AppPaths,
-        CONFIG_SCHEMA_VERSION, Configuration, LEGACY_CONFIG_SCHEMA_VERSION,
+        ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION, ActionDefinition,
+        ActionKind, ActivationBinding, AppPaths, Appearance, CONFIG_SCHEMA_VERSION, Configuration,
+        LEGACY_CONFIG_SCHEMA_VERSION,
     };
     use uuid::Uuid;
 
@@ -606,6 +628,7 @@ mod tests {
             serde_json::Value::from(LEGACY_CONFIG_SCHEMA_VERSION),
         );
         root.remove("activation_binding");
+        root.remove("appearance");
         root.remove("actions");
         let slices = root
             .get_mut("global_profile")
@@ -628,11 +651,24 @@ mod tests {
             serde_json::Value::from(ACTION_CONFIG_SCHEMA_VERSION),
         );
         root.remove("activation_binding");
+        root.remove("appearance");
         serde_json::to_vec_pretty(&value).expect("schema-two bytes")
     }
 
+    fn schema_three_bytes() -> Vec<u8> {
+        let mut value =
+            serde_json::to_value(Configuration::default()).expect("configuration value");
+        let root = value.as_object_mut().expect("configuration object");
+        root.insert(
+            "schema_version".to_owned(),
+            serde_json::Value::from(ACTIVATION_CONFIG_SCHEMA_VERSION),
+        );
+        root.remove("appearance");
+        serde_json::to_vec_pretty(&value).expect("schema-three bytes")
+    }
+
     #[test]
-    fn first_load_atomically_initializes_schema_three() {
+    fn first_load_atomically_initializes_schema_four() {
         let (_temporary_directory, paths, store) = store();
         let loaded = store.load_or_initialize().expect("initialize configuration");
 
@@ -760,6 +796,7 @@ mod tests {
         );
         assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(loaded.configuration.activation_binding, ActivationBinding::default());
+        assert_eq!(loaded.configuration.appearance, Appearance::default());
         assert!(loaded.configuration.actions.is_empty());
         assert!(
             loaded
@@ -774,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_gains_the_default_binding_only_in_memory() {
+    fn schema_two_gains_binding_and_appearance_defaults_only_in_memory() {
         let (_temporary_directory, paths, store) = store();
         let schema_two = schema_two_bytes();
         fs::write(&paths.config, &schema_two).expect("schema-two configuration");
@@ -791,7 +828,30 @@ mod tests {
         );
         assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(loaded.configuration.activation_binding, ActivationBinding::default());
+        assert_eq!(loaded.configuration.appearance, Appearance::default());
         assert_eq!(fs::read(&paths.config).expect("schema two retained"), schema_two);
+    }
+
+    #[test]
+    fn schema_three_gains_only_the_default_appearance_in_memory() {
+        let (_temporary_directory, paths, store) = store();
+        let schema_three = schema_three_bytes();
+        fs::write(&paths.config, &schema_three).expect("schema-three configuration");
+
+        let loaded = store.load_or_initialize().expect("migrated configuration");
+
+        assert_eq!(loaded.source, ConfigurationSource::Primary);
+        assert_eq!(
+            loaded.migration,
+            Some(ConfigurationMigration {
+                from_schema: ACTIVATION_CONFIG_SCHEMA_VERSION,
+                to_schema: CONFIG_SCHEMA_VERSION,
+            })
+        );
+        assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(loaded.configuration.activation_binding, ActivationBinding::default());
+        assert_eq!(loaded.configuration.appearance, Appearance::default());
+        assert_eq!(fs::read(&paths.config).expect("schema three retained"), schema_three);
     }
 
     #[test]
@@ -840,6 +900,28 @@ mod tests {
     }
 
     #[test]
+    fn older_schemas_cannot_smuggle_appearance_settings() {
+        let (_temporary_directory, paths, store) = store();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&schema_three_bytes()).expect("schema-three value");
+        value["appearance"] = serde_json::to_value(Appearance::default()).expect("appearance");
+        fs::write(&paths.config, serde_json::to_vec_pretty(&value).expect("schema-three bytes"))
+            .expect("schema-three configuration");
+
+        let loaded = store.load_or_initialize().expect("recovery configuration");
+
+        assert_eq!(loaded.source, ConfigurationSource::InMemoryRecoveryDefault);
+        assert!(loaded.migration.is_none());
+        assert!(
+            loaded
+                .warning
+                .expect("migration warning")
+                .primary_error
+                .contains("older schemas cannot contain appearance settings")
+        );
+    }
+
+    #[test]
     fn import_migrates_privately_resets_revision_and_preserves_literal_paths() {
         let (_temporary_directory, paths, store) = store();
         let current = store.load_or_initialize().expect("current configuration").configuration;
@@ -861,6 +943,7 @@ mod tests {
             serde_json::Value::from(ACTION_CONFIG_SCHEMA_VERSION),
         );
         root.remove("activation_binding");
+        root.remove("appearance");
         let bytes = serde_json::to_vec_pretty(&value).expect("import bytes");
         let source = paths.root.join("private-import.json");
         fs::write(&source, &bytes).expect("import source");

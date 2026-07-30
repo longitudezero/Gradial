@@ -525,6 +525,21 @@ try {
         throw "Import changed its source file instead of retaining literal schema-two data."
     }
 
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x80)) {
+        throw "Could not apply the appearance draft in the settings window."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_appearance_draft_edited .*accent_red=224 .*accent_green=96 .*accent_blue=72 .*label_theme=dark .*size_preset=large" `
+        -Failure "The appearance editor did not retain its color, label, and size draft." |
+        Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-appearance-editor-smoke.png")
+    }
+
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x70)) {
         throw "Could not configure and arm the activation-binding tester."
     }
@@ -709,10 +724,15 @@ try {
     $exportedApplication = $exported.actions |
         Where-Object { $_.id -eq $executableActionId }
     if (
-        $exported.schema_version -ne 3 -or
+        $exported.schema_version -ne 4 -or
         $exported.config_revision -ne 1 -or
         $exported.global_profile.menu.slice_count -ne 4 -or
         @($exported.actions).Count -ne 10 -or
+        $exported.appearance.accent_color.red -ne 224 -or
+        $exported.appearance.accent_color.green -ne 96 -or
+        $exported.appearance.accent_color.blue -ne 72 -or
+        $exported.appearance.label_theme -ne "dark" -or
+        $exported.appearance.size_preset -ne "large" -or
         $exported.activation_binding.button -ne "m5" -or
         $exported.activation_binding.modifiers.control -ne $true -or
         -not $exportedApplication -or
@@ -771,8 +791,12 @@ try {
     }
     Wait-LogPattern `
         -Path $logPath `
-        -Pattern "event_code=settings_saved .*config_revision=2 .*slice_count=4" `
+        -Pattern "event_code=settings_saved .*config_revision=2 .*slice_count=4 .*accent_red=224 .*accent_green=96 .*accent_blue=72 .*label_theme=dark .*size_preset=large" `
         -Failure "The settings draft did not save atomically." | Out-Null
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=renderer_appearance_updated .*config_revision=2 .*accent_red=224 .*accent_green=96 .*accent_blue=72 .*label_theme=dark .*size_preset=large" `
+        -Failure "The production renderer did not accept the saved appearance." | Out-Null
     Wait-LogPattern `
         -Path $logPath `
         -Pattern "event_code=overlay_pool_ready .*config_revision=2" `
@@ -780,7 +804,7 @@ try {
 
     $saved = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     if (
-        $saved.schema_version -ne 3 -or
+        $saved.schema_version -ne 4 -or
         $saved.config_revision -ne 2 -or
         $saved.global_profile.menu.slice_count -ne 4
     ) {
@@ -793,6 +817,15 @@ try {
         $saved.activation_binding.modifiers.shift -ne $false
     ) {
         throw "The exact Ctrl plus M5 activation binding was not saved."
+    }
+    if (
+        $saved.appearance.accent_color.red -ne 224 -or
+        $saved.appearance.accent_color.green -ne 96 -or
+        $saved.appearance.accent_color.blue -ne 72 -or
+        $saved.appearance.label_theme -ne "dark" -or
+        $saved.appearance.size_preset -ne "large"
+    ) {
+        throw "The saved appearance does not match the editor draft."
     }
     $expectedEditedLabels = @(
         "North edited",
@@ -997,8 +1030,8 @@ try {
 
     Write-Host (
         "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
-        "private import, draft export, advanced profiles, all action editors, " +
-        "schema-three save, and live reload."
+        "private import, appearance preview, draft export, advanced profiles, all action " +
+        "editors, schema-four save, and live reload."
     )
 }
 catch {

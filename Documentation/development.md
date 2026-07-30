@@ -37,8 +37,9 @@ slices, and the current bounded Milestone 2 slices establish:
   Explorer restart.
 - Persistent per-monitor geometry caches and bounded 60/35/50 ms
   open/selection/close animation state.
-- A validated schema-three configuration with safe in-memory schema-one and
-  schema-two migration plus atomic primary/backup replacement.
+- A validated schema-four configuration with safe in-memory schema-one,
+  schema-two, and schema-three migration plus atomic primary/backup
+  replacement.
 - Complete immutable target/display/modifier identity for every invocation.
 - A compiled, deterministic application-profile resolver with explanation
   data.
@@ -93,11 +94,13 @@ slices, and the current bounded Milestone 2 slices establish:
 - Required, versioned first-run onboarding that chooses the exact activation
   chord, requires the dedicated-button acknowledgment, and practices selection
   and cancellation through an action-free production interaction.
+- Draft-safe accent, label-theme, and size-preset appearance editing through
+  the production renderer, with immediate post-save application.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
 profiles with their independent menus and complete matching rules. Required
-onboarding is complete; appearance and icons are not exposed yet. A release logs the
+onboarding and v1 appearance are complete; custom icons are not exposed yet. A release logs the
 chosen slice, compiles its assigned plan, and submits it to the coordinator.
 Every schema-two action family can execute through its bounded backend.
 
@@ -150,8 +153,9 @@ On first run, Gradial creates:
     logs\
 ```
 
-`config.json` starts at schema 3 and revision 1 with the default unmodified M4
-binding, stable global profile, eight-slice menu, and empty action catalog.
+`config.json` starts at schema 4 and revision 1 with the default unmodified M4
+binding, original blue/light/standard appearance, stable global profile,
+eight-slice menu, and empty action catalog.
 Each menu slice has an optional action UUID. A successful later replacement
 preserves the previous valid primary as `config.json.bak`; `config.json.tmp`
 exists only during a save.
@@ -163,9 +167,10 @@ the flow again. `onboarding-v1.json.tmp` is used only while atomically writing
 successful completion.
 
 Existing schema-one files are accepted only when they contain no schema-two
-action fields. Gradial adds the action and binding defaults in memory.
-Schema-two files gain only the default binding in memory. Both paths validate
-the complete schema-three model and leave the original bytes untouched.
+action fields. Gradial adds the action, binding, and appearance defaults in
+memory. Schema-two files gain binding and appearance; schema-three files gain
+only appearance. All paths validate the complete schema-four model and leave
+the original bytes untouched.
 Migration is persisted only through a later explicit, successful save. This
 prevents startup from silently rewriting either a valid legacy file or a file
 containing ambiguous fields.
@@ -177,7 +182,7 @@ running configuration, and persistent primary remain untouched. A dirty editor
 requires an explicit **Import file** choice before its proposed draft is
 replaced.
 
-Settings export validates the current proposed draft, serializes schema-three
+Settings export validates the current proposed draft, serializes schema-four
 JSON beside a uniquely named temporary file in the selected directory, flushes
 it, and atomically moves it over the selected destination. It may include
 unsaved edits but never changes the active revision. Gradial's three active
@@ -377,6 +382,25 @@ eight flick directions. It does not enter the interaction controller or action
 executor, and it never logs target-window data. Leaving the tab, discarding,
 saving, or closing disarms the tester; a release already paired with a
 consumed down remains suppressed.
+
+The **Appearance** tab edits one global schema-four value shared by Global and
+all application profiles. The accent is stored as three bounded RGB bytes.
+Label theme is a closed light/dark choice, and size is a closed
+compact/standard/large choice. The original `(124, 154, 255)` accent, light
+labels, and standard size are the default and schema-one-through-three
+migration values.
+
+Compact, standard, and large multiply only renderer coordinates and font sizes
+by `0.85`, `1.0`, and `1.15`. Input center/entry radii, hysteresis, direction
+boundaries, edge assist, and the fixed overlay window remain unchanged. Dark
+labels select a contrasting light ring and a bounded light backing behind each
+label so long text remains readable over arbitrary foreground content.
+
+The appearance preview passes the draft value to
+`FoundationOverlayRenderer`; the Menu and Profiles previews use the same draft
+appearance. Discard restores the saved value. Save atomically persists the
+complete configuration, updates the existing prewarmed pool's appearance, and
+restarts input against the new revision without rebuilding geometry caches.
 
 The **Menu** tab can switch between four and eight clockwise directions, edit
 each label, and assign or clear any action in the validated catalog.
@@ -717,6 +741,12 @@ cache pair for each replacement child. Selection animation uses fixed-size
 eight-entry state and can retarget from its current color without rebuilding
 geometry.
 
+Appearance remains a small copied render-frame value. Accent colors replace
+only the foundation outline, divider, and selection colors. The label theme
+chooses a complete contrast palette, and the size preset multiplies cached
+coordinates at paint time. None of these choices invalidates the prewarmed
+four/eight cache pair or enters the interaction thread's gesture calculations.
+
 `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, and `WM_SETTINGCHANGE` for the work area
 invalidate the pool. Monitoring is deliberately disabled while windows are
 being placed, because initial PMv2 placement can itself emit DPI messages. A
@@ -933,7 +963,9 @@ a schema-two fixture into the private draft, and confirms that neither the
 source nor active `config.json` changes. It edits the activation draft to exact
 Ctrl+M5, arms the safe tester, submits a
 native hold/east-flick/release gesture, and requires that no production action
-run during the test. It creates and
+run during the test. It also edits the appearance draft to RGB `(224, 96, 72)`,
+dark labels, and large size, and optionally captures the real production
+preview with its contrast backings. It creates and
 persists every leaf-action type plus a base and nested sequence, exercises
 duplication, unreferenced deletion, sequence addition/removal/reordering, and
 records an exact left-Ctrl+F14 combination through native key messages. It
@@ -949,14 +981,15 @@ harness opens the real native application chooser, observes its window, and
 cancels it without changing the draft. It then selects the nested sequence and
 observes four expanded steps, depth two, and 275 ms total Delay before
 converting the Global draft to four slices. It exports that complete unsaved
-draft, verifies schema three at the unchanged revision with literal executable
-path, working folder, and argument rows, and again confirms that the active
-configuration is untouched. After the guarded close it requires
+draft, verifies schema four at the unchanged revision with the exact
+appearance, literal executable path, working folder, and argument rows, and
+again confirms that the active configuration is untouched. After the guarded close it requires
 revision 2 on disk with the exact complete profile rule, priority, independent
-menu, action payloads, ordered sequence UUIDs, and Ctrl+M5 schema-three binding;
+menu, action payloads, ordered sequence UUIDs, Ctrl+M5 binding, and appearance;
 the old profile-free schema-two revision remains in `config.json.bak`. It then
-requires a fresh Ctrl+M5 invocation to freeze the saved binding and use the
-reloaded Global menu. Optional screenshots cover activation, the menu,
+requires the renderer appearance update and a fresh Ctrl+M5 invocation to
+freeze the saved binding and use the reloaded Global menu. Optional screenshots
+cover appearance, activation, the menu,
 advanced profile tester, payload, sequence, shortcut-recorder, Windows chooser,
 JSON import/export choosers, and confirmation surfaces. The fixture never reads or writes the user's
 Gradial configuration.

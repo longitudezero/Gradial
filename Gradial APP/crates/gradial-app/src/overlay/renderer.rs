@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Stroke, Vec2, epaint::CircleShape};
-use gradial_core::{ActivationBindingId, ResolvedMenu, SliceCount};
+use gradial_core::{
+    AccentColor, ActivationBindingId, Appearance, LabelTheme, ResolvedMenu, SliceCount,
+};
 use uuid::Uuid;
 
 use super::animation::{AnimationMode, selection_progress};
@@ -21,6 +23,7 @@ pub(crate) struct OverlayRenderFrame {
     pub(crate) invocation_id: Option<Uuid>,
     pub(crate) menu: Option<Arc<ResolvedMenu>>,
     pub(crate) activation_button: ActivationBindingId,
+    pub(crate) appearance: Appearance,
     pub(crate) selected_slice: Option<usize>,
     pub(crate) selection_changed_at: Option<Instant>,
     pub(crate) opacity: f32,
@@ -84,48 +87,40 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         let center = ui.max_rect().center();
         let painter = ui.painter();
         let opacity = frame.opacity.clamp(0.0, 1.0);
-        let scale = frame.scale.clamp(0.0, 1.0);
+        let scale = frame.scale.clamp(0.0, 1.0) * frame.appearance.size_preset.visual_scale();
+        let theme = theme_colors(frame.appearance.label_theme);
+        let accent = frame.appearance.accent_color;
 
         painter.add(CircleShape {
             center,
             radius: RING_RADIUS_DIP * scale,
             fill: Color32::TRANSPARENT,
-            stroke: Stroke::new(
-                RING_WIDTH_DIP * scale,
-                faded(Color32::from_rgba_unmultiplied(18, 23, 35, 224), opacity),
-            ),
+            stroke: Stroke::new(RING_WIDTH_DIP * scale, faded(theme.ring, opacity)),
         });
 
-        draw_selected_slices(painter, center, geometry, selection_levels, opacity, scale);
+        draw_selected_slices(painter, center, geometry, selection_levels, opacity, scale, accent);
 
         painter.circle_stroke(
             center,
             OUTER_RADIUS_DIP * scale,
-            Stroke::new(
-                1.5 * scale,
-                faded(Color32::from_rgba_unmultiplied(124, 154, 255, 210), opacity),
-            ),
+            Stroke::new(1.5 * scale, faded(accent_color(accent, 210), opacity)),
         );
         painter.circle_stroke(
             center,
             INNER_RADIUS_DIP * scale,
-            Stroke::new(scale, faded(Color32::from_rgba_unmultiplied(124, 154, 255, 125), opacity)),
+            Stroke::new(scale, faded(accent_color(accent, 125), opacity)),
         );
 
-        draw_slice_boundaries(painter, center, geometry, opacity, scale);
-        draw_slice_labels(painter, center, geometry, menu.labels(), opacity, scale);
+        draw_slice_boundaries(painter, center, geometry, opacity, scale, accent);
+        draw_slice_labels(painter, center, geometry, menu.labels(), opacity, scale, theme);
 
-        painter.circle_filled(
-            center,
-            28.0 * scale,
-            faded(Color32::from_rgba_unmultiplied(8, 12, 20, 235), opacity),
-        );
+        painter.circle_filled(center, 28.0 * scale, faded(theme.center, opacity));
         painter.text(
             center,
             Align2::CENTER_CENTER,
             frame.activation_button.short_label(),
             FontId::proportional(11.0 * scale),
-            faded(Color32::from_rgba_unmultiplied(225, 232, 255, 245), opacity),
+            faded(theme.center_label, opacity),
         );
 
         selection_animating
@@ -284,6 +279,7 @@ fn draw_selected_slices(
     levels: [f32; MAX_SLICE_COUNT],
     opacity: f32,
     scale: f32,
+    accent: AccentColor,
 ) {
     for (index, segments) in geometry.selected_arcs.iter().enumerate() {
         let intensity = levels[index];
@@ -292,7 +288,7 @@ fn draw_selected_slices(
         }
         let stroke = Stroke::new(
             (RING_WIDTH_DIP - 5.0) * scale,
-            faded(Color32::from_rgba_unmultiplied(91, 135, 255, 242), opacity * intensity),
+            faded(selected_accent_color(accent, 242), opacity * intensity),
         );
         for segment in segments {
             painter
@@ -307,9 +303,9 @@ fn draw_slice_boundaries(
     geometry: &RendererGeometryCache,
     opacity: f32,
     scale: f32,
+    accent: AccentColor,
 ) {
-    let stroke =
-        Stroke::new(scale, faded(Color32::from_rgba_unmultiplied(124, 154, 255, 88), opacity));
+    let stroke = Stroke::new(scale, faded(accent_color(accent, 88), opacity));
     for segment in &geometry.boundaries {
         painter.line_segment([center + segment[0] * scale, center + segment[1] * scale], stroke);
     }
@@ -322,11 +318,26 @@ fn draw_slice_labels(
     labels: &[String],
     opacity: f32,
     scale: f32,
+    theme: ThemeColors,
 ) {
-    let color = faded(Color32::from_rgba_unmultiplied(225, 232, 255, 230), opacity);
+    let color = faded(theme.label, opacity);
     for (offset, label) in menu_label_layout(geometry, labels) {
+        let label_center = center + offset * scale;
+        if let Some(background) = theme.label_background {
+            let font = FontId::monospace(12.0 * scale);
+            let galley = painter.layout_no_wrap(label.to_owned(), font, color);
+            let label_rect = egui::Rect::from_center_size(label_center, galley.size())
+                .expand2(Vec2::new(5.0, 2.5) * scale);
+            painter.rect_filled(
+                label_rect,
+                egui::CornerRadius::same(4),
+                faded(background, opacity),
+            );
+            painter.galley(label_rect.center() - galley.size() / 2.0, galley, color);
+            continue;
+        }
         painter.text(
-            center + offset * scale,
+            label_center,
             Align2::CENTER_CENTER,
             label,
             FontId::monospace(12.0 * scale),
@@ -346,6 +357,47 @@ fn faded(color: Color32, opacity: f32) -> Color32 {
     color.gamma_multiply(opacity.clamp(0.0, 1.0))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThemeColors {
+    ring: Color32,
+    center: Color32,
+    label: Color32,
+    center_label: Color32,
+    label_background: Option<Color32>,
+}
+
+fn theme_colors(theme: LabelTheme) -> ThemeColors {
+    match theme {
+        LabelTheme::Light => ThemeColors {
+            ring: Color32::from_rgba_unmultiplied(18, 23, 35, 224),
+            center: Color32::from_rgba_unmultiplied(8, 12, 20, 235),
+            label: Color32::from_rgba_unmultiplied(225, 232, 255, 230),
+            center_label: Color32::from_rgba_unmultiplied(225, 232, 255, 245),
+            label_background: None,
+        },
+        LabelTheme::Dark => ThemeColors {
+            ring: Color32::from_rgba_unmultiplied(232, 236, 245, 232),
+            center: Color32::from_rgba_unmultiplied(246, 248, 252, 242),
+            label: Color32::from_rgba_unmultiplied(24, 31, 44, 238),
+            center_label: Color32::from_rgba_unmultiplied(24, 31, 44, 248),
+            label_background: Some(Color32::from_rgba_unmultiplied(250, 251, 253, 232)),
+        },
+    }
+}
+
+fn accent_color(accent: AccentColor, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(accent.red, accent.green, accent.blue, alpha)
+}
+
+fn selected_accent_color(accent: AccentColor, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        accent.red.saturating_sub(33),
+        accent.green.saturating_sub(19),
+        accent.blue,
+        alpha,
+    )
+}
+
 const fn half_slice_angle(slice_count: SliceCount) -> f32 {
     match slice_count {
         SliceCount::Four => std::f32::consts::FRAC_PI_4,
@@ -359,10 +411,11 @@ mod tests {
 
     use std::sync::Arc;
 
-    use gradial_core::{ResolvedMenu, SliceCount};
+    use gradial_core::{AccentColor, Appearance, LabelTheme, ResolvedMenu, SizePreset, SliceCount};
 
     use super::{
         FoundationOverlayRenderer, SelectionTransition, half_slice_angle, menu_label_layout,
+        selected_accent_color, theme_colors,
     };
     use crate::overlay::AnimationMode;
 
@@ -411,6 +464,36 @@ mod tests {
                 .collect();
 
         assert_eq!(labels, ["Build", "Search", "Tests", "Terminal"]);
+    }
+
+    #[test]
+    fn default_appearance_preserves_foundation_colors_and_scale() {
+        let appearance = Appearance::default();
+        let theme = theme_colors(appearance.label_theme);
+
+        assert_eq!(appearance.size_preset, SizePreset::Standard);
+        assert_close(appearance.size_preset.visual_scale(), 1.0);
+        assert_eq!(theme.ring, eframe::egui::Color32::from_rgba_unmultiplied(18, 23, 35, 224));
+        assert_eq!(theme.label, eframe::egui::Color32::from_rgba_unmultiplied(225, 232, 255, 230));
+        assert_eq!(
+            selected_accent_color(appearance.accent_color, 242),
+            eframe::egui::Color32::from_rgba_unmultiplied(91, 135, 255, 242)
+        );
+    }
+
+    #[test]
+    fn dark_labels_select_the_contrasting_light_surface() {
+        let light = theme_colors(LabelTheme::Light);
+        let dark = theme_colors(LabelTheme::Dark);
+
+        assert!(u16::from(dark.ring.r()) > u16::from(light.ring.r()) + 150);
+        assert!(dark.label.r() < light.label.r());
+        assert!(light.label_background.is_none());
+        assert!(dark.label_background.is_some());
+        assert_eq!(
+            selected_accent_color(AccentColor { red: 20, green: 10, blue: 5 }, 242),
+            eframe::egui::Color32::from_rgba_unmultiplied(0, 0, 5, 242)
+        );
     }
 
     #[test]

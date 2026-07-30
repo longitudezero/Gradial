@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
-use gradial_core::{InvocationSnapshot, MonitorGeometry, ResolvedMenu, ScreenPoint};
+use gradial_core::{Appearance, InvocationSnapshot, MonitorGeometry, ResolvedMenu, ScreenPoint};
 use uuid::Uuid;
 
 use crate::{
@@ -82,6 +82,7 @@ pub(crate) struct OverlayPool {
     monitors: Vec<MonitorGeometry>,
     slots: Vec<OverlaySlot>,
     animation_mode: AnimationMode,
+    appearance: Appearance,
     config_revision: u64,
     timing_markers: Arc<TimingMarkers>,
     close_coordinator: CloseCoordinator,
@@ -92,6 +93,7 @@ impl OverlayPool {
         generation: u64,
         monitors: Vec<MonitorGeometry>,
         animation_mode: AnimationMode,
+        appearance: Appearance,
         config_revision: u64,
         timing_markers: Arc<TimingMarkers>,
     ) -> Self {
@@ -114,20 +116,46 @@ impl OverlayPool {
             "component=renderer event_code=renderer_geometry_cache_ready result_code=ok \
              config_revision={config_revision} generation={generation} monitor_count={} \
              slice_counts=4,8 \
-             reduced_motion={} open_ms=60 selection_ms=35 close_ms=50",
+             reduced_motion={} accent_red={} accent_green={} accent_blue={} \
+             label_theme={} size_preset={} open_ms=60 selection_ms=35 close_ms=50",
             slots.len(),
-            animation_mode.is_reduced()
+            animation_mode.is_reduced(),
+            appearance.accent_color.red,
+            appearance.accent_color.green,
+            appearance.accent_color.blue,
+            appearance.label_theme.as_str(),
+            appearance.size_preset.as_str()
         );
 
-        Self { monitors, slots, animation_mode, config_revision, timing_markers, close_coordinator }
+        Self {
+            monitors,
+            slots,
+            animation_mode,
+            appearance,
+            config_revision,
+            timing_markers,
+            close_coordinator,
+        }
     }
 
     pub(crate) fn monitors(&self) -> &[MonitorGeometry] {
         &self.monitors
     }
 
-    pub(crate) fn set_config_revision(&mut self, config_revision: u64) {
+    pub(crate) fn set_configuration(&mut self, config_revision: u64, appearance: Appearance) {
         self.config_revision = config_revision;
+        self.appearance = appearance;
+        log::info!(
+            target: "renderer",
+            "component=renderer event_code=renderer_appearance_updated result_code=ok \
+             config_revision={config_revision} accent_red={} accent_green={} accent_blue={} \
+             label_theme={} size_preset={}",
+            appearance.accent_color.red,
+            appearance.accent_color.green,
+            appearance.accent_color.blue,
+            appearance.label_theme.as_str(),
+            appearance.size_preset.as_str()
+        );
     }
 
     pub(crate) fn show(&self, context: &Context) {
@@ -139,6 +167,7 @@ impl OverlayPool {
             let renderer = Arc::clone(&slot.renderer);
             let timing_markers = Arc::clone(&self.timing_markers);
             let animation_mode = self.animation_mode;
+            let appearance = self.appearance;
             let config_revision = self.config_revision;
             let builder = viewport_builder(&title);
 
@@ -167,6 +196,7 @@ impl OverlayPool {
                     viewport_id,
                     &state,
                     animation_mode,
+                    appearance,
                     &timing_markers,
                 );
                 if let Some(repaint_after) = prepared.repaint_after {
@@ -564,6 +594,7 @@ fn prepare_overlay_frame(
     viewport_id: ViewportId,
     state: &Mutex<OverlayViewportState>,
     animation_mode: AnimationMode,
+    appearance: Appearance,
     timing_markers: &TimingMarkers,
 ) -> PreparedOverlayFrame {
     let now = Instant::now();
@@ -618,6 +649,7 @@ fn prepare_overlay_frame(
                 .map_or(gradial_core::ActivationBindingId::default(), |snapshot| {
                     snapshot.context.activation_binding
                 }),
+            appearance,
             selected_slice: state.selected_slice,
             selection_changed_at: state.selection_changed_at,
             opacity: presence.opacity,

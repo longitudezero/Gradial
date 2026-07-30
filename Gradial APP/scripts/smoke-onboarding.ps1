@@ -282,7 +282,7 @@ try {
             }
     )
     $configuration = [ordered]@{
-        schema_version = 3
+        schema_version = 4
         config_revision = 1
         activation_binding = [ordered]@{
             button = "m4"
@@ -291,6 +291,15 @@ try {
                 alt = $false
                 shift = $false
             }
+        }
+        appearance = [ordered]@{
+            accent_color = [ordered]@{
+                red = 124
+                green = 154
+                blue = 255
+            }
+            label_theme = "light"
+            size_preset = "standard"
         }
         global_profile = [ordered]@{
             id = $profileId
