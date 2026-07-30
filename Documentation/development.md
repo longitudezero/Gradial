@@ -77,15 +77,19 @@ slices, and the current bounded Milestone 2 slices establish:
 - An ordered reusable-sequence editor with nested-sequence support,
   validator-backed candidate filtering, and live depth, expanded-step, and
   Delay metrics.
+- An application-profile catalog with exact executable selection, explicit
+  priority, complete-menu duplication, lifecycle controls, and independent
+  four/eight-slice editing through the production preview.
 - Draft-safe close confirmation, complete pre-save validation, atomic
   replacement, and immediate live configuration reload.
 
 Configuration editing currently covers the global menu and the complete action
-catalog, including sequences. Application-profile rules, activation binding,
-appearance, icons, import/export, and onboarding are not exposed yet. A release
-logs the chosen slice, compiles its assigned plan, and submits it to the
-coordinator. Every schema-two action family can execute through its bounded
-backend.
+catalog, including sequences, plus exact-executable application profiles and
+their independent menus. Optional window-class/title rules and the
+current-window tester, activation binding, appearance, icons, import/export,
+and onboarding are not exposed yet. A release logs the chosen slice, compiles
+its assigned plan, and submits it to the coordinator. Every schema-two action
+family can execute through its bounded backend.
 
 ## Workspace layout
 
@@ -294,6 +298,30 @@ The clickable live preview uses `FoundationOverlayRenderer` and
 `ResolvedMenu`, so it shares production geometry, label placement, slice
 ordering, and selection rendering. It does not contain a second gesture or
 layout implementation.
+
+The **Profiles** tab lists application-specific profiles separately from the
+Global fallback. **New profile** opens the native application chooser and adds
+nothing when that chooser is cancelled. A selected `.exe` receives a new UUID,
+a readable unique name derived from the filename, priority 50, an exact-path
+rule, and an independent copy of the current Global menu. The executable can
+later be replaced through the same chooser. Priority is constrained to 0
+through 100.
+
+**Duplicate selected** copies the complete profile rule and menu under a new
+UUID and unique name. **Delete selected** removes only that private draft
+profile; normal discard and guarded-close behavior can still recover the
+saved configuration. Existing optional window-class and title-regex predicates
+are preserved by edits and duplication, with a visible boundary notice, but
+their controls remain deferred to the advanced matching slice.
+
+Each application profile can independently switch between four and eight
+directions, edit labels, assign or clear any catalog action, and select a slice
+in its own production-renderer preview. A per-profile diagonal stash preserves
+eight-slice edits while that profile temporarily uses four slices. Creating,
+resizing, duplicating, or deleting a profile never mutates the Global menu or
+another profile. Empty profile names, required paths, out-of-range priorities,
+empty profile-menu labels, and invalid preserved advanced predicates receive
+field-specific save messages.
 
 The **Actions** tab lists the complete catalog. Its **New action** menu creates
 every leaf type: keyboard shortcut, Unicode text, website, file/folder,
@@ -787,18 +815,22 @@ appears in the local log. The isolated configuration is always removed.
 eight-slice configuration and opens its real settings viewport. It creates and
 persists every leaf-action type plus a base and nested sequence, exercises
 duplication, unreferenced deletion, sequence addition/removal/reordering, and
-records an exact left-Ctrl+F14 combination through native key messages. The
+records an exact left-Ctrl+F14 combination through native key messages. It
+also creates, duplicates, and deletes application profiles, round-trips one
+profile through four/eight geometry, and retains an eight-slice menu with its
+own nested-sequence assignment while Global later becomes four slices. The
 application fixture includes three exact argument rows—one containing spaces
 and one empty—plus a working folder. The harness opens the real native
 application chooser, observes its window, and cancels it without changing the
 draft. It then selects the nested sequence and observes four expanded steps,
-depth two, and 275 ms total Delay before converting the draft to four slices.
-After the guarded close it requires revision 2 on disk with all exact action
-payloads and ordered sequence UUIDs, the old eight-slice revision in
-`config.json.bak`, preserved cardinal assignments, and a fresh M4 action using
-the reloaded four-slice menu. Optional screenshots cover the menu, payload and
-sequence editors, shortcut recorder, Windows chooser, and confirmation. The
-fixture never reads or writes the user's Gradial configuration.
+depth two, and 275 ms total Delay before converting the Global draft to four
+slices. After the guarded close it requires revision 2 on disk with the exact
+profile path, priority, independent menu, action payloads, and ordered sequence
+UUIDs, the old profile-free eight-slice revision in `config.json.bak`,
+preserved cardinal assignments, and a fresh M4 action using the reloaded
+Global menu. Optional screenshots cover the menu, profile, payload, sequence,
+shortcut-recorder, Windows-chooser, and confirmation surfaces. The fixture
+never reads or writes the user's Gradial configuration.
 
 For matrix validation, first build the selected configuration, then run one of
 the versioned suites:

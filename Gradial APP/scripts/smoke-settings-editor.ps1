@@ -305,6 +305,7 @@ $delayActionId = "67726164-6961-4c00-8000-000000000908"
 $windowActionId = "67726164-6961-4c00-8000-000000000909"
 $sequenceActionId = "67726164-6961-4c00-8000-000000000910"
 $nestedSequenceActionId = "67726164-6961-4c00-8000-000000000911"
+$applicationProfileId = "67726164-6961-4c00-8000-000000000920"
 $profileId = "67726164-6961-4c00-8000-000000000001"
 $labels = @("North old", "NE old", "East old", "SE old", "South old", "SW old", "West old", "NW old")
 $gradial = $null
@@ -400,6 +401,25 @@ try {
         -Pattern "event_code=settings_debug_action_draft_edited .*action_count=10" `
         -Failure "The action catalog did not accept all isolated leaf-action payloads." |
         Out-Null
+
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x73)) {
+        throw "Could not send the profile edit command to the settings window."
+    }
+    Wait-LogPattern `
+        -Path $logPath `
+        -Pattern "event_code=settings_debug_profile_draft_edited .*profile_count=1 .*profile_id=$applicationProfileId .*priority=72 .*slice_count=8" `
+        -Failure "The application-profile editor did not preserve its isolated profile." |
+        Out-Null
+    if ($CaptureScreenshot) {
+        Start-Sleep -Milliseconds 200
+        Save-WindowScreenshot `
+            -Window $settingsWindow `
+            -Path (Join-Path $workspace "captures\settings-profile-editor-smoke.png")
+    }
+    if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x78)) {
+        throw "Could not return to the action editor after the profile check."
+    }
+    Start-Sleep -Milliseconds 150
 
     if (-not [GradialSettingsSmokeNative]::SendKey($settingsWindow, [uint32]0x79)) {
         throw "Could not start shortcut recording in the settings window."
@@ -655,6 +675,25 @@ try {
     ) {
         throw "The reordered nested sequence was not saved exactly."
     }
+    if (@($saved.application_profiles).Count -ne 1) {
+        throw "The settings save did not preserve exactly one application profile."
+    }
+    $applicationProfile = $saved.application_profiles[0]
+    if (
+        $applicationProfile.profile.id -ne $applicationProfileId -or
+        $applicationProfile.profile.name -ne "Editor Notepad" -or
+        $applicationProfile.rule.executable_path -ne "C:\Windows\System32\notepad.exe" -or
+        $applicationProfile.rule.priority -ne 72 -or
+        $null -ne $applicationProfile.rule.window_class -or
+        $null -ne $applicationProfile.rule.title_regex -or
+        $applicationProfile.profile.menu.slice_count -ne 8 -or
+        @($applicationProfile.profile.menu.slices).Count -ne 8 -or
+        $applicationProfile.profile.menu.slices[1].label -ne "NE old" -or
+        $applicationProfile.profile.menu.slices[2].label -ne "Profile east" -or
+        $applicationProfile.profile.menu.slices[2].action_id -ne $nestedSequenceActionId
+    ) {
+        throw "The independent application profile, exact rule, priority, or menu was not saved exactly."
+    }
     $backup = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
     if (
         $backup.config_revision -ne 1 -or
@@ -700,8 +739,8 @@ try {
         -Failure "The preserved cardinal action did not execute from the reloaded menu." | Out-Null
 
     Write-Host (
-        "Settings editor smoke check passed: all action editors, nested sequence ordering, " +
-        "cycle-safe metrics, guarded dirty close, atomic revision 2 save, and live reload."
+        "Settings editor smoke check passed: application-profile lifecycle and independent menu, " +
+        "all action editors, guarded dirty close, atomic revision 2 save, and live reload."
     )
 }
 catch {

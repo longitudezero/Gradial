@@ -39,7 +39,10 @@ saves, and immediate runtime reload. The action-catalog editor now creates and
 edits every leaf action, supports rename and duplication across every action
 type, opens native Windows path choosers, and prevents deletion while an action
 is still referenced. Reusable sequences can now be created and edited as
-ordered, safely nested action lists with live expansion limits.
+ordered, safely nested action lists with live expansion limits. The application
+profile editor creates, duplicates, and deletes exact-executable profiles,
+sets deterministic priority, and gives each profile an independent
+four/eight-direction menu.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -155,19 +158,24 @@ restore for the invocation window.
 Choose **Open settings** from the notification-area menu to edit the global
 menu. The window can switch between four and eight directions, edit every
 visible label, assign or clear catalog actions, and select directions directly
-in the live radial preview. The **Actions** tab creates and edits keyboard
-shortcuts, Unicode text, websites, files/folders, applications, Delay, and
-invocation-window commands. Application arguments are separate literal rows,
-and native Windows choosers select files, folders, applications, and working
-folders. The catalog can rename or duplicate every action and safely delete
-unreferenced actions. Sequences provide ordered add, remove, move-up, and
-move-down controls; only additions that avoid cycles and stay within nested
-depth, executed-step, and Delay limits are offered. Closing a dirty draft
-requires **Discard changes** or **Keep editing**. A successful save validates
-and compiles the complete proposed configuration before atomic replacement,
-advances its revision, and reloads new M4 invocations without restarting
-Gradial. Application profiles, activation binding, import/export, icons, and
-onboarding remain future slices.
+in the live radial preview. The **Profiles** tab creates an application profile
+by choosing an `.exe`, copies the current Global menu as an independent
+starting point, and supports rename, priority, duplication, deletion, complete
+four/eight-direction editing, action assignment, and a production preview.
+Existing window-class or title rules are preserved but are not editable yet.
+The **Actions** tab creates and edits keyboard shortcuts, Unicode text,
+websites, files/folders, applications, Delay, and invocation-window commands.
+Application arguments are separate literal rows, and native Windows choosers
+select files, folders, applications, and working folders. The catalog can
+rename or duplicate every action and safely delete unreferenced actions.
+Sequences provide ordered add, remove, move-up, and move-down controls; only
+additions that avoid cycles and stay within nested depth, executed-step, and
+Delay limits are offered. Closing a dirty draft requires **Discard changes**
+or **Keep editing**. A successful save validates and compiles the complete
+proposed configuration before atomic replacement, advances its revision, and
+reloads new M4 invocations without restarting Gradial. Advanced profile
+predicates and the current-window tester, activation binding, import/export,
+icons, and onboarding remain future slices.
 
 Run all local checks with:
 
@@ -233,3 +241,5 @@ Remaining leaf-action editor and native-picker results are recorded in
 [`Documentation/milestone-2-leaf-action-editor-results.md`](Documentation/milestone-2-leaf-action-editor-results.md).
 Reusable-sequence editor results are recorded in
 [`Documentation/milestone-2-sequence-editor-results.md`](Documentation/milestone-2-sequence-editor-results.md).
+Application-profile editor results are recorded in
+[`Documentation/milestone-2-application-profile-editor-results.md`](Documentation/milestone-2-application-profile-editor-results.md).

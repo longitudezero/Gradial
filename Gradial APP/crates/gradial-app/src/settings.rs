@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
@@ -11,10 +12,11 @@ use eframe::egui::{
 #[cfg(debug_assertions)]
 use gradial_core::ShortcutModifier;
 use gradial_core::{
-    ActionDefinition, ActionKind, ActionPlanCompiler, Configuration, ConfigurationError,
-    ExecutionOperation, MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS,
-    MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu, MenuSlice, ProfileResolver,
-    ResolvedMenu, ShortcutKey, SliceCount, WindowCommand,
+    ActionDefinition, ActionKind, ActionPlanCompiler, ApplicationProfile, Configuration,
+    ConfigurationError, ExecutionOperation, MAX_ACTION_SEQUENCE_DEPTH,
+    MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu,
+    MenuSlice, Profile, ProfileResolver, ProfileRule, ResolvedMenu, ShortcutKey, SliceCount,
+    WindowCommand,
 };
 use uuid::Uuid;
 
@@ -24,8 +26,8 @@ use crate::{
     shortcut_recorder::{CaptureOutcome, ShortcutRecorder, shortcut_display},
 };
 
-const SETTINGS_SIZE: [f32; 2] = [820.0, 620.0];
-const SETTINGS_MIN_SIZE: [f32; 2] = [720.0, 540.0];
+const SETTINGS_SIZE: [f32; 2] = [940.0, 680.0];
+const SETTINGS_MIN_SIZE: [f32; 2] = [820.0, 580.0];
 const PREVIEW_SIZE: f32 = 288.0;
 const PREVIEW_INVOCATION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0901);
 #[cfg(debug_assertions)]
@@ -49,6 +51,11 @@ const DEBUG_SEQUENCE_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_800
 #[cfg(debug_assertions)]
 const DEBUG_NESTED_SEQUENCE_ACTION_ID: Uuid =
     Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0911);
+#[cfg(debug_assertions)]
+const DEBUG_APPLICATION_PROFILE_ID: Uuid =
+    Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0920);
+#[cfg(debug_assertions)]
+const DEBUG_DUPLICATE_PROFILE_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0921);
 pub(crate) fn settings_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("gradial-settings")
 }
@@ -57,7 +64,7 @@ pub(crate) fn settings_viewport_id() -> ViewportId {
 struct SettingsDraft {
     original: Configuration,
     proposed: Configuration,
-    eight_slice_stash: Option<Vec<MenuSlice>>,
+    eight_slice_stashes: HashMap<Uuid, Vec<MenuSlice>>,
 }
 
 impl SettingsDraft {
@@ -65,7 +72,7 @@ impl SettingsDraft {
         Self {
             original: configuration.clone(),
             proposed: configuration.clone(),
-            eight_slice_stash: None,
+            eight_slice_stashes: HashMap::new(),
         }
     }
 
@@ -75,21 +82,28 @@ impl SettingsDraft {
 
     fn discard(&mut self) {
         self.proposed = self.original.clone();
-        self.eight_slice_stash = None;
+        self.eight_slice_stashes.clear();
     }
 
     fn accept_saved(&mut self, configuration: &Configuration) {
         self.original = configuration.clone();
         self.proposed = configuration.clone();
-        self.eight_slice_stash = None;
+        self.eight_slice_stashes.clear();
     }
 
     fn set_slice_count(&mut self, slice_count: SliceCount) {
-        resize_menu(
-            &mut self.proposed.global_profile.menu,
-            slice_count,
-            &mut self.eight_slice_stash,
-        );
+        self.set_profile_slice_count(self.proposed.global_profile.id, slice_count);
+    }
+
+    fn set_profile_slice_count(&mut self, profile_id: Uuid, slice_count: SliceCount) {
+        let mut stash = self.eight_slice_stashes.remove(&profile_id);
+        let Some(menu) = profile_menu_mut(&mut self.proposed, profile_id) else {
+            return;
+        };
+        resize_menu(menu, slice_count, &mut stash);
+        if let Some(stash) = stash {
+            self.eight_slice_stashes.insert(profile_id, stash);
+        }
     }
 }
 
@@ -111,6 +125,7 @@ enum EditorLifecycle {
 enum SettingsSection {
     #[default]
     Menu,
+    Profiles,
     Actions,
 }
 
@@ -196,6 +211,11 @@ enum SaveFeedback {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DraftValidationError {
     EmptyLabel { index: usize, slice_count: SliceCount },
+    EmptyApplicationLabel { profile: usize, index: usize, slice_count: SliceCount },
+    EmptyApplicationProfileName { profile: usize },
+    EmptyApplicationProfilePath { profile: usize },
+    InvalidApplicationProfilePriority { profile: usize, priority: u8 },
+    InvalidApplicationProfileRule { profile: usize },
     EmptyActionName { index: usize },
     TypedTextTooLong { index: usize, bytes: usize },
     InvalidUrl { index: usize },
@@ -213,10 +233,36 @@ enum DraftValidationError {
 }
 
 impl DraftValidationError {
+    #[allow(clippy::too_many_lines)]
     fn message(&self) -> String {
         match self {
             Self::EmptyLabel { index, slice_count } => {
                 format!("Give {} a label before saving.", direction_name(*index, *slice_count))
+            }
+            Self::EmptyApplicationLabel { profile, index, slice_count } => {
+                format!(
+                    "Give {} in application profile {} a label before saving.",
+                    direction_name(*index, *slice_count),
+                    profile + 1
+                )
+            }
+            Self::EmptyApplicationProfileName { profile } => {
+                format!("Give application profile {} a name before saving.", profile + 1)
+            }
+            Self::EmptyApplicationProfilePath { profile } => {
+                format!("Choose an application for profile {} before saving.", profile + 1)
+            }
+            Self::InvalidApplicationProfilePriority { profile, priority } => {
+                format!(
+                    "Set application profile {} to a priority from 0 through 100; it currently uses {priority}.",
+                    profile + 1
+                )
+            }
+            Self::InvalidApplicationProfileRule { profile } => {
+                format!(
+                    "Review the preserved window-specific rule in application profile {}.",
+                    profile + 1
+                )
             }
             Self::EmptyActionName { index } => {
                 format!("Give action {} a name before saving.", index + 1)
@@ -296,6 +342,12 @@ impl DraftValidationError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ActionEditorFeedback {
+    Info(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProfileEditorFeedback {
     Info(String),
     Error(String),
 }
@@ -399,7 +451,9 @@ struct SettingsState {
     draft: Option<SettingsDraft>,
     section: SettingsSection,
     selected_slice: usize,
+    selected_profile: Option<Uuid>,
     selected_action: Option<Uuid>,
+    profile_feedback: Option<ProfileEditorFeedback>,
     action_feedback: Option<ActionEditorFeedback>,
     shortcut_recorder: ShortcutRecorder,
     recording_action_id: Option<Uuid>,
@@ -416,7 +470,9 @@ impl SettingsState {
             draft: None,
             section: SettingsSection::Menu,
             selected_slice: 0,
+            selected_profile: None,
             selected_action: None,
+            profile_feedback: None,
             action_feedback: None,
             shortcut_recorder: ShortcutRecorder::default(),
             recording_action_id: None,
@@ -434,7 +490,12 @@ impl SettingsState {
             self.draft = Some(SettingsDraft::new(configuration));
             self.section = SettingsSection::Menu;
             self.selected_slice = 0;
+            self.selected_profile = configuration
+                .application_profiles
+                .first()
+                .map(|application| application.profile.id);
             self.selected_action = configuration.actions.first().map(|action| action.id);
+            self.profile_feedback = None;
             self.action_feedback = None;
             self.shortcut_recorder.cancel();
             self.recording_action_id = None;
@@ -454,6 +515,7 @@ impl SettingsState {
             draft.accept_saved(configuration);
         }
         self.save_feedback = SaveFeedback::Saved;
+        self.profile_feedback = None;
         self.action_feedback = None;
         self.recovery_warning = false;
     }
@@ -605,6 +667,60 @@ impl SettingsState {
     }
 
     #[cfg(debug_assertions)]
+    fn debug_apply_profile_fixture_edit(&mut self) -> bool {
+        let Some(draft) = &mut self.draft else {
+            return false;
+        };
+        if !draft
+            .proposed
+            .application_profiles
+            .iter()
+            .any(|application| application.profile.id == DEBUG_APPLICATION_PROFILE_ID)
+        {
+            let _created = create_application_profile(
+                &mut draft.proposed,
+                DEBUG_APPLICATION_PROFILE_ID,
+                PathBuf::from(r"C:\Windows\System32\notepad.exe"),
+            );
+            if let Some(application) =
+                application_profile_mut(&mut draft.proposed, DEBUG_APPLICATION_PROFILE_ID)
+            {
+                "Editor Notepad".clone_into(&mut application.profile.name);
+                application.rule.priority = 72;
+            }
+            draft.set_profile_slice_count(DEBUG_APPLICATION_PROFILE_ID, SliceCount::Four);
+            if let Some(application) =
+                application_profile_mut(&mut draft.proposed, DEBUG_APPLICATION_PROFILE_ID)
+            {
+                "Profile east".clone_into(&mut application.profile.menu.slices[1].label);
+                application.profile.menu.slices[1].action_id =
+                    Some(DEBUG_NESTED_SEQUENCE_ACTION_ID);
+            }
+            draft.set_profile_slice_count(DEBUG_APPLICATION_PROFILE_ID, SliceCount::Eight);
+        }
+        let _duplicated = duplicate_application_profile(
+            &mut draft.proposed,
+            DEBUG_APPLICATION_PROFILE_ID,
+            DEBUG_DUPLICATE_PROFILE_ID,
+        );
+        let _deleted = delete_application_profile(&mut draft.proposed, DEBUG_DUPLICATE_PROFILE_ID);
+        self.section = SettingsSection::Profiles;
+        self.selected_profile = Some(DEBUG_APPLICATION_PROFILE_ID);
+        self.selected_slice = 2;
+        self.profile_feedback = None;
+        self.save_feedback = SaveFeedback::None;
+        log::info!(
+            target: "settings",
+            "component=settings event_code=settings_debug_profile_draft_edited result_code=ok \
+             config_revision={} profile_count={} profile_id={DEBUG_APPLICATION_PROFILE_ID} \
+             priority=72 slice_count=8",
+            draft.original.config_revision,
+            draft.proposed.application_profiles.len()
+        );
+        true
+    }
+
+    #[cfg(debug_assertions)]
     fn debug_begin_shortcut_recording(&mut self) -> bool {
         let Some(action_id) = self.selected_action else {
             return false;
@@ -721,6 +837,12 @@ impl SettingsState {
             None
         } else if ui
             .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F4))
+        {
+            let _edited = self.debug_apply_profile_fixture_edit();
+            None
+        } else if ui
+            .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F10))
         {
             let _recording = self.debug_begin_shortcut_recording();
@@ -790,6 +912,7 @@ impl SettingsState {
             });
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.section, SettingsSection::Menu, "Menu");
+                ui.selectable_value(&mut self.section, SettingsSection::Profiles, "Profiles");
                 ui.selectable_value(&mut self.section, SettingsSection::Actions, "Actions");
             });
             if self.recovery_warning {
@@ -815,7 +938,13 @@ impl SettingsState {
                     self.selected_slice = self
                         .selected_slice
                         .min(draft.proposed.global_profile.menu.slices.len() - 1);
+                    self.selected_profile = draft
+                        .proposed
+                        .application_profiles
+                        .first()
+                        .map(|application| application.profile.id);
                     self.selected_action = draft.proposed.actions.first().map(|action| action.id);
+                    self.profile_feedback = None;
                     self.action_feedback = None;
                     self.shortcut_recorder.cancel();
                     self.recording_action_id = None;
@@ -840,6 +969,7 @@ impl SettingsState {
 
         match self.section {
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
+            SettingsSection::Profiles => self.render_profiles_section(ui, &mut draft),
             SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
         }
 
@@ -890,6 +1020,9 @@ impl SettingsState {
     }
 
     fn render_menu_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
+        let global_slice_count =
+            draft.proposed.global_profile.menu.resolved_slice_count().unwrap_or_default();
+        self.selected_slice = self.selected_slice.min(global_slice_count.get().saturating_sub(1));
         egui::Panel::left("menu_editor").resizable(false).exact_size(350.0).show(ui, |ui| {
             ui.add_space(12.0);
             ui.heading("Menu");
@@ -961,8 +1094,295 @@ impl SettingsState {
             ui.label("Click a direction to select it.");
             ui.add_space(18.0);
             ui.vertical_centered(|ui| {
-                self.render_preview(ui, &draft.proposed);
+                self.render_preview(ui, &draft.proposed.global_profile.menu);
             });
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_profiles_section(&mut self, ui: &mut egui::Ui, draft: &mut SettingsDraft) {
+        if self.selected_profile.is_some_and(|selected| {
+            !draft
+                .proposed
+                .application_profiles
+                .iter()
+                .any(|application| application.profile.id == selected)
+        }) {
+            self.selected_profile = draft
+                .proposed
+                .application_profiles
+                .first()
+                .map(|application| application.profile.id);
+        }
+        self.render_profile_catalog(ui, &mut draft.proposed);
+        let Some(profile_id) = self.selected_profile else {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.add_space(18.0);
+                ui.heading("Application profiles");
+                ui.label("Add a profile to use a different menu in one application.");
+                ui.add_space(8.0);
+                ui.weak("The Global menu remains active whenever no application profile matches.");
+                if let Some(feedback) = &self.profile_feedback {
+                    ui.add_space(8.0);
+                    match feedback {
+                        ProfileEditorFeedback::Info(message) => {
+                            ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+                        }
+                        ProfileEditorFeedback::Error(message) => {
+                            ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+                        }
+                    }
+                }
+            });
+            return;
+        };
+
+        let profile_slice_count = profile_menu(&draft.proposed, profile_id)
+            .and_then(Menu::resolved_slice_count)
+            .unwrap_or_default();
+        self.selected_slice = self.selected_slice.min(profile_slice_count.get().saturating_sub(1));
+
+        egui::Panel::left("profile_editor")
+            .resizable(false)
+            .exact_size(340.0)
+            .show(ui, |ui| {
+                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(12.0);
+                ui.heading("Profile");
+
+                let Some(profile_index) = application_profile_index(&draft.proposed, profile_id)
+                else {
+                    ui.label("Select an available profile.");
+                    return;
+                };
+                {
+                    let application = &mut draft.proposed.application_profiles[profile_index];
+                    ui.label("Name");
+                    if ui.text_edit_singleline(&mut application.profile.name).changed() {
+                        self.profile_feedback = None;
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    ui.add_space(10.0);
+                    ui.label("Exact application");
+                    ui.label(
+                        RichText::new(application.rule.executable_path.to_string_lossy())
+                            .monospace(),
+                    );
+                    if ui.button("Choose application...").clicked() {
+                        match choose_path(PathDialogKind::Executable) {
+                            PathDialogOutcome::Selected(path) => {
+                                application.rule.executable_path = path;
+                                self.profile_feedback = Some(ProfileEditorFeedback::Info(
+                                    "Application updated.".to_owned(),
+                                ));
+                                self.save_feedback = SaveFeedback::None;
+                            }
+                            PathDialogOutcome::Cancelled => {}
+                            PathDialogOutcome::Failed => {
+                                self.profile_feedback = Some(ProfileEditorFeedback::Error(
+                                    "Gradial could not open the application chooser.".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    ui.weak("This profile matches that complete application path.");
+
+                    ui.add_space(10.0);
+                    ui.label("Priority");
+                    if ui
+                        .add(
+                            DragValue::new(&mut application.rule.priority)
+                                .range(0..=100)
+                                .speed(1),
+                        )
+                        .changed()
+                    {
+                        self.profile_feedback = None;
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    ui.weak("Higher priority wins when more than one profile matches.");
+                    if application.rule.window_class.is_some()
+                        || application.rule.title_regex.is_some()
+                    {
+                        ui.add_space(6.0);
+                        ui.weak(
+                            "Existing window-specific matching is preserved. Its editor is coming in the next profile step.",
+                        );
+                    }
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(RichText::new("Profile menu").strong());
+                let current_count = profile_menu(&draft.proposed, profile_id)
+                    .and_then(Menu::resolved_slice_count)
+                    .unwrap_or_default();
+                let mut selected_count = current_count;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut selected_count, SliceCount::Four, "4 directions");
+                    ui.selectable_value(&mut selected_count, SliceCount::Eight, "8 directions");
+                });
+                if selected_count != current_count {
+                    draft.set_profile_slice_count(profile_id, selected_count);
+                    self.selected_slice =
+                        map_selected_slice(self.selected_slice, current_count, selected_count);
+                    self.profile_feedback = None;
+                    self.save_feedback = SaveFeedback::None;
+                }
+
+                ui.add_space(10.0);
+                direction_selector(ui, selected_count, &mut self.selected_slice);
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(direction_name(self.selected_slice, selected_count)).strong(),
+                );
+                let action_options = action_options(&draft.proposed);
+                let action_catalog_empty = action_options.is_empty();
+                if let Some(menu) = profile_menu_mut(&mut draft.proposed, profile_id)
+                    && let Some(slice) = menu.slices.get_mut(self.selected_slice)
+                {
+                    ui.label("Label");
+                    if ui.text_edit_singleline(&mut slice.label).changed() {
+                        self.profile_feedback = None;
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    ui.label("Action");
+                    ComboBox::from_id_salt(("profile_slice_action", profile_id, self.selected_slice))
+                        .width(310.0)
+                        .selected_text(action_option_text(slice.action_id, &action_options))
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(&mut slice.action_id, None, "No action")
+                                .changed()
+                            {
+                                self.profile_feedback = None;
+                                self.save_feedback = SaveFeedback::None;
+                            }
+                            for (action_id, label) in &action_options {
+                                if ui
+                                    .selectable_value(
+                                        &mut slice.action_id,
+                                        Some(*action_id),
+                                        label,
+                                    )
+                                    .changed()
+                                {
+                                    self.profile_feedback = None;
+                                    self.save_feedback = SaveFeedback::None;
+                                }
+                            }
+                        });
+                }
+                if action_catalog_empty && ui.link("Create an action first.").clicked() {
+                    self.section = SettingsSection::Actions;
+                }
+                if let Some(feedback) = &self.profile_feedback {
+                    ui.add_space(8.0);
+                    match feedback {
+                        ProfileEditorFeedback::Info(message) => {
+                            ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+                        }
+                        ProfileEditorFeedback::Error(message) => {
+                            ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+                        }
+                    }
+                }
+                });
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Profile preview");
+            ui.label("This is a complete menu, independent from Global.");
+            ui.add_space(18.0);
+            if let Some(menu) = profile_menu(&draft.proposed, profile_id) {
+                ui.vertical_centered(|ui| self.render_preview(ui, menu));
+            }
+        });
+    }
+
+    fn render_profile_catalog(&mut self, ui: &mut egui::Ui, configuration: &mut Configuration) {
+        egui::Panel::left("profile_catalog").resizable(false).exact_size(220.0).show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.heading("Profiles");
+            ui.weak("Global is the fallback.");
+            ui.add_space(10.0);
+            let rows = configuration
+                .application_profiles
+                .iter()
+                .map(|application| {
+                    (
+                        application.profile.id,
+                        application.profile.name.clone(),
+                        application.rule.priority,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                if rows.is_empty() {
+                    ui.weak("No application profiles yet.");
+                }
+                for (profile_id, name, priority) in rows {
+                    let selected = self.selected_profile;
+                    if ui
+                        .selectable_value(
+                            &mut self.selected_profile,
+                            Some(profile_id),
+                            format!("{name}\nPriority {priority}"),
+                        )
+                        .changed()
+                        && self.selected_profile != selected
+                    {
+                        self.selected_slice = 0;
+                        self.profile_feedback = None;
+                    }
+                }
+            });
+            ui.separator();
+            if ui.button("+ New profile...").clicked() {
+                match choose_path(PathDialogKind::Executable) {
+                    PathDialogOutcome::Selected(path) => {
+                        let profile_id = Uuid::new_v4();
+                        if create_application_profile(configuration, profile_id, path) {
+                            self.selected_profile = Some(profile_id);
+                            self.selected_slice = 0;
+                            self.profile_feedback = Some(ProfileEditorFeedback::Info(
+                                "Profile created with a copy of the Global menu.".to_owned(),
+                            ));
+                            self.save_feedback = SaveFeedback::None;
+                        }
+                    }
+                    PathDialogOutcome::Cancelled => {}
+                    PathDialogOutcome::Failed => {
+                        self.profile_feedback = Some(ProfileEditorFeedback::Error(
+                            "Gradial could not open the application chooser.".to_owned(),
+                        ));
+                    }
+                }
+            }
+            let has_selection = self.selected_profile.is_some();
+            if ui.add_enabled(has_selection, egui::Button::new("Duplicate selected")).clicked()
+                && let Some(source_id) = self.selected_profile
+            {
+                let duplicate_id = Uuid::new_v4();
+                if duplicate_application_profile(configuration, source_id, duplicate_id) {
+                    self.selected_profile = Some(duplicate_id);
+                    self.selected_slice = 0;
+                    self.profile_feedback =
+                        Some(ProfileEditorFeedback::Info("Profile duplicated.".to_owned()));
+                    self.save_feedback = SaveFeedback::None;
+                }
+            }
+            if ui.add_enabled(has_selection, egui::Button::new("Delete selected")).clicked()
+                && let Some(profile_id) = self.selected_profile
+            {
+                self.selected_profile = delete_application_profile(configuration, profile_id);
+                self.selected_slice = 0;
+                self.profile_feedback =
+                    Some(ProfileEditorFeedback::Info("Profile deleted.".to_owned()));
+                self.save_feedback = SaveFeedback::None;
+            }
         });
     }
 
@@ -1264,8 +1684,8 @@ impl SettingsState {
         }
     }
 
-    fn render_preview(&mut self, ui: &mut egui::Ui, configuration: &Configuration) {
-        let Some(menu) = resolved_global_menu(configuration) else {
+    fn render_preview(&mut self, ui: &mut egui::Ui, configured_menu: &Menu) {
+        let Some(menu) = resolved_menu(configured_menu) else {
             ui.colored_label(Color32::from_rgb(239, 113, 113), "Preview unavailable.");
             return;
         };
@@ -1291,7 +1711,7 @@ impl SettingsState {
             && let Some(pointer) = response.interact_pointer_pos()
             && let Some(slice) = preview_slice_at(
                 pointer - rect.center(),
-                configuration.global_profile.menu.resolved_slice_count().unwrap_or_default(),
+                configured_menu.resolved_slice_count().unwrap_or_default(),
             )
         {
             self.selected_slice = slice;
@@ -1811,6 +2231,113 @@ fn resize_menu(
     }
 }
 
+fn application_profile_index(configuration: &Configuration, profile_id: Uuid) -> Option<usize> {
+    configuration
+        .application_profiles
+        .iter()
+        .position(|application| application.profile.id == profile_id)
+}
+
+fn application_profile_mut(
+    configuration: &mut Configuration,
+    profile_id: Uuid,
+) -> Option<&mut ApplicationProfile> {
+    configuration
+        .application_profiles
+        .iter_mut()
+        .find(|application| application.profile.id == profile_id)
+}
+
+fn profile_menu(configuration: &Configuration, profile_id: Uuid) -> Option<&Menu> {
+    configuration.profile(profile_id).map(|profile| &profile.menu)
+}
+
+fn profile_menu_mut(configuration: &mut Configuration, profile_id: Uuid) -> Option<&mut Menu> {
+    if configuration.global_profile.id == profile_id {
+        return Some(&mut configuration.global_profile.menu);
+    }
+    application_profile_mut(configuration, profile_id)
+        .map(|application| &mut application.profile.menu)
+}
+
+fn create_application_profile(
+    configuration: &mut Configuration,
+    profile_id: Uuid,
+    executable_path: PathBuf,
+) -> bool {
+    if configuration.profile(profile_id).is_some() || executable_path.as_os_str().is_empty() {
+        return false;
+    }
+    let preferred_name = executable_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("Application");
+    configuration.application_profiles.push(ApplicationProfile {
+        profile: Profile {
+            id: profile_id,
+            name: unique_profile_name(configuration, preferred_name),
+            menu: configuration.global_profile.menu.clone(),
+        },
+        rule: ProfileRule { executable_path, window_class: None, title_regex: None, priority: 50 },
+    });
+    true
+}
+
+fn duplicate_application_profile(
+    configuration: &mut Configuration,
+    source_id: Uuid,
+    duplicate_id: Uuid,
+) -> bool {
+    if configuration.profile(duplicate_id).is_some() {
+        return false;
+    }
+    let Some(mut duplicate) = configuration
+        .application_profiles
+        .iter()
+        .find(|application| application.profile.id == source_id)
+        .cloned()
+    else {
+        return false;
+    };
+    duplicate.profile.id = duplicate_id;
+    duplicate.profile.name =
+        unique_profile_name(configuration, &format!("{} copy", duplicate.profile.name));
+    configuration.application_profiles.push(duplicate);
+    true
+}
+
+fn delete_application_profile(configuration: &mut Configuration, profile_id: Uuid) -> Option<Uuid> {
+    let index = application_profile_index(configuration, profile_id)?;
+    configuration.application_profiles.remove(index);
+    configuration
+        .application_profiles
+        .get(index)
+        .or_else(|| configuration.application_profiles.last())
+        .map(|application| application.profile.id)
+}
+
+fn unique_profile_name(configuration: &Configuration, preferred_name: &str) -> String {
+    let name_exists = |candidate: &str| {
+        configuration.global_profile.name == candidate
+            || configuration
+                .application_profiles
+                .iter()
+                .any(|application| application.profile.name == candidate)
+    };
+    if !name_exists(preferred_name) {
+        return preferred_name.to_owned();
+    }
+    for suffix in 2_u32.. {
+        let candidate = format!("{preferred_name} {suffix}");
+        if !name_exists(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the finite profile catalog cannot exhaust every u32 name suffix")
+}
+
 fn map_selected_slice(selected_slice: usize, from: SliceCount, to: SliceCount) -> usize {
     match (from, to) {
         (SliceCount::Eight, SliceCount::Four) => selected_slice.div_ceil(2) % 4,
@@ -1983,8 +2510,7 @@ const fn action_kind_name(kind: &ActionKind) -> &'static str {
     }
 }
 
-fn resolved_global_menu(configuration: &Configuration) -> Option<Arc<ResolvedMenu>> {
-    let menu = &configuration.global_profile.menu;
+fn resolved_menu(menu: &Menu) -> Option<Arc<ResolvedMenu>> {
     ResolvedMenu::new(
         menu.resolved_slice_count()?,
         menu.slices.iter().map(|slice| slice.label.clone()).collect(),
@@ -2052,6 +2578,27 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
     {
         return Err(DraftValidationError::EmptyLabel { index, slice_count });
     }
+    for (profile, application) in configuration.application_profiles.iter().enumerate() {
+        let profile_slice_count = application
+            .profile
+            .menu
+            .resolved_slice_count()
+            .ok_or(DraftValidationError::InvalidConfiguration)?;
+        if let Some((index, _)) = application
+            .profile
+            .menu
+            .slices
+            .iter()
+            .enumerate()
+            .find(|(_, slice)| slice.label.trim().is_empty())
+        {
+            return Err(DraftValidationError::EmptyApplicationLabel {
+                profile,
+                index,
+                slice_count: profile_slice_count,
+            });
+        }
+    }
     if let Some((index, _)) =
         configuration.actions.iter().enumerate().find(|(_, action)| action.name.trim().is_empty())
     {
@@ -2082,7 +2629,34 @@ fn draft_validation_error(
     let action_index = |action_id| {
         configuration.actions.iter().position(|action| action.id == action_id).unwrap_or(0)
     };
+    let profile_index = |profile_id| {
+        configuration
+            .application_profiles
+            .iter()
+            .position(|application| application.profile.id == profile_id)
+    };
     match error {
+        ConfigurationError::EmptyProfileName { profile_id } => profile_index(*profile_id)
+            .map_or(DraftValidationError::InvalidConfiguration, |profile| {
+                DraftValidationError::EmptyApplicationProfileName { profile }
+            }),
+        ConfigurationError::EmptyExecutablePath { profile_id } => profile_index(*profile_id)
+            .map_or(DraftValidationError::InvalidConfiguration, |profile| {
+                DraftValidationError::EmptyApplicationProfilePath { profile }
+            }),
+        ConfigurationError::InvalidPriority { profile_id, priority } => profile_index(*profile_id)
+            .map_or(DraftValidationError::InvalidConfiguration, |profile| {
+                DraftValidationError::InvalidApplicationProfilePriority {
+                    profile,
+                    priority: *priority,
+                }
+            }),
+        ConfigurationError::EmptyWindowClass { profile_id }
+        | ConfigurationError::EmptyTitleRegex { profile_id }
+        | ConfigurationError::InvalidTitleRegex { profile_id, .. } => profile_index(*profile_id)
+            .map_or(DraftValidationError::InvalidConfiguration, |profile| {
+                DraftValidationError::InvalidApplicationProfileRule { profile }
+            }),
         ConfigurationError::InvalidActionUrl { action_id } => {
             DraftValidationError::InvalidUrl { index: action_index(*action_id) }
         }
@@ -2151,7 +2725,8 @@ mod tests {
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
         NewActionTemplate, PayloadEditOutcome, SequenceEditorContext, SequenceMetrics,
         SequenceMove, SettingsDraft, SettingsState, action_references, add_executable_argument,
-        add_sequence_step, apply_dialog_outcome, create_action, delete_action, duplicate_action,
+        add_sequence_step, apply_dialog_outcome, create_action, create_application_profile,
+        delete_action, delete_application_profile, duplicate_action, duplicate_application_profile,
         map_selected_slice, move_sequence_step, preview_slice_at, remove_executable_argument,
         remove_sequence_step, resize_menu, validate_draft,
     };
@@ -2198,6 +2773,128 @@ mod tests {
         assert_eq!(menu.slices[1].label, "NE");
         assert_eq!(menu.slices[2].label, "Two");
         assert_eq!(menu.slices[7].label, "NW");
+    }
+
+    #[test]
+    fn new_application_profile_copies_global_menu_and_uses_a_readable_unique_name() {
+        let mut configuration = Configuration::default();
+        configuration.global_profile.name = "notepad".to_owned();
+        configuration.global_profile.menu.slices[0].label = "Global north".to_owned();
+        let profile_id = Uuid::from_u128(41);
+
+        assert!(create_application_profile(
+            &mut configuration,
+            profile_id,
+            PathBuf::from(r"C:\Windows\System32\notepad.exe"),
+        ));
+
+        let application = &configuration.application_profiles[0];
+        assert_eq!(application.profile.id, profile_id);
+        assert_eq!(application.profile.name, "notepad 2");
+        assert_eq!(application.profile.menu, configuration.global_profile.menu);
+        assert_eq!(
+            application.rule.executable_path,
+            PathBuf::from(r"C:\Windows\System32\notepad.exe")
+        );
+        assert_eq!(application.rule.priority, 50);
+        assert_eq!(validate_draft(&configuration), Ok(()));
+    }
+
+    #[test]
+    fn duplicate_and_delete_application_profiles_preserve_complete_independent_data() {
+        let source_id = Uuid::from_u128(51);
+        let duplicate_id = Uuid::from_u128(52);
+        let mut configuration = Configuration::default();
+        assert!(create_application_profile(
+            &mut configuration,
+            source_id,
+            PathBuf::from(r"C:\Apps\Editor.exe"),
+        ));
+        configuration.application_profiles[0].profile.name = "Editor".to_owned();
+        configuration.application_profiles[0].profile.menu.slices[2].label =
+            "Profile east".to_owned();
+        configuration.application_profiles[0].rule.window_class = Some("EditorWindow".to_owned());
+        configuration.application_profiles[0].rule.priority = 88;
+
+        assert!(duplicate_application_profile(&mut configuration, source_id, duplicate_id));
+        let duplicate = &configuration.application_profiles[1];
+        assert_eq!(duplicate.profile.id, duplicate_id);
+        assert_eq!(duplicate.profile.name, "Editor copy");
+        assert_eq!(duplicate.profile.menu, configuration.application_profiles[0].profile.menu);
+        assert_eq!(duplicate.rule, configuration.application_profiles[0].rule);
+        assert_eq!(delete_application_profile(&mut configuration, source_id), Some(duplicate_id));
+        assert_eq!(configuration.application_profiles.len(), 1);
+        assert_eq!(configuration.application_profiles[0].profile.id, duplicate_id);
+    }
+
+    #[test]
+    fn profile_slice_resizing_does_not_mutate_global_and_restores_its_own_diagonals() {
+        let profile_id = Uuid::from_u128(61);
+        let mut configuration = Configuration::default();
+        for (index, slice) in configuration.global_profile.menu.slices.iter_mut().enumerate() {
+            slice.label = format!("Global {index}");
+        }
+        assert!(create_application_profile(
+            &mut configuration,
+            profile_id,
+            PathBuf::from(r"C:\Apps\Paint.exe"),
+        ));
+        let original_global = configuration.global_profile.menu.clone();
+        let mut draft = SettingsDraft::new(&configuration);
+
+        draft.set_profile_slice_count(profile_id, SliceCount::Four);
+        draft.proposed.application_profiles[0].profile.menu.slices[1].label =
+            "Profile east".to_owned();
+        draft.set_profile_slice_count(profile_id, SliceCount::Eight);
+
+        assert_eq!(draft.proposed.global_profile.menu, original_global);
+        let menu = &draft.proposed.application_profiles[0].profile.menu;
+        assert_eq!(menu.slice_count, 8);
+        assert_eq!(menu.slices[1].label, "Global 1");
+        assert_eq!(menu.slices[2].label, "Profile east");
+    }
+
+    #[test]
+    fn application_profile_validation_reports_editor_specific_fields() {
+        let profile_id = Uuid::from_u128(71);
+        let mut configuration = Configuration::default();
+        assert!(create_application_profile(
+            &mut configuration,
+            profile_id,
+            PathBuf::from(r"C:\Apps\Profile.exe"),
+        ));
+
+        configuration.application_profiles[0].profile.name = " ".to_owned();
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::EmptyApplicationProfileName { profile: 0 })
+        );
+        configuration.application_profiles[0].profile.name = "Profile".to_owned();
+        configuration.application_profiles[0].rule.executable_path = PathBuf::new();
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::EmptyApplicationProfilePath { profile: 0 })
+        );
+        configuration.application_profiles[0].rule.executable_path =
+            PathBuf::from(r"C:\Apps\Profile.exe");
+        configuration.application_profiles[0].rule.priority = 101;
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::InvalidApplicationProfilePriority {
+                profile: 0,
+                priority: 101,
+            })
+        );
+        configuration.application_profiles[0].rule.priority = 50;
+        configuration.application_profiles[0].profile.menu.slices[2].label = String::new();
+        assert_eq!(
+            validate_draft(&configuration),
+            Err(DraftValidationError::EmptyApplicationLabel {
+                profile: 0,
+                index: 2,
+                slice_count: SliceCount::Eight,
+            })
+        );
     }
 
     #[test]
