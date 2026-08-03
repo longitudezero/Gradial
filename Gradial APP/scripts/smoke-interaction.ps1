@@ -81,6 +81,8 @@ param(
     [ValidateSet("N", "NE", "E", "SE", "S", "SW", "W", "NW")]
     [string]$Direction = "E",
 
+    [string]$ChangeFromDirection = "",
+
     [switch]$AllDirections,
 
     [ValidateRange(1, 1000)]
@@ -363,6 +365,19 @@ if (
 }
 if ($Slices -eq "4" -and -not $AllDirections -and $Direction.Length -ne 1) {
     throw "Four-slice validation accepts only N, E, S, or W."
+}
+if (-not [string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
+    $allowedChangeDirections = if ($Slices -eq "4") {
+        @("N", "E", "S", "W")
+    } else {
+        @("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    }
+    if ($ChangeFromDirection -notin $allowedChangeDirections) {
+        throw "ChangeFromDirection is not valid for the selected slice count."
+    }
+    if (-not $ContinuousMeter -or $AllDirections) {
+        throw "ChangeFromDirection requires one continuous-meter direction."
+    }
 }
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
     throw "Close the existing Gradial process before running the isolated live smoke check."
@@ -738,7 +753,6 @@ try {
     $maxCursorDistance = 0.0
     $completedInvocations = 0
     foreach ($gestureDirection in $directions) {
-        $vector = $directionVectors[$gestureDirection]
         for ($invocationIndex = 0; $invocationIndex -lt $InvocationCount; $invocationIndex++) {
             if (-not [GradialSmokeNative]::SetCursorPos($testX, $testY)) {
                 throw "Could not reset the cursor for invocation $invocationIndex."
@@ -751,28 +765,43 @@ try {
             if ($gestureDelay -gt 0) {
                 Start-Sleep -Milliseconds $gestureDelay
             }
-            [GradialSmokeNative]::SendRelativeMove($vector[0], $vector[1])
-            if ($continuousUsesFixedOrigin) {
-                $desiredX = $testX + $vector[0]
-                $desiredY = $testY + $vector[1]
-                $correctionTolerance = if ($ContinuousMeter) { 0 } else { 1 }
-                for ($correction = 0; $correction -lt 8; $correction++) {
-                    Start-Sleep -Milliseconds 10
-                    $correctedCursor = New-Object GradialSmokeNative+Point
-                    [GradialSmokeNative]::GetCursorPos([ref]$correctedCursor) | Out-Null
-                    $errorX = $desiredX - $correctedCursor.X
-                    $errorY = $desiredY - $correctedCursor.Y
-                    if (
-                        [Math]::Abs($errorX) -le $correctionTolerance -and
-                        [Math]::Abs($errorY) -le $correctionTolerance
-                    ) {
-                        break
-                    }
-                    [GradialSmokeNative]::SendRelativeMove($errorX, $errorY)
-                }
+            $gesturePath = if ([string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
+                @($gestureDirection)
+            } else {
+                @($ChangeFromDirection, $gestureDirection)
             }
-            if ($gestureDelay -gt 0) {
-                Start-Sleep -Milliseconds $gestureDelay
+            $currentOffsetX = 0
+            $currentOffsetY = 0
+            foreach ($pathDirection in $gesturePath) {
+                $targetVector = $directionVectors[$pathDirection]
+                [GradialSmokeNative]::SendRelativeMove(
+                    $targetVector[0] - $currentOffsetX,
+                    $targetVector[1] - $currentOffsetY
+                )
+                $currentOffsetX = $targetVector[0]
+                $currentOffsetY = $targetVector[1]
+                if ($continuousUsesFixedOrigin) {
+                    $desiredX = $testX + $currentOffsetX
+                    $desiredY = $testY + $currentOffsetY
+                    $correctionTolerance = if ($ContinuousMeter) { 0 } else { 1 }
+                    for ($correction = 0; $correction -lt 8; $correction++) {
+                        Start-Sleep -Milliseconds 10
+                        $correctedCursor = New-Object GradialSmokeNative+Point
+                        [GradialSmokeNative]::GetCursorPos([ref]$correctedCursor) | Out-Null
+                        $errorX = $desiredX - $correctedCursor.X
+                        $errorY = $desiredY - $correctedCursor.Y
+                        if (
+                            [Math]::Abs($errorX) -le $correctionTolerance -and
+                            [Math]::Abs($errorY) -le $correctionTolerance
+                        ) {
+                            break
+                        }
+                        [GradialSmokeNative]::SendRelativeMove($errorX, $errorY)
+                    }
+                }
+                if ($gestureDelay -gt 0) {
+                    Start-Sleep -Milliseconds $gestureDelay
+                }
             }
 
             $cursorDuringGesture = New-Object GradialSmokeNative+Point

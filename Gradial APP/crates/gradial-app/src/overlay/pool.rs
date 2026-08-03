@@ -8,7 +8,8 @@ use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
 use gradial_core::{
-    Appearance, ContinuousSelection, InvocationSnapshot, MonitorGeometry, ResolvedMenu, ScreenPoint,
+    Appearance, ContinuousSelection, ContinuousVisualState, InvocationSnapshot, MonitorGeometry,
+    Point, ResolvedGeometry, ResolvedMenu, ScreenPoint,
 };
 use uuid::Uuid;
 
@@ -50,12 +51,13 @@ struct OverlayViewportState {
     menu: Option<Arc<ResolvedMenu>>,
     selected_slice: Option<usize>,
     continuous_selection: Option<ContinuousSelection>,
+    continuous_pointer: Option<Point>,
     selection_changed_at: Option<Instant>,
     phase: VisualPhase,
     pending_open_marker: bool,
     pending_first_frame: Option<InvocationSnapshot>,
     pending_highlight_marker: Option<(Uuid, Option<usize>)>,
-    pending_continuous_marker: Option<(Uuid, ContinuousSelection)>,
+    pending_continuous_marker: Option<(Uuid, ContinuousVisualState)>,
 }
 
 impl OverlayViewportState {
@@ -64,6 +66,7 @@ impl OverlayViewportState {
         self.menu = None;
         self.selected_slice = None;
         self.continuous_selection = None;
+        self.continuous_pointer = None;
         self.selection_changed_at = None;
         self.phase = VisualPhase::Hidden;
         self.pending_open_marker = false;
@@ -314,6 +317,7 @@ impl OverlayRoute {
             state.menu = Some(menu);
             state.selected_slice = None;
             state.continuous_selection = None;
+            state.continuous_pointer = None;
             state.selection_changed_at = Some(started_at);
             state.phase = VisualPhase::Opening { started_at };
             state.pending_open_marker = true;
@@ -373,6 +377,7 @@ impl OverlayRoute {
             {
                 state.selected_slice = selected_slice;
                 state.continuous_selection = None;
+                state.continuous_pointer = None;
                 state.selection_changed_at = Some(Instant::now());
                 state.pending_highlight_marker = Some((invocation_id, selected_slice));
                 true
@@ -389,21 +394,23 @@ impl OverlayRoute {
         &self,
         context: &Context,
         invocation_id: Uuid,
-        selection: ContinuousSelection,
+        visual: ContinuousVisualState,
     ) {
         let applied = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state
+            let edge_assist = state
                 .snapshot
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.invocation_id == invocation_id)
-            {
-                if state.selected_slice != Some(selection.slice_index) {
+                .filter(|snapshot| snapshot.invocation_id == invocation_id)
+                .map(|snapshot| snapshot.geometry.behavior == ResolvedGeometry::EdgeAssist);
+            if let Some(edge_assist) = edge_assist {
+                if state.selected_slice != Some(visual.selection.slice_index) {
                     state.selection_changed_at = Some(Instant::now());
                 }
-                state.selected_slice = Some(selection.slice_index);
-                state.continuous_selection = Some(selection);
-                state.pending_continuous_marker = Some((invocation_id, selection));
+                state.selected_slice = Some(visual.selection.slice_index);
+                state.continuous_selection = visual.armed.then_some(visual.selection);
+                state.continuous_pointer = edge_assist.then_some(visual.pointer_offset_dip);
+                state.pending_continuous_marker = Some((invocation_id, visual));
                 true
             } else {
                 false
@@ -699,6 +706,7 @@ fn prepare_overlay_frame(
             appearance,
             selected_slice: state.selected_slice,
             continuous_selection: state.continuous_selection,
+            continuous_pointer: state.continuous_pointer,
             selection_changed_at: state.selection_changed_at,
             opacity: presence.opacity,
             scale: presence.scale,
@@ -762,14 +770,14 @@ fn process_pending_markers(
             &format!("selected_slice={selected_slice:?} transition_ms=35"),
         );
     }
-    if let Some((invocation_id, selection)) = state.pending_continuous_marker.take() {
+    if let Some((invocation_id, visual)) = state.pending_continuous_marker.take() {
         timing_markers.emit(
             "continuous_value_applied",
             Some(invocation_id),
             0,
             &format!(
-                "slice_index={} normalized_value={:.6}",
-                selection.slice_index, selection.value
+                "slice_index={} normalized_value={:.6} armed={}",
+                visual.selection.slice_index, visual.selection.value, visual.armed
             ),
         );
     }

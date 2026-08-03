@@ -22,13 +22,13 @@ pub use configuration::{
 pub use geometry::{Point, SliceCount};
 pub use interaction::{
     ActivationBinding, ActivationBindingId, CONTINUOUS_OVERLAY_HALF_EXTENT_DIP, CancelReason,
-    ContinuousSelection, ContinuousSliceMask, DEFAULT_CONTINUOUS_ARM_RADIUS_DIP,
-    DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP, DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode,
-    GestureConfig, InputEvent, InputEventKind, InteractionController, InteractionEffect,
-    InteractionOutcome, InteractionState, InvocationContext, InvocationGeometry,
-    InvocationSnapshot, MonitorGeometry, PhysicalModifiers, ResolvedGeometry, ScreenPoint,
-    ScreenRect, monitor_index_for_point, normalize_continuous_distance,
-    resolve_invocation_geometry, slice_for_delta,
+    ContinuousSelection, ContinuousSliceMask, ContinuousVisualState,
+    DEFAULT_CONTINUOUS_ARM_RADIUS_DIP, DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+    DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, InputEvent, InputEventKind,
+    InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
+    InvocationContext, InvocationGeometry, InvocationSnapshot, MonitorGeometry, PhysicalModifiers,
+    ResolvedGeometry, ScreenPoint, ScreenRect, monitor_index_for_point,
+    normalize_continuous_distance, resolve_invocation_geometry, slice_for_delta,
 };
 pub use paths::{AppPaths, AppPathsError};
 pub use profiles::{

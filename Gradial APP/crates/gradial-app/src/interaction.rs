@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicU8;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
-    ActionPlanCompiler, ActionResult, CancelReason, ContinuousSelection, ContinuousSliceMask,
+    ActionPlanCompiler, ActionResult, CancelReason, ContinuousSliceMask, ContinuousVisualState,
     ExecutionPlan, GestureConfig, InputEvent, InputEventKind, InteractionController,
     InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, ProfileResolver,
     ProfileTarget, ResolvedMenu, monitor_index_for_point,
@@ -723,10 +723,10 @@ fn dispatch_effect(
                 dispatcher,
             );
         }
-        InteractionEffect::ContinuousChanged { invocation_id, selection } => {
+        InteractionEffect::ContinuousChanged { invocation_id, visual } => {
             dispatch_continuous_changed(
                 invocation_id,
-                selection,
+                visual,
                 source_qpc,
                 active_snapshot,
                 route,
@@ -843,7 +843,7 @@ fn dispatch_selection_changed(
 
 fn dispatch_continuous_changed(
     invocation_id: uuid::Uuid,
-    selection: ContinuousSelection,
+    visual: ContinuousVisualState,
     source_qpc: i64,
     active_snapshot: Option<&InvocationSnapshot>,
     route: &OverlayRoute,
@@ -853,20 +853,24 @@ fn dispatch_continuous_changed(
         target: "interaction",
         "component=interaction event_code=continuous_meter_updated result_code=ok \
          config_revision={} invocation_id={invocation_id} \
-         slice_index={} normalized_value={:.6} action_executed=false",
+         slice_index={} normalized_value={:.6} armed={} action_executed=false",
         active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
             snapshot.context.config_revision
         }),
-        selection.slice_index,
-        selection.value
+        visual.selection.slice_index,
+        visual.selection.value,
+        visual.armed
     );
     dispatcher.timing_markers.emit(
         "continuous_value_requested",
         Some(invocation_id),
         source_qpc,
-        &format!("slice_index={} normalized_value={:.6}", selection.slice_index, selection.value),
+        &format!(
+            "slice_index={} normalized_value={:.6} armed={}",
+            visual.selection.slice_index, visual.selection.value, visual.armed
+        ),
     );
-    route.set_continuous(dispatcher.egui_context, invocation_id, selection);
+    route.set_continuous(dispatcher.egui_context, invocation_id, visual);
 }
 
 #[derive(Clone, Copy)]

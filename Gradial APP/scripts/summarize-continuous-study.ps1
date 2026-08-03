@@ -61,7 +61,7 @@ function Test-ParticipantReport {
         [string]$Source
     )
 
-    if ($Report.schema_version -ne 1 -or $Report.protocol -ne "gradial-continuous-usability-v1") {
+    if ($Report.schema_version -ne 2 -or $Report.protocol -ne "gradial-continuous-usability-v2") {
         throw "Unsupported continuous-study report: $Source"
     }
     if ($Report.planned_trials -ne 37 -or $Report.summary.accepted_trials -ne 37) {
@@ -81,6 +81,17 @@ function Test-ParticipantReport {
         }
     }
     if ($acceptedAttempts.Count -ne 37) {
+        throw "Incomplete continuous-study report: $Source"
+    }
+    $preArmChanges = @(
+        $acceptedAttempts |
+            Where-Object { $_.phase -eq "direction_change" -and $_.requested_change_after_arm -ne $true }
+    )
+    $armedChanges = @(
+        $acceptedAttempts |
+            Where-Object { $_.phase -eq "direction_change" -and $_.requested_change_after_arm -eq $true }
+    )
+    if ($preArmChanges.Count -ne 4 -or $armedChanges.Count -ne 4) {
         throw "Incomplete continuous-study report: $Source"
     }
     $excludedData = @($Report.privacy.excluded_data)
@@ -121,8 +132,21 @@ function Get-CohortSummary {
     $withinFraction = Get-Fraction $withinCount $scalarErrors.Count
 
     $directionChange = @($accepted | Where-Object phase -eq "direction_change")
-    $accidentalArms = @($directionChange | Where-Object result -eq "committed").Count
-    $accidentalArmingRate = Get-Fraction $accidentalArms $directionChange.Count
+    $preArmDirectionChange = @(
+        $directionChange | Where-Object requested_change_after_arm -ne $true
+    )
+    $accidentalArms = @($preArmDirectionChange | Where-Object result -eq "committed").Count
+    $accidentalArmingRate = Get-Fraction $accidentalArms $preArmDirectionChange.Count
+    $armedDirectionChange = @(
+        $directionChange | Where-Object requested_change_after_arm -eq $true
+    )
+    $armedDirectionSwitchSuccesses = @(
+        $armedDirectionChange |
+            Where-Object { $_.result -eq "committed" -and $_.direction_correct -eq $true }
+    ).Count
+    $armedDirectionSwitchSuccessRate = Get-Fraction `
+        $armedDirectionSwitchSuccesses `
+        $armedDirectionChange.Count
 
     $successfulCancellationParticipants = @(
         $Reports | Where-Object {
@@ -171,9 +195,12 @@ function Get-CohortSummary {
         median_absolute_scalar_error = $medianScalarError
         samples_within_0_15 = $withinCount
         fraction_within_0_15 = $withinFraction
-        accidental_arming_trials = $directionChange.Count
+        accidental_arming_trials = $preArmDirectionChange.Count
         accidental_arms = $accidentalArms
         accidental_arming_rate = $accidentalArmingRate
+        armed_direction_switch_trials = $armedDirectionChange.Count
+        armed_direction_switch_successes = $armedDirectionSwitchSuccesses
+        armed_direction_switch_success_rate = $armedDirectionSwitchSuccessRate
         successful_cancellation_participants = $successfulCancellationParticipants
         cancellation_participant_fraction = $cancellationParticipantFraction
         center_median_completion_ms = $centerMedian
@@ -207,7 +234,15 @@ function Get-CohortSummary {
             -Requirement "accidental arming below 2%" `
             -EnoughParticipants $enoughParticipants `
             -Passed ($null -ne $accidentalArmingRate -and $accidentalArmingRate -lt 0.02) `
-            -Evidence "$accidentalArms accidental arms across $($directionChange.Count) direction-change trials."
+            -Evidence "$accidentalArms accidental arms across $($preArmDirectionChange.Count) pre-arm direction-change trials."
+        New-Gate `
+            -Requirement "at least 95% of armed direction switches finish in the requested wedge" `
+            -EnoughParticipants $enoughParticipants `
+            -Passed (
+                $null -ne $armedDirectionSwitchSuccessRate -and
+                $armedDirectionSwitchSuccessRate -ge 0.95
+            ) `
+            -Evidence "$armedDirectionSwitchSuccesses of $($armedDirectionChange.Count) armed direction switches finished in the requested wedge."
         New-Gate `
             -Requirement "at least seven of eight participants cancel after one instruction" `
             -EnoughParticipants $enoughParticipants `
@@ -224,9 +259,9 @@ function Get-CohortSummary {
     )
 
     [ordered]@{
-        schema_version = 1
-        source_schema_version = 1
-        protocol = "gradial-continuous-usability-v1"
+        schema_version = 2
+        source_schema_version = 2
+        protocol = "gradial-continuous-usability-v2"
         metrics = $metrics
         gates = $gates
     }
@@ -264,16 +299,18 @@ function New-SelfTestReport {
         })
     }
     for ($index = 0; $index -lt 8; $index++) {
+        $changeAfterArm = $index % 2 -eq 1
         $attempts.Add([pscustomobject]@{
             accepted = $true
             phase = "direction_change"
             requested_slice_count = 8
-            direction_correct = $null
+            requested_change_after_arm = $changeAfterArm
+            direction_correct = if ($changeAfterArm) { $true } else { $null }
             absolute_scalar_error = $null
             requested_placement = "center"
             duration_ms = 80
-            result = "cancelled"
-            cancel_reason = "no_selection"
+            result = if ($changeAfterArm) { "committed" } else { "cancelled" }
+            cancel_reason = if ($changeAfterArm) { $null } else { "no_selection" }
         })
     }
     $attempts.Add([pscustomobject]@{
@@ -288,8 +325,8 @@ function New-SelfTestReport {
         cancel_reason = "returned_to_center"
     })
     [pscustomobject]@{
-        schema_version = 1
-        protocol = "gradial-continuous-usability-v1"
+        schema_version = 2
+        protocol = "gradial-continuous-usability-v2"
         session_id = "00000000-0000-0000-0000-$($Participant.ToString('000000000000'))"
         planned_trials = 37
         attempts = $attempts

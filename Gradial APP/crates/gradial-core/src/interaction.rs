@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::SliceCount;
+use crate::{Point, SliceCount};
 
 pub const DEFAULT_OVERLAY_HALF_EXTENT_DIP: u32 = 144;
 pub const CONTINUOUS_OVERLAY_HALF_EXTENT_DIP: u32 = 200;
@@ -300,7 +300,7 @@ pub enum InteractionOutcome {
 pub enum InteractionEffect {
     Open { invocation_id: Uuid, origin: ScreenPoint },
     SelectionChanged { invocation_id: Uuid, selected_slice: Option<usize> },
-    ContinuousChanged { invocation_id: Uuid, selection: ContinuousSelection },
+    ContinuousChanged { invocation_id: Uuid, visual: ContinuousVisualState },
     Close { invocation_id: Uuid, outcome: InteractionOutcome },
 }
 
@@ -308,6 +308,18 @@ pub enum InteractionEffect {
 pub struct ContinuousSelection {
     pub slice_index: usize,
     pub value: f64,
+}
+
+/// Gradial-owned feedback for rendering a continuous gesture.
+///
+/// The pointer offset is DIP displacement from the invocation point, clamped
+/// to the configured full-scale radius. It is not a raw screen coordinate and
+/// is never part of the plugin protocol.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContinuousVisualState {
+    pub selection: ContinuousSelection,
+    pub pointer_offset_dip: Point,
+    pub armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -345,6 +357,14 @@ pub struct GestureConfig {
     pub continuous_full_scale_radius_dip: f64,
     pub boundary_hysteresis_degrees: f64,
     pub slice_count: SliceCount,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PointerContext {
+    invocation_id: Uuid,
+    origin: ScreenPoint,
+    monitor_dpi: u32,
+    behavior: ResolvedGeometry,
 }
 
 impl Default for GestureConfig {
@@ -463,42 +483,73 @@ impl InteractionController {
             return None;
         }
 
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        let Some(pointer_context) = self.snapshot.as_ref().map(|snapshot| PointerContext {
+            invocation_id: snapshot.invocation_id,
+            origin: snapshot.cursor_physical_px,
+            monitor_dpi: snapshot.monitor_dpi,
+            behavior: snapshot.geometry.behavior,
+        }) else {
             self.state = InteractionState::Faulted;
             return None;
         };
 
-        let distance_dip = distance_dip(snapshot.cursor_physical_px, point, snapshot.monitor_dpi);
-        if let Some(mut continuous) = self.continuous_selection {
-            if distance_dip <= self.config.center_cancel_radius_dip {
-                self.state = InteractionState::Cancelling;
-                self.selected_slice = None;
-                self.continuous_selection = None;
-                return Some(InteractionEffect::Close {
-                    invocation_id: snapshot.invocation_id,
-                    outcome: InteractionOutcome::Cancelled {
-                        reason: CancelReason::ReturnedToCenter,
-                    },
-                });
-            }
+        let distance_dip = distance_dip(pointer_context.origin, point, pointer_context.monitor_dpi);
+        if let Some(continuous) = self.continuous_selection {
+            return self.update_armed_continuous(pointer_context, point, distance_dip, continuous);
+        }
 
-            let value = normalize_continuous_distance(
-                distance_dip,
-                self.config.continuous_arm_radius_dip,
-                self.config.continuous_full_scale_radius_dip,
-            );
-            if (continuous.value - value).abs() <= f64::EPSILON {
-                return None;
-            }
-            continuous.value = value;
-            self.continuous_selection = Some(continuous);
-            return Some(InteractionEffect::ContinuousChanged {
-                invocation_id: snapshot.invocation_id,
-                selection: continuous,
+        self.update_tracking(pointer_context, point, distance_dip)
+    }
+
+    fn update_armed_continuous(
+        &mut self,
+        pointer_context: PointerContext,
+        point: ScreenPoint,
+        distance_dip: f64,
+        continuous: ContinuousSelection,
+    ) -> Option<InteractionEffect> {
+        if distance_dip <= self.config.center_cancel_radius_dip {
+            self.state = InteractionState::Cancelling;
+            self.selected_slice = None;
+            self.continuous_selection = None;
+            return Some(InteractionEffect::Close {
+                invocation_id: pointer_context.invocation_id,
+                outcome: InteractionOutcome::Cancelled { reason: CancelReason::ReturnedToCenter },
             });
         }
 
-        let new_selection = self.selection_for_point(snapshot, point);
+        let slice_index = self
+            .selection_for_point(pointer_context.origin, point, pointer_context.monitor_dpi)
+            .filter(|slice_index| self.continuous_slices.contains(*slice_index))
+            .unwrap_or(continuous.slice_index);
+        let selection = ContinuousSelection {
+            slice_index,
+            value: normalize_continuous_distance(
+                distance_dip,
+                self.config.continuous_arm_radius_dip,
+                self.config.continuous_full_scale_radius_dip,
+            ),
+        };
+        let changed = selection != continuous;
+        self.selected_slice = Some(slice_index);
+        self.continuous_selection = Some(selection);
+        if !changed && pointer_context.behavior != ResolvedGeometry::EdgeAssist {
+            return None;
+        }
+        Some(InteractionEffect::ContinuousChanged {
+            invocation_id: pointer_context.invocation_id,
+            visual: self.continuous_visual(pointer_context, point, selection, true),
+        })
+    }
+
+    fn update_tracking(
+        &mut self,
+        pointer_context: PointerContext,
+        point: ScreenPoint,
+        distance_dip: f64,
+    ) -> Option<InteractionEffect> {
+        let new_selection =
+            self.selection_for_point(pointer_context.origin, point, pointer_context.monitor_dpi);
         let selection_changed = new_selection != self.selected_slice;
         self.selected_slice = new_selection;
         if new_selection.is_some() {
@@ -507,8 +558,8 @@ impl InteractionController {
 
         if let Some(slice_index) = new_selection
             && self.continuous_slices.contains(slice_index)
-            && distance_dip >= self.config.continuous_arm_radius_dip
         {
+            let armed = distance_dip >= self.config.continuous_arm_radius_dip;
             let selection = ContinuousSelection {
                 slice_index,
                 value: normalize_continuous_distance(
@@ -517,12 +568,19 @@ impl InteractionController {
                     self.config.continuous_full_scale_radius_dip,
                 ),
             };
-            self.continuous_selection = Some(selection);
-            self.state = InteractionState::Continuous;
-            return Some(InteractionEffect::ContinuousChanged {
-                invocation_id: snapshot.invocation_id,
-                selection,
-            });
+            if armed {
+                self.continuous_selection = Some(selection);
+                self.state = InteractionState::Continuous;
+            }
+            if armed
+                || selection_changed
+                || pointer_context.behavior == ResolvedGeometry::EdgeAssist
+            {
+                return Some(InteractionEffect::ContinuousChanged {
+                    invocation_id: pointer_context.invocation_id,
+                    visual: self.continuous_visual(pointer_context, point, selection, armed),
+                });
+            }
         }
 
         if !selection_changed {
@@ -530,9 +588,28 @@ impl InteractionController {
         }
 
         Some(InteractionEffect::SelectionChanged {
-            invocation_id: snapshot.invocation_id,
+            invocation_id: pointer_context.invocation_id,
             selected_slice: new_selection,
         })
+    }
+
+    fn continuous_visual(
+        &self,
+        pointer_context: PointerContext,
+        point: ScreenPoint,
+        selection: ContinuousSelection,
+        armed: bool,
+    ) -> ContinuousVisualState {
+        ContinuousVisualState {
+            selection,
+            pointer_offset_dip: continuous_pointer_offset_dip(
+                pointer_context.origin,
+                point,
+                pointer_context.monitor_dpi,
+                self.config.continuous_full_scale_radius_dip,
+            ),
+            armed,
+        }
     }
 
     pub fn activation_up(&mut self) -> Option<InteractionEffect> {
@@ -614,12 +691,13 @@ impl InteractionController {
 
     fn selection_for_point(
         &self,
-        snapshot: &InvocationSnapshot,
+        origin: ScreenPoint,
         point: ScreenPoint,
+        monitor_dpi: u32,
     ) -> Option<usize> {
-        let dx = point.x - snapshot.cursor_physical_px.x;
-        let dy = point.y - snapshot.cursor_physical_px.y;
-        let dpi_scale = f64::from(snapshot.monitor_dpi) / 96.0;
+        let dx = point.x - origin.x;
+        let dy = point.y - origin.y;
+        let dpi_scale = f64::from(monitor_dpi) / 96.0;
         let distance = f64::from(dx).hypot(f64::from(dy));
         let center_radius = self.config.center_cancel_radius_dip * dpi_scale;
         let entry_radius = self.config.selection_entry_radius_dip * dpi_scale;
@@ -668,6 +746,30 @@ fn distance_dip(origin: ScreenPoint, point: ScreenPoint, monitor_dpi: u32) -> f6
     let dy = f64::from(point.y) - f64::from(origin.y);
     let dpi_scale = f64::from(monitor_dpi.max(96)) / 96.0;
     dx.hypot(dy) / dpi_scale
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn continuous_pointer_offset_dip(
+    origin: ScreenPoint,
+    point: ScreenPoint,
+    monitor_dpi: u32,
+    maximum_radius_dip: f64,
+) -> Point {
+    let dpi_scale = f64::from(monitor_dpi.max(96)) / 96.0;
+    let dx = (f64::from(point.x) - f64::from(origin.x)) / dpi_scale;
+    let dy = (f64::from(point.y) - f64::from(origin.y)) / dpi_scale;
+    let distance = dx.hypot(dy);
+    let bounded_maximum = if maximum_radius_dip.is_finite() && maximum_radius_dip >= 0.0 {
+        maximum_radius_dip
+    } else {
+        0.0
+    };
+    let scale = if distance > bounded_maximum && distance > f64::EPSILON {
+        bounded_maximum / distance
+    } else {
+        1.0
+    };
+    Point::new((dx * scale) as f32, (dy * scale) as f32)
 }
 
 /// Maps radial distance to the runtime-neutral continuous scalar.
@@ -819,13 +921,14 @@ fn shortest_angular_distance(left: f64, right: f64) -> f64 {
 mod tests {
     use super::{
         ActivationBinding, ActivationBindingId, CancelReason, ContinuousSelection,
-        ContinuousSliceMask, GeometryMode, GestureConfig, InteractionController, InteractionEffect,
-        InteractionOutcome, InteractionState, InvocationGeometry, InvocationSnapshot,
-        MonitorGeometry, PhysicalModifiers, ResolvedGeometry, ScreenPoint, ScreenRect,
+        ContinuousSliceMask, ContinuousVisualState, GeometryMode, GestureConfig,
+        InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
+        InvocationGeometry, InvocationSnapshot, MonitorGeometry, PhysicalModifiers,
+        ResolvedGeometry, ScreenPoint, ScreenRect, continuous_pointer_offset_dip,
         monitor_index_for_point, normalize_continuous_distance, resolve_invocation_geometry,
         slice_for_angle, slice_for_delta,
     };
-    use crate::SliceCount;
+    use crate::{Point, SliceCount};
     use uuid::Uuid;
 
     fn snapshot(origin: ScreenPoint) -> InvocationSnapshot {
@@ -959,10 +1062,19 @@ mod tests {
         assert_scalar(normalize_continuous_distance(f64::INFINITY, 48.0, 160.0), 1.0);
         assert_scalar(normalize_continuous_distance(f64::NAN, 48.0, 160.0), 0.0);
         assert_scalar(normalize_continuous_distance(104.0, 160.0, 48.0), 0.0);
+        assert_eq!(
+            continuous_pointer_offset_dip(
+                ScreenPoint::new(0, 0),
+                ScreenPoint::new(100, 0),
+                96,
+                f64::NAN,
+            ),
+            Point::new(0.0, 0.0)
+        );
     }
 
     #[test]
-    fn continuous_slice_arms_locks_direction_and_commits_final_value() {
+    fn continuous_slice_tracks_direction_after_arming_and_commits_the_live_wedge() {
         let origin = ScreenPoint::new(100, 100);
         let mut controller = InteractionController::new(GestureConfig::default());
         controller
@@ -977,26 +1089,44 @@ mod tests {
             controller.pointer_moved(ScreenPoint::new(204, 100)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
-                selection: ContinuousSelection { slice_index: 2, value: 0.5 },
+                visual: ContinuousVisualState {
+                    selection: ContinuousSelection { slice_index: 2, value: 0.5 },
+                    pointer_offset_dip: Point::new(104.0, 0.0),
+                    armed: true,
+                },
             })
         );
         assert_eq!(controller.state(), InteractionState::Continuous);
         assert_eq!(controller.selected_slice(), Some(2));
 
-        assert_eq!(controller.pointer_moved(ScreenPoint::new(100, -4)), None);
-        assert_eq!(controller.selected_slice(), Some(2));
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(100, -4)),
+            Some(InteractionEffect::ContinuousChanged {
+                invocation_id: Uuid::nil(),
+                visual: ContinuousVisualState {
+                    selection: ContinuousSelection { slice_index: 0, value: 0.5 },
+                    pointer_offset_dip: Point::new(0.0, -104.0),
+                    armed: true,
+                },
+            })
+        );
+        assert_eq!(controller.selected_slice(), Some(0));
         assert_eq!(
             controller.pointer_moved(ScreenPoint::new(-60, 100)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
-                selection: ContinuousSelection { slice_index: 2, value: 1.0 },
+                visual: ContinuousVisualState {
+                    selection: ContinuousSelection { slice_index: 6, value: 1.0 },
+                    pointer_offset_dip: Point::new(-160.0, 0.0),
+                    armed: true,
+                },
             })
         );
         assert_eq!(
             controller.activation_up(),
             Some(InteractionEffect::Close {
                 invocation_id: Uuid::nil(),
-                outcome: InteractionOutcome::ContinuousCommitted { slice_index: 2, value: 1.0 },
+                outcome: InteractionOutcome::ContinuousCommitted { slice_index: 6, value: 1.0 },
             })
         );
     }
@@ -1014,7 +1144,14 @@ mod tests {
             .expect("continuous open");
         assert!(matches!(
             controller.pointer_moved(ScreenPoint::new(147, 100)),
-            Some(InteractionEffect::SelectionChanged { selected_slice: Some(2), .. })
+            Some(InteractionEffect::ContinuousChanged {
+                visual: ContinuousVisualState {
+                    selection: ContinuousSelection { slice_index: 2, value: 0.0 },
+                    pointer_offset_dip: Point { x: 47.0, y: 0.0 },
+                    armed: false,
+                },
+                ..
+            })
         ));
 
         assert_eq!(
@@ -1070,7 +1207,11 @@ mod tests {
             controller.pointer_moved(ScreenPoint::new(-292, -500)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
-                selection: ContinuousSelection { slice_index: 2, value: 0.5 },
+                visual: ContinuousVisualState {
+                    selection: ContinuousSelection { slice_index: 2, value: 0.5 },
+                    pointer_offset_dip: Point::new(104.0, 0.0),
+                    armed: true,
+                },
             })
         );
     }
@@ -1255,6 +1396,40 @@ mod tests {
                 })
             );
             assert_eq!(controller.snapshot(), Some(&edge_snapshot));
+        }
+    }
+
+    #[test]
+    fn edge_assist_continuous_feedback_tracks_and_clamps_the_virtual_pointer() {
+        let origin = ScreenPoint::new(0, 0);
+        let mut edge_snapshot = snapshot(origin);
+        edge_snapshot.geometry = InvocationGeometry {
+            behavior: ResolvedGeometry::EdgeAssist,
+            overlay_origin_physical_px: ScreenPoint::new(144, 144),
+            monitor_dpi: 96,
+        };
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_behavior(
+                edge_snapshot,
+                SliceCount::Eight,
+                ContinuousSliceMask::all(SliceCount::Eight),
+            )
+            .expect("continuous edge-assist open");
+
+        for ((dx, dy), slice_index, pointer_offset) in [
+            ((0, -104), 0, Point::new(0.0, -104.0)),
+            ((-104, 104), 6, Point::new(-104.0, 0.0)),
+            ((-1_000, 0), 6, Point::new(-160.0, 0.0)),
+        ] {
+            let Some(InteractionEffect::ContinuousChanged { visual, .. }) =
+                controller.raw_pointer_delta(dx, dy)
+            else {
+                panic!("expected continuous edge-assist feedback");
+            };
+            assert_eq!(visual.selection.slice_index, slice_index);
+            assert_eq!(visual.pointer_offset_dip, pointer_offset);
+            assert!(visual.armed);
         }
     }
 

@@ -34,6 +34,8 @@ function Invoke-ContinuousScenario {
         [int]$Value,
         [string]$ActivationPoint,
         [int]$ExpectedInvocations,
+        [string]$Direction = "",
+        [string]$ChangeFromDirection = "",
         [string]$Notes = ""
     )
 
@@ -45,10 +47,14 @@ function Invoke-ContinuousScenario {
         "-ContinuousMeter",
         "-ContinuousPercent", $Value,
         "-ActivationPoint", $ActivationPoint,
-        "-AllDirections",
         "-GestureDelayMilliseconds", "25",
         "-InterInvocationDelayMilliseconds", "100"
     )
+    if ([string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
+        $arguments += "-AllDirections"
+    } else {
+        $arguments += @("-Direction", $Direction, "-ChangeFromDirection", $ChangeFromDirection)
+    }
     $scenarioStarted = [DateTimeOffset]::UtcNow
     $priorPreference = $ErrorActionPreference
     try {
@@ -94,6 +100,16 @@ if ($Suite -ne "quick") {
         -Value 50 `
         -ActivationPoint "center" `
         -ExpectedInvocations 4
+
+    Invoke-ContinuousScenario `
+        -Id "center-eight-armed-turn-N-to-W-value-50" `
+        -Slices "8" `
+        -Value 50 `
+        -ActivationPoint "center" `
+        -ExpectedInvocations 1 `
+        -Direction "W" `
+        -ChangeFromDirection "N" `
+        -Notes "Arms north, changes to west at the same radius, and commits west."
 
     foreach ($point in @("top-left", "top-right", "bottom-right", "bottom-left")) {
         Invoke-ContinuousScenario `
@@ -186,6 +202,21 @@ $coverage = @(
             "Corners are excluded from the quick suite."
         } else {
             "All eight directions exercised at 75% from all four corners."
+        }
+    },
+    [pscustomobject]@{
+        requirement = "live wedge change after continuous arming"
+        status = if ($Suite -eq "quick") {
+            "not_run"
+        } elseif ($failed -eq 0) {
+            "passed"
+        } else {
+            "failed"
+        }
+        evidence = if ($Suite -eq "quick") {
+            "Armed direction switching is excluded from the quick suite."
+        } else {
+            "A 50% north arm changed to west and committed the west wedge."
         }
     },
     [pscustomobject]@{

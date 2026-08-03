@@ -11,8 +11,8 @@ study has already been performed.
 - Debug-only `--continuous-study` opens a dedicated nontechnical study window
   and implies the no-side-effect continuous meter.
 - The 37-trial session contains four practice trials, 24 balanced measured
-  scalar trials, eight pre-arm direction-change trials, and one cancellation
-  trial.
+  scalar trials, four pre-arm direction corrections, four armed wedge changes,
+  and one cancellation trial.
 - Measured scalar trials cover 25%, 50%, 75%, and 100% in both four- and
   eight-slice menus at center, edge, and corner placements. Placement and menu
   conditions are interleaved within each target value.
@@ -28,7 +28,7 @@ study has already been performed.
 
 ## Privacy and export
 
-Each run creates a random session ID and atomically publishes one schema-one
+Each run creates a random session ID and atomically publishes one schema-two
 JSON report under `%LOCALAPPDATA%\Gradial\continuous-studies`.
 
 The report includes requested and observed categories, direction correctness,
@@ -52,6 +52,7 @@ Automated coverage verifies:
   virtual-screen coordinates;
 - exclusion of practice and rejected attempts from measured summaries;
 - scalar-error, accidental-arm, cancellation, and timing summaries;
+- armed direction-switch success summaries;
 - atomic report publication without temporary debris;
 - absence of identity and raw-position fields from serialized reports;
 - debug-option isolation and release rejection; and
@@ -68,6 +69,7 @@ No participant dataset has been fabricated. The current status remains:
 | Median absolute scalar error at most 0.06 | Not evaluated |
 | At least 95% of final samples within 0.15 | Not evaluated |
 | Accidental arming below 2% | Not evaluated |
+| At least 95% of armed direction changes finish in the requested wedge | Not evaluated |
 | At least seven of eight participants cancel after one instruction | Not evaluated |
 | Edge/corner median no more than 20% slower than center | Not evaluated |
 

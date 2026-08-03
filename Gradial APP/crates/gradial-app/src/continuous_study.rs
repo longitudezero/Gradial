@@ -23,7 +23,7 @@ use windows::{
     core::PCWSTR,
 };
 
-const STUDY_SCHEMA_VERSION: u32 = 1;
+const STUDY_SCHEMA_VERSION: u32 = 2;
 const STUDY_EVENT_CAPACITY: usize = 32;
 const STUDY_SIZE: [f32; 2] = [760.0, 680.0];
 const STUDY_MIN_SIZE: [f32; 2] = [680.0, 600.0];
@@ -75,6 +75,7 @@ struct StudyTrial {
     target_percent: Option<u8>,
     direction_index: usize,
     change_from_index: Option<usize>,
+    change_after_arm: bool,
     placement: StudyPlacement,
 }
 
@@ -173,6 +174,7 @@ struct StudyAttemptRecord {
     requested_slice_count: u8,
     requested_direction: String,
     requested_change_from_direction: Option<String>,
+    requested_change_after_arm: bool,
     requested_target: Option<f64>,
     requested_placement: StudyPlacement,
     observed_placement: StudyPlacement,
@@ -206,6 +208,7 @@ impl StudyAttemptRecord {
             observed_value.zip(requested_target).map(|(actual, target)| (actual - target).abs());
         let terminal_is_accepted = match trial.phase {
             StudyPhase::Practice | StudyPhase::Scalar => observed_value.is_some(),
+            StudyPhase::DirectionChange if trial.change_after_arm => observed_value.is_some(),
             StudyPhase::DirectionChange => {
                 observed_value.is_some() || cancel_reason.as_deref() == Some("no_selection")
             }
@@ -227,6 +230,7 @@ impl StudyAttemptRecord {
             requested_slice_count: slice_count_value(trial.slices),
             requested_direction: trial.direction().to_owned(),
             requested_change_from_direction: trial.change_from_direction().map(str::to_owned),
+            requested_change_after_arm: trial.change_after_arm,
             requested_target,
             requested_placement: trial.placement,
             observed_placement: observation.placement,
@@ -248,7 +252,16 @@ impl StudyAttemptRecord {
     }
 
     fn accidentally_armed(&self) -> bool {
-        self.phase == StudyPhase::DirectionChange && self.result == "committed"
+        self.phase == StudyPhase::DirectionChange
+            && !self.requested_change_after_arm
+            && self.result == "committed"
+    }
+
+    fn armed_direction_switch_succeeded(&self) -> bool {
+        self.phase == StudyPhase::DirectionChange
+            && self.requested_change_after_arm
+            && self.result == "committed"
+            && self.direction_correct == Some(true)
     }
 }
 
@@ -265,6 +278,9 @@ struct StudySummary {
     accidental_arming_trials: usize,
     accidental_arms: usize,
     accidental_arming_rate: Option<f64>,
+    armed_direction_switch_trials: usize,
+    armed_direction_switch_successes: usize,
+    armed_direction_switch_success_rate: Option<f64>,
     cancellation_trials: usize,
     cancellation_successes: usize,
     center_median_completion_ms: Option<f64>,
@@ -395,7 +411,7 @@ impl StudyState {
     fn report(&self) -> StudyReport {
         StudyReport {
             schema_version: STUDY_SCHEMA_VERSION,
-            protocol: "gradial-continuous-usability-v1",
+            protocol: "gradial-continuous-usability-v2",
             session_id: self.session_id,
             privacy: StudyPrivacy {
                 identity: "random_session_id_only",
@@ -531,15 +547,27 @@ impl StudyState {
                     ));
                 }
                 StudyPhase::DirectionChange => {
-                    ui.label(RichText::new(format!(
-                        "Begin toward {}, then change to {}",
-                        trial.change_from_direction().unwrap_or("?"),
-                        trial.direction()
-                    )).size(24.0).strong());
-                    ui.label(format!(
-                        "Hold {}, change direction before reaching the 48-DIP arm distance, and release below that distance.",
-                        binding_display(binding)
-                    ));
+                    if trial.change_after_arm {
+                        ui.label(RichText::new(format!(
+                            "Arm toward {} near 50%, then turn to {}",
+                            trial.change_from_direction().unwrap_or("?"),
+                            trial.direction()
+                        )).size(24.0).strong());
+                        ui.label(format!(
+                            "Hold {}, move outward until armed, turn to the requested final wedge without returning to center, then release.",
+                            binding_display(binding)
+                        ));
+                    } else {
+                        ui.label(RichText::new(format!(
+                            "Begin toward {}, then change to {}",
+                            trial.change_from_direction().unwrap_or("?"),
+                            trial.direction()
+                        )).size(24.0).strong());
+                        ui.label(format!(
+                            "Hold {}, change direction before reaching the 48-DIP arm distance, and release below that distance.",
+                            binding_display(binding)
+                        ));
+                    }
                 }
                 StudyPhase::Cancellation => {
                     ui.label(RichText::new(format!(
@@ -578,6 +606,15 @@ impl StudyState {
                     ui,
                     "Accidental arming",
                     format!("{} of {}", summary.accidental_arms, summary.accidental_arming_trials),
+                );
+                summary_row(
+                    ui,
+                    "Armed direction switches",
+                    format!(
+                        "{} of {}",
+                        summary.armed_direction_switch_successes,
+                        summary.armed_direction_switch_trials
+                    ),
                 );
                 summary_row(
                     ui,
@@ -780,6 +817,7 @@ fn study_plan() -> Vec<StudyTrial> {
             target_percent: Some(target),
             direction_index: index * 2,
             change_from_index: None,
+            change_after_arm: false,
             placement: StudyPlacement::Center,
         });
         next_id += 1;
@@ -803,6 +841,7 @@ fn study_plan() -> Vec<StudyTrial> {
                     target_percent: Some(target),
                     direction_index,
                     change_from_index: None,
+                    change_after_arm: false,
                     placement,
                 });
                 next_id += 1;
@@ -811,13 +850,15 @@ fn study_plan() -> Vec<StudyTrial> {
     }
 
     for initial_direction in 0..8 {
+        let change_after_arm = initial_direction % 2 == 1;
         trials.push(StudyTrial {
             id: next_id,
             phase: StudyPhase::DirectionChange,
             slices: SliceCount::Eight,
-            target_percent: None,
+            target_percent: change_after_arm.then_some(50),
             direction_index: (initial_direction + 2) % 8,
             change_from_index: Some(initial_direction),
+            change_after_arm,
             placement: StudyPlacement::Center,
         });
         next_id += 1;
@@ -829,6 +870,7 @@ fn study_plan() -> Vec<StudyTrial> {
         target_percent: Some(50),
         direction_index: 2,
         change_from_index: None,
+        change_after_arm: false,
         placement: StudyPlacement::Center,
     });
     trials
@@ -858,12 +900,26 @@ fn summarize_attempts(attempts: &[StudyAttemptRecord]) -> StudySummary {
     let eight_direction_errors =
         eight_direction.iter().filter(|attempt| attempt.direction_correct == Some(false)).count();
     let within = scalar_errors.iter().filter(|error| **error <= 0.15).count();
-    let accidental: Vec<_> = accepted
+    let direction_changes: Vec<_> = accepted
         .iter()
         .copied()
         .filter(|attempt| attempt.phase == StudyPhase::DirectionChange)
         .collect();
+    let accidental: Vec<_> = direction_changes
+        .iter()
+        .copied()
+        .filter(|attempt| !attempt.requested_change_after_arm)
+        .collect();
     let accidental_arms = accidental.iter().filter(|attempt| attempt.accidentally_armed()).count();
+    let armed_direction_switches: Vec<_> = direction_changes
+        .iter()
+        .copied()
+        .filter(|attempt| attempt.requested_change_after_arm)
+        .collect();
+    let armed_direction_switch_successes = armed_direction_switches
+        .iter()
+        .filter(|attempt| attempt.armed_direction_switch_succeeded())
+        .count();
     let cancellation: Vec<_> = accepted
         .iter()
         .copied()
@@ -901,6 +957,12 @@ fn summarize_attempts(attempts: &[StudyAttemptRecord]) -> StudySummary {
         accidental_arming_trials: accidental.len(),
         accidental_arms,
         accidental_arming_rate: fraction(accidental_arms, accidental.len()),
+        armed_direction_switch_trials: armed_direction_switches.len(),
+        armed_direction_switch_successes,
+        armed_direction_switch_success_rate: fraction(
+            armed_direction_switch_successes,
+            armed_direction_switches.len(),
+        ),
         cancellation_trials: cancellation.len(),
         cancellation_successes,
         center_median_completion_ms: center_median,
@@ -1101,6 +1163,12 @@ mod tests {
             plan.iter().filter(|trial| trial.phase == StudyPhase::DirectionChange).count(),
             8
         );
+        assert_eq!(
+            plan.iter()
+                .filter(|trial| trial.phase == StudyPhase::DirectionChange && trial.change_after_arm)
+                .count(),
+            4
+        );
         assert_eq!(plan.iter().filter(|trial| trial.phase == StudyPhase::Cancellation).count(), 1);
         for placement in [StudyPlacement::Center, StudyPlacement::Edge, StudyPlacement::Corner] {
             for slices in [SliceCount::Four, SliceCount::Eight] {
@@ -1141,8 +1209,12 @@ mod tests {
         let scalar = plan.iter().find(|trial| trial.phase == StudyPhase::Scalar).expect("scalar");
         let accidental = plan
             .iter()
-            .find(|trial| trial.phase == StudyPhase::DirectionChange)
-            .expect("direction change");
+            .find(|trial| trial.phase == StudyPhase::DirectionChange && !trial.change_after_arm)
+            .expect("pre-arm direction change");
+        let armed_switch = plan
+            .iter()
+            .find(|trial| trial.phase == StudyPhase::DirectionChange && trial.change_after_arm)
+            .expect("armed direction change");
         let cancellation = plan
             .iter()
             .find(|trial| trial.phase == StudyPhase::Cancellation)
@@ -1168,6 +1240,17 @@ mod tests {
                 ),
             ),
             StudyAttemptRecord::from_observation(
+                armed_switch,
+                observation(
+                    armed_switch.id,
+                    armed_switch.placement,
+                    StudyTerminal::Committed {
+                        slice_index: armed_switch.direction_index,
+                        value: 0.5,
+                    },
+                ),
+            ),
+            StudyAttemptRecord::from_observation(
                 cancellation,
                 observation(
                     cancellation.id,
@@ -1179,6 +1262,7 @@ mod tests {
         let summary = summarize_attempts(&attempts);
         assert_eq!(summary.measured_scalar_samples, 1);
         assert_eq!(summary.accidental_arms, 0);
+        assert_eq!(summary.armed_direction_switch_successes, 1);
         assert_eq!(summary.cancellation_successes, 1);
         assert!(summary.median_absolute_scalar_error.is_some_and(|error| error < 0.041));
     }
@@ -1194,8 +1278,11 @@ mod tests {
                     slice_index: trial.direction_index,
                     value: f64::from(trial.target_percent.unwrap_or_default()) / 100.0,
                 },
-                StudyPhase::DirectionChange => {
+                StudyPhase::DirectionChange if !trial.change_after_arm => {
                     StudyTerminal::Cancelled { reason: CancelReason::NoSelection }
+                }
+                StudyPhase::DirectionChange => {
+                    StudyTerminal::Committed { slice_index: trial.direction_index, value: 0.5 }
                 }
                 StudyPhase::Cancellation => {
                     StudyTerminal::Cancelled { reason: CancelReason::ReturnedToCenter }
@@ -1210,6 +1297,7 @@ mod tests {
         assert_eq!(report.summary.accepted_trials, 37);
         assert_eq!(report.summary.measured_scalar_samples, 24);
         assert_eq!(report.summary.accidental_arms, 0);
+        assert_eq!(report.summary.armed_direction_switch_successes, 4);
         assert_eq!(report.summary.cancellation_successes, 1);
     }
 
@@ -1230,7 +1318,7 @@ mod tests {
             assert!(!json.contains(prohibited), "found prohibited field {prohibited}");
         }
         assert!(json.contains("\"identity\": \"random_session_id_only\""));
-        assert!(json.contains("gradial-continuous-usability-v1"));
+        assert!(json.contains("gradial-continuous-usability-v2"));
         assert!(directory.path().read_dir().expect("report directory").all(|entry| {
             entry
                 .expect("report entry")

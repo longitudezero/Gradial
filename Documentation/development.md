@@ -111,9 +111,9 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   PresentMon displayed-frame correlation, phased resource sampling, and
   explicit evidence-status reporting.
 - The first v0.3 continuous-input prototype: pure 48–160 DIP normalization,
-  per-invocation continuous-slice masks, direction locking, center-stop
-  behavior, a production-overlay scalar track, and a debug-only meter that
-  cannot compile or dispatch configured actions.
+  per-invocation continuous-slice masks, live post-arm direction, center-stop
+  behavior, a production-overlay scalar track, an edge-assist pointer proxy,
+  and a debug-only meter that cannot compile or dispatch configured actions.
 - A dedicated continuous interaction matrix that checks four/eight directions,
   normalized target values, focus, edge assist, inert execution, and
   machine-readable coverage without fabricating the pending human study.
@@ -448,15 +448,16 @@ or saved action definitions. The pure controller:
 
 - selects by the existing angle and 36 DIP entry threshold;
 - arms at 48 DIP;
-- locks that slice for the rest of the invocation;
+- continues selecting the live wedge after arming with boundary hysteresis;
 - maps 48–160 DIP linearly to an unsigned `0.0..=1.0` scalar;
 - clamps greater distance to `1.0`;
 - commits the final scalar on activation release;
 - cancels without a commit when released before arming; and
 - stops an armed gesture when it returns inside 24 DIP.
 
-The render thread receives only the locked slice and scalar. It draws a radial
-track and percentage through `FoundationOverlayRenderer`; it performs no
+The render thread receives the live slice, scalar, armed state, and a bounded
+DIP pointer offset. It draws a radial track, percentage, and—during edge
+assist—a pointer proxy through `FoundationOverlayRenderer`; it performs no
 callback or configured action work. The interaction outcome is
 `ContinuousCommitted`, which the debug meter logs and closes without entering
 action-plan compilation. This makes the meter a no-side-effect sample sink,
@@ -465,7 +466,8 @@ including when the selected configured slice normally has an action.
 The normalized value uses the invocation DPI. Edge assist accumulates raw
 physical deltas into the same virtual pointer and divides by that DPI before
 normalization, so equivalent DIP travel produces the same value on every
-monitor.
+monitor. The pointer proxy is clamped to the 160-DIP full-scale boundary and
+contains no raw screen coordinate.
 
 ### Continuous usability study
 
@@ -481,7 +483,9 @@ One anonymous session contains:
 - 24 measured scalar trials covering those four values for both four- and
   eight-slice menus at center, edge, and corner placements, interleaved by
   target to limit simple ordering bias;
-- eight pre-arm direction-change trials for accidental-arming measurement; and
+- four pre-arm direction-change trials for accidental-arming measurement;
+- four armed direction-change trials that must finish in the requested live
+  wedge; and
 - one armed center-return cancellation trial after the instruction was shown
   once on the introduction page.
 
@@ -490,7 +494,7 @@ in the wrong placement category or a scalar trial released before commit is
 retained as a rejected attempt and retried. Placement classification uses a
 32-DIP boundary around the work area, but reports contain only the category.
 
-The report schema starts at version 1 and records a random session ID, requested
+The report schema is version 2 and records a random session ID, requested
 and observed categories, direction correctness, normalized values, scalar
 error, cancellation reason, invocation duration, and monitor DPI. It does not
 record names, raw coordinates, foreground application identity, paths, window
@@ -1110,6 +1114,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault queue-overflow
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ReducedMotion
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 75
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection N -Direction W
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint top-left -AllDirections
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint center -Direction SW -InvocationCount 20 -QuickFlick -InterInvocationDelayMilliseconds 10
@@ -1136,6 +1141,8 @@ shell, add `-TimingMarkersOnly`. Pass `-Configuration release` after building
 with `cargo build --release` for performance-oriented checks. `-MonitorIndex`
 selects an entry from Windows' current display list. `-Slices 4` or `-Slices 8`
 selects and validates the corresponding startup geometry.
+`-ChangeFromDirection N -Direction W` adds a deliberate post-arm turn to a
+single continuous-meter invocation and verifies the final live wedge.
 `-SimulateDisplayChange` holds M4, posts the same notification used by the
 native rebuild path, verifies the active invocation is cancelled, waits until
 generation 1 is fully rewarmed, and then sends a fresh gesture.

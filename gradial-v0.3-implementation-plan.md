@@ -54,7 +54,9 @@ limits resource use, and exposes only declared Gradial capabilities.
 - One continuous scalar per plugin-backed continuous action.
 - A normalized `0.0..=1.0` value derived from radial distance.
 - Begin, update, commit, and cancel lifecycle messages.
-- Direction locking after a continuous action is armed.
+- Live angular selection before and after a continuous action is armed.
+- Deterministic handoff between continuous actions when the selected wedge
+  changes.
 - Latest-value coalescing with a configurable 10–60 Hz update rate.
 - Production-overlay feedback for continuous distance.
 - Edge-assist support for the full continuous range without cursor warping.
@@ -136,8 +138,9 @@ monitor's DPI.
 | Default update rate | 30 Hz |
 | Allowed update-rate range | 10–60 Hz |
 
-Before the pointer reaches the continuous arm radius, angle may change the
-selected slice using the existing v0.2 geometry and hysteresis.
+Angle may change the selected slice throughout the held gesture using the
+existing v0.2 geometry and hysteresis. Angle chooses the wedge; radial distance
+chooses the scalar. Neither dimension freezes the other.
 
 For radial distance `d`, arm radius `a`, and full-scale radius `f`, Gradial
 computes:
@@ -159,9 +162,10 @@ value = clamp((d - a) / (f - a), 0.0, 1.0)
 
 The Milestone 0 usability prototype may adjust the 48 DIP and 160 DIP defaults.
 Changing them requires recorded results for precision, accidental arming, edge
-use, and cancellation; it does not change the normalized protocol.
+use, live direction switching, and cancellation; it does not change the
+normalized protocol.
 
-### 3.3 Arming and direction lock
+### 3.3 Arming and live direction
 
 A continuous session arms when all of the following are true:
 
@@ -171,30 +175,47 @@ A continuous session arms when all of the following are true:
 4. The referenced plugin and action are enabled and healthy.
 5. The plugin accepts `Begin`.
 
-Crossing the arm radius freezes the candidate direction before `Begin` is
-submitted. If the plugin rejects or times out, the invocation cancels instead
-of changing direction. Once `Begin` is accepted:
+Crossing the arm radius submits `Begin` for the currently selected continuous
+slice. If the plugin rejects or times out, the invocation cancels. Once
+`Begin` is accepted:
 
-- The selected slice is locked for that invocation.
-- Angular movement no longer switches to a neighboring action.
-- Radial movement continues to update the scalar.
-- Choosing a different direction requires cancelling and invoking Gradial
-  again.
-- The continuous session owns the action coordinator until it ends.
-- A second discrete or continuous dispatch fails immediately with
-  `action_busy`.
+- Angular movement continues to select the live wedge using the existing
+  boundary hysteresis.
+- Radial movement continues to update the scalar independently of angle.
+- The action coordinator lease belongs to the whole held invocation, not to
+  one wedge segment. A second external dispatch fails with `action_busy`.
+- Releasing commits only the continuous action in the live wedge.
+- Once any continuous `Begin` has succeeded, moving onto a discrete or empty
+  wedge never dispatches that wedge's discrete action during the same
+  invocation.
 
-Direction locking prevents live side effects from unexpectedly switching
-between plugins or actions during one held gesture.
+When angular movement selects a different enabled continuous action after
+`Begin`, Gradial performs a bounded handoff:
+
+1. Stop publishing updates to the old action.
+2. Send its one best-effort `Cancel` with reason `direction_changed`.
+3. Increment the segment generation and submit `Begin` to the new action with
+   the latest scalar and the original frozen target snapshot.
+4. Resume coalesced updates only after the new `Begin` succeeds.
+
+Moving onto an empty, discrete, unavailable, or disabled wedge stops the old
+continuous action but starts no replacement. Moving back onto an enabled
+continuous wedge may begin a new segment while the activation control remains
+held. Releasing without an active continuous segment closes with no selection.
+A rejected or timed-out replacement `Begin` cancels the whole invocation.
+
+`direction_changed` is a stop, not a rollback. Effects already produced by the
+old action remain. The overlay switches immediately from Gradial-owned input
+state and never waits for a plugin callback.
 
 Releasing on a continuous slice before the arm radius is reached cancels with
 no plugin callback and no application effect.
 
 ### 3.4 Release and cancellation
 
-Releasing the activation control after a successful `Begin` sends `Commit`
-with the final sample. `Commit` is delivered even if the same value was already
-sent in the latest `Update`.
+Releasing the activation control while a continuous segment is active sends
+`Commit` to that segment with the final live wedge and scalar. `Commit` is
+delivered even if the same value was already sent in the latest `Update`.
 
 The v0.2 cancellation causes remain valid. In addition, an active continuous
 session cancels when:
@@ -224,13 +245,18 @@ After any terminal event:
 
 The overlay renderer receives only Gradial-owned immutable render data:
 
-- Locked direction.
+- Live selected direction.
 - Normalized scalar.
 - Armed/active/faulted visual state.
+- A bounded DIP pointer offset for edge-assist feedback.
 
 The production overlay SHOULD show a radial progress track from arm radius to
 full-scale radius. It may display `0–100%`, but it does not display a
 plugin-supplied dynamic label or application value in v0.3.
+
+During edge assist, the production overlay MUST show a Gradial-owned pointer
+proxy that follows the signed raw-delta virtual pointer. The proxy is clamped
+to the full-scale radius and contains no raw screen coordinate.
 
 Plugin code MUST NOT run during layout, painting, texture upload, animation, or
 frame presentation. A stalled plugin may stop application effects, but it
@@ -242,6 +268,8 @@ Continuous distance uses the same physical-pointer or raw-delta virtual pointer
 selected by the v0.2 invocation geometry.
 
 - Edge assist accumulates signed raw deltas beyond the visible work-area edge.
+- A visible proxy exposes the virtual pointer's live angle and bounded radial
+  position when the system cursor cannot represent them.
 - The system cursor is not warped.
 - The foreground application receives no synthetic pointer movement.
 - The normalized value is the same for equivalent DIP movement at every tested
@@ -300,6 +328,10 @@ Protocol rules:
   `1`.
 - Every accepted session receives exactly one `Begin`, zero or more `Update`
   requests, and at most one terminal `Commit` or `Cancel`.
+- Each post-arm wedge segment has a fresh `session_id` and sequence starting at
+  zero. A direction handoff delivers the old segment's `direction_changed`
+  cancel before submitting the new segment's `Begin`; the invocation-level
+  coordinator lease remains held between them.
 - Sequence numbers strictly increase.
 - Requests for different sessions are never interleaved in v0.3.
 - The value transport is loss-tolerant; each `Update` contains complete current
@@ -668,7 +700,7 @@ action belongs to a plugin.
 | Owner | New responsibility | Prohibited work |
 | --- | --- | --- |
 | Input thread | Existing fixed-size pointer events only | Lua, manifests, capabilities |
-| Interaction thread | Scalar calculation, lock state, latest sample publication | Lua execution, blocking I/O |
+| Interaction thread | Scalar calculation, live direction, segment handoff, latest sample publication | Lua execution, blocking I/O |
 | UI/render thread | Draw immutable scalar feedback | Lua callbacks, plugin file reads |
 | Action coordinator | Grant one continuous-session lease | Running Lua or network requests |
 | Plugin worker | Own Lua states and serialized callbacks | Hooks, rendering, configuration writes |
@@ -829,6 +861,7 @@ Accept the defaults when:
 - Median absolute scalar error after practice is at most 0.06.
 - At least 95% of final samples are within 0.15 of the requested target.
 - Accidental arming while changing direction is below 2%.
+- At least 95% of armed direction changes finish in the requested live wedge.
 - At least seven of eight participants can cancel an armed action after being
   told once that cancellation stops but does not undo prior effects.
 - Edge/corner median completion time is no more than 20% slower than
@@ -846,8 +879,8 @@ application-specific values in the core.
   beyond both bounds.
 - NaN, infinity, very large deltas, negative coordinates, and every supported
   DPI.
-- Four/eight slice centers, boundaries, hysteresis, direction locking, and
-  return-to-center cancellation.
+- Four/eight slice centers, boundaries, hysteresis, live post-arm direction
+  changes, and return-to-center cancellation.
 - Monotonic scalar behavior for monotonic outward movement.
 - Deterministic update coalescing and sequence gaps.
 - Begin rejection, callback error, timeout, cancellation, and exact terminal
@@ -906,8 +939,9 @@ error messages, and author guide before release.
 Deliver:
 
 - Pure distance normalization.
-- Continuous arming and direction-lock state.
+- Continuous arming and live-direction state.
 - Production-renderer progress feedback.
+- Bounded virtual-pointer feedback during edge assist.
 - Edge-assist extension to the candidate full-scale radius.
 - A built-in no-side-effect sample sink.
 - Repeatable direction/distance interaction matrix.

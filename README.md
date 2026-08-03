@@ -62,10 +62,11 @@ performance-report harness with QPC hook/dispatch timing, PresentMon
 correlation, resource sampling, and explicit unavailable/not-run evidence.
 Configured application paths remain excluded from diagnostics unless the user
 explicitly includes them. The first bounded v0.3 slice adds pure,
-DPI-independent continuous distance, direction locking after arming, a
-production-overlay progress track, and a debug-only inert meter. The meter
-exercises the real input, edge-assist, interaction, rendering, focus, and close
-paths while remaining unable to compile or dispatch a saved action.
+DPI-independent continuous distance, live direction before and after arming,
+a production-overlay progress track, an edge-assist pointer proxy, and a
+debug-only inert meter. The meter exercises the real input, edge-assist,
+interaction, rendering, focus, and close paths while remaining unable to
+compile or dispatch a saved action.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -97,7 +98,8 @@ The app starts hidden. With the default binding:
 Gradial normally keeps the gesture fixed at activation-down. If the complete ring would
 clip the current monitor's work area, it automatically insets the ring and uses
 raw mouse deltas as a virtual pointer. The system cursor stays at the invocation
-point during that edge-assisted gesture.
+point during that edge-assisted gesture; continuous input displays a bounded
+pointer proxy inside the overlay.
 
 The two Milestone 0 prototypes can also be forced for comparison:
 
@@ -118,9 +120,10 @@ cargo run --package gradial-app -- --slices=4
 reject this override and always use the resolved profile configuration.
 
 The debug-only continuous meter makes every direction inert and maps 48–160
-DIP of radial travel to `0–100%`. It locks the chosen direction after arming,
-uses the wider edge-assist extent, and never compiles or dispatches the saved
-slice action:
+DIP of radial travel to `0–100%`. The highlighted wedge follows the live angle
+before and after arming with boundary hysteresis, while distance remains the
+independent scalar. It uses the wider edge-assist extent and never compiles or
+dispatches the saved slice action:
 
 ```powershell
 cargo run --package gradial-app -- --continuous-meter --skip-onboarding
@@ -137,8 +140,9 @@ configured actions disabled:
 cargo run --package gradial-app -- --continuous-study
 ```
 
-Each participant completes practice, balanced scalar trials, direction-change
-checks, and one cancellation check. Gradial asks for no name and writes one
+Each participant completes practice, balanced scalar trials, four pre-arm
+direction corrections, four armed wedge changes, and one cancellation check.
+Gradial asks for no name and writes one
 anonymous JSON report under
 `%LOCALAPPDATA%\Gradial\continuous-studies`. After collecting at least eight
 reports, evaluate the cohort gates with:
@@ -328,7 +332,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-continuous-matri
 
 It writes ignored JSON and CSV evidence under
 `Gradial APP\captures\continuous-matrix`. Automated results deliberately leave
-the eight-participant usability study as `not_run`.
+the eight-participant usability study as `not_run`; the standard suite includes
+a post-arm N-to-W wedge change on the real Windows input path.
 
 Run a short, non-qualifying local performance baseline after building the
 release executable:

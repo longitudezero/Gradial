@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2, epaint::CircleShape};
 use gradial_core::{
-    AccentColor, ActivationBindingId, Appearance, ContinuousSelection, LabelTheme, ResolvedMenu,
-    SliceCount,
+    AccentColor, ActivationBindingId, Appearance, ContinuousSelection, LabelTheme, Point,
+    ResolvedMenu, SliceCount,
 };
 use uuid::Uuid;
 
@@ -34,6 +34,7 @@ pub(crate) struct OverlayRenderFrame {
     pub(crate) appearance: Appearance,
     pub(crate) selected_slice: Option<usize>,
     pub(crate) continuous_selection: Option<ContinuousSelection>,
+    pub(crate) continuous_pointer: Option<Point>,
     pub(crate) selection_changed_at: Option<Instant>,
     pub(crate) opacity: f32,
     pub(crate) scale: f32,
@@ -144,6 +145,10 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             &self.icons,
         );
 
+        if let Some(pointer_offset) = frame.continuous_pointer {
+            draw_continuous_pointer(painter, center, pointer_offset, opacity, scale, accent, theme);
+        }
+
         painter.circle_filled(center, 28.0 * scale, faded(theme.center, opacity));
         let center_label = frame.continuous_selection.map_or_else(
             || frame.activation_button.short_label().to_owned(),
@@ -159,6 +164,36 @@ impl OverlayRenderer for FoundationOverlayRenderer {
 
         selection_animating
     }
+}
+
+fn continuous_pointer_position(center: Pos2, offset: Point, scale: f32) -> Pos2 {
+    center + Vec2::new(offset.x, offset.y) * scale
+}
+
+fn draw_continuous_pointer(
+    painter: &egui::Painter,
+    center: Pos2,
+    offset: Point,
+    opacity: f32,
+    scale: f32,
+    accent: AccentColor,
+    theme: ThemeColors,
+) {
+    let pointer_position = continuous_pointer_position(center, offset, scale);
+    painter.line_segment(
+        [center, pointer_position],
+        Stroke::new(scale, faded(theme.center_label, opacity * 0.42)),
+    );
+    painter.circle_filled(
+        pointer_position,
+        5.0 * scale,
+        faded(selected_accent_color(accent, 255), opacity),
+    );
+    painter.circle_stroke(
+        pointer_position,
+        7.0 * scale,
+        Stroke::new(1.5 * scale, faded(theme.center_label, opacity)),
+    );
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -595,9 +630,9 @@ mod tests {
     };
 
     use super::{
-        FoundationOverlayRenderer, SelectionTransition, continuous_track_offsets, fitted_icon_rect,
-        half_slice_angle, icon_and_label_offsets, menu_label_layout, selected_accent_color,
-        theme_colors,
+        FoundationOverlayRenderer, SelectionTransition, continuous_pointer_position,
+        continuous_track_offsets, fitted_icon_rect, half_slice_angle, icon_and_label_offsets,
+        menu_label_layout, selected_accent_color, theme_colors,
     };
     use crate::icons::IconVisual;
     use crate::overlay::AnimationMode;
@@ -689,6 +724,17 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn continuous_pointer_uses_the_bounded_virtual_offset() {
+        let pointer = continuous_pointer_position(
+            eframe::egui::Pos2::new(200.0, 200.0),
+            gradial_core::Point::new(-80.0, 120.0),
+            1.0,
+        );
+        assert_close(pointer.x, 120.0);
+        assert_close(pointer.y, 320.0);
     }
 
     #[test]

@@ -3297,6 +3297,7 @@ impl SettingsState {
                 appearance,
                 selected_slice: Some(self.selected_slice),
                 continuous_selection: None,
+                continuous_pointer: None,
                 selection_changed_at: Some(now),
                 opacity: 1.0,
                 scale: 1.0,
