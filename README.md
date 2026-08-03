@@ -130,6 +130,23 @@ Releasing before 48 DIP cancels. Returning inside the existing 24 DIP center
 radius after arming stops the meter; cancellation does not imply rollback for
 future application plugins.
 
+The debug-only guided study runs the Section 11.3 participant protocol with
+configured actions disabled:
+
+```powershell
+cargo run --package gradial-app -- --continuous-study
+```
+
+Each participant completes practice, balanced scalar trials, direction-change
+checks, and one cancellation check. Gradial asks for no name and writes one
+anonymous JSON report under
+`%LOCALAPPDATA%\Gradial\continuous-studies`. After collecting at least eight
+reports, evaluate the cohort gates with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/summarize-continuous-study.ps1
+```
+
 The overlay opens from 96% scale and 85% opacity over 60 ms, changes selection
 color over 35 ms, and fades out over 50 ms. Gesture recognition and release do
 not wait for those animations. Appearance presets change only drawing size;
@@ -330,6 +347,8 @@ current limitations. The latest bounded interaction evidence is recorded in
 [`Documentation/milestone-0-smoke-results.md`](Documentation/milestone-0-smoke-results.md),
 and continuous-input prototype evidence is recorded in
 [`Documentation/milestone-0-continuous-input-results.md`](Documentation/milestone-0-continuous-input-results.md).
+The guided participant protocol is documented in
+[`Documentation/milestone-0-continuous-study-results.md`](Documentation/milestone-0-continuous-study-results.md).
 The per-display pool evidence is in
 [`Documentation/milestone-1-overlay-pool-results.md`](Documentation/milestone-1-overlay-pool-results.md).
 Four/eight geometry results are recorded in

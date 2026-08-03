@@ -18,6 +18,7 @@ pub struct AppPaths {
     pub config_temporary: PathBuf,
     pub onboarding: PathBuf,
     pub onboarding_temporary: PathBuf,
+    pub continuous_studies: PathBuf,
     pub icons: PathBuf,
     pub logs: PathBuf,
 }
@@ -45,6 +46,7 @@ impl AppPaths {
             config_temporary: root.join("config.json.tmp"),
             onboarding: root.join("onboarding-v1.json"),
             onboarding_temporary: root.join("onboarding-v1.json.tmp"),
+            continuous_studies: root.join("continuous-studies"),
             icons: root.join("icons"),
             logs: root.join("logs"),
             root,
@@ -62,6 +64,7 @@ impl AppPaths {
         create_directory(&self.root)?;
         create_directory(&self.icons)?;
         create_directory(&self.logs)?;
+        create_directory(&self.continuous_studies)?;
         Ok(())
     }
 }
@@ -98,6 +101,7 @@ mod tests {
         assert_eq!(paths.config_temporary, paths.root.join("config.json.tmp"));
         assert_eq!(paths.onboarding, paths.root.join("onboarding-v1.json"));
         assert_eq!(paths.onboarding_temporary, paths.root.join("onboarding-v1.json.tmp"));
+        assert_eq!(paths.continuous_studies, paths.root.join("continuous-studies"));
         assert_eq!(paths.icons, paths.root.join("icons"));
         assert_eq!(paths.logs, paths.root.join("logs"));
     }
@@ -113,6 +117,7 @@ mod tests {
         assert!(paths.root.is_dir());
         assert!(paths.icons.is_dir());
         assert!(paths.logs.is_dir());
+        assert!(paths.continuous_studies.is_dir());
         assert!(!paths.config.exists());
     }
 }

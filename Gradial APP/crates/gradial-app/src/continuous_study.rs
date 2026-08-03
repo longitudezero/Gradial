@@ -1,0 +1,1242 @@
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+};
+
+use anyhow::{Context, Result, bail};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use eframe::egui::{
+    self, Align, Color32, Layout, RichText, ViewportBuilder, ViewportClass, ViewportCommand,
+    ViewportId,
+};
+use gradial_core::{
+    ActivationBinding, CancelReason, InteractionOutcome, InvocationSnapshot, ResolvedMenu,
+    ScreenPoint, ScreenRect, SliceCount,
+};
+use serde::Serialize;
+use uuid::Uuid;
+use windows::{
+    Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+    core::PCWSTR,
+};
+
+const STUDY_SCHEMA_VERSION: u32 = 1;
+const STUDY_EVENT_CAPACITY: usize = 32;
+const STUDY_SIZE: [f32; 2] = [760.0, 680.0];
+const STUDY_MIN_SIZE: [f32; 2] = [680.0, 600.0];
+const TARGETS: [u8; 4] = [25, 50, 75, 100];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StudyPhase {
+    Practice,
+    Scalar,
+    DirectionChange,
+    Cancellation,
+}
+
+impl StudyPhase {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Practice => "Practice",
+            Self::Scalar => "Measured target",
+            Self::DirectionChange => "Direction-change check",
+            Self::Cancellation => "Cancellation check",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StudyPlacement {
+    Center,
+    Edge,
+    Corner,
+}
+
+impl StudyPlacement {
+    const fn instruction(self) -> &'static str {
+        match self {
+            Self::Center => "Place the pointer comfortably away from every screen edge.",
+            Self::Edge => "Place the pointer directly against any one screen edge.",
+            Self::Corner => "Place the pointer directly in any screen corner.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StudyTrial {
+    id: u32,
+    phase: StudyPhase,
+    slices: SliceCount,
+    target_percent: Option<u8>,
+    direction_index: usize,
+    change_from_index: Option<usize>,
+    placement: StudyPlacement,
+}
+
+impl StudyTrial {
+    fn direction(&self) -> &'static str {
+        direction_label(self.slices, self.direction_index)
+    }
+
+    fn change_from_direction(&self) -> Option<&'static str> {
+        self.change_from_index.map(|index| direction_label(self.slices, index))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StudyInvocationSetup {
+    pub(crate) trial_id: u32,
+    pub(crate) menu: Arc<ResolvedMenu>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ContinuousStudySink {
+    current: Arc<Mutex<Option<StudyInvocationSetup>>>,
+    sender: Sender<StudyObservation>,
+}
+
+impl ContinuousStudySink {
+    pub(crate) fn invocation_if_enabled(&self) -> Option<StudyInvocationSetup> {
+        self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn completed(
+        &self,
+        trial_id: Option<u32>,
+        snapshot: &InvocationSnapshot,
+        outcome: InteractionOutcome,
+        duration_ms: u32,
+    ) {
+        let Some(trial_id) = trial_id else {
+            return;
+        };
+        let terminal = match outcome {
+            InteractionOutcome::ContinuousCommitted { slice_index, value } => {
+                StudyTerminal::Committed { slice_index, value }
+            }
+            InteractionOutcome::Cancelled { reason } => StudyTerminal::Cancelled { reason },
+            InteractionOutcome::Selected { .. } => return,
+        };
+        let observation = StudyObservation {
+            trial_id,
+            placement: classify_placement(
+                snapshot.cursor_physical_px,
+                snapshot.context.work_area_physical_px,
+                snapshot.monitor_dpi,
+            ),
+            monitor_dpi: snapshot.monitor_dpi,
+            duration_ms,
+            terminal,
+        };
+        match self.sender.try_send(observation) {
+            Ok(()) => crate::platform::request_controller_repaint(),
+            Err(error) => {
+                let status = match error {
+                    TrySendError::Full(_) => "full",
+                    TrySendError::Disconnected(_) => "disconnected",
+                };
+                log::error!(
+                    target: "study",
+                    "component=continuous_study event_code=study_observation_dropped \
+                     result_code=failure error_code=channel_{status} config_revision=0"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StudyTerminal {
+    Committed { slice_index: usize, value: f64 },
+    Cancelled { reason: CancelReason },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StudyObservation {
+    trial_id: u32,
+    placement: StudyPlacement,
+    monitor_dpi: u32,
+    duration_ms: u32,
+    terminal: StudyTerminal,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StudyAttemptRecord {
+    trial_id: u32,
+    phase: StudyPhase,
+    accepted: bool,
+    requested_slice_count: u8,
+    requested_direction: String,
+    requested_change_from_direction: Option<String>,
+    requested_target: Option<f64>,
+    requested_placement: StudyPlacement,
+    observed_placement: StudyPlacement,
+    placement_matches: bool,
+    result: String,
+    observed_direction: Option<String>,
+    direction_correct: Option<bool>,
+    observed_value: Option<f64>,
+    absolute_scalar_error: Option<f64>,
+    cancel_reason: Option<String>,
+    duration_ms: u32,
+    monitor_dpi: u32,
+}
+
+impl StudyAttemptRecord {
+    fn from_observation(trial: &StudyTrial, observation: StudyObservation) -> Self {
+        let placement_matches = trial.placement == observation.placement;
+        let requested_target = trial.target_percent.map(|value| f64::from(value) / 100.0);
+        let (result, observed_index, observed_value, cancel_reason) = match observation.terminal {
+            StudyTerminal::Committed { slice_index, value } => {
+                ("committed".to_owned(), Some(slice_index), Some(value), None)
+            }
+            StudyTerminal::Cancelled { reason } => {
+                ("cancelled".to_owned(), None, None, Some(cancel_reason_name(reason).to_owned()))
+            }
+        };
+        let direction_correct = observed_index.map(|index| index == trial.direction_index);
+        let observed_direction =
+            observed_index.map(|index| direction_label(trial.slices, index).to_owned());
+        let absolute_scalar_error =
+            observed_value.zip(requested_target).map(|(actual, target)| (actual - target).abs());
+        let terminal_is_accepted = match trial.phase {
+            StudyPhase::Practice | StudyPhase::Scalar => observed_value.is_some(),
+            StudyPhase::DirectionChange => {
+                observed_value.is_some() || cancel_reason.as_deref() == Some("no_selection")
+            }
+            StudyPhase::Cancellation => {
+                observed_value.is_some()
+                    || matches!(
+                        cancel_reason.as_deref(),
+                        Some(
+                            "escape" | "other_mouse_button" | "no_selection" | "returned_to_center"
+                        )
+                    )
+            }
+        };
+
+        Self {
+            trial_id: trial.id,
+            phase: trial.phase,
+            accepted: placement_matches && terminal_is_accepted,
+            requested_slice_count: slice_count_value(trial.slices),
+            requested_direction: trial.direction().to_owned(),
+            requested_change_from_direction: trial.change_from_direction().map(str::to_owned),
+            requested_target,
+            requested_placement: trial.placement,
+            observed_placement: observation.placement,
+            placement_matches,
+            result,
+            observed_direction,
+            direction_correct,
+            observed_value,
+            absolute_scalar_error,
+            cancel_reason,
+            duration_ms: observation.duration_ms,
+            monitor_dpi: observation.monitor_dpi,
+        }
+    }
+
+    fn cancellation_succeeded(&self) -> bool {
+        self.phase == StudyPhase::Cancellation
+            && self.cancel_reason.as_deref() == Some("returned_to_center")
+    }
+
+    fn accidentally_armed(&self) -> bool {
+        self.phase == StudyPhase::DirectionChange && self.result == "committed"
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct StudySummary {
+    accepted_trials: usize,
+    measured_scalar_samples: usize,
+    eight_direction_samples: usize,
+    eight_direction_errors: usize,
+    eight_direction_error_rate: Option<f64>,
+    median_absolute_scalar_error: Option<f64>,
+    samples_within_0_15: usize,
+    fraction_within_0_15: Option<f64>,
+    accidental_arming_trials: usize,
+    accidental_arms: usize,
+    accidental_arming_rate: Option<f64>,
+    cancellation_trials: usize,
+    cancellation_successes: usize,
+    center_median_completion_ms: Option<f64>,
+    edge_median_completion_ms: Option<f64>,
+    corner_median_completion_ms: Option<f64>,
+    edge_corner_slowdown_fraction: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StudyReport {
+    schema_version: u32,
+    protocol: &'static str,
+    session_id: Uuid,
+    privacy: StudyPrivacy,
+    candidate_geometry_dip: CandidateGeometry,
+    planned_trials: usize,
+    attempts: Vec<StudyAttemptRecord>,
+    summary: StudySummary,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct StudyPrivacy {
+    identity: &'static str,
+    excluded_data: [&'static str; 6],
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct CandidateGeometry {
+    cancel: u32,
+    direction: u32,
+    arm: u32,
+    full_scale: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StudyStage {
+    #[default]
+    Closed,
+    Intro,
+    Running,
+    Results,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StudyUiEvent {
+    Start,
+    RetryExport,
+    Close,
+}
+
+#[derive(Debug)]
+struct StudyState {
+    stage: StudyStage,
+    session_id: Uuid,
+    plan: Vec<StudyTrial>,
+    trial_index: usize,
+    attempts: Vec<StudyAttemptRecord>,
+    privacy_acknowledged: bool,
+    feedback: Option<String>,
+    pending_event: Option<StudyUiEvent>,
+    export_pending: bool,
+    report_path: Option<PathBuf>,
+}
+
+impl StudyState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            stage: if enabled { StudyStage::Intro } else { StudyStage::Closed },
+            session_id: Uuid::new_v4(),
+            plan: study_plan(),
+            trial_index: 0,
+            attempts: Vec::new(),
+            privacy_acknowledged: false,
+            feedback: None,
+            pending_event: None,
+            export_pending: false,
+            report_path: None,
+        }
+    }
+
+    fn current_trial(&self) -> Option<&StudyTrial> {
+        (self.stage == StudyStage::Running).then(|| self.plan.get(self.trial_index)).flatten()
+    }
+
+    fn start(&mut self) {
+        self.stage = StudyStage::Running;
+        self.trial_index = 0;
+        self.attempts.clear();
+        self.feedback = None;
+        self.export_pending = false;
+        self.report_path = None;
+    }
+
+    fn record(&mut self, observation: StudyObservation) {
+        let Some(trial) = self.current_trial().cloned() else {
+            return;
+        };
+        if observation.trial_id != trial.id {
+            return;
+        }
+        let record = StudyAttemptRecord::from_observation(&trial, observation);
+        let accepted = record.accepted;
+        self.feedback = if !record.placement_matches {
+            Some(format!(
+                "That attempt began at {:?}, but this trial requires {:?}. Reposition and try again.",
+                record.observed_placement, record.requested_placement
+            ))
+        } else if !accepted {
+            Some(
+                "That attempt ended before a value was committed. Try the same target again."
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        self.attempts.push(record);
+        if !accepted {
+            return;
+        }
+
+        self.trial_index += 1;
+        if self.trial_index >= self.plan.len() {
+            self.stage = StudyStage::Results;
+            self.export_pending = true;
+        }
+    }
+
+    fn report(&self) -> StudyReport {
+        StudyReport {
+            schema_version: STUDY_SCHEMA_VERSION,
+            protocol: "gradial-continuous-usability-v1",
+            session_id: self.session_id,
+            privacy: StudyPrivacy {
+                identity: "random_session_id_only",
+                excluded_data: [
+                    "participant_name",
+                    "raw_cursor_coordinates",
+                    "application_identity",
+                    "file_paths",
+                    "window_details",
+                    "monitor_device_names",
+                ],
+            },
+            candidate_geometry_dip: CandidateGeometry {
+                cancel: 24,
+                direction: 36,
+                arm: 48,
+                full_scale: 160,
+            },
+            planned_trials: self.plan.len(),
+            attempts: self.attempts.clone(),
+            summary: summarize_attempts(&self.attempts),
+        }
+    }
+
+    fn render(&mut self, ui: &mut egui::Ui, binding: ActivationBinding) -> Option<StudyUiEvent> {
+        if ui.ctx().input(|input| input.viewport().close_requested()) {
+            return Some(StudyUiEvent::Close);
+        }
+
+        #[cfg(debug_assertions)]
+        let debug_event = if self.stage == StudyStage::Intro
+            && ui.ctx().input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F1))
+        {
+            self.privacy_acknowledged = true;
+            Some(StudyUiEvent::Start)
+        } else {
+            None
+        };
+        #[cfg(not(debug_assertions))]
+        let debug_event = None;
+        let mut event = debug_event;
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("Gradial continuous-input study");
+                ui.label("A guided, no-side-effect test of the candidate distance gesture.");
+            });
+            ui.add_space(18.0);
+
+            match self.stage {
+                StudyStage::Intro => self.render_intro(ui, binding, &mut event),
+                StudyStage::Running => self.render_trial(ui, binding),
+                StudyStage::Results => self.render_results(ui, &mut event),
+                StudyStage::Closed => {}
+            }
+
+            if let Some(feedback) = &self.feedback {
+                ui.add_space(14.0);
+                ui.colored_label(Color32::from_rgb(239, 113, 113), feedback);
+            }
+        });
+        event
+    }
+
+    fn render_intro(
+        &mut self,
+        ui: &mut egui::Ui,
+        binding: ActivationBinding,
+        event: &mut Option<StudyUiEvent>,
+    ) {
+        ui.heading("Before you begin");
+        ui.label(format!(
+            "The study uses {} and the real production overlay, but every direction is inert.",
+            binding_display(binding)
+        ));
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(650.0);
+            ui.label(RichText::new("Privacy").strong());
+            ui.label("• A random session ID is generated; you are not asked for a name.");
+            ui.label("• No raw cursor coordinates, application identity, paths, or window details are exported.");
+            ui.label("• The report stays on this computer until you choose to share the JSON file.");
+        });
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("Cancellation instruction — read once").strong());
+            ui.label("After a continuous action is armed, return to the center while still holding to cancel it.");
+            ui.label("Cancellation stops further effects; it does not undo effects already produced.");
+        });
+        ui.add_space(14.0);
+        ui.checkbox(
+            &mut self.privacy_acknowledged,
+            "I understand the privacy summary and the cancellation instruction.",
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add_enabled(self.privacy_acknowledged, egui::Button::new("Start practice"))
+                .clicked()
+            {
+                *event = Some(StudyUiEvent::Start);
+            }
+        });
+    }
+
+    fn render_trial(&self, ui: &mut egui::Ui, binding: ActivationBinding) {
+        let Some(trial) = self.current_trial() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(trial.phase.title()).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(format!("Trial {} of {}", self.trial_index + 1, self.plan.len()));
+            });
+        });
+        ui.add(egui::ProgressBar::new(progress_fraction(self.trial_index, self.plan.len())));
+        ui.add_space(18.0);
+        ui.label(RichText::new(trial.placement.instruction()).size(18.0));
+        ui.add_space(18.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(650.0);
+            match trial.phase {
+                StudyPhase::Practice | StudyPhase::Scalar => {
+                    ui.label(RichText::new(format!(
+                        "Direction {}  •  Target {}%  •  {} slices",
+                        trial.direction(),
+                        trial.target_percent.unwrap_or_default(),
+                        slice_count_value(trial.slices)
+                    )).size(24.0).strong());
+                    ui.label(format!(
+                        "Hold {}, move toward the requested direction until the live percentage matches the target, then release.",
+                        binding_display(binding)
+                    ));
+                }
+                StudyPhase::DirectionChange => {
+                    ui.label(RichText::new(format!(
+                        "Begin toward {}, then change to {}",
+                        trial.change_from_direction().unwrap_or("?"),
+                        trial.direction()
+                    )).size(24.0).strong());
+                    ui.label(format!(
+                        "Hold {}, change direction before reaching the 48-DIP arm distance, and release below that distance.",
+                        binding_display(binding)
+                    ));
+                }
+                StudyPhase::Cancellation => {
+                    ui.label(RichText::new(format!(
+                        "Arm toward {} near {}%, then cancel",
+                        trial.direction(),
+                        trial.target_percent.unwrap_or_default()
+                    )).size(24.0).strong());
+                    ui.label("Use the cancellation method described once at the beginning of the study.");
+                }
+            }
+        });
+        ui.add_space(16.0);
+        ui.weak("The next trial appears automatically after a valid attempt. A misplaced or incomplete attempt is retained but must be retried.");
+    }
+
+    fn render_results(&self, ui: &mut egui::Ui, event: &mut Option<StudyUiEvent>) {
+        let summary = summarize_attempts(&self.attempts);
+        ui.heading("Study complete");
+        ui.label("Thank you. The configured actions were never available to this study.");
+        ui.add_space(14.0);
+        egui::Grid::new("continuous-study-summary").num_columns(2).spacing([24.0, 8.0]).show(
+            ui,
+            |ui| {
+                summary_row(ui, "Measured samples", summary.measured_scalar_samples.to_string());
+                summary_row(
+                    ui,
+                    "Median scalar error",
+                    format_optional_percent(summary.median_absolute_scalar_error),
+                );
+                summary_row(
+                    ui,
+                    "Samples within 15%",
+                    format_optional_percent(summary.fraction_within_0_15),
+                );
+                summary_row(
+                    ui,
+                    "Accidental arming",
+                    format!("{} of {}", summary.accidental_arms, summary.accidental_arming_trials),
+                );
+                summary_row(
+                    ui,
+                    "Cancellation",
+                    format!(
+                        "{} of {}",
+                        summary.cancellation_successes, summary.cancellation_trials
+                    ),
+                );
+            },
+        );
+        ui.add_space(16.0);
+        if let Some(path) = &self.report_path {
+            ui.label(RichText::new("Anonymous JSON report saved locally:").strong());
+            ui.monospace(path.display().to_string());
+        } else if self.export_pending {
+            ui.label("Saving the anonymous report…");
+        } else {
+            ui.colored_label(Color32::from_rgb(239, 113, 113), "The report could not be saved.");
+            if ui.button("Retry export").clicked() {
+                *event = Some(StudyUiEvent::RetryExport);
+            }
+        }
+        ui.add_space(18.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Close study").clicked() {
+                *event = Some(StudyUiEvent::Close);
+            }
+        });
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContinuousStudy {
+    state: Arc<Mutex<StudyState>>,
+    current: Arc<Mutex<Option<StudyInvocationSetup>>>,
+    observations: Receiver<StudyObservation>,
+    sink: ContinuousStudySink,
+    binding: ActivationBinding,
+    report_directory: PathBuf,
+}
+
+impl ContinuousStudy {
+    pub(crate) fn new(
+        enabled: bool,
+        binding: ActivationBinding,
+        report_directory: PathBuf,
+    ) -> Self {
+        let (sender, observations) = bounded(STUDY_EVENT_CAPACITY);
+        let current = Arc::new(Mutex::new(None));
+        Self {
+            state: Arc::new(Mutex::new(StudyState::new(enabled))),
+            current: Arc::clone(&current),
+            observations,
+            sink: ContinuousStudySink { current, sender },
+            binding,
+            report_directory,
+        }
+    }
+
+    pub(crate) fn sink(&self) -> ContinuousStudySink {
+        self.sink.clone()
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.state().stage != StudyStage::Closed
+    }
+
+    pub(crate) fn settings_open_blocked(&self) {
+        self.state().feedback =
+            Some("Finish or close the study before opening Settings or onboarding.".to_owned());
+    }
+
+    pub(crate) fn update(&self, context: &egui::Context) {
+        let mut changed = false;
+        while let Ok(observation) = self.observations.try_recv() {
+            self.state().record(observation);
+            changed = true;
+        }
+
+        let event = self.state().pending_event.take();
+        match event {
+            Some(StudyUiEvent::Start) => {
+                self.state().start();
+                changed = true;
+                log::info!(
+                    target: "study",
+                    "component=continuous_study event_code=study_started result_code=ok \
+                     config_revision=0 participant_identity_collected=false"
+                );
+            }
+            Some(StudyUiEvent::RetryExport) => {
+                self.state().export_pending = true;
+                changed = true;
+            }
+            Some(StudyUiEvent::Close) => {
+                self.state().stage = StudyStage::Closed;
+                self.set_current(None);
+                context.send_viewport_cmd_to(study_viewport_id(), ViewportCommand::Close);
+                return;
+            }
+            None => {}
+        }
+
+        if changed {
+            self.publish_current_trial();
+            context.request_repaint_of(study_viewport_id());
+        }
+
+        if self.state().export_pending {
+            self.export_report();
+            context.request_repaint_of(study_viewport_id());
+        }
+    }
+
+    pub(crate) fn show(&self, context: &egui::Context) {
+        if !self.is_open() {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let binding = self.binding;
+        context.show_viewport_deferred(
+            study_viewport_id(),
+            study_viewport_builder(),
+            move |ui, viewport_class| {
+                if viewport_class == ViewportClass::EmbeddedWindow {
+                    log::error!(
+                        target: "study",
+                        "component=continuous_study event_code=study_viewport_embedded \
+                         result_code=failure config_revision=0"
+                    );
+                }
+                let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(event) = state.render(ui, binding) {
+                    state.pending_event = Some(event);
+                    drop(state);
+                    ui.ctx().request_repaint_of(ViewportId::ROOT);
+                }
+            },
+        );
+    }
+
+    fn publish_current_trial(&self) {
+        let setup = self.state().current_trial().map(|trial| StudyInvocationSetup {
+            trial_id: trial.id,
+            menu: Arc::new(study_menu(trial)),
+        });
+        self.set_current(setup);
+    }
+
+    fn set_current(&self, setup: Option<StudyInvocationSetup>) {
+        *self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = setup;
+    }
+
+    fn export_report(&self) {
+        let report = self.state().report();
+        match write_report(&self.report_directory, &report) {
+            Ok(path) => {
+                let mut state = self.state();
+                state.report_path = Some(path);
+                state.export_pending = false;
+                state.feedback = None;
+                log::info!(
+                    target: "study",
+                    "component=continuous_study event_code=study_report_saved result_code=ok \
+                     config_revision=0 schema_version={STUDY_SCHEMA_VERSION} session_id={} \
+                     participant_identity_collected=false",
+                    report.session_id
+                );
+            }
+            Err(error) => {
+                let mut state = self.state();
+                state.export_pending = false;
+                state.feedback = Some(
+                    "Gradial could not save the anonymous report. Check the local data folder and retry."
+                        .to_owned(),
+                );
+                log::error!(
+                    target: "study",
+                    "component=continuous_study event_code=study_report_save_failed \
+                     result_code=failure error_code=write_failed config_revision=0 error={error}"
+                );
+            }
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, StudyState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn study_plan() -> Vec<StudyTrial> {
+    let mut trials = Vec::with_capacity(37);
+    let mut next_id = 1_u32;
+    for (index, target) in TARGETS.into_iter().enumerate() {
+        trials.push(StudyTrial {
+            id: next_id,
+            phase: StudyPhase::Practice,
+            slices: SliceCount::Eight,
+            target_percent: Some(target),
+            direction_index: index * 2,
+            change_from_index: None,
+            placement: StudyPlacement::Center,
+        });
+        next_id += 1;
+    }
+
+    for (target_index, target) in TARGETS.into_iter().enumerate() {
+        for (placement_index, placement) in
+            [StudyPlacement::Center, StudyPlacement::Edge, StudyPlacement::Corner]
+                .into_iter()
+                .enumerate()
+        {
+            for slices in [SliceCount::Four, SliceCount::Eight] {
+                let direction_index = match slices {
+                    SliceCount::Four => (target_index + placement_index) % 4,
+                    SliceCount::Eight => (target_index * 2 + placement_index) % 8,
+                };
+                trials.push(StudyTrial {
+                    id: next_id,
+                    phase: StudyPhase::Scalar,
+                    slices,
+                    target_percent: Some(target),
+                    direction_index,
+                    change_from_index: None,
+                    placement,
+                });
+                next_id += 1;
+            }
+        }
+    }
+
+    for initial_direction in 0..8 {
+        trials.push(StudyTrial {
+            id: next_id,
+            phase: StudyPhase::DirectionChange,
+            slices: SliceCount::Eight,
+            target_percent: None,
+            direction_index: (initial_direction + 2) % 8,
+            change_from_index: Some(initial_direction),
+            placement: StudyPlacement::Center,
+        });
+        next_id += 1;
+    }
+    trials.push(StudyTrial {
+        id: next_id,
+        phase: StudyPhase::Cancellation,
+        slices: SliceCount::Eight,
+        target_percent: Some(50),
+        direction_index: 2,
+        change_from_index: None,
+        placement: StudyPlacement::Center,
+    });
+    trials
+}
+
+fn study_menu(trial: &StudyTrial) -> ResolvedMenu {
+    let count = usize::from(slice_count_value(trial.slices));
+    let labels: Arc<[String]> = (0..count)
+        .map(|index| match trial.target_percent {
+            Some(target) => format!("{} · {target}%", direction_label(trial.slices, index)),
+            None => direction_label(trial.slices, index).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .into();
+    ResolvedMenu::new(trial.slices, labels, vec![None; count].into())
+        .expect("the built-in study menu is complete")
+}
+
+fn summarize_attempts(attempts: &[StudyAttemptRecord]) -> StudySummary {
+    let accepted: Vec<_> = attempts.iter().filter(|attempt| attempt.accepted).collect();
+    let measured: Vec<_> =
+        accepted.iter().copied().filter(|attempt| attempt.phase == StudyPhase::Scalar).collect();
+    let scalar_errors: Vec<_> =
+        measured.iter().filter_map(|attempt| attempt.absolute_scalar_error).collect();
+    let eight_direction: Vec<_> =
+        measured.iter().copied().filter(|attempt| attempt.requested_slice_count == 8).collect();
+    let eight_direction_errors =
+        eight_direction.iter().filter(|attempt| attempt.direction_correct == Some(false)).count();
+    let within = scalar_errors.iter().filter(|error| **error <= 0.15).count();
+    let accidental: Vec<_> = accepted
+        .iter()
+        .copied()
+        .filter(|attempt| attempt.phase == StudyPhase::DirectionChange)
+        .collect();
+    let accidental_arms = accidental.iter().filter(|attempt| attempt.accidentally_armed()).count();
+    let cancellation: Vec<_> = accepted
+        .iter()
+        .copied()
+        .filter(|attempt| attempt.phase == StudyPhase::Cancellation)
+        .collect();
+    let cancellation_successes =
+        cancellation.iter().filter(|attempt| attempt.cancellation_succeeded()).count();
+    let center = completion_times(&measured, StudyPlacement::Center);
+    let edge = completion_times(&measured, StudyPlacement::Edge);
+    let corner = completion_times(&measured, StudyPlacement::Corner);
+    let center_median = median(&center);
+    let edge_median = median(&edge);
+    let corner_median = median(&corner);
+    let edge_corner_slowdown_fraction = center_median.and_then(|center_value| {
+        if center_value <= f64::EPSILON {
+            None
+        } else {
+            edge_median
+                .into_iter()
+                .chain(corner_median)
+                .reduce(f64::max)
+                .map(|outer| outer / center_value - 1.0)
+        }
+    });
+
+    StudySummary {
+        accepted_trials: accepted.len(),
+        measured_scalar_samples: measured.len(),
+        eight_direction_samples: eight_direction.len(),
+        eight_direction_errors,
+        eight_direction_error_rate: fraction(eight_direction_errors, eight_direction.len()),
+        median_absolute_scalar_error: median(&scalar_errors),
+        samples_within_0_15: within,
+        fraction_within_0_15: fraction(within, scalar_errors.len()),
+        accidental_arming_trials: accidental.len(),
+        accidental_arms,
+        accidental_arming_rate: fraction(accidental_arms, accidental.len()),
+        cancellation_trials: cancellation.len(),
+        cancellation_successes,
+        center_median_completion_ms: center_median,
+        edge_median_completion_ms: edge_median,
+        corner_median_completion_ms: corner_median,
+        edge_corner_slowdown_fraction,
+    }
+}
+
+fn completion_times(attempts: &[&StudyAttemptRecord], placement: StudyPlacement) -> Vec<f64> {
+    attempts
+        .iter()
+        .filter(|attempt| attempt.requested_placement == placement)
+        .map(|attempt| f64::from(attempt.duration_ms))
+        .collect()
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut ordered = values.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    let midpoint = ordered.len() / 2;
+    if ordered.len().is_multiple_of(2) {
+        Some(f64::midpoint(ordered[midpoint - 1], ordered[midpoint]))
+    } else {
+        Some(ordered[midpoint])
+    }
+}
+
+fn fraction(numerator: usize, denominator: usize) -> Option<f64> {
+    let numerator = u32::try_from(numerator).ok()?;
+    let denominator = u32::try_from(denominator).ok()?;
+    (denominator != 0).then(|| f64::from(numerator) / f64::from(denominator))
+}
+
+fn progress_fraction(completed: usize, total: usize) -> f32 {
+    let completed = u16::try_from(completed).unwrap_or(u16::MAX);
+    let total = u16::try_from(total).unwrap_or(u16::MAX);
+    if total == 0 { 0.0 } else { f32::from(completed) / f32::from(total) }
+}
+
+fn classify_placement(cursor: ScreenPoint, work_area: ScreenRect, dpi: u32) -> StudyPlacement {
+    let threshold =
+        i32::try_from((32_u64 * u64::from(dpi.max(96))).div_ceil(96)).unwrap_or(i32::MAX);
+    let near_horizontal = cursor.x.saturating_sub(work_area.left).abs() <= threshold
+        || cursor.x.saturating_sub(work_area.right).abs() <= threshold;
+    let near_vertical = cursor.y.saturating_sub(work_area.top).abs() <= threshold
+        || cursor.y.saturating_sub(work_area.bottom).abs() <= threshold;
+    match (near_horizontal, near_vertical) {
+        (true, true) => StudyPlacement::Corner,
+        (true, false) | (false, true) => StudyPlacement::Edge,
+        (false, false) => StudyPlacement::Center,
+    }
+}
+
+fn write_report(directory: &Path, report: &StudyReport) -> Result<PathBuf> {
+    fs::create_dir_all(directory).context("could not create the study-report directory")?;
+    let destination = directory.join(format!("continuous-study-{}.json", report.session_id));
+    let temporary = directory.join(format!(".continuous-study-{}.tmp", report.session_id));
+    if destination.exists() || temporary.exists() {
+        bail!("the anonymous study report already exists");
+    }
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .context("could not create the temporary study report")?;
+        serde_json::to_writer_pretty(&mut file, report)
+            .context("could not serialize the study report")?;
+        file.write_all(b"\n").context("could not finish the study report")?;
+        file.sync_all().context("could not flush the study report")?;
+        drop(file);
+        let temporary_wide = wide_path(&temporary);
+        let destination_wide = wide_path(&destination);
+        // SAFETY: both buffers are live, null-terminated paths in the same
+        // Gradial-owned directory. The unique destination is never replaced.
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(temporary_wide.as_ptr()),
+                PCWSTR::from_raw(destination_wide.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .context("could not atomically publish the study report")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _removed = fs::remove_file(&temporary);
+    }
+    result.map(|()| destination)
+}
+
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn direction_label(slices: SliceCount, index: usize) -> &'static str {
+    match slices {
+        SliceCount::Four => ["N", "E", "S", "W"].get(index).copied().unwrap_or("?"),
+        SliceCount::Eight => {
+            ["N", "NE", "E", "SE", "S", "SW", "W", "NW"].get(index).copied().unwrap_or("?")
+        }
+    }
+}
+
+const fn slice_count_value(slices: SliceCount) -> u8 {
+    match slices {
+        SliceCount::Four => 4,
+        SliceCount::Eight => 8,
+    }
+}
+
+fn cancel_reason_name(reason: CancelReason) -> &'static str {
+    match reason {
+        CancelReason::Escape => "escape",
+        CancelReason::OtherMouseButton => "other_mouse_button",
+        CancelReason::NoSelection => "no_selection",
+        CancelReason::ReturnedToCenter => "returned_to_center",
+        CancelReason::InputQueueOverflow => "input_queue_overflow",
+        CancelReason::HookUnresponsive => "hook_unresponsive",
+        CancelReason::InputReregistration => "input_reregistration",
+        CancelReason::DisplayTopologyChange => "display_topology_change",
+        CancelReason::Shutdown => "shutdown",
+    }
+}
+
+fn binding_display(binding: ActivationBinding) -> String {
+    let mut parts = Vec::with_capacity(4);
+    if binding.modifiers.control {
+        parts.push("Ctrl");
+    }
+    if binding.modifiers.alt {
+        parts.push("Alt");
+    }
+    if binding.modifiers.shift {
+        parts.push("Shift");
+    }
+    parts.push(binding.button.short_label());
+    parts.join(" + ")
+}
+
+fn summary_row(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(label);
+    ui.label(RichText::new(value).strong());
+    ui.end_row();
+}
+
+fn format_optional_percent(value: Option<f64>) -> String {
+    value.map_or_else(|| "—".to_owned(), |value| format!("{:.1}%", value * 100.0))
+}
+
+pub(crate) fn study_viewport_id() -> ViewportId {
+    ViewportId::from_hash_of("gradial-continuous-study")
+}
+
+fn study_viewport_builder() -> ViewportBuilder {
+    ViewportBuilder::default()
+        .with_app_id("gradial-continuous-study")
+        .with_title("Gradial continuous-input study")
+        .with_inner_size(STUDY_SIZE)
+        .with_min_inner_size(STUDY_MIN_SIZE)
+        .with_resizable(true)
+        .with_decorations(true)
+        .with_taskbar(true)
+        .with_active(true)
+        .with_visible(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use gradial_core::{CancelReason, ScreenPoint, ScreenRect, SliceCount};
+
+    use super::{
+        StudyAttemptRecord, StudyObservation, StudyPhase, StudyPlacement, StudyTerminal,
+        classify_placement, study_plan, summarize_attempts, write_report,
+    };
+
+    fn observation(
+        trial_id: u32,
+        placement: StudyPlacement,
+        terminal: StudyTerminal,
+    ) -> StudyObservation {
+        StudyObservation { trial_id, placement, monitor_dpi: 144, duration_ms: 100, terminal }
+    }
+
+    #[test]
+    fn plan_balances_required_conditions_and_keeps_practice_separate() {
+        let plan = study_plan();
+        assert_eq!(plan.len(), 37);
+        assert_eq!(plan.iter().filter(|trial| trial.phase == StudyPhase::Practice).count(), 4);
+        assert_eq!(plan.iter().filter(|trial| trial.phase == StudyPhase::Scalar).count(), 24);
+        assert_eq!(
+            plan.iter().filter(|trial| trial.phase == StudyPhase::DirectionChange).count(),
+            8
+        );
+        assert_eq!(plan.iter().filter(|trial| trial.phase == StudyPhase::Cancellation).count(), 1);
+        for placement in [StudyPlacement::Center, StudyPlacement::Edge, StudyPlacement::Corner] {
+            for slices in [SliceCount::Four, SliceCount::Eight] {
+                let targets: Vec<_> = plan
+                    .iter()
+                    .filter(|trial| {
+                        trial.phase == StudyPhase::Scalar
+                            && trial.placement == placement
+                            && trial.slices == slices
+                    })
+                    .filter_map(|trial| trial.target_percent)
+                    .collect();
+                assert_eq!(targets, vec![25, 50, 75, 100]);
+            }
+        }
+    }
+
+    #[test]
+    fn placement_classification_uses_dpi_scaled_edges_without_exporting_coordinates() {
+        let work_area = ScreenRect::new(-1920, -200, 0, 880);
+        assert_eq!(
+            classify_placement(ScreenPoint::new(-960, 340), work_area, 144),
+            StudyPlacement::Center
+        );
+        assert_eq!(
+            classify_placement(ScreenPoint::new(-1919, 340), work_area, 144),
+            StudyPlacement::Edge
+        );
+        assert_eq!(
+            classify_placement(ScreenPoint::new(-1919, -199), work_area, 144),
+            StudyPlacement::Corner
+        );
+    }
+
+    #[test]
+    fn summary_excludes_practice_and_rejected_attempts() {
+        let plan = study_plan();
+        let scalar = plan.iter().find(|trial| trial.phase == StudyPhase::Scalar).expect("scalar");
+        let accidental = plan
+            .iter()
+            .find(|trial| trial.phase == StudyPhase::DirectionChange)
+            .expect("direction change");
+        let cancellation = plan
+            .iter()
+            .find(|trial| trial.phase == StudyPhase::Cancellation)
+            .expect("cancellation");
+        let attempts = vec![
+            StudyAttemptRecord::from_observation(
+                scalar,
+                observation(
+                    scalar.id,
+                    scalar.placement,
+                    StudyTerminal::Committed {
+                        slice_index: scalar.direction_index,
+                        value: f64::from(scalar.target_percent.unwrap_or_default()) / 100.0 + 0.04,
+                    },
+                ),
+            ),
+            StudyAttemptRecord::from_observation(
+                accidental,
+                observation(
+                    accidental.id,
+                    accidental.placement,
+                    StudyTerminal::Cancelled { reason: CancelReason::NoSelection },
+                ),
+            ),
+            StudyAttemptRecord::from_observation(
+                cancellation,
+                observation(
+                    cancellation.id,
+                    cancellation.placement,
+                    StudyTerminal::Cancelled { reason: CancelReason::ReturnedToCenter },
+                ),
+            ),
+        ];
+        let summary = summarize_attempts(&attempts);
+        assert_eq!(summary.measured_scalar_samples, 1);
+        assert_eq!(summary.accidental_arms, 0);
+        assert_eq!(summary.cancellation_successes, 1);
+        assert!(summary.median_absolute_scalar_error.is_some_and(|error| error < 0.041));
+    }
+
+    #[test]
+    fn complete_guided_session_advances_every_trial_and_builds_a_complete_report() {
+        let mut state = super::StudyState::new(true);
+        state.start();
+        let plan = state.plan.clone();
+        for trial in &plan {
+            let terminal = match trial.phase {
+                StudyPhase::Practice | StudyPhase::Scalar => StudyTerminal::Committed {
+                    slice_index: trial.direction_index,
+                    value: f64::from(trial.target_percent.unwrap_or_default()) / 100.0,
+                },
+                StudyPhase::DirectionChange => {
+                    StudyTerminal::Cancelled { reason: CancelReason::NoSelection }
+                }
+                StudyPhase::Cancellation => {
+                    StudyTerminal::Cancelled { reason: CancelReason::ReturnedToCenter }
+                }
+            };
+            state.record(observation(trial.id, trial.placement, terminal));
+        }
+
+        let report = state.report();
+        assert_eq!(state.stage, super::StudyStage::Results);
+        assert!(state.export_pending);
+        assert_eq!(report.summary.accepted_trials, 37);
+        assert_eq!(report.summary.measured_scalar_samples, 24);
+        assert_eq!(report.summary.accidental_arms, 0);
+        assert_eq!(report.summary.cancellation_successes, 1);
+    }
+
+    #[test]
+    fn report_is_atomic_and_contains_no_identity_or_raw_position_fields() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = super::StudyState::new(true);
+        let report = state.report();
+        let path = write_report(directory.path(), &report).expect("study report");
+        let json = fs::read_to_string(path).expect("report JSON");
+        for prohibited in [
+            "participant_name_collected",
+            "cursor_physical_px",
+            "executable_path",
+            "window_title",
+            "\"monitor_device_name\":",
+        ] {
+            assert!(!json.contains(prohibited), "found prohibited field {prohibited}");
+        }
+        assert!(json.contains("\"identity\": \"random_session_id_only\""));
+        assert!(json.contains("gradial-continuous-usability-v1"));
+        assert!(directory.path().read_dir().expect("report directory").all(|entry| {
+            entry
+                .expect("report entry")
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        }));
+    }
+}

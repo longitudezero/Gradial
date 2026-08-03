@@ -23,6 +23,7 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 
 use crate::{
     action_executor::{ActionDispatch, ActionExecutorHandle},
+    continuous_study::ContinuousStudySink,
     diagnostics::TimingMarkers,
     input::{HookThread, HookThreadMetrics, InputConfiguration},
     onboarding::OnboardingPractice,
@@ -54,6 +55,7 @@ struct ActiveInvocation {
     route: Option<usize>,
     practice: bool,
     continuous_meter: bool,
+    study_trial_id: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +74,7 @@ impl ActiveInvocation {
         self.route = None;
         self.practice = false;
         self.continuous_meter = false;
+        self.study_trial_id = None;
     }
 }
 
@@ -83,6 +86,8 @@ struct EffectDispatcher<'a> {
     action_plan_compiler: &'a ActionPlanCompiler,
     action_executor: &'a ActionExecutorHandle,
     onboarding_practice: &'a OnboardingPractice,
+    continuous_study: &'a ContinuousStudySink,
+    qpc_frequency: i64,
     config_revision: u64,
 }
 
@@ -123,6 +128,7 @@ impl InteractionRuntime {
         action_plan_compiler: Arc<ActionPlanCompiler>,
         action_executor: ActionExecutorHandle,
         onboarding_practice: OnboardingPractice,
+        continuous_study: ContinuousStudySink,
         debug_menu_override: Option<Arc<ResolvedMenu>>,
         debug_continuous_meter: bool,
         config_revision: u64,
@@ -161,6 +167,7 @@ impl InteractionRuntime {
                     &action_plan_compiler,
                     &action_executor,
                     &onboarding_practice,
+                    &continuous_study,
                     debug_menu_override.as_ref(),
                     debug_continuous_meter,
                     config_revision,
@@ -274,6 +281,7 @@ fn run_interaction_thread(
     action_plan_compiler: &ActionPlanCompiler,
     action_executor: &ActionExecutorHandle,
     onboarding_practice: &OnboardingPractice,
+    continuous_study: &ContinuousStudySink,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
     debug_continuous_meter: bool,
     config_revision: u64,
@@ -281,6 +289,7 @@ fn run_interaction_thread(
     let mut controller = InteractionController::new(GestureConfig::default());
     let mut active = ActiveInvocation::default();
     let mut counters = EventCounters::default();
+    let qpc_frequency = query_qpc_frequency();
     let dispatcher = EffectDispatcher {
         egui_context,
         timing_markers,
@@ -288,13 +297,14 @@ fn run_interaction_thread(
         action_plan_compiler,
         action_executor,
         onboarding_practice,
+        continuous_study,
+        qpc_frequency,
         config_revision,
     };
     let debug_options = DebugInteractionOptions {
         menu_override: debug_menu_override,
         continuous_meter: debug_continuous_meter,
     };
-    let qpc_frequency = query_qpc_frequency();
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut runtime_stop_pending = false;
 
@@ -583,17 +593,18 @@ fn begin_invocation(
         window_class: &snapshot.context.window_class,
         window_title: &snapshot.context.window_title,
     });
+    let study_setup = dispatcher.continuous_study.invocation_if_enabled();
+    let study_trial_id = study_setup.as_ref().map(|setup| setup.trial_id);
     let practice_menu = dispatcher.onboarding_practice.menu_if_enabled();
-    let practice_active = practice_menu.is_some();
-    let (menu, menu_source) = practice_menu.map_or_else(
-        || {
-            debug_menu_override.map_or_else(
-                || (Arc::clone(&resolution.menu), "configuration"),
-                |menu| (Arc::clone(menu), "debug_override"),
-            )
-        },
-        |menu| (menu, "onboarding_practice"),
-    );
+    let (menu, menu_source, practice_active) = if let Some(setup) = study_setup {
+        (setup.menu, "continuous_study", false)
+    } else if let Some(menu) = practice_menu {
+        (menu, "onboarding_practice", true)
+    } else if let Some(menu) = debug_menu_override {
+        (Arc::clone(menu), "debug_override", false)
+    } else {
+        (Arc::clone(&resolution.menu), "configuration", false)
+    };
     let continuous_meter = debug_continuous_meter && !practice_active;
     log::info!(
         target: "profiles",
@@ -601,7 +612,8 @@ fn begin_invocation(
          config_revision={} invocation_id={} profile_id={} used_global={} \
          decision={} matching_profile_count={} configured_slice_count={} \
          menu_slice_count={} menu_label_count={} menu_source={menu_source} \
-         onboarding_practice={practice_active} continuous_meter={continuous_meter}",
+         onboarding_practice={practice_active} continuous_meter={continuous_meter} \
+         continuous_study_trial={study_trial_id:?}",
         snapshot.context.config_revision,
         snapshot.invocation_id,
         resolution.profile_id,
@@ -635,6 +647,7 @@ fn begin_invocation(
         active.menu = Some(menu);
         active.practice = practice_active;
         active.continuous_meter = continuous_meter;
+        active.study_trial_id = study_trial_id;
     }
     effect
 }
@@ -737,6 +750,14 @@ fn dispatch_close(
     let active_snapshot = active.snapshot.as_ref();
     let config_revision = active_snapshot
         .map_or(dispatcher.config_revision, |snapshot| snapshot.context.config_revision);
+    if let Some(snapshot) = active_snapshot {
+        dispatcher.continuous_study.completed(
+            active.study_trial_id,
+            snapshot,
+            outcome,
+            qpc_elapsed_milliseconds(snapshot.qpc_timestamp, source_qpc, dispatcher.qpc_frequency),
+        );
+    }
     match outcome {
         InteractionOutcome::Selected { slice_index } => {
             let action_assigned = active.action_id.is_some();
@@ -1064,6 +1085,14 @@ fn query_qpc_frequency() -> i64 {
     let mut frequency = 0_i64;
     // SAFETY: the output pointer refers to a live local i64.
     if unsafe { QueryPerformanceFrequency(&raw mut frequency) }.is_ok() { frequency } else { 0 }
+}
+
+fn qpc_elapsed_milliseconds(start: i64, end: i64, frequency: i64) -> u32 {
+    if frequency <= 0 || end < start {
+        return 0;
+    }
+    let elapsed = end.saturating_sub(start);
+    u32::try_from(elapsed.saturating_mul(1_000) / frequency).unwrap_or(u32::MAX)
 }
 
 const fn heartbeat_is_unresponsive(

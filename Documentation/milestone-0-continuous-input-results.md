@@ -91,6 +91,9 @@ participants and must measure:
 - understanding of release and center-return cancellation.
 
 Automation records that study as `not_run`; it does not infer human usability.
+The guided schema-one participant harness and cohort evaluator are now
+available and documented in `milestone-0-continuous-study-results.md`, but no
+participant reports have yet been collected.
 The current 48-DIP arm and 160-DIP full-scale radii therefore remain candidate
 defaults until the study is recorded. Mixed-DPI, negative-coordinate, and
 high-refresh hardware were also unavailable in this local run and remain part

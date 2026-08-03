@@ -117,6 +117,10 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
 - A dedicated continuous interaction matrix that checks four/eight directions,
   normalized target values, focus, edge assist, inert execution, and
   machine-readable coverage without fabricating the pending human study.
+- A guided participant-study window with a fixed 37-trial protocol, automatic
+  center/edge/corner validation, anonymous atomic JSON reports, and a cohort
+  summarizer that applies the Section 11.3 gates only with at least eight
+  complete reports.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -139,6 +143,7 @@ Gradial APP\
         capture-timing.ps1 Capture ETW markers and presented-frame timings
         run-performance-report.ps1 Run development or release performance protocol
         run-continuous-matrix.ps1 Run the continuous direction/distance matrix
+        summarize-continuous-study.ps1 Evaluate anonymous participant reports
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
         smoke-delay-executor.ps1 Run an isolated Delay action fixture
         smoke-input-executor.ps1 Shared isolated input-action fixture
@@ -461,6 +466,48 @@ The normalized value uses the invocation DPI. Edge assist accumulates raw
 physical deltas into the same virtual pointer and divides by that DPI before
 normalization, so equivalent DIP travel produces the same value on every
 monitor.
+
+### Continuous usability study
+
+Debug builds expose `--continuous-study`. The option implies the inert
+continuous meter, bypasses first-run onboarding for that process, requires
+automatic geometry, and rejects `--slices` and `--open-settings`. Settings and
+onboarding also stay blocked while the study window is open. Saved profiles
+and actions remain untouched.
+
+One anonymous session contains:
+
+- four center-screen practice trials at 25%, 50%, 75%, and 100%;
+- 24 measured scalar trials covering those four values for both four- and
+  eight-slice menus at center, edge, and corner placements, interleaved by
+  target to limit simple ordering bias;
+- eight pre-arm direction-change trials for accidental-arming measurement; and
+- one armed center-return cancellation trial after the instruction was shown
+  once on the introduction page.
+
+The next trial appears only after an accepted terminal outcome. A trial begun
+in the wrong placement category or a scalar trial released before commit is
+retained as a rejected attempt and retried. Placement classification uses a
+32-DIP boundary around the work area, but reports contain only the category.
+
+The report schema starts at version 1 and records a random session ID, requested
+and observed categories, direction correctness, normalized values, scalar
+error, cancellation reason, invocation duration, and monitor DPI. It does not
+record names, raw coordinates, foreground application identity, paths, window
+details, or monitor device names. Reports are flushed and atomically published
+as `continuous-study-<session-id>.json` under
+`%LOCALAPPDATA%\Gradial\continuous-studies`.
+
+After at least eight complete participant runs, execute:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/summarize-continuous-study.ps1
+```
+
+The summarizer rejects incomplete, duplicate, unsupported, or privacy-incompatible
+reports. It recomputes the cohort metrics from accepted attempts and writes a
+JSON summary plus gate CSV. With fewer than eight participants the sample-size
+gate fails and the usability gates remain `not_evaluated`.
 
 ## Configuration and profile resolution
 

@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use gradial_core::{
@@ -9,6 +12,7 @@ use gradial_core::{
 use crate::{
     action_executor::ActionExecutor,
     configuration::ConfigStore,
+    continuous_study::{ContinuousStudy, study_viewport_id},
     diagnostic_bundle::{DiagnosticBundleService, DiagnosticInputStatus},
     diagnostics::TimingMarkers,
     icons::IconManager,
@@ -31,6 +35,7 @@ pub(crate) struct ApplicationServices {
     config_store: ConfigStore,
     diagnostic_bundles: DiagnosticBundleService,
     start_at_login: StartAtLoginService,
+    continuous_study_directory: PathBuf,
 }
 
 impl ApplicationServices {
@@ -38,11 +43,22 @@ impl ApplicationServices {
         config_store: ConfigStore,
         diagnostic_bundles: DiagnosticBundleService,
     ) -> Self {
+        let continuous_study_directory = config_store.continuous_study_directory();
         Self {
             config_store,
             diagnostic_bundles,
             start_at_login: StartAtLoginService::for_current_executable(),
+            continuous_study_directory,
         }
+    }
+
+    fn into_parts(self) -> (ConfigStore, DiagnosticBundleService, StartAtLoginService, PathBuf) {
+        (
+            self.config_store,
+            self.diagnostic_bundles,
+            self.start_at_login,
+            self.continuous_study_directory,
+        )
     }
 }
 
@@ -62,6 +78,47 @@ fn resolve_debug_menu_options(
         let _ = startup_options;
         (None, "none")
     }
+}
+
+fn create_continuous_study(
+    startup_options: StartupOptions,
+    binding: gradial_core::ActivationBinding,
+    report_directory: PathBuf,
+) -> ContinuousStudy {
+    ContinuousStudy::new(
+        startup_options.debug_continuous_meter.is_study(),
+        binding,
+        report_directory,
+    )
+}
+
+struct LearningTools {
+    onboarding: OnboardingEditor,
+    continuous_study: ContinuousStudy,
+}
+
+impl LearningTools {
+    fn new(
+        onboarding_required: bool,
+        startup_options: StartupOptions,
+        binding: gradial_core::ActivationBinding,
+        report_directory: PathBuf,
+    ) -> Self {
+        Self {
+            onboarding: OnboardingEditor::new(onboarding_required, binding),
+            continuous_study: create_continuous_study(startup_options, binding, report_directory),
+        }
+    }
+}
+
+fn create_settings_editor(
+    recovery_warning: bool,
+    icons: &Arc<IconManager>,
+    start_at_login: &StartAtLoginService,
+) -> SettingsEditor {
+    let settings = SettingsEditor::new(recovery_warning, Arc::clone(icons));
+    settings.update_start_at_login_status(start_at_login.inspect());
+    settings
 }
 
 pub(crate) struct GradialApp {
@@ -88,6 +145,7 @@ pub(crate) struct GradialApp {
     settings: SettingsEditor,
     onboarding_store: OnboardingStore,
     onboarding: OnboardingEditor,
+    continuous_study: ContinuousStudy,
     config_revision: u64,
     tray_icon: TrayIcon,
 }
@@ -104,7 +162,8 @@ impl GradialApp {
         configuration: Configuration,
         recovery_warning: bool,
     ) -> Result<Self> {
-        let ApplicationServices { config_store, diagnostic_bundles, start_at_login } = services;
+        let (config_store, diagnostic_bundles, start_at_login, continuous_study_directory) =
+            services.into_parts();
         let config_revision = configuration.config_revision;
         let icons = Arc::new(IconManager::new(config_store.icon_directory()));
         let icon_protection = config_store.icon_protection_snapshot(&configuration, None);
@@ -165,10 +224,13 @@ impl GradialApp {
             Arc::clone(&timing_markers),
         );
         creation_context.egui_ctx.request_repaint();
-        let settings = SettingsEditor::new(recovery_warning, Arc::clone(&icons));
-        settings.update_start_at_login_status(start_at_login.inspect());
-        let onboarding =
-            OnboardingEditor::new(onboarding_startup.required, configuration.activation_binding);
+        let settings = create_settings_editor(recovery_warning, &icons, &start_at_login);
+        let learning_tools = LearningTools::new(
+            onboarding_startup.required,
+            startup_options,
+            configuration.activation_binding,
+            continuous_study_directory,
+        );
         if startup_options.debug_open_settings {
             settings.open(&configuration);
         }
@@ -196,7 +258,8 @@ impl GradialApp {
             icons,
             settings,
             onboarding_store: onboarding_startup.store,
-            onboarding,
+            onboarding: learning_tools.onboarding,
+            continuous_study: learning_tools.continuous_study,
             config_revision,
             tray_icon,
         })
@@ -360,6 +423,12 @@ impl GradialApp {
     }
 
     fn open_settings(&mut self, context: &eframe::egui::Context) {
+        if self.continuous_study.is_open() {
+            self.continuous_study.settings_open_blocked();
+            context.request_repaint_of(study_viewport_id());
+            context.send_viewport_cmd_to(study_viewport_id(), eframe::egui::ViewportCommand::Focus);
+            return;
+        }
         if self.onboarding.is_open() {
             self.onboarding.settings_open_blocked();
             context.request_repaint_of(onboarding_viewport_id());
@@ -535,6 +604,12 @@ impl GradialApp {
     }
 
     fn restart_onboarding(&mut self, context: &eframe::egui::Context) {
+        if self.continuous_study.is_open() {
+            self.continuous_study.settings_open_blocked();
+            context.request_repaint_of(study_viewport_id());
+            context.send_viewport_cmd_to(study_viewport_id(), eframe::egui::ViewportCommand::Focus);
+            return;
+        }
         self.onboarding.restart(self.configuration.activation_binding);
         context.request_repaint_of(onboarding_viewport_id());
         context
@@ -870,6 +945,7 @@ impl GradialApp {
             Arc::clone(&self.action_plan_compiler),
             self.action_executor.handle(),
             self.onboarding.practice(),
+            self.continuous_study.sink(),
             self.debug_menu_override.clone(),
             self.debug_continuous_meter.is_enabled(),
             self.config_revision,
@@ -1012,6 +1088,8 @@ impl eframe::App for GradialApp {
             self.handle_onboarding_event(context, event);
         }
 
+        self.continuous_study.update(context);
+
         self.start_interaction_if_ready(context);
     }
 
@@ -1019,5 +1097,6 @@ impl eframe::App for GradialApp {
         self.overlay_pool.show(ui.ctx());
         self.settings.show(ui.ctx());
         self.onboarding.show(ui.ctx());
+        self.continuous_study.show(ui.ctx());
     }
 }

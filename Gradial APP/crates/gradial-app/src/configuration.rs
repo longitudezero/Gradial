@@ -149,6 +149,10 @@ impl ConfigStore {
         self.paths.icons.clone()
     }
 
+    pub(crate) fn continuous_study_directory(&self) -> PathBuf {
+        self.paths.continuous_studies.clone()
+    }
+
     pub(crate) fn icon_protection_snapshot(
         &self,
         active: &Configuration,

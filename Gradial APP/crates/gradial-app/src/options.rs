@@ -8,7 +8,7 @@ pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
 Usage:
-  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--continuous-meter] [--reduced-motion] [--open-settings] [--skip-onboarding]
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--continuous-meter|--continuous-study] [--reduced-motion] [--open-settings] [--skip-onboarding]
 
 Geometry modes:
   auto          Use edge assist only when the complete ring would clip.
@@ -21,6 +21,7 @@ Slice counts:
 
 Continuous input:
   --continuous-meter  Make every direction an inert 0-100% distance meter.
+  --continuous-study  Run the guided, anonymous distance usability study.
 
 Animation:
   --reduced-motion  Remove visual interpolation without changing gesture timing.
@@ -56,6 +57,8 @@ pub(crate) enum ContinuousMeterMode {
     Disabled,
     #[cfg(debug_assertions)]
     Enabled,
+    #[cfg(debug_assertions)]
+    Study,
 }
 
 impl ContinuousMeterMode {
@@ -63,7 +66,18 @@ impl ContinuousMeterMode {
         match self {
             Self::Disabled => false,
             #[cfg(debug_assertions)]
-            Self::Enabled => true,
+            Self::Enabled | Self::Study => true,
+        }
+    }
+
+    pub(crate) const fn is_study(self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            matches!(self, Self::Study)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
         }
     }
 }
@@ -79,6 +93,10 @@ pub(crate) struct StartupOptions {
 }
 
 impl StartupOptions {
+    pub(crate) const fn bypasses_onboarding(self) -> bool {
+        self.debug_skip_onboarding || self.debug_continuous_meter.is_study()
+    }
+
     pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut geometry_mode = GeometryMode::Auto;
         #[cfg(debug_assertions)]
@@ -133,12 +151,33 @@ impl StartupOptions {
                         continue;
                     }
                     if argument == "--continuous-meter" {
+                        if debug_continuous_meter.is_enabled() {
+                            bail!("choose only one continuous development mode");
+                        }
                         debug_continuous_meter = ContinuousMeterMode::Enabled;
+                        continue;
+                    }
+                    if argument == "--continuous-study" {
+                        if debug_continuous_meter.is_enabled() {
+                            bail!("choose only one continuous development mode");
+                        }
+                        debug_continuous_meter = ContinuousMeterMode::Study;
                         continue;
                     }
                 }
                 bail!("unknown Gradial argument: {argument}");
             }
+        }
+
+        #[cfg(debug_assertions)]
+        if debug_continuous_meter.is_study()
+            && (debug_slice_override.is_some()
+                || debug_open_settings
+                || geometry_mode != GeometryMode::Auto)
+        {
+            bail!(
+                "--continuous-study requires automatic geometry and cannot combine with --slices or --open-settings"
+            );
         }
 
         Ok(Self {
@@ -258,10 +297,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    fn continuous_study_is_isolated_from_geometry_and_editor_overrides() {
+        let study =
+            StartupOptions::parse(["--continuous-study".to_owned()]).expect("continuous study");
+        assert_eq!(study.debug_continuous_meter, ContinuousMeterMode::Study);
+        assert!(study.debug_continuous_meter.is_study());
+
+        for arguments in [
+            vec!["--continuous-study", "--slices=4"],
+            vec!["--continuous-study", "--open-settings"],
+            vec!["--continuous-study", "--geometry=fixed-origin"],
+            vec!["--continuous-study", "--continuous-meter"],
+        ] {
+            let error = StartupOptions::parse(arguments.into_iter().map(str::to_owned))
+                .expect_err("incompatible study options");
+            assert!(error.to_string().contains("continuous"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
     #[cfg(not(debug_assertions))]
     fn release_build_rejects_development_only_options() {
-        for argument in ["--slices=4", "--open-settings", "--skip-onboarding", "--continuous-meter"]
-        {
+        for argument in [
+            "--slices=4",
+            "--open-settings",
+            "--skip-onboarding",
+            "--continuous-meter",
+            "--continuous-study",
+        ] {
             let error =
                 StartupOptions::parse([argument.to_owned()]).expect_err("debug-only option");
             assert!(error.to_string().contains("unknown Gradial argument"));

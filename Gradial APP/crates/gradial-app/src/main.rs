@@ -4,6 +4,7 @@ mod action_executor;
 mod action_target;
 mod application;
 mod configuration;
+mod continuous_study;
 mod diagnostic_bundle;
 mod diagnostics;
 mod focus;
@@ -86,7 +87,7 @@ fn main() -> Result<()> {
         diagnostic_bundle::DiagnosticBundleService::new(paths.clone(), logger.clone()),
     );
     let onboarding_store = onboarding::OnboardingStore::new(&paths);
-    let onboarding_bypassed = startup_options.debug_skip_onboarding;
+    let onboarding_bypassed = startup_options.bypasses_onboarding();
     let onboarding_required =
         !onboarding_bypassed && onboarding_store.load() == onboarding::OnboardingLoad::Required;
     log::info!(
