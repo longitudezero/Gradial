@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
 use gradial_core::{
     Appearance, ContinuousSelection, ContinuousVisualState, InvocationSnapshot, MonitorGeometry,
-    Point, ResolvedGeometry, ResolvedMenu, ScreenPoint,
+    Point, ResolvedGeometry, ResolvedMenu, ScreenPoint, continuous_arm_radius_for_size,
 };
 use uuid::Uuid;
 
@@ -125,6 +125,7 @@ impl OverlayPool {
                 }
             })
             .collect();
+        let continuous_arm_radius_dip = continuous_arm_radius_for_size(appearance.size_preset);
         log::info!(
             target: "renderer",
             "component=renderer event_code=renderer_geometry_cache_ready result_code=ok \
@@ -133,7 +134,7 @@ impl OverlayPool {
              reduced_motion={} accent_red={} accent_green={} accent_blue={} \
              label_theme={} size_preset={} cached_icon_count={} \
              open_ms=60 selection_ms=35 close_ms=50 \
-             continuous_arm_radius_dip=48 continuous_full_scale_radius_dip=160 \
+             continuous_arm_radius_dip={} continuous_full_scale_radius_dip=160 \
              overlay_size_dip=400",
             slots.len(),
             animation_mode.is_reduced(),
@@ -142,7 +143,8 @@ impl OverlayPool {
             appearance.accent_color.blue,
             appearance.label_theme.as_str(),
             appearance.size_preset.as_str(),
-            icons.cached_count()
+            icons.cached_count(),
+            continuous_arm_radius_dip
         );
 
         Self {

@@ -110,10 +110,11 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
 - A versioned performance-report harness with QPC hook/dispatch timing,
   PresentMon displayed-frame correlation, phased resource sampling, and
   explicit evidence-status reporting.
-- The first v0.3 continuous-input prototype: pure 48–160 DIP normalization,
-  per-invocation continuous-slice masks, live post-arm direction, center-stop
-  behavior, a production-overlay scalar track, an edge-assist pointer proxy,
-  and a debug-only meter that cannot compile or dispatch configured actions.
+- The first v0.3 continuous-input prototype: hybrid discrete/continuous wedges,
+  an outer-edge boundary (107 DIP for Standard) with a candidate 160-DIP
+  endpoint, live direction and radius modes, a production-overlay scalar track,
+  an edge-assist pointer proxy, and a debug-only meter that cannot compile or
+  dispatch configured actions.
 - A dedicated continuous interaction matrix that checks four/eight directions,
   normalized target values, focus, edge assist, inert execution, and
   machine-readable coverage without fabricating the pending human study.
@@ -442,26 +443,30 @@ written to routine logs.
 
 ### Continuous prototype
 
-The debug-only `--continuous-meter` marks all resolved directions as
-continuous for that invocation. It does not modify schema-five configuration
-or saved action definitions. The pure controller:
+The debug-only `--continuous-meter` gives every resolved direction an inert
+continuous extension for that invocation. It does not modify schema-five
+configuration or saved action definitions. The pure controller:
 
 - selects by the existing angle and 36 DIP entry threshold;
-- arms at 48 DIP;
-- continues selecting the live wedge after arming with boundary hysteresis;
-- maps 48–160 DIP linearly to an unsigned `0.0..=1.0` scalar;
+- keeps the selected wedge live at every radius with boundary hysteresis;
+- uses the visible ring's outer edge as the mode boundary: 90.95 DIP for
+  Compact, 107 DIP for Standard, and 123.05 DIP for Large;
+- maps that boundary through the candidate 160-DIP endpoint linearly to an
+  unsigned `0.0..=1.0` scalar;
 - clamps greater distance to `1.0`;
-- commits the final scalar on activation release;
-- cancels without a commit when released before arming; and
-- stops an armed gesture when it returns inside 24 DIP.
+- commits the final scalar when released outside the boundary;
+- restores normal discrete selection when movement returns inside the
+  boundary; and
+- clears selection when movement returns to the center.
 
-The render thread receives the live slice, scalar, armed state, and a bounded
+The render thread receives the live slice, scalar, continuous-active state, and a bounded
 DIP pointer offset. It draws a radial track, percentage, and—during edge
 assist—a pointer proxy through `FoundationOverlayRenderer`; it performs no
 callback or configured action work. The interaction outcome is
-`ContinuousCommitted`, which the debug meter logs and closes without entering
-action-plan compilation. This makes the meter a no-side-effect sample sink,
-including when the selected configured slice normally has an action.
+`ContinuousCommitted` outside the ring or `Selected` inside it. The debug meter
+logs either result and closes without entering action-plan compilation. This
+makes both hybrid branches no-side-effect sample sinks, including when the
+selected configured slice normally has an action.
 
 The normalized value uses the invocation DPI. Edge assist accumulates raw
 physical deltas into the same virtual pointer and divides by that DPI before
@@ -470,12 +475,13 @@ monitor. The pointer proxy is clamped to the 160-DIP full-scale boundary and
 contains no raw screen coordinate.
 
 The controller evaluates every queued fixed-origin point and edge-assist delta,
-including intermediate center-return samples. To prevent a high-polling mouse
-from making rendering and diagnostics lag behind the cursor, consecutive
-continuous visual effects are latest-value coalesced while the input queue is
-drained. A selection clear supersedes a pending visual update, and the newest
-pending update is flushed before release, cancellation, or another terminal
-effect. Shutdown diagnostics record dispatched and coalesced counts.
+including intermediate outer-edge crossings and direction changes. To prevent
+a high-polling mouse from making rendering and diagnostics lag behind the
+cursor, consecutive continuous visual effects are latest-value coalesced while
+the input queue is drained. A selection clear supersedes a pending visual
+update, and the newest pending update is flushed before release, cancellation,
+or another terminal effect. Shutdown diagnostics record dispatched and
+coalesced counts.
 
 ### Continuous usability study
 
@@ -491,10 +497,11 @@ One anonymous session contains:
 - 24 measured scalar trials covering those four values for both four- and
   eight-slice menus at center, edge, and corner placements, interleaved by
   target to limit simple ordering bias;
-- four pre-arm direction-change trials for accidental-arming measurement;
-- four armed direction-change trials that must finish in the requested live
-  wedge; and
-- one armed center-return cancellation trial after the instruction was shown
+- four inside-ring direction-change trials for accidental continuous-entry
+  measurement;
+- four outside-ring direction-change trials that must finish in the requested
+  live wedge; and
+- one center-clear cancellation trial after the instruction was shown
   once on the introduction page.
 
 The next trial appears only after an accepted terminal outcome. A trial begun
@@ -502,7 +509,7 @@ in the wrong placement category or a scalar trial released before commit is
 retained as a rejected attempt and retried. Placement classification uses a
 32-DIP boundary around the work area, but reports contain only the category.
 
-The report schema is version 2 and records a random session ID, requested
+The report schema is version 3 and records a random session ID, requested
 and observed categories, direction correctness, normalized values, scalar
 error, cancellation reason, invocation duration, and monitor DPI. It does not
 record names, raw coordinates, foreground application identity, paths, window
@@ -1127,7 +1134,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -SimulateInputFault queue-overflow
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ReducedMotion
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 75
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection N -Direction W
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection W -Direction S
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -Direction W -ReturnInsideBeforeRelease
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection N -Direction E -PointerBurstEvents 1000
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry edge-assist -ContinuousMeter -ContinuousPercent 50 -ActivationPoint top-left -ChangeFromDirection E -Direction E -InvocationCount 20 -GestureDelayMilliseconds 75 -InterInvocationDelayMilliseconds 5 -RequireOpenAnimationComplete
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick

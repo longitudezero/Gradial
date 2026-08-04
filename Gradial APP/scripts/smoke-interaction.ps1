@@ -48,6 +48,8 @@ param(
     [ValidateRange(0, 100)]
     [int]$ContinuousPercent = 75,
 
+    [switch]$ReturnInsideBeforeRelease,
+
     [switch]$QuickFlick,
 
     [switch]$ExpectDelayExecution,
@@ -436,6 +438,9 @@ if ($PointerBurstEvents -ne 0) {
         throw "PointerBurstEvents requires one single-direction continuous-meter invocation."
     }
 }
+if ($ReturnInsideBeforeRelease -and (-not $ContinuousMeter -or $AllDirections)) {
+    throw "ReturnInsideBeforeRelease requires one continuous-meter direction."
+}
 if ($RequireOpenAnimationComplete -and ($QuickFlick -or $GestureDelayMilliseconds -lt 60)) {
     throw "RequireOpenAnimationComplete requires a gesture delay of at least 60 ms."
 }
@@ -514,7 +519,7 @@ try {
     }
     $effectiveDpi = [GradialSmokeNative]::EffectiveDpiAt($testX, $testY)
     $gestureDistanceDip = if ($ContinuousMeter) {
-        48.0 + (160.0 - 48.0) * ($ContinuousPercent / 100.0)
+        107.0 + (160.0 - 107.0) * ($ContinuousPercent / 100.0)
     } else {
         80.0
     }
@@ -522,7 +527,8 @@ try {
     $diagonalDistancePx = $gestureDistancePx / [Math]::Sqrt(2.0)
     # A one-pixel cardinal bias keeps the 0% target on the armed side of the
     # inclusive threshold after DPI conversion and integer cursor quantization.
-    # Diagonal rounding is already outward because each component is ceiled.
+    # Diagonals use nearest rounding to minimize scalar error across the now
+    # deliberately narrow 107-160 DIP candidate range.
     $continuousBoundaryBias = if ($ContinuousMeter -and $ContinuousPercent -eq 0) {
         1
     } else {
@@ -534,7 +540,7 @@ try {
         [int][Math]::Round($gestureDistancePx)
     }
     $diagonal = if ($ContinuousMeter) {
-        [int][Math]::Ceiling($diagonalDistancePx)
+        [int][Math]::Round($diagonalDistancePx)
     } else {
         [int][Math]::Round($diagonalDistancePx)
     }
@@ -547,6 +553,19 @@ try {
         SW = @(-$diagonal, $diagonal)
         W  = @(-$cardinal, 0)
         NW = @(-$diagonal, -$diagonal)
+    }
+    $insideDistancePx = 84.0 * $effectiveDpi / 96.0
+    $insideCardinal = [int][Math]::Round($insideDistancePx)
+    $insideDiagonal = [int][Math]::Round($insideDistancePx / [Math]::Sqrt(2.0))
+    $insideDirectionVectors = @{
+        N  = @(0, -$insideCardinal)
+        NE = @($insideDiagonal, -$insideDiagonal)
+        E  = @($insideCardinal, 0)
+        SE = @($insideDiagonal, $insideDiagonal)
+        S  = @(0, $insideCardinal)
+        SW = @(-$insideDiagonal, $insideDiagonal)
+        W  = @(-$insideCardinal, 0)
+        NW = @(-$insideDiagonal, -$insideDiagonal)
     }
     $directionSlices = if ($Slices -eq "4") {
         @{ N = 0; E = 1; S = 2; W = 3 }
@@ -866,6 +885,33 @@ try {
                     Start-Sleep -Milliseconds $gestureDelay
                 }
             }
+            if ($ReturnInsideBeforeRelease) {
+                $insideVector = $insideDirectionVectors[$gestureDirection]
+                [GradialSmokeNative]::SendRelativeMove(
+                    $insideVector[0] - $currentOffsetX,
+                    $insideVector[1] - $currentOffsetY
+                )
+                $currentOffsetX = $insideVector[0]
+                $currentOffsetY = $insideVector[1]
+                if ($continuousUsesFixedOrigin) {
+                    $desiredX = $testX + $currentOffsetX
+                    $desiredY = $testY + $currentOffsetY
+                    for ($correction = 0; $correction -lt 8; $correction++) {
+                        Start-Sleep -Milliseconds 10
+                        $correctedCursor = New-Object GradialSmokeNative+Point
+                        [GradialSmokeNative]::GetCursorPos([ref]$correctedCursor) | Out-Null
+                        $errorX = $desiredX - $correctedCursor.X
+                        $errorY = $desiredY - $correctedCursor.Y
+                        if ($errorX -eq 0 -and $errorY -eq 0) {
+                            break
+                        }
+                        [GradialSmokeNative]::SendRelativeMove($errorX, $errorY)
+                    }
+                }
+                if ($gestureDelay -gt 0) {
+                    Start-Sleep -Milliseconds $gestureDelay
+                }
+            }
             if ($PointerBurstEvents -ne 0) {
                 [GradialSmokeNative]::SendAbsoluteJitterBurst(
                     $testX + $currentOffsetX,
@@ -993,7 +1039,7 @@ if (
         "event_code=renderer_geometry_cache_ready .*slice_counts=4,8 " +
         ".*reduced_motion=$expectedReducedMotion .*open_ms=60 " +
         ".*selection_ms=35 .*close_ms=50 " +
-        ".*continuous_arm_radius_dip=48 " +
+        ".*continuous_arm_radius_dip=107 " +
         ".*continuous_full_scale_radius_dip=160 .*overlay_size_dip=400"
     )
 ) {
@@ -1084,7 +1130,7 @@ if ($RequireOpenAnimationComplete) {
         }
     }
 }
-$selectionRecords = if ($ContinuousMeter) {
+$selectionRecords = if ($ContinuousMeter -and -not $ReturnInsideBeforeRelease) {
     [regex]::Matches(
         $log,
         "(?m)^(?<time>\S+) .*event_code=continuous_meter_committed .*" +
@@ -1102,7 +1148,11 @@ $selectionRecords = if ($ContinuousMeter) {
     )
 }
 if ($selectionRecords.Count -ne $expectedInvocations) {
-    $outcomeName = if ($ContinuousMeter) { "continuous commits" } else { "selected gestures" }
+    $outcomeName = if ($ContinuousMeter -and -not $ReturnInsideBeforeRelease) {
+        "continuous commits"
+    } else {
+        "selected gestures"
+    }
     throw "Expected $expectedInvocations $outcomeName; observed $($selectionRecords.Count)."
 }
 if (-not $QuickFlick) {
@@ -1132,7 +1182,7 @@ if ($RequireOpenAnimationComplete) {
         }
     }
 }
-if ($ContinuousMeter) {
+if ($ContinuousMeter -and -not $ReturnInsideBeforeRelease) {
     $unexpectedDiscreteSelections = [regex]::Matches($log, "event_code=slice_selected")
     if ($unexpectedDiscreteSelections.Count -ne 0) {
         throw "The continuous meter unexpectedly produced a discrete slice selection."
@@ -1149,6 +1199,29 @@ if ($ContinuousMeter) {
                 "the tolerance is 0.02."
             )
         }
+    }
+}
+if ($ReturnInsideBeforeRelease) {
+    $unexpectedContinuousCommits = [regex]::Matches($log, "event_code=continuous_meter_committed")
+    if ($unexpectedContinuousCommits.Count -ne 0) {
+        throw "Returning inside the wedge unexpectedly committed a continuous value."
+    }
+    $armedUpdates = [regex]::Matches(
+        $log,
+        "event_code=continuous_meter_updated .*armed=true action_executed=false"
+    )
+    $discreteUpdates = [regex]::Matches(
+        $log,
+        "event_code=continuous_meter_updated .*armed=false action_executed=false"
+    )
+    if (
+        $armedUpdates.Count -lt $expectedInvocations -or
+        $discreteUpdates.Count -lt $expectedInvocations
+    ) {
+        throw "The live meter did not report both outside and restored discrete states."
+    }
+    if ($log -match "event_code=action_execution_started") {
+        throw "The inert hybrid meter unexpectedly started a configured action."
     }
 }
 if ($expectedActionModes.Count -eq 1) {

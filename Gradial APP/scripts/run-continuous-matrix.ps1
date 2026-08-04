@@ -41,6 +41,7 @@ function Invoke-ContinuousScenario {
         [int]$GestureDelayMilliseconds = 25,
         [int]$InterInvocationDelayMilliseconds = 100,
         [switch]$RequireOpenAnimationComplete,
+        [switch]$ReturnInsideBeforeRelease,
         [string]$Notes = ""
     )
 
@@ -56,16 +57,22 @@ function Invoke-ContinuousScenario {
         "-GestureDelayMilliseconds", $GestureDelayMilliseconds,
         "-InterInvocationDelayMilliseconds", $InterInvocationDelayMilliseconds
     )
-    if ([string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
+    if ([string]::IsNullOrWhiteSpace($Direction)) {
         $arguments += "-AllDirections"
     } else {
-        $arguments += @("-Direction", $Direction, "-ChangeFromDirection", $ChangeFromDirection)
+        $arguments += @("-Direction", $Direction)
+        if (-not [string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
+            $arguments += @("-ChangeFromDirection", $ChangeFromDirection)
+        }
     }
     if ($PointerBurstEvents -ne 0) {
         $arguments += @("-PointerBurstEvents", $PointerBurstEvents)
     }
     if ($RequireOpenAnimationComplete) {
         $arguments += "-RequireOpenAnimationComplete"
+    }
+    if ($ReturnInsideBeforeRelease) {
+        $arguments += "-ReturnInsideBeforeRelease"
     }
     $scenarioStarted = [DateTimeOffset]::UtcNow
     $priorPreference = $ErrorActionPreference
@@ -114,14 +121,24 @@ if ($Suite -ne "quick") {
         -ExpectedInvocations 4
 
     Invoke-ContinuousScenario `
-        -Id "center-eight-armed-turn-N-to-W-value-50" `
+        -Id "center-eight-outside-turn-W-to-S-value-50" `
+        -Slices "8" `
+        -Value 50 `
+        -ActivationPoint "center" `
+        -ExpectedInvocations 1 `
+        -Direction "S" `
+        -ChangeFromDirection "W" `
+        -Notes "Enters continuous west, turns south at the same radius, and commits south."
+
+    Invoke-ContinuousScenario `
+        -Id "center-eight-outside-W-return-inside-W" `
         -Slices "8" `
         -Value 50 `
         -ActivationPoint "center" `
         -ExpectedInvocations 1 `
         -Direction "W" `
-        -ChangeFromDirection "N" `
-        -Notes "Arms north, changes to west at the same radius, and commits west."
+        -ReturnInsideBeforeRelease `
+        -Notes "Enters continuous west, returns over the west button, and releases as an inert discrete selection."
 
     Invoke-ContinuousScenario `
         -Id "center-eight-fixed-origin-pointer-burst-value-50" `
@@ -253,7 +270,7 @@ $coverage = @(
         evidence = if ($Suite -eq "quick") {
             "Armed direction switching is excluded from the quick suite."
         } else {
-            "A 50% north arm changed to west and committed the west wedge."
+            "A 50% west continuous selection changed to south and committed the south wedge."
         }
     },
     [pscustomobject]@{
@@ -269,6 +286,21 @@ $coverage = @(
             "The fixed-origin pointer burst is excluded from the quick suite."
         } else {
             "A 1,000-event no-coalescing Windows pointer burst committed the live value and reported obsolete visual-update coalescing."
+        }
+    },
+    [pscustomobject]@{
+        requirement = "hybrid mode follows live radius and direction"
+        status = if ($Suite -eq "quick") {
+            "not_run"
+        } elseif ($failed -eq 0) {
+            "passed"
+        } else {
+            "failed"
+        }
+        evidence = if ($Suite -eq "quick") {
+            "The hybrid transition scenarios are excluded from the quick suite."
+        } else {
+            "Outside movement switched from west to south, while returning inside west restored an inert discrete release."
         }
     },
     [pscustomobject]@{
@@ -324,7 +356,7 @@ $coverage | Export-Csv -LiteralPath $coverageCsvPath -NoTypeInformation -Encodin
 
 Write-Host ""
 Write-Host "Continuous matrix complete: $passed passed, $failed failed."
-Write-Host "Expected inert commits: $expectedInvocations"
+Write-Host "Expected inert outcomes: $expectedInvocations"
 Write-Host "JSON report:    $jsonPath"
 Write-Host "Scenario table: $scenarioCsvPath"
 Write-Host "Coverage table: $coverageCsvPath"

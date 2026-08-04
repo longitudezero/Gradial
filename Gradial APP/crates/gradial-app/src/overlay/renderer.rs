@@ -22,7 +22,6 @@ const ICON_LABEL_RADIUS_DIP: f32 = 106.0;
 const ICON_SIZE_DIP: f32 = 30.0;
 const SELECTED_ARC_STEPS: u8 = 24;
 const SELECTED_ARC_INSET_RADIANS: f32 = 0.035;
-const CONTINUOUS_ARM_RADIUS_DIP: f32 = 48.0;
 const CONTINUOUS_FULL_SCALE_RADIUS_DIP: f32 = 160.0;
 const MAX_SLICE_COUNT: usize = 8;
 
@@ -99,7 +98,8 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         let center = ui.max_rect().center();
         let painter = ui.painter();
         let opacity = frame.opacity.clamp(0.0, 1.0);
-        let scale = frame.scale.clamp(0.0, 1.0) * frame.appearance.size_preset.visual_scale();
+        let lifecycle_scale = frame.scale.clamp(0.0, 1.0);
+        let scale = lifecycle_scale * frame.appearance.size_preset.visual_scale();
         let theme = theme_colors(frame.appearance.label_theme);
         let accent = frame.appearance.accent_color;
 
@@ -117,8 +117,10 @@ impl OverlayRenderer for FoundationOverlayRenderer {
                 center,
                 menu.slice_count(),
                 selection,
+                OUTER_RADIUS_DIP * frame.appearance.size_preset.visual_scale(),
+                CONTINUOUS_FULL_SCALE_RADIUS_DIP,
                 opacity,
-                scale,
+                lifecycle_scale,
                 accent,
                 theme,
             );
@@ -146,7 +148,15 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         );
 
         if let Some(pointer_offset) = frame.continuous_pointer {
-            draw_continuous_pointer(painter, center, pointer_offset, opacity, scale, accent, theme);
+            draw_continuous_pointer(
+                painter,
+                center,
+                pointer_offset,
+                opacity,
+                lifecycle_scale,
+                accent,
+                theme,
+            );
         }
 
         painter.circle_filled(center, 28.0 * scale, faded(theme.center, opacity));
@@ -204,16 +214,24 @@ fn continuous_value_f32(value: f64) -> f32 {
 fn continuous_track_offsets(
     slice_count: SliceCount,
     selection: ContinuousSelection,
+    arm_radius_dip: f32,
+    full_scale_radius_dip: f32,
 ) -> Option<[Vec2; 3]> {
+    if !arm_radius_dip.is_finite()
+        || !full_scale_radius_dip.is_finite()
+        || arm_radius_dip < 0.0
+        || full_scale_radius_dip <= arm_radius_dip
+    {
+        return None;
+    }
     let direction = slice_count.unit_vector(selection.slice_index)?;
     let direction = Vec2::new(direction.x, direction.y);
     let value = continuous_value_f32(selection.value);
-    let current_radius = CONTINUOUS_ARM_RADIUS_DIP
-        + (CONTINUOUS_FULL_SCALE_RADIUS_DIP - CONTINUOUS_ARM_RADIUS_DIP) * value;
+    let current_radius = arm_radius_dip + (full_scale_radius_dip - arm_radius_dip) * value;
     Some([
-        direction * CONTINUOUS_ARM_RADIUS_DIP,
+        direction * arm_radius_dip,
         direction * current_radius,
-        direction * CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+        direction * full_scale_radius_dip,
     ])
 }
 
@@ -223,12 +241,16 @@ fn draw_continuous_track(
     center: Pos2,
     slice_count: SliceCount,
     selection: ContinuousSelection,
+    arm_radius_dip: f32,
+    full_scale_radius_dip: f32,
     opacity: f32,
     scale: f32,
     accent: AccentColor,
     theme: ThemeColors,
 ) {
-    let Some([start, current, end]) = continuous_track_offsets(slice_count, selection) else {
+    let Some([start, current, end]) =
+        continuous_track_offsets(slice_count, selection, arm_radius_dip, full_scale_radius_dip)
+    else {
         return;
     };
     let start = center + start * scale;
@@ -630,9 +652,10 @@ mod tests {
     };
 
     use super::{
-        FoundationOverlayRenderer, SelectionTransition, continuous_pointer_position,
-        continuous_track_offsets, fitted_icon_rect, half_slice_angle, icon_and_label_offsets,
-        menu_label_layout, selected_accent_color, theme_colors,
+        CONTINUOUS_FULL_SCALE_RADIUS_DIP, FoundationOverlayRenderer, OUTER_RADIUS_DIP,
+        SelectionTransition, continuous_pointer_position, continuous_track_offsets,
+        fitted_icon_rect, half_slice_angle, icon_and_label_offsets, menu_label_layout,
+        selected_accent_color, theme_colors,
     };
     use crate::icons::IconVisual;
     use crate::overlay::AnimationMode;
@@ -708,19 +731,35 @@ mod tests {
         let [start, current, end] = continuous_track_offsets(
             SliceCount::Eight,
             ContinuousSelection { slice_index: 2, value: 0.5 },
+            OUTER_RADIUS_DIP,
+            CONTINUOUS_FULL_SCALE_RADIUS_DIP,
         )
         .expect("east continuous track");
 
-        assert_close(start.x, 48.0);
+        assert_close(start.x, 107.0);
         assert_close(start.y, 0.0);
-        assert_close(current.x, 104.0);
+        assert_close(current.x, 133.5);
         assert_close(current.y, 0.0);
         assert_close(end.x, 160.0);
         assert_close(end.y, 0.0);
+
+        let [large_start, large_current, large_end] = continuous_track_offsets(
+            SliceCount::Eight,
+            ContinuousSelection { slice_index: 2, value: 0.5 },
+            OUTER_RADIUS_DIP * SizePreset::Large.visual_scale(),
+            CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+        )
+        .expect("large east continuous track");
+        assert_close(large_start.x, 123.05);
+        assert_close(large_current.x, 141.525);
+        assert_close(large_end.x, 160.0);
+
         assert!(
             continuous_track_offsets(
                 SliceCount::Four,
-                ContinuousSelection { slice_index: 7, value: 0.5 }
+                ContinuousSelection { slice_index: 7, value: 0.5 },
+                OUTER_RADIUS_DIP,
+                CONTINUOUS_FULL_SCALE_RADIUS_DIP,
             )
             .is_none()
         );

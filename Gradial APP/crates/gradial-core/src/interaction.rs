@@ -7,12 +7,21 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Point, SliceCount};
+use crate::{Point, SizePreset, SliceCount};
 
 pub const DEFAULT_OVERLAY_HALF_EXTENT_DIP: u32 = 144;
 pub const CONTINUOUS_OVERLAY_HALF_EXTENT_DIP: u32 = 200;
-pub const DEFAULT_CONTINUOUS_ARM_RADIUS_DIP: f64 = 48.0;
+/// Standard-size menu outer edge and the boundary between discrete and
+/// continuous interaction.
+pub const DEFAULT_CONTINUOUS_ARM_RADIUS_DIP: f64 = 107.0;
 pub const DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP: f64 = 160.0;
+
+/// Matches continuous activation to the visible outer edge of the selected
+/// menu-size preset.
+#[must_use]
+pub fn continuous_arm_radius_for_size(size_preset: SizePreset) -> f64 {
+    DEFAULT_CONTINUOUS_ARM_RADIUS_DIP * f64::from(size_preset.visual_scale())
+}
 
 /// A signed physical-pixel coordinate in the Windows virtual screen.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -322,6 +331,8 @@ pub struct ContinuousVisualState {
     pub armed: bool,
 }
 
+/// Identifies slices that have a continuous extension in addition to their
+/// ordinary discrete release behavior.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ContinuousSliceMask(u8);
 
@@ -494,52 +505,7 @@ impl InteractionController {
         };
 
         let distance_dip = distance_dip(pointer_context.origin, point, pointer_context.monitor_dpi);
-        if let Some(continuous) = self.continuous_selection {
-            return self.update_armed_continuous(pointer_context, point, distance_dip, continuous);
-        }
-
         self.update_tracking(pointer_context, point, distance_dip)
-    }
-
-    fn update_armed_continuous(
-        &mut self,
-        pointer_context: PointerContext,
-        point: ScreenPoint,
-        distance_dip: f64,
-        continuous: ContinuousSelection,
-    ) -> Option<InteractionEffect> {
-        if distance_dip <= self.config.center_cancel_radius_dip {
-            self.state = InteractionState::Cancelling;
-            self.selected_slice = None;
-            self.continuous_selection = None;
-            return Some(InteractionEffect::Close {
-                invocation_id: pointer_context.invocation_id,
-                outcome: InteractionOutcome::Cancelled { reason: CancelReason::ReturnedToCenter },
-            });
-        }
-
-        let slice_index = self
-            .selection_for_point(pointer_context.origin, point, pointer_context.monitor_dpi)
-            .filter(|slice_index| self.continuous_slices.contains(*slice_index))
-            .unwrap_or(continuous.slice_index);
-        let selection = ContinuousSelection {
-            slice_index,
-            value: normalize_continuous_distance(
-                distance_dip,
-                self.config.continuous_arm_radius_dip,
-                self.config.continuous_full_scale_radius_dip,
-            ),
-        };
-        let changed = selection != continuous;
-        self.selected_slice = Some(slice_index);
-        self.continuous_selection = Some(selection);
-        if !changed && pointer_context.behavior != ResolvedGeometry::EdgeAssist {
-            return None;
-        }
-        Some(InteractionEffect::ContinuousChanged {
-            invocation_id: pointer_context.invocation_id,
-            visual: self.continuous_visual(pointer_context, point, selection, true),
-        })
     }
 
     fn update_tracking(
@@ -548,13 +514,13 @@ impl InteractionController {
         point: ScreenPoint,
         distance_dip: f64,
     ) -> Option<InteractionEffect> {
+        let previous_continuous = self.continuous_selection.take();
+        let was_continuous = previous_continuous.is_some();
         let new_selection =
             self.selection_for_point(pointer_context.origin, point, pointer_context.monitor_dpi);
         let selection_changed = new_selection != self.selected_slice;
         self.selected_slice = new_selection;
-        if new_selection.is_some() {
-            self.state = InteractionState::Tracking;
-        }
+        self.state = InteractionState::Tracking;
 
         if let Some(slice_index) = new_selection
             && self.continuous_slices.contains(slice_index)
@@ -568,11 +534,13 @@ impl InteractionController {
                     self.config.continuous_full_scale_radius_dip,
                 ),
             };
+            let next_continuous = armed.then_some(selection);
+            let continuous_changed = next_continuous != previous_continuous;
+            self.continuous_selection = next_continuous;
             if armed {
-                self.continuous_selection = Some(selection);
                 self.state = InteractionState::Continuous;
             }
-            if armed
+            if continuous_changed
                 || selection_changed
                 || pointer_context.behavior == ResolvedGeometry::EdgeAssist
             {
@@ -581,9 +549,10 @@ impl InteractionController {
                     visual: self.continuous_visual(pointer_context, point, selection, armed),
                 });
             }
+            return None;
         }
 
-        if !selection_changed {
+        if !selection_changed && !was_continuous {
             return None;
         }
 
@@ -625,15 +594,7 @@ impl InteractionController {
                     || {
                         self.selected_slice.map_or(
                             InteractionOutcome::Cancelled { reason: CancelReason::NoSelection },
-                            |slice_index| {
-                                if self.continuous_slices.contains(slice_index) {
-                                    InteractionOutcome::Cancelled {
-                                        reason: CancelReason::NoSelection,
-                                    }
-                                } else {
-                                    InteractionOutcome::Selected { slice_index }
-                                }
-                            },
+                            |slice_index| InteractionOutcome::Selected { slice_index },
                         )
                     },
                     |selection| InteractionOutcome::ContinuousCommitted {
@@ -924,11 +885,11 @@ mod tests {
         ContinuousSliceMask, ContinuousVisualState, GeometryMode, GestureConfig,
         InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
         InvocationGeometry, InvocationSnapshot, MonitorGeometry, PhysicalModifiers,
-        ResolvedGeometry, ScreenPoint, ScreenRect, continuous_pointer_offset_dip,
-        monitor_index_for_point, normalize_continuous_distance, resolve_invocation_geometry,
-        slice_for_angle, slice_for_delta,
+        ResolvedGeometry, ScreenPoint, ScreenRect, continuous_arm_radius_for_size,
+        continuous_pointer_offset_dip, monitor_index_for_point, normalize_continuous_distance,
+        resolve_invocation_geometry, slice_for_angle, slice_for_delta,
     };
-    use crate::{Point, SliceCount};
+    use crate::{Point, SizePreset, SliceCount};
     use uuid::Uuid;
 
     fn snapshot(origin: ScreenPoint) -> InvocationSnapshot {
@@ -1054,13 +1015,13 @@ mod tests {
         let assert_scalar = |actual: f64, expected: f64| {
             assert!((actual - expected).abs() <= f64::EPSILON, "expected {expected}, got {actual}");
         };
-        assert_scalar(normalize_continuous_distance(0.0, 48.0, 160.0), 0.0);
-        assert_scalar(normalize_continuous_distance(48.0, 48.0, 160.0), 0.0);
-        assert_scalar(normalize_continuous_distance(104.0, 48.0, 160.0), 0.5);
-        assert_scalar(normalize_continuous_distance(160.0, 48.0, 160.0), 1.0);
-        assert_scalar(normalize_continuous_distance(10_000.0, 48.0, 160.0), 1.0);
-        assert_scalar(normalize_continuous_distance(f64::INFINITY, 48.0, 160.0), 1.0);
-        assert_scalar(normalize_continuous_distance(f64::NAN, 48.0, 160.0), 0.0);
+        assert_scalar(normalize_continuous_distance(0.0, 107.0, 160.0), 0.0);
+        assert_scalar(normalize_continuous_distance(107.0, 107.0, 160.0), 0.0);
+        assert_scalar(normalize_continuous_distance(133.5, 107.0, 160.0), 0.5);
+        assert_scalar(normalize_continuous_distance(160.0, 107.0, 160.0), 1.0);
+        assert_scalar(normalize_continuous_distance(10_000.0, 107.0, 160.0), 1.0);
+        assert_scalar(normalize_continuous_distance(f64::INFINITY, 107.0, 160.0), 1.0);
+        assert_scalar(normalize_continuous_distance(f64::NAN, 107.0, 160.0), 0.0);
         assert_scalar(normalize_continuous_distance(104.0, 160.0, 48.0), 0.0);
         assert_eq!(
             continuous_pointer_offset_dip(
@@ -1071,6 +1032,13 @@ mod tests {
             ),
             Point::new(0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn continuous_boundary_matches_each_visible_menu_outer_edge() {
+        assert!((continuous_arm_radius_for_size(SizePreset::Compact) - 90.95).abs() < 0.001);
+        assert!((continuous_arm_radius_for_size(SizePreset::Standard) - 107.0).abs() < 0.001);
+        assert!((continuous_arm_radius_for_size(SizePreset::Large) - 123.05).abs() < 0.001);
     }
 
     #[test]
@@ -1086,26 +1054,27 @@ mod tests {
             .expect("continuous open");
 
         assert_eq!(
-            controller.pointer_moved(ScreenPoint::new(204, 100)),
+            controller.pointer_moved(ScreenPoint::new(234, 100)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
                 visual: ContinuousVisualState {
-                    selection: ContinuousSelection { slice_index: 2, value: 0.5 },
-                    pointer_offset_dip: Point::new(104.0, 0.0),
+                    selection: ContinuousSelection { slice_index: 2, value: 27.0 / 53.0 },
+                    pointer_offset_dip: Point::new(134.0, 0.0),
                     armed: true,
                 },
             })
         );
         assert_eq!(controller.state(), InteractionState::Continuous);
         assert_eq!(controller.selected_slice(), Some(2));
+        assert_eq!(controller.pointer_moved(ScreenPoint::new(234, 100)), None);
 
         assert_eq!(
-            controller.pointer_moved(ScreenPoint::new(100, -4)),
+            controller.pointer_moved(ScreenPoint::new(100, -34)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
                 visual: ContinuousVisualState {
-                    selection: ContinuousSelection { slice_index: 0, value: 0.5 },
-                    pointer_offset_dip: Point::new(0.0, -104.0),
+                    selection: ContinuousSelection { slice_index: 0, value: 27.0 / 53.0 },
+                    pointer_offset_dip: Point::new(0.0, -134.0),
                     armed: true,
                 },
             })
@@ -1132,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_slice_release_before_arm_is_inert() {
+    fn releasing_inside_a_continuous_capable_wedge_selects_its_discrete_action() {
         let origin = ScreenPoint::new(100, 100);
         let mut controller = InteractionController::new(GestureConfig::default());
         controller
@@ -1143,11 +1112,11 @@ mod tests {
             )
             .expect("continuous open");
         assert!(matches!(
-            controller.pointer_moved(ScreenPoint::new(147, 100)),
+            controller.pointer_moved(ScreenPoint::new(200, 100)),
             Some(InteractionEffect::ContinuousChanged {
                 visual: ContinuousVisualState {
                     selection: ContinuousSelection { slice_index: 2, value: 0.0 },
-                    pointer_offset_dip: Point { x: 47.0, y: 0.0 },
+                    pointer_offset_dip: Point { x: 100.0, y: 0.0 },
                     armed: false,
                 },
                 ..
@@ -1158,13 +1127,13 @@ mod tests {
             controller.activation_up(),
             Some(InteractionEffect::Close {
                 invocation_id: Uuid::nil(),
-                outcome: InteractionOutcome::Cancelled { reason: CancelReason::NoSelection },
+                outcome: InteractionOutcome::Selected { slice_index: 2 },
             })
         );
     }
 
     #[test]
-    fn returning_to_center_cancels_an_armed_continuous_slice() {
+    fn returning_inside_the_wedge_restores_discrete_release() {
         let origin = ScreenPoint::new(100, 100);
         let mut controller = InteractionController::new(GestureConfig::default());
         controller
@@ -1174,18 +1143,66 @@ mod tests {
                 ContinuousSliceMask::all(SliceCount::Eight),
             )
             .expect("continuous open");
-        controller.pointer_moved(ScreenPoint::new(204, 100)).expect("armed");
+        controller.pointer_moved(ScreenPoint::new(234, 100)).expect("continuous");
 
         assert_eq!(
-            controller.pointer_moved(ScreenPoint::new(110, 100)),
-            Some(InteractionEffect::Close {
+            controller.pointer_moved(ScreenPoint::new(200, 100)),
+            Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
-                outcome: InteractionOutcome::Cancelled { reason: CancelReason::ReturnedToCenter },
+                visual: ContinuousVisualState {
+                    selection: ContinuousSelection { slice_index: 2, value: 0.0 },
+                    pointer_offset_dip: Point::new(100.0, 0.0),
+                    armed: false,
+                },
             })
         );
-        assert_eq!(controller.state(), InteractionState::Cancelling);
-        assert_eq!(controller.activation_up(), None);
-        assert_eq!(controller.state(), InteractionState::Idle);
+        assert_eq!(controller.state(), InteractionState::Tracking);
+        assert_eq!(controller.continuous_selection(), None);
+        assert_eq!(
+            controller.activation_up(),
+            Some(InteractionEffect::Close {
+                invocation_id: Uuid::nil(),
+                outcome: InteractionOutcome::Selected { slice_index: 2 },
+            })
+        );
+    }
+
+    #[test]
+    fn outside_direction_change_selects_the_live_continuous_wedge() {
+        let origin = ScreenPoint::new(100, 100);
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_behavior(
+                snapshot(origin),
+                SliceCount::Eight,
+                ContinuousSliceMask::all(SliceCount::Eight),
+            )
+            .expect("continuous open");
+        controller.pointer_moved(ScreenPoint::new(-34, 100)).expect("west continuous");
+
+        let effect = controller.pointer_moved(ScreenPoint::new(100, 234));
+        assert!(matches!(
+            effect,
+            Some(InteractionEffect::ContinuousChanged {
+                visual: ContinuousVisualState {
+                    selection: ContinuousSelection { slice_index: 4, .. },
+                    armed: true,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(controller.selected_slice(), Some(4));
+        assert_eq!(
+            controller.activation_up(),
+            Some(InteractionEffect::Close {
+                invocation_id: Uuid::nil(),
+                outcome: InteractionOutcome::ContinuousCommitted {
+                    slice_index: 4,
+                    value: 27.0 / 53.0,
+                },
+            })
+        );
     }
 
     #[test]
@@ -1204,12 +1221,12 @@ mod tests {
             .expect("high-DPI open");
 
         assert_eq!(
-            controller.pointer_moved(ScreenPoint::new(-292, -500)),
+            controller.pointer_moved(ScreenPoint::new(-233, -500)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
                 visual: ContinuousVisualState {
                     selection: ContinuousSelection { slice_index: 2, value: 0.5 },
-                    pointer_offset_dip: Point::new(104.0, 0.0),
+                    pointer_offset_dip: Point::new(133.5, 0.0),
                     armed: true,
                 },
             })
@@ -1418,8 +1435,8 @@ mod tests {
             .expect("continuous edge-assist open");
 
         for ((dx, dy), slice_index, pointer_offset) in [
-            ((0, -104), 0, Point::new(0.0, -104.0)),
-            ((-104, 104), 6, Point::new(-104.0, 0.0)),
+            ((0, -134), 0, Point::new(0.0, -134.0)),
+            ((-134, 134), 6, Point::new(-134.0, 0.0)),
             ((-1_000, 0), 6, Point::new(-160.0, 0.0)),
         ] {
             let Some(InteractionEffect::ContinuousChanged { visual, .. }) =

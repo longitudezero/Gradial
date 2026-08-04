@@ -6,7 +6,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use gradial_core::{
     ActionPlanCompiler, CONTINUOUS_OVERLAY_HALF_EXTENT_DIP, Configuration,
-    DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, ProfileResolver, ResolvedMenu,
+    DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, ProfileResolver, ResolvedMenu,
+    continuous_arm_radius_for_size,
 };
 
 use crate::{
@@ -948,6 +949,12 @@ impl GradialApp {
             self.continuous_study.sink(),
             self.debug_menu_override.clone(),
             self.debug_continuous_meter.is_enabled(),
+            GestureConfig {
+                continuous_arm_radius_dip: continuous_arm_radius_for_size(
+                    self.configuration.appearance.size_preset,
+                ),
+                ..GestureConfig::default()
+            },
             self.config_revision,
         ) {
             Ok(interaction) => interaction,

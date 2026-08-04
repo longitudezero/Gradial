@@ -166,6 +166,7 @@ impl InteractionRuntime {
         continuous_study: ContinuousStudySink,
         debug_menu_override: Option<Arc<ResolvedMenu>>,
         debug_continuous_meter: bool,
+        gesture_config: GestureConfig,
         config_revision: u64,
     ) -> Result<Self> {
         let (producer, consumer) = RingBuffer::new(INPUT_QUEUE_CAPACITY);
@@ -205,6 +206,7 @@ impl InteractionRuntime {
                     &continuous_study,
                     debug_menu_override.as_ref(),
                     debug_continuous_meter,
+                    gesture_config,
                     config_revision,
                 );
             })
@@ -319,9 +321,10 @@ fn run_interaction_thread(
     continuous_study: &ContinuousStudySink,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
     debug_continuous_meter: bool,
+    gesture_config: GestureConfig,
     config_revision: u64,
 ) {
-    let mut controller = InteractionController::new(GestureConfig::default());
+    let mut controller = InteractionController::new(gesture_config);
     let mut active = ActiveInvocation::default();
     let mut counters = EventCounters::default();
     let qpc_frequency = query_qpc_frequency();
@@ -605,7 +608,7 @@ fn prepare_selected_action(
     action_plan_compiler: &ActionPlanCompiler,
     active_config_revision: u64,
 ) {
-    if active.practice {
+    if active.practice || active.continuous_meter {
         return;
     }
     let Some(InteractionEffect::Close {
@@ -1337,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_meter_commit_never_compiles_a_saved_action() {
+    fn continuous_meter_discrete_release_never_compiles_a_saved_action() {
         let action_id = Uuid::from_u128(51);
         let invocation_id = Uuid::from_u128(52);
         let configuration = Configuration {
@@ -1365,7 +1368,7 @@ mod tests {
         prepare_selected_action(
             Some(InteractionEffect::Close {
                 invocation_id,
-                outcome: InteractionOutcome::ContinuousCommitted { slice_index: 0, value: 0.75 },
+                outcome: InteractionOutcome::Selected { slice_index: 0 },
             }),
             &mut active,
             &compiler,

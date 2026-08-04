@@ -62,11 +62,11 @@ performance-report harness with QPC hook/dispatch timing, PresentMon
 correlation, resource sampling, and explicit unavailable/not-run evidence.
 Configured application paths remain excluded from diagnostics unless the user
 explicitly includes them. The first bounded v0.3 slice adds pure,
-DPI-independent continuous distance, live direction before and after arming,
-a production-overlay progress track, an edge-assist pointer proxy, and a
-debug-only inert meter. The meter exercises the real input, edge-assist,
-interaction, rendering, focus, and close paths while remaining unable to
-compile or dispatch a saved action.
+DPI-independent continuous distance, live direction with reversible
+inside/outside behavior, a production-overlay progress track, an edge-assist
+pointer proxy, and a debug-only inert meter. The meter exercises the real
+input, edge-assist, interaction, rendering, focus, and close paths while
+remaining unable to compile or dispatch a saved action.
 
 The implementation baseline is
 [`gradial-v0.2-implementation-plan.md`](gradial-v0.2-implementation-plan.md).
@@ -119,23 +119,27 @@ cargo run --package gradial-app -- --slices=4
 `--slices 4` and `--slices 8` are also accepted by debug builds. Release builds
 reject this override and always use the resolved profile configuration.
 
-The debug-only continuous meter makes every direction inert and maps 48–160
-DIP of radial travel to `0–100%`. The highlighted wedge follows the live angle
-before and after arming with boundary hysteresis, while distance remains the
-independent scalar. It uses the wider edge-assist extent and never compiles or
-dispatches the saved slice action:
+The debug-only continuous meter makes every direction an inert hybrid wedge.
+Inside the visible button ring, release follows the normal discrete-selection
+path; crossing its outer edge switches the live wedge to a `0–100%` continuous
+meter. For the standard menu size that boundary is 107 DIP and the current
+candidate endpoint is 160 DIP. Compact and Large boundaries follow their
+visible outer edges. The wedge follows live angle at every radius, while radial
+distance independently chooses discrete or continuous mode and the scalar. The
+meter uses the wider edge-assist extent and never compiles or dispatches the
+saved slice action:
 
 ```powershell
 cargo run --package gradial-app -- --continuous-meter --skip-onboarding
 ```
 
-Releasing before 48 DIP cancels. Returning inside the existing 24 DIP center
-radius after arming stops the meter; cancellation does not imply rollback for
-future application plugins.
+Returning across the outer edge removes the meter immediately and restores the
+discrete wedge. Releasing there selects that button; moving outside again
+restores continuous mode. Returning to the center clears the selection.
 
 High-polling mice do not enqueue a render/log operation for every physical
-sample. Gradial still evaluates every sample for direction and center-return
-cancellation, but each input-queue drain publishes only its newest continuous
+sample. Gradial still evaluates every sample for live direction and radius,
+but each input-queue drain publishes only its newest continuous
 visual state. Release and cancellation remain ordered after the final sample.
 Each per-monitor native overlay is explicitly woken after show and state
 changes, and active animations keep that native repaint path alive until their
@@ -148,8 +152,9 @@ configured actions disabled:
 cargo run --package gradial-app -- --continuous-study
 ```
 
-Each participant completes practice, balanced scalar trials, four pre-arm
-direction corrections, four armed wedge changes, and one cancellation check.
+Each participant completes practice, balanced scalar trials, four inside-ring
+direction corrections, four outside-ring wedge changes, and one center-clear
+check.
 Gradial asks for no name and writes one
 anonymous JSON report under
 `%LOCALAPPDATA%\Gradial\continuous-studies`. After collecting at least eight

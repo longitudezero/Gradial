@@ -54,7 +54,9 @@ limits resource use, and exposes only declared Gradial capabilities.
 - One continuous scalar per plugin-backed continuous action.
 - A normalized `0.0..=1.0` value derived from radial distance.
 - Begin, update, commit, and cancel lifecycle messages.
-- Live angular selection before and after a continuous action is armed.
+- Live angular selection in both discrete and continuous radial modes.
+- Reversible inside/outside mode selection with discrete release restored after
+  an inward transition.
 - Deterministic handoff between continuous actions when the selected wedge
   changes.
 - Latest-value coalescing with a configurable 10–60 Hz update rate.
@@ -110,19 +112,22 @@ downloadable or marketplace-distributed plugins.
 
 ### 3.1 Discrete and continuous slices
 
-Every menu slice remains exactly one of:
+Every menu slice keeps its optional v0.2 discrete action and may additionally
+have one v0.3 continuous plugin extension. This permits four useful states:
 
 1. Empty.
-2. Assigned to a v0.2 discrete action.
-3. Assigned to a v0.3 continuous plugin action.
+2. Discrete only.
+3. Continuous extension only.
+4. Hybrid discrete plus continuous extension.
 
-A discrete slice behaves exactly as it did in v0.2. Merely installing or
-enabling plugins MUST NOT change normal hold/flick/release behavior, geometry,
+Inside the visible wedge's outer edge, a slice behaves exactly as it did in
+v0.2. Releasing there dispatches its discrete action, if one exists. Merely
+installing or enabling plugins MUST NOT change that inside-ring behavior,
 latency, cancellation, or action execution.
 
-A continuous action is valid only as a direct menu-slice assignment. It cannot
-be referenced by a sequence because its lifetime is tied to the held activation
-control rather than the bounded discrete executor.
+A continuous extension is valid only as a direct menu-slice assignment. It
+cannot be referenced by a sequence because its lifetime is tied to the held
+activation control rather than the bounded discrete executor.
 
 ### 3.2 Distance mapping
 
@@ -133,17 +138,22 @@ monitor's DPI.
 | --- | ---: |
 | Existing center cancel radius | 24 DIP |
 | Existing direction-selection radius | 36 DIP |
-| Continuous arm radius | 48 DIP |
+| Continuous boundary, Standard menu | 107 DIP (visible outer edge) |
 | Continuous full-scale radius | 160 DIP |
 | Default update rate | 30 Hz |
 | Allowed update-rate range | 10–60 Hz |
 
 Angle may change the selected slice throughout the held gesture using the
-existing v0.2 geometry and hysteresis. Angle chooses the wedge; radial distance
-chooses the scalar. Neither dimension freezes the other.
+existing v0.2 geometry and hysteresis. Angle chooses the wedge. Radial distance
+chooses discrete mode inside the visible outer edge or continuous mode beyond
+it, and then chooses the scalar. Neither dimension nor mode freezes the other.
 
-For radial distance `d`, arm radius `a`, and full-scale radius `f`, Gradial
-computes:
+The continuous boundary MUST match the rendered outer edge for the active size
+preset: 90.95 DIP for Compact, 107 DIP for Standard, and 123.05 DIP for Large.
+The full-scale radius is independent of menu-size scaling.
+
+For radial distance `d`, outer-edge boundary `a`, and full-scale radius `f`,
+Gradial computes:
 
 ```text
 value = clamp((d - a) / (f - a), 0.0, 1.0)
@@ -160,34 +170,39 @@ value = clamp((d - a) / (f - a), 0.0, 1.0)
 - Raw cursor coordinates and raw Win32 handles are never included in a
   continuous sample.
 
-The Milestone 0 usability prototype may adjust the 48 DIP and 160 DIP defaults.
-Changing them requires recorded results for precision, accidental arming, edge
-use, live direction switching, and cancellation; it does not change the
-normalized protocol.
+The Milestone 0 usability prototype will compare 160, 200, 250, and 300 DIP
+full-scale candidates before selecting user-facing Fast, Normal, and Precise
+presets. Changing that endpoint requires recorded results for precision,
+accidental continuous entry, edge use, live direction switching, and inward
+mode reversal; it does not change the normalized protocol.
 
-### 3.3 Arming and live direction
+### 3.3 Live mode and direction
 
-A continuous session arms when all of the following are true:
+A continuous segment begins when all of the following are true:
 
-1. A continuous slice is selected.
-2. Distance reaches at least the arm radius.
+1. A slice with an enabled continuous extension is selected.
+2. Distance crosses its visible outer-edge boundary.
 3. The target snapshot remains valid.
 4. The referenced plugin and action are enabled and healthy.
 5. The plugin accepts `Begin`.
 
-Crossing the arm radius submits `Begin` for the currently selected continuous
-slice. If the plugin rejects or times out, the invocation cancels. Once
-`Begin` is accepted:
+Crossing the outer edge submits `Begin` for the currently selected continuous
+extension. If the plugin rejects or times out, the invocation cancels. While
+`Begin` is accepted and the pointer remains outside:
 
 - Angular movement continues to select the live wedge using the existing
   boundary hysteresis.
 - Radial movement continues to update the scalar independently of angle.
-- The action coordinator lease belongs to the whole held invocation, not to
-  one wedge segment. A second external dispatch fails with `action_busy`.
-- Releasing commits only the continuous action in the live wedge.
-- Once any continuous `Begin` has succeeded, moving onto a discrete or empty
-  wedge never dispatches that wedge's discrete action during the same
-  invocation.
+- The action coordinator lease belongs to the whole held invocation so
+  segment cancellation, handoff, and a possible final discrete release remain
+  exactly ordered. A second external dispatch fails with `action_busy`.
+- Releasing outside commits only the continuous extension in the live wedge.
+- Moving back inside the outer edge sends one best-effort `Cancel` with reason
+  `returned_to_discrete`, removes continuous feedback immediately, and restores
+  normal discrete selection for the live wedge.
+- Releasing after that inward transition dispatches the live wedge's discrete
+  action after the continuous terminal event, even if a continuous segment ran
+  earlier in the invocation.
 
 When angular movement selects a different enabled continuous action after
 `Begin`, Gradial performs a bounded handoff:
@@ -198,24 +213,28 @@ When angular movement selects a different enabled continuous action after
    the latest scalar and the original frozen target snapshot.
 4. Resume coalesced updates only after the new `Begin` succeeds.
 
-Moving onto an empty, discrete, unavailable, or disabled wedge stops the old
-continuous action but starts no replacement. Moving back onto an enabled
-continuous wedge may begin a new segment while the activation control remains
-held. Releasing without an active continuous segment closes with no selection.
-A rejected or timed-out replacement `Begin` cancels the whole invocation.
+Moving outside onto an empty, discrete-only, unavailable, or disabled extension
+stops the old continuous segment but starts no replacement. Its ordinary
+discrete selection remains live. Moving back onto an enabled continuous
+extension while outside may begin a new segment while the activation control
+remains held. A rejected or timed-out replacement `Begin` cancels the whole
+invocation.
 
 `direction_changed` is a stop, not a rollback. Effects already produced by the
 old action remain. The overlay switches immediately from Gradial-owned input
 state and never waits for a plugin callback.
 
-Releasing on a continuous slice before the arm radius is reached cancels with
-no plugin callback and no application effect.
+Releasing inside the outer edge never calls the continuous extension. It
+dispatches the selected discrete action, or closes with no application effect
+when that slice has no discrete action.
 
 ### 3.4 Release and cancellation
 
 Releasing the activation control while a continuous segment is active sends
 `Commit` to that segment with the final live wedge and scalar. `Commit` is
 delivered even if the same value was already sent in the latest `Update`.
+Releasing with no active continuous segment follows the ordinary discrete
+release path at that exact live wedge and radius.
 
 The v0.2 cancellation causes remain valid. In addition, an active continuous
 session cancels when:
@@ -225,8 +244,10 @@ session cancels when:
 - The capability broker becomes unavailable.
 - Plugin reload is requested while the session is active.
 
-Returning inside the 24 DIP center radius after `Begin` cancels the continuous
-session. It does not select another slice.
+Returning inside the outer-edge boundary after `Begin` cancels only that
+continuous segment with `returned_to_discrete`; the held invocation continues
+in discrete mode. Entering the 24 DIP center clears the live discrete selection.
+Releasing at the center closes with no application effect.
 
 `Cancel` means “stop producing effects and release session resources.” It does
 **not** promise to undo effects already applied by a plugin. The settings UI,
@@ -247,11 +268,12 @@ The overlay renderer receives only Gradial-owned immutable render data:
 
 - Live selected direction.
 - Normalized scalar.
-- Armed/active/faulted visual state.
+- Discrete/active/faulted visual state.
 - A bounded DIP pointer offset for edge-assist feedback.
 
-The production overlay SHOULD show a radial progress track from arm radius to
-full-scale radius. It may display `0–100%`, but it does not display a
+The production overlay SHOULD show a radial progress track from the visible
+outer-edge boundary to the full-scale radius. It may display `0–100%`, but it
+does not display a
 plugin-supplied dynamic label or application value in v0.3.
 
 During edge assist, the production overlay MUST show a Gradial-owned pointer
@@ -329,13 +351,17 @@ enum ContinuousRequest {
 }
 ```
 
+`ContinuousCancelReason` includes `returned_to_discrete` for an inward
+outer-edge crossing and `direction_changed` for an outside wedge handoff.
+These stop an active segment without closing or freezing the held invocation.
+
 Protocol rules:
 
 - `api_version` is separate from the Gradial application version and begins at
   `1`.
 - Every accepted session receives exactly one `Begin`, zero or more `Update`
   requests, and at most one terminal `Commit` or `Cancel`.
-- Each post-arm wedge segment has a fresh `session_id` and sequence starting at
+- Each outside wedge segment has a fresh `session_id` and sequence starting at
   zero. A direction handoff delivers the old segment's `direction_changed`
   cancel before submitting the new segment's `Begin`; the invocation-level
   coordinator lease remains held between them.
@@ -357,11 +383,11 @@ Protocol rules:
 
 Before the plugin runtime exists, Gradial applies the same latest-value
 principle to its own continuous visual feedback. The interaction controller
-still evaluates every queued pointer sample so a transient center return,
-direction change, or cancellation cannot be skipped. While draining a burst,
-only the newest ordinary render sample is published. The newest sample is
-flushed before release or cancellation, and a newer selection-clear event
-supersedes obsolete pending feedback.
+still evaluates every queued pointer sample so an outer-edge crossing, inward
+mode reversal, direction change, or cancellation cannot be skipped. While
+draining a burst, only the newest ordinary render sample is published. The
+newest sample is flushed before release or cancellation, and a newer discrete
+selection event supersedes obsolete pending feedback.
 
 The interaction thread publishes the latest complete sample into a
 single-session latest-value slot. It does not enqueue every mouse event.
@@ -389,6 +415,12 @@ ActionKind::PluginContinuous {
 }
 ```
 
+`MenuSlice` retains its existing optional discrete `action_id` and gains a
+separate optional `continuous_action_id`. The new field may reference only a
+`PluginContinuous` action. This explicit second slot permits a Mute discrete
+action and a Volume continuous extension to share one wedge without encoding
+either behavior inside the other.
+
 `PluginValue` supports only:
 
 - Boolean.
@@ -409,19 +441,22 @@ configuration revision at activation.
 - Parameter keys not declared by the referenced action are invalid.
 - Missing required parameters and type/range mismatches are invalid.
 - Continuous actions are rejected from sequences at save and import time.
-- A continuous action may be assigned only to a menu slice.
+- A continuous action may be assigned only through a menu slice's
+  `continuous_action_id`; it is invalid in the existing discrete `action_id`.
+- A non-continuous action is invalid in `continuous_action_id`.
 - A syntactically valid reference to a missing or disabled local plugin remains
   loadable but is marked unavailable and cannot execute.
 
 Allowing an unavailable plugin reference preserves portable configuration
 without treating absent local plugin files as configuration corruption. The
-settings editor shows the affected actions and profiles. Activation of such a
-slice cancels with `plugin_unavailable`.
+settings editor shows the affected actions and profiles. The slice's discrete
+action remains usable inside the ring. Crossing outside toward an unavailable
+continuous extension cancels with `plugin_unavailable`.
 
 ### 5.2 Migration, import, and export
 
 - Schema-five configuration migrates to schema six in memory with no plugin
-  actions.
+  actions and `continuous_action_id: None` on every menu slice.
 - Migration follows the existing explicit-save rule; startup does not rewrite
   a valid legacy file.
 - Import and atomic replacement retain the v0.2 recovery contract.
@@ -768,12 +803,15 @@ The action catalog gains **Plugin continuous action**.
 - Plugin code does not run while editing parameters.
 - The editor shows requested capabilities before assignment.
 - Save uses complete schema-six validation.
+- A menu-slice editor exposes the continuous extension separately from its
+  existing discrete action.
 - A missing plugin produces a visible unavailable warning rather than deleting
-  the action or slice assignment.
+  either assignment.
 - Continuous actions are not offered in the sequence editor.
 
-The production radial preview visualizes direction, arming, and normalized
-distance but never calls the plugin or performs its effects.
+The production radial preview visualizes direction, the reversible
+inside/outside mode, and normalized distance but never calls the plugin or
+performs its effects.
 
 ### 9.3 Local development loop
 
@@ -835,7 +873,7 @@ receive a separate latency exemption.
 
 | Metric | Release gate |
 | --- | ---: |
-| Arm threshold to `Begin` callback start | p95 < 20 ms; p99 < 35 ms |
+| Outer-edge crossing to `Begin` callback start | p95 < 20 ms; p99 < 35 ms |
 | Latest sample publication to `Update` callback start | p95 ≤ configured update period + 5 ms |
 | Activation release to terminal callback start | p95 < 20 ms; p99 < 35 ms |
 | Pending ordinary updates per session | ≤ 1 |
@@ -870,32 +908,43 @@ Before freezing the distance defaults, test at least eight participants using
 four- and eight-slice menus at screen center, edges, and corners.
 
 Participants select displayed target values at 25%, 50%, 75%, and 100%.
+Before choosing presets, each participant also receives matched trials where
+direction and target are held constant while the full-scale endpoint changes
+among 160, 200, 250, and 300 DIP. Candidate order is counterbalanced so
+practice does not systematically favor one endpoint. Record completion time,
+absolute scalar error, overshoot count, and the participant's preference.
 Accept the defaults when:
 
 - Existing eight-direction error remains within the accepted v0.2 baseline.
 - Median absolute scalar error after practice is at most 0.06.
 - At least 95% of final samples are within 0.15 of the requested target.
-- Accidental arming while changing direction is below 2%.
-- At least 95% of armed direction changes finish in the requested live wedge.
-- At least seven of eight participants can cancel an armed action after being
-  told once that cancellation stops but does not undo prior effects.
+- Accidental continuous entry during intended discrete selection is below 2%.
+- At least 95% of outside direction changes finish in the requested live wedge.
+- At least 95% of inward reversals visibly restore discrete mode and release as
+  the requested discrete wedge.
+- At least seven of eight participants can clear a selection at the center
+  after being told once.
 - Edge/corner median completion time is no more than 20% slower than
   center-screen completion.
 
-If these gates fail, adjust arm radius, full-scale radius, progress rendering,
-or onboarding and repeat the prototype. Do not compensate by exposing
-application-specific values in the core.
+Use the matched endpoint comparison to select two or three named travel presets
+such as Fast, Normal, and Precise. Preserve the exact DIP endpoint internally;
+a custom value may be exposed later. If these gates fail, adjust the endpoint,
+progress rendering, or onboarding and repeat the prototype. Do not compensate
+by exposing application-specific values in the core.
 
 ## 12. Test matrix
 
 ### 12.1 Pure and automated tests
 
-- Distance normalization at arm radius, full-scale radius, between them, and
-  beyond both bounds.
+- Distance normalization at the outer-edge boundary, full-scale radius,
+  between them, and beyond both bounds.
 - NaN, infinity, very large deltas, negative coordinates, and every supported
   DPI.
-- Four/eight slice centers, boundaries, hysteresis, live post-arm direction
-  changes, and return-to-center cancellation.
+- Four/eight slice centers, boundaries, hysteresis, live outside direction
+  changes, inward restoration of discrete mode, and center selection clearing.
+- Release inside a hybrid wedge selects its discrete action; release outside
+  commits its continuous extension; neither result is latched from history.
 - Monotonic scalar behavior for monotonic outward movement.
 - Deterministic update coalescing and sequence gaps.
 - Begin rejection, callback error, timeout, cancellation, and exact terminal
@@ -954,18 +1003,20 @@ error messages, and author guide before release.
 Deliver:
 
 - Pure distance normalization.
-- Continuous arming and live-direction state.
+- Reversible hybrid radius mode and live-direction state.
 - Production-renderer progress feedback.
 - Bounded virtual-pointer feedback during edge assist.
 - Edge-assist extension to the candidate full-scale radius.
 - A built-in no-side-effect sample sink.
 - Repeatable direction/distance interaction matrix.
-- The usability study in Section 11.3.
+- The matched 160/200/250/300-DIP comparison and usability study in Section
+  11.3.
 
 No Lua or plugin configuration is introduced in this milestone.
 
-Exit only when arm radius, full-scale radius, visual feedback, cancellation,
-and edge behavior have recorded results.
+Exit only when the visible-edge boundary, selected full-scale presets, visual
+feedback, inward reversal, cancellation, and edge behavior have recorded
+results.
 
 ### Milestone 1 — Runtime-neutral continuous core
 
@@ -1009,7 +1060,8 @@ Deliver:
 - Per-call target and permission validation.
 - Capability rate, payload, origin, and timeout limits.
 - Generic manifest parameter controls.
-- Plugin continuous action creation and assignment.
+- Plugin continuous action creation and separate slice-extension assignment
+  without replacing the slice's discrete action.
 - Shortcut-based smooth/banded example.
 - Loopback integration harness.
 - Import/export dependency summary.

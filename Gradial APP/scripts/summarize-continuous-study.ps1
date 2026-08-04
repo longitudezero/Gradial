@@ -61,7 +61,11 @@ function Test-ParticipantReport {
         [string]$Source
     )
 
-    if ($Report.schema_version -ne 2 -or $Report.protocol -ne "gradial-continuous-usability-v2") {
+    $supportedProtocol = (
+        ($Report.schema_version -eq 2 -and $Report.protocol -eq "gradial-continuous-usability-v2") -or
+        ($Report.schema_version -eq 3 -and $Report.protocol -eq "gradial-continuous-usability-v3")
+    )
+    if (-not $supportedProtocol) {
         throw "Unsupported continuous-study report: $Source"
     }
     if ($Report.planned_trials -ne 37 -or $Report.summary.accepted_trials -ne 37) {
@@ -154,7 +158,7 @@ function Get-CohortSummary {
                 $_.attempts | Where-Object {
                     $_.accepted -eq $true -and
                     $_.phase -eq "cancellation" -and
-                    $_.cancel_reason -eq "returned_to_center"
+                    $_.cancel_reason -in @("no_selection", "returned_to_center")
                 }
             ).Count -gt 0
         }
@@ -231,26 +235,26 @@ function Get-CohortSummary {
             -Passed ($null -ne $withinFraction -and $withinFraction -ge 0.95) `
             -Evidence "$withinCount of $($scalarErrors.Count) measured samples were within 0.15."
         New-Gate `
-            -Requirement "accidental arming below 2%" `
+            -Requirement "accidental continuous entry below 2%" `
             -EnoughParticipants $enoughParticipants `
             -Passed ($null -ne $accidentalArmingRate -and $accidentalArmingRate -lt 0.02) `
-            -Evidence "$accidentalArms accidental arms across $($preArmDirectionChange.Count) pre-arm direction-change trials."
+            -Evidence "$accidentalArms accidental continuous entries across $($preArmDirectionChange.Count) inside-ring direction-change trials."
         New-Gate `
-            -Requirement "at least 95% of armed direction switches finish in the requested wedge" `
+            -Requirement "at least 95% of outside direction switches finish in the requested wedge" `
             -EnoughParticipants $enoughParticipants `
             -Passed (
                 $null -ne $armedDirectionSwitchSuccessRate -and
                 $armedDirectionSwitchSuccessRate -ge 0.95
             ) `
-            -Evidence "$armedDirectionSwitchSuccesses of $($armedDirectionChange.Count) armed direction switches finished in the requested wedge."
+            -Evidence "$armedDirectionSwitchSuccesses of $($armedDirectionChange.Count) outside direction switches finished in the requested wedge."
         New-Gate `
-            -Requirement "at least seven of eight participants cancel after one instruction" `
+            -Requirement "at least seven of eight participants clear selection after one instruction" `
             -EnoughParticipants $enoughParticipants `
             -Passed (
                 $null -ne $cancellationParticipantFraction -and
                 $cancellationParticipantFraction -ge 0.875
             ) `
-            -Evidence "$successfulCancellationParticipants of $participantCount participants cancelled by returning to center."
+            -Evidence "$successfulCancellationParticipants of $participantCount participants cleared selection at the center."
         New-Gate `
             -Requirement "edge and corner median no more than 20% slower than center" `
             -EnoughParticipants $enoughParticipants `
@@ -259,9 +263,9 @@ function Get-CohortSummary {
     )
 
     [ordered]@{
-        schema_version = 2
-        source_schema_version = 2
-        protocol = "gradial-continuous-usability-v2"
+        schema_version = 3
+        source_schema_versions = @($Reports.schema_version | Sort-Object -Unique)
+        protocol = "gradial-continuous-usability-cohort-v3"
         metrics = $metrics
         gates = $gates
     }
@@ -347,6 +351,17 @@ function New-SelfTestReport {
 
 if ($SelfTest) {
     $reports = @(0..7 | ForEach-Object { New-SelfTestReport $_ })
+    $reports[0].schema_version = 3
+    $reports[0].protocol = "gradial-continuous-usability-v3"
+    foreach ($attempt in $reports[0].attempts) {
+        if ($attempt.phase -eq "direction_change" -and $attempt.requested_change_after_arm -ne $true) {
+            $attempt.result = "discrete_selected"
+            $attempt.cancel_reason = $null
+        }
+        if ($attempt.phase -eq "cancellation") {
+            $attempt.cancel_reason = "no_selection"
+        }
+    }
     foreach ($report in $reports) {
         Test-ParticipantReport -Report $report -Source "self-test"
     }

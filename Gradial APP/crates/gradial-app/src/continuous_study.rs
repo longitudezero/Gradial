@@ -23,7 +23,7 @@ use windows::{
     core::PCWSTR,
 };
 
-const STUDY_SCHEMA_VERSION: u32 = 2;
+const STUDY_SCHEMA_VERSION: u32 = 3;
 const STUDY_EVENT_CAPACITY: usize = 32;
 const STUDY_SIZE: [f32; 2] = [760.0, 680.0];
 const STUDY_MIN_SIZE: [f32; 2] = [680.0, 600.0];
@@ -121,7 +121,9 @@ impl ContinuousStudySink {
                 StudyTerminal::Committed { slice_index, value }
             }
             InteractionOutcome::Cancelled { reason } => StudyTerminal::Cancelled { reason },
-            InteractionOutcome::Selected { .. } => return,
+            InteractionOutcome::Selected { slice_index } => {
+                StudyTerminal::DiscreteSelected { slice_index }
+            }
         };
         let observation = StudyObservation {
             trial_id,
@@ -154,6 +156,7 @@ impl ContinuousStudySink {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StudyTerminal {
     Committed { slice_index: usize, value: f64 },
+    DiscreteSelected { slice_index: usize },
     Cancelled { reason: CancelReason },
 }
 
@@ -197,6 +200,9 @@ impl StudyAttemptRecord {
             StudyTerminal::Committed { slice_index, value } => {
                 ("committed".to_owned(), Some(slice_index), Some(value), None)
             }
+            StudyTerminal::DiscreteSelected { slice_index } => {
+                ("discrete_selected".to_owned(), Some(slice_index), None, None)
+            }
             StudyTerminal::Cancelled { reason } => {
                 ("cancelled".to_owned(), None, None, Some(cancel_reason_name(reason).to_owned()))
             }
@@ -210,7 +216,9 @@ impl StudyAttemptRecord {
             StudyPhase::Practice | StudyPhase::Scalar => observed_value.is_some(),
             StudyPhase::DirectionChange if trial.change_after_arm => observed_value.is_some(),
             StudyPhase::DirectionChange => {
-                observed_value.is_some() || cancel_reason.as_deref() == Some("no_selection")
+                result == "discrete_selected"
+                    || observed_value.is_some()
+                    || cancel_reason.as_deref() == Some("no_selection")
             }
             StudyPhase::Cancellation => {
                 observed_value.is_some()
@@ -248,7 +256,7 @@ impl StudyAttemptRecord {
 
     fn cancellation_succeeded(&self) -> bool {
         self.phase == StudyPhase::Cancellation
-            && self.cancel_reason.as_deref() == Some("returned_to_center")
+            && matches!(self.cancel_reason.as_deref(), Some("no_selection" | "returned_to_center"))
     }
 
     fn accidentally_armed(&self) -> bool {
@@ -311,8 +319,15 @@ struct StudyPrivacy {
 struct CandidateGeometry {
     cancel: u32,
     direction: u32,
-    arm: u32,
+    continuous_boundary: CandidateBoundaries,
     full_scale: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct CandidateBoundaries {
+    compact: f64,
+    standard: f64,
+    large: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -411,7 +426,7 @@ impl StudyState {
     fn report(&self) -> StudyReport {
         StudyReport {
             schema_version: STUDY_SCHEMA_VERSION,
-            protocol: "gradial-continuous-usability-v2",
+            protocol: "gradial-continuous-usability-v3",
             session_id: self.session_id,
             privacy: StudyPrivacy {
                 identity: "random_session_id_only",
@@ -427,7 +442,11 @@ impl StudyState {
             candidate_geometry_dip: CandidateGeometry {
                 cancel: 24,
                 direction: 36,
-                arm: 48,
+                continuous_boundary: CandidateBoundaries {
+                    compact: 90.95,
+                    standard: 107.0,
+                    large: 123.05,
+                },
                 full_scale: 160,
             },
             planned_trials: self.plan.len(),
@@ -498,8 +517,10 @@ impl StudyState {
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("Cancellation instruction — read once").strong());
-            ui.label("After a continuous action is armed, return to the center while still holding to cancel it.");
-            ui.label("Cancellation stops further effects; it does not undo effects already produced.");
+            ui.label("To cancel, return to the center while still holding, then release there.");
+            ui.label(
+                "Cancellation stops further effects; it does not undo effects already produced.",
+            );
         });
         ui.add_space(14.0);
         ui.checkbox(
@@ -549,12 +570,12 @@ impl StudyState {
                 StudyPhase::DirectionChange => {
                     if trial.change_after_arm {
                         ui.label(RichText::new(format!(
-                            "Arm toward {} near 50%, then turn to {}",
+                            "Move outside toward {} near 50%, then turn to {}",
                             trial.change_from_direction().unwrap_or("?"),
                             trial.direction()
                         )).size(24.0).strong());
                         ui.label(format!(
-                            "Hold {}, move outward until armed, turn to the requested final wedge without returning to center, then release.",
+                            "Hold {}, move beyond the outer edge, turn to the requested final wedge while remaining outside, then release.",
                             binding_display(binding)
                         ));
                     } else {
@@ -564,14 +585,14 @@ impl StudyState {
                             trial.direction()
                         )).size(24.0).strong());
                         ui.label(format!(
-                            "Hold {}, change direction before reaching the 48-DIP arm distance, and release below that distance.",
+                            "Hold {}, change direction inside the visible outer edge, and release over the requested wedge.",
                             binding_display(binding)
                         ));
                     }
                 }
                 StudyPhase::Cancellation => {
                     ui.label(RichText::new(format!(
-                        "Arm toward {} near {}%, then cancel",
+                        "Move outside toward {} near {}%, then clear",
                         trial.direction(),
                         trial.target_percent.unwrap_or_default()
                     )).size(24.0).strong());
@@ -604,12 +625,12 @@ impl StudyState {
                 );
                 summary_row(
                     ui,
-                    "Accidental arming",
+                    "Accidental continuous entry",
                     format!("{} of {}", summary.accidental_arms, summary.accidental_arming_trials),
                 );
                 summary_row(
                     ui,
-                    "Armed direction switches",
+                    "Outside direction switches",
                     format!(
                         "{} of {}",
                         summary.armed_direction_switch_successes,
@@ -1236,7 +1257,7 @@ mod tests {
                 observation(
                     accidental.id,
                     accidental.placement,
-                    StudyTerminal::Cancelled { reason: CancelReason::NoSelection },
+                    StudyTerminal::DiscreteSelected { slice_index: accidental.direction_index },
                 ),
             ),
             StudyAttemptRecord::from_observation(
@@ -1255,7 +1276,7 @@ mod tests {
                 observation(
                     cancellation.id,
                     cancellation.placement,
-                    StudyTerminal::Cancelled { reason: CancelReason::ReturnedToCenter },
+                    StudyTerminal::Cancelled { reason: CancelReason::NoSelection },
                 ),
             ),
         ];
@@ -1279,13 +1300,13 @@ mod tests {
                     value: f64::from(trial.target_percent.unwrap_or_default()) / 100.0,
                 },
                 StudyPhase::DirectionChange if !trial.change_after_arm => {
-                    StudyTerminal::Cancelled { reason: CancelReason::NoSelection }
+                    StudyTerminal::DiscreteSelected { slice_index: trial.direction_index }
                 }
                 StudyPhase::DirectionChange => {
                     StudyTerminal::Committed { slice_index: trial.direction_index, value: 0.5 }
                 }
                 StudyPhase::Cancellation => {
-                    StudyTerminal::Cancelled { reason: CancelReason::ReturnedToCenter }
+                    StudyTerminal::Cancelled { reason: CancelReason::NoSelection }
                 }
             };
             state.record(observation(trial.id, trial.placement, terminal));
@@ -1318,7 +1339,7 @@ mod tests {
             assert!(!json.contains(prohibited), "found prohibited field {prohibited}");
         }
         assert!(json.contains("\"identity\": \"random_session_id_only\""));
-        assert!(json.contains("gradial-continuous-usability-v2"));
+        assert!(json.contains("gradial-continuous-usability-v3"));
         assert!(directory.path().read_dir().expect("report directory").all(|entry| {
             entry
                 .expect("report entry")

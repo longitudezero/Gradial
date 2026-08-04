@@ -27,8 +27,9 @@ pub use interaction::{
     DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, InputEvent, InputEventKind,
     InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
     InvocationContext, InvocationGeometry, InvocationSnapshot, MonitorGeometry, PhysicalModifiers,
-    ResolvedGeometry, ScreenPoint, ScreenRect, monitor_index_for_point,
-    normalize_continuous_distance, resolve_invocation_geometry, slice_for_delta,
+    ResolvedGeometry, ScreenPoint, ScreenRect, continuous_arm_radius_for_size,
+    monitor_index_for_point, normalize_continuous_distance, resolve_invocation_geometry,
+    slice_for_delta,
 };
 pub use paths::{AppPaths, AppPathsError};
 pub use profiles::{
