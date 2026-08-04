@@ -1340,12 +1340,16 @@ $interactionStop = [regex]::Match(
     "event_code=interaction_thread_stopped .*" +
     "pointer_moved_events=(?<pointer>[0-9]+) .*" +
     "continuous_updates_dispatched=(?<dispatched>[0-9]+) " +
+    "continuous_updates_prioritized=(?<prioritized>[0-9]+) " +
     "continuous_updates_coalesced=(?<coalesced>[0-9]+)"
 )
 if (-not $interactionStop.Success) {
     throw "The interaction shutdown record did not contain coalescing diagnostics."
 }
 $coalescedUpdates = [int]$interactionStop.Groups["coalesced"].Value
+if ($ContinuousMeter -and [int]$interactionStop.Groups["prioritized"].Value -eq 0) {
+    throw "The continuous meter did not prioritize any direction or mode transition."
+}
 if ($PointerBurstEvents -ne 0 -and $coalescedUpdates -eq 0) {
     throw "The fixed-origin pointer burst did not coalesce any obsolete visual updates."
 }

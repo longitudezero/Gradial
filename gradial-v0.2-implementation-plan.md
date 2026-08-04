@@ -108,7 +108,11 @@ All persisted dimensions use device-independent pixels (DIP). At invocation they
 | Boundary hysteresis | 5 degrees |
 | Open animation | 60 ms |
 | Close animation | 50 ms |
-| Selection-color transition | 35 ms |
+| Selection-color transition | Immediate |
+
+The original 35 ms selection-color prototype was removed after interaction
+testing showed that consistent immediate wedge feedback felt more accurate in
+both fixed-origin and edge-assist geometry.
 
 - The gesture origin is the physical cursor position captured on button-down.
 - No slice is selected until the pointer reaches 36 DIP from the origin.

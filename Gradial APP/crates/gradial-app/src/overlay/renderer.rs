@@ -1,16 +1,11 @@
 use std::sync::Arc;
-use std::time::Instant;
 
+use crate::icons::{IconManager, IconVisual};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2, epaint::CircleShape};
 use gradial_core::{
     AccentColor, ActivationBindingId, Appearance, ContinuousSelection, LabelTheme, Point,
     ResolvedMenu, SliceCount,
 };
-use uuid::Uuid;
-
-use crate::icons::{IconManager, IconVisual};
-
-use super::animation::{AnimationMode, selection_progress};
 
 const RING_RADIUS_DIP: f32 = 84.0;
 const RING_WIDTH_DIP: f32 = 46.0;
@@ -27,32 +22,25 @@ const MAX_SLICE_COUNT: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct OverlayRenderFrame {
-    pub(crate) invocation_id: Option<Uuid>,
     pub(crate) menu: Option<Arc<ResolvedMenu>>,
     pub(crate) activation_button: ActivationBindingId,
     pub(crate) appearance: Appearance,
     pub(crate) selected_slice: Option<usize>,
     pub(crate) continuous_selection: Option<ContinuousSelection>,
     pub(crate) continuous_pointer: Option<Point>,
-    pub(crate) selection_changed_at: Option<Instant>,
     pub(crate) opacity: f32,
     pub(crate) scale: f32,
-    pub(crate) animation_mode: AnimationMode,
-    pub(crate) now: Instant,
 }
 
 /// Narrow rendering boundary used by the interaction layer.
 pub(crate) trait OverlayRenderer {
-    /// Returns true while the selection transition needs another frame.
-    fn render(&mut self, ui: &mut egui::Ui, frame: OverlayRenderFrame) -> bool;
+    fn render(&mut self, ui: &mut egui::Ui, frame: OverlayRenderFrame);
 }
 
 #[derive(Debug)]
 pub(crate) struct FoundationOverlayRenderer {
     geometry: RendererGeometryCaches,
     icons: Arc<IconManager>,
-    active_invocation: Option<Uuid>,
-    selection: SelectionTransition,
 }
 
 impl Default for FoundationOverlayRenderer {
@@ -63,12 +51,7 @@ impl Default for FoundationOverlayRenderer {
 
 impl FoundationOverlayRenderer {
     pub(crate) fn new(icons: Arc<IconManager>) -> Self {
-        Self {
-            geometry: RendererGeometryCaches::new(),
-            icons,
-            active_invocation: None,
-            selection: SelectionTransition::default(),
-        }
+        Self { geometry: RendererGeometryCaches::new(), icons }
     }
 
     #[cfg(test)]
@@ -79,19 +62,10 @@ impl FoundationOverlayRenderer {
 }
 
 impl OverlayRenderer for FoundationOverlayRenderer {
-    fn render(&mut self, ui: &mut egui::Ui, frame: OverlayRenderFrame) -> bool {
-        if self.active_invocation != frame.invocation_id {
-            self.active_invocation = frame.invocation_id;
-            self.selection.reset(None, frame.selection_changed_at.unwrap_or(frame.now));
-        }
-        let (selection_levels, selection_animating) = self.selection.sample(
-            frame.selected_slice,
-            frame.selection_changed_at,
-            frame.now,
-            frame.animation_mode,
-        );
+    fn render(&mut self, ui: &mut egui::Ui, frame: OverlayRenderFrame) {
+        let selection_levels = target_levels(frame.selected_slice);
         let Some(menu) = frame.menu.as_deref() else {
-            return selection_animating;
+            return;
         };
         let geometry = self.geometry.for_slice_count(menu.slice_count());
 
@@ -171,8 +145,6 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             FontId::proportional(11.0 * scale),
             faded(theme.center_label, opacity),
         );
-
-        selection_animating
     }
 }
 
@@ -326,67 +298,6 @@ impl RendererGeometryCache {
         }
 
         Self { boundaries, label_offsets, selected_arcs }
-    }
-}
-
-#[derive(Debug)]
-struct SelectionTransition {
-    target: Option<usize>,
-    from: [f32; MAX_SLICE_COUNT],
-    displayed: [f32; MAX_SLICE_COUNT],
-    started_at: Instant,
-}
-
-impl Default for SelectionTransition {
-    fn default() -> Self {
-        Self {
-            target: None,
-            from: [0.0; MAX_SLICE_COUNT],
-            displayed: [0.0; MAX_SLICE_COUNT],
-            started_at: Instant::now(),
-        }
-    }
-}
-
-impl SelectionTransition {
-    fn reset(&mut self, target: Option<usize>, now: Instant) {
-        self.target = target;
-        self.from = target_levels(target);
-        self.displayed = self.from;
-        self.started_at = now;
-    }
-
-    fn sample(
-        &mut self,
-        target: Option<usize>,
-        changed_at: Option<Instant>,
-        now: Instant,
-        mode: AnimationMode,
-    ) -> ([f32; MAX_SLICE_COUNT], bool) {
-        if mode.is_reduced() {
-            self.reset(target, now);
-            return (self.displayed, false);
-        }
-
-        if target != self.target {
-            let transition_time = changed_at.unwrap_or(now);
-            self.advance(transition_time);
-            self.from = self.displayed;
-            self.target = target;
-            self.started_at = transition_time;
-        }
-
-        let complete = self.advance(now);
-        (self.displayed, !complete)
-    }
-
-    fn advance(&mut self, now: Instant) -> bool {
-        let progress = selection_progress(now.saturating_duration_since(self.started_at));
-        let targets = target_levels(self.target);
-        for (index, target) in targets.iter().enumerate() {
-            self.displayed[index] = self.from[index] + (*target - self.from[index]) * progress;
-        }
-        progress >= 1.0
     }
 }
 
@@ -642,8 +553,6 @@ const fn half_slice_angle(slice_count: SliceCount) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use std::sync::Arc;
 
     use gradial_core::{
@@ -653,12 +562,11 @@ mod tests {
 
     use super::{
         CONTINUOUS_FULL_SCALE_RADIUS_DIP, FoundationOverlayRenderer, OUTER_RADIUS_DIP,
-        SelectionTransition, continuous_pointer_position, continuous_track_offsets,
-        fitted_icon_rect, half_slice_angle, icon_and_label_offsets, menu_label_layout,
-        selected_accent_color, theme_colors,
+        continuous_pointer_position, continuous_track_offsets, fitted_icon_rect, half_slice_angle,
+        icon_and_label_offsets, menu_label_layout, selected_accent_color, target_levels,
+        theme_colors,
     };
     use crate::icons::IconVisual;
-    use crate::overlay::AnimationMode;
 
     fn assert_close(actual: f32, expected: f32) {
         assert!((actual - expected).abs() < 0.0001);
@@ -807,56 +715,9 @@ mod tests {
     }
 
     #[test]
-    fn selection_color_reaches_target_in_thirty_five_milliseconds() {
-        let start = Instant::now();
-        let mut transition = SelectionTransition::default();
-        transition.reset(None, start);
-
-        let (first, animating) =
-            transition.sample(Some(2), Some(start), start, AnimationMode::Standard);
-        assert_close(first[2], 0.0);
-        assert!(animating);
-
-        let (middle, animating) = transition.sample(
-            Some(2),
-            Some(start),
-            start + Duration::from_millis(17),
-            AnimationMode::Standard,
-        );
-        assert!(middle[2] > 0.48 && middle[2] < 0.49);
-        assert!(animating);
-
-        let (last, animating) = transition.sample(
-            Some(2),
-            Some(start),
-            start + Duration::from_millis(35),
-            AnimationMode::Standard,
-        );
-        assert_close(last[2], 1.0);
-        assert!(!animating);
-    }
-
-    #[test]
-    fn reduced_motion_applies_selection_without_interpolation() {
-        let now = Instant::now();
-        let mut transition = SelectionTransition::default();
-        let (levels, animating) =
-            transition.sample(Some(1), Some(now), now, AnimationMode::ReducedMotion);
-        assert_close(levels[1], 1.0);
-        assert!(!animating);
-    }
-
-    #[test]
-    fn selection_retarget_starts_from_the_current_color() {
-        let start = Instant::now();
-        let mut transition = SelectionTransition::default();
-        transition.reset(None, start);
-        let _first = transition.sample(Some(1), Some(start), start, AnimationMode::Standard);
-        let halfway = start + Duration::from_millis(17);
-        let _middle = transition.sample(Some(1), Some(start), halfway, AnimationMode::Standard);
-        let (retargeted, _) =
-            transition.sample(Some(2), Some(halfway), halfway, AnimationMode::Standard);
-        assert!(retargeted[1] > 0.48 && retargeted[1] < 0.49);
-        assert_close(retargeted[2], 0.0);
+    fn selection_color_snaps_to_the_current_wedge() {
+        let levels = target_levels(Some(2));
+        assert_close(levels[2], 1.0);
+        assert!(levels.iter().enumerate().all(|(index, level)| index == 2 || *level == 0.0));
     }
 }

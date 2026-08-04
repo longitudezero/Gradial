@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(debug_assertions)]
@@ -35,6 +35,7 @@ const INPUT_QUEUE_CAPACITY: usize = 4_096;
 const RUNTIME_CHANNEL_CAPACITY: usize = 4;
 const HOOK_UNRESPONSIVE_AFTER_MS: i64 = 750;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const CONTINUOUS_VISUAL_INTERVAL: Duration = Duration::from_micros(4_167);
 
 #[derive(Debug, Default)]
 struct EventCounters {
@@ -42,6 +43,7 @@ struct EventCounters {
     pointer_moved: u64,
     raw_pointer_delta: u64,
     continuous_updates_dispatched: u64,
+    continuous_updates_prioritized: u64,
     continuous_updates_coalesced: u64,
     activation_up: u64,
     cancel: u64,
@@ -54,9 +56,34 @@ struct PendingContinuousUpdate {
     source_qpc: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContinuousVisualKey {
+    invocation_id: uuid::Uuid,
+    slice_index: usize,
+    armed: bool,
+}
+
+impl From<PendingContinuousUpdate> for ContinuousVisualKey {
+    fn from(update: PendingContinuousUpdate) -> Self {
+        Self {
+            invocation_id: update.invocation_id,
+            slice_index: update.visual.selection.slice_index,
+            armed: update.visual.armed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReadyContinuousUpdate {
+    update: PendingContinuousUpdate,
+    transition: bool,
+}
+
 #[derive(Debug, Default)]
 struct ContinuousUpdateBatch {
     pending: Option<PendingContinuousUpdate>,
+    last_dispatched: Option<ContinuousVisualKey>,
+    last_dispatched_at: Option<Instant>,
 }
 
 impl ContinuousUpdateBatch {
@@ -71,12 +98,34 @@ impl ContinuousUpdateBatch {
             .is_some()
     }
 
-    fn take(&mut self) -> Option<PendingContinuousUpdate> {
-        self.pending.take()
+    fn pending_is_transition(&self) -> bool {
+        self.pending
+            .is_some_and(|pending| self.last_dispatched != Some(ContinuousVisualKey::from(pending)))
     }
 
-    fn discard(&mut self) -> bool {
+    fn take_ready(&mut self, now: Instant, force: bool) -> Option<ReadyContinuousUpdate> {
+        let transition = self.pending_is_transition();
+        let interval_elapsed = self
+            .last_dispatched_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= CONTINUOUS_VISUAL_INTERVAL);
+        if !force && !transition && !interval_elapsed {
+            return None;
+        }
+        let update = self.pending.take()?;
+        self.last_dispatched = Some(ContinuousVisualKey::from(update));
+        self.last_dispatched_at = Some(now);
+        Some(ReadyContinuousUpdate { update, transition })
+    }
+
+    fn discard_pending(&mut self) -> bool {
         self.pending.take().is_some()
+    }
+
+    fn reset(&mut self) -> bool {
+        let discarded = self.discard_pending();
+        self.last_dispatched = None;
+        self.last_dispatched_at = None;
+        discarded
     }
 }
 
@@ -345,6 +394,7 @@ fn run_interaction_thread(
     };
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut runtime_stop_pending = false;
+    let mut continuous_batch = ContinuousUpdateBatch::default();
 
     while !shutdown.load(Ordering::Acquire) {
         #[cfg(debug_assertions)]
@@ -360,6 +410,10 @@ fn run_interaction_thread(
                 event_sender,
                 &dispatcher,
             );
+            if continuous_batch.reset() {
+                counters.continuous_updates_coalesced =
+                    counters.continuous_updates_coalesced.saturating_add(1);
+            }
             runtime_stop_pending = true;
         }
 
@@ -372,6 +426,10 @@ fn run_interaction_thread(
             accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::InputQueueOverflow) {
                 dispatch_effect(effect, query_qpc(), &active, &dispatcher);
+            }
+            if continuous_batch.reset() {
+                counters.continuous_updates_coalesced =
+                    counters.continuous_updates_coalesced.saturating_add(1);
             }
             active.clear();
             runtime_stop_pending = true;
@@ -396,6 +454,10 @@ fn run_interaction_thread(
             if let Some(effect) = controller.fault(CancelReason::HookUnresponsive) {
                 dispatch_effect(effect, now, &active, &dispatcher);
             }
+            if continuous_batch.reset() {
+                counters.continuous_updates_coalesced =
+                    counters.continuous_updates_coalesced.saturating_add(1);
+            }
             active.clear();
             runtime_stop_pending = true;
             log::error!(
@@ -411,7 +473,6 @@ fn run_interaction_thread(
         }
 
         let mut handled_event = false;
-        let mut continuous_batch = ContinuousUpdateBatch::default();
         while let Ok(event) = consumer.pop() {
             handled_event = true;
             let source_qpc = event.qpc_timestamp;
@@ -431,9 +492,18 @@ fn run_interaction_thread(
                             counters.continuous_updates_coalesced =
                                 counters.continuous_updates_coalesced.saturating_add(1);
                         }
+                        if continuous_batch.pending_is_transition() {
+                            dispatch_pending_continuous(
+                                &mut continuous_batch,
+                                &active,
+                                &dispatcher,
+                                &mut counters,
+                                false,
+                            );
+                        }
                     }
                     InteractionEffect::SelectionChanged { .. } => {
-                        if continuous_batch.discard() {
+                        if continuous_batch.discard_pending() {
                             counters.continuous_updates_coalesced =
                                 counters.continuous_updates_coalesced.saturating_add(1);
                         }
@@ -445,26 +515,34 @@ fn run_interaction_thread(
                             &active,
                             &dispatcher,
                             &mut counters,
+                            true,
                         );
                         dispatch_effect(effect, source_qpc, &active, &dispatcher);
                     }
                 }
             }
             if matches!(controller.state(), InteractionState::Idle | InteractionState::Faulted) {
-                if continuous_batch.discard() {
+                if continuous_batch.reset() {
                     counters.continuous_updates_coalesced =
                         counters.continuous_updates_coalesced.saturating_add(1);
                 }
                 active.clear();
             }
         }
-        dispatch_pending_continuous(&mut continuous_batch, &active, &dispatcher, &mut counters);
+        dispatch_pending_continuous(
+            &mut continuous_batch,
+            &active,
+            &dispatcher,
+            &mut counters,
+            false,
+        );
 
         if !handled_event {
             thread::sleep(IDLE_POLL_INTERVAL);
         }
     }
 
+    dispatch_pending_continuous(&mut continuous_batch, &active, &dispatcher, &mut counters, true);
     if let Some(effect) = controller.fault(CancelReason::Shutdown) {
         dispatch_effect(effect, query_qpc(), &active, &dispatcher);
     }
@@ -477,12 +555,14 @@ fn log_interaction_stopped(counters: &EventCounters, config_revision: u64) {
         "component=interaction event_code=interaction_thread_stopped result_code=ok \
          config_revision={config_revision} activation_down_events={} pointer_moved_events={} \
          activation_up_events={} raw_pointer_delta_events={} \
-         continuous_updates_dispatched={} continuous_updates_coalesced={} cancel_events={}",
+         continuous_updates_dispatched={} continuous_updates_prioritized={} \
+         continuous_updates_coalesced={} cancel_events={}",
         counters.activation_down,
         counters.pointer_moved,
         counters.activation_up,
         counters.raw_pointer_delta,
         counters.continuous_updates_dispatched,
+        counters.continuous_updates_prioritized,
         counters.continuous_updates_coalesced,
         counters.cancel
     );
@@ -493,21 +573,18 @@ fn dispatch_pending_continuous(
     active: &ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
     counters: &mut EventCounters,
+    force: bool,
 ) {
-    let Some(update) = batch.take() else {
+    let Some(ready) = batch.take_ready(Instant::now(), force) else {
         return;
     };
     counters.continuous_updates_dispatched =
         counters.continuous_updates_dispatched.saturating_add(1);
-    dispatch_effect(
-        InteractionEffect::ContinuousChanged {
-            invocation_id: update.invocation_id,
-            visual: update.visual,
-        },
-        update.source_qpc,
-        active,
-        dispatcher,
-    );
+    if ready.transition {
+        counters.continuous_updates_prioritized =
+            counters.continuous_updates_prioritized.saturating_add(1);
+    }
+    dispatch_continuous_effect(ready.update, ready.transition, active, dispatcher);
 }
 
 fn handle_runtime_control(
@@ -771,6 +848,28 @@ fn route_for_point(point: gradial_core::ScreenPoint, routes: &[OverlayRoute]) ->
     monitor_index_for_point(point, &monitors)
 }
 
+fn dispatch_continuous_effect(
+    update: PendingContinuousUpdate,
+    transition: bool,
+    active: &ActiveInvocation,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    let Some((_, route)) =
+        active_overlay_route(active.route, dispatcher.routes, dispatcher.config_revision)
+    else {
+        return;
+    };
+    dispatch_continuous_changed(
+        update.invocation_id,
+        update.visual,
+        update.source_qpc,
+        active.snapshot.as_ref(),
+        route,
+        dispatcher,
+        transition,
+    );
+}
+
 fn dispatch_effect(
     effect: InteractionEffect,
     source_qpc: i64,
@@ -823,6 +922,7 @@ fn dispatch_effect(
                 active_snapshot,
                 route,
                 dispatcher,
+                true,
             );
         }
         InteractionEffect::Close { invocation_id, outcome } => {
@@ -940,19 +1040,31 @@ fn dispatch_continuous_changed(
     active_snapshot: Option<&InvocationSnapshot>,
     route: &OverlayRoute,
     dispatcher: &EffectDispatcher<'_>,
+    transition: bool,
 ) {
-    log::info!(
-        target: "interaction",
-        "component=interaction event_code=continuous_meter_updated result_code=ok \
-         config_revision={} invocation_id={invocation_id} \
-         slice_index={} normalized_value={:.6} armed={} action_executed=false",
-        active_snapshot.map_or(dispatcher.config_revision, |snapshot| {
-            snapshot.context.config_revision
-        }),
-        visual.selection.slice_index,
-        visual.selection.value,
-        visual.armed
-    );
+    let config_revision = active_snapshot
+        .map_or(dispatcher.config_revision, |snapshot| snapshot.context.config_revision);
+    if transition {
+        log::info!(
+            target: "interaction",
+            "component=interaction event_code=continuous_meter_updated result_code=ok \
+             config_revision={config_revision} invocation_id={invocation_id} change_kind=transition \
+             slice_index={} normalized_value={:.6} armed={} action_executed=false",
+            visual.selection.slice_index,
+            visual.selection.value,
+            visual.armed
+        );
+    } else {
+        log::debug!(
+            target: "interaction",
+            "component=interaction event_code=continuous_meter_updated result_code=ok \
+             config_revision={config_revision} invocation_id={invocation_id} change_kind=value \
+             slice_index={} normalized_value={:.6} armed={} action_executed=false",
+            visual.selection.slice_index,
+            visual.selection.value,
+            visual.armed
+        );
+    }
     dispatcher.timing_markers.emit(
         "continuous_value_requested",
         Some(invocation_id),
@@ -1202,7 +1314,11 @@ const fn heartbeat_is_unresponsive(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use gradial_core::{
         ActionDefinition, ActionKind, ActionPlanCompiler, ActionResult, Configuration,
@@ -1216,8 +1332,8 @@ mod tests {
     use crate::diagnostics::TimingMarkers;
 
     use super::{
-        ActionDispatchTrace, ActiveInvocation, ContinuousUpdateBatch, heartbeat_is_unresponsive,
-        log_selected_action_outcome, prepare_selected_action,
+        ActionDispatchTrace, ActiveInvocation, CONTINUOUS_VISUAL_INTERVAL, ContinuousUpdateBatch,
+        heartbeat_is_unresponsive, log_selected_action_outcome, prepare_selected_action,
     };
 
     #[test]
@@ -1241,13 +1357,51 @@ mod tests {
         }
 
         assert_eq!(coalesced, 999);
-        let latest = batch.take().expect("latest continuous update");
+        let latest =
+            batch.take_ready(Instant::now(), true).expect("latest continuous update").update;
         assert_eq!(latest.invocation_id, invocation_id);
         assert_eq!(latest.source_qpc, 999);
         assert_eq!(latest.visual.selection.slice_index, 7);
         assert!((latest.visual.selection.value - 1.0).abs() <= f64::EPSILON);
         assert_eq!(latest.visual.pointer_offset_dip, Point::new(999.0, -999.0));
-        assert!(batch.take().is_none());
+        assert!(batch.take_ready(Instant::now(), true).is_none());
+    }
+
+    #[test]
+    fn continuous_batch_prioritizes_direction_and_mode_but_throttles_value_only_updates() {
+        let invocation_id = Uuid::from_u128(32);
+        let start = Instant::now();
+        let mut batch = ContinuousUpdateBatch::default();
+        let visual = |slice_index, value, armed| ContinuousVisualState {
+            selection: ContinuousSelection { slice_index, value },
+            pointer_offset_dip: Point::new(0.0, 0.0),
+            armed,
+        };
+
+        batch.defer(invocation_id, visual(2, 0.0, false), 1);
+        let initial = batch.take_ready(start, false).expect("initial transition");
+        assert!(initial.transition);
+
+        batch.defer(invocation_id, visual(2, 0.25, false), 2);
+        assert!(batch.take_ready(start + Duration::from_millis(1), false).is_none());
+        batch.defer(invocation_id, visual(2, 0.5, false), 3);
+        let value = batch
+            .take_ready(start + CONTINUOUS_VISUAL_INTERVAL, false)
+            .expect("latest value after interval");
+        assert!(!value.transition);
+        assert!((value.update.visual.selection.value - 0.5).abs() <= f64::EPSILON);
+
+        batch.defer(invocation_id, visual(3, 0.5, false), 4);
+        let direction = batch
+            .take_ready(start + CONTINUOUS_VISUAL_INTERVAL, false)
+            .expect("direction transition bypasses interval");
+        assert!(direction.transition);
+
+        batch.defer(invocation_id, visual(3, 0.5, true), 5);
+        let mode = batch
+            .take_ready(start + CONTINUOUS_VISUAL_INTERVAL, false)
+            .expect("mode transition bypasses interval");
+        assert!(mode.transition);
     }
 
     #[test]

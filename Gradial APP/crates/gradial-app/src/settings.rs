@@ -32,7 +32,7 @@ use crate::{
     icons::{IconImportError, IconManager},
     input::{self, ActivationBindingTestResult},
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
-    overlay::{AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
+    overlay::{FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
     platform::{self, ProfileTestTarget},
     shortcut_recorder::{CaptureOutcome, ShortcutRecorder, shortcut_display},
     start_at_login::{StartAtLoginAction, StartAtLoginError, StartAtLoginStatus},
@@ -42,7 +42,6 @@ const SETTINGS_SIZE: [f32; 2] = [940.0, 680.0];
 const SETTINGS_MIN_SIZE: [f32; 2] = [820.0, 580.0];
 const PREVIEW_SIZE: f32 = 288.0;
 const PROFILE_TEST_COUNTDOWN: Duration = Duration::from_secs(3);
-const PREVIEW_INVOCATION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0901);
 #[cfg(debug_assertions)]
 const DEBUG_SHORTCUT_ACTION_ID: Uuid = Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0902);
 #[cfg(debug_assertions)]
@@ -3287,22 +3286,17 @@ impl SettingsState {
         let mut preview_ui =
             ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Center)));
         preview_ui.set_clip_rect(rect);
-        let now = Instant::now();
         self.preview_renderer.render(
             &mut preview_ui,
             OverlayRenderFrame {
-                invocation_id: Some(PREVIEW_INVOCATION_ID),
                 menu: Some(menu),
                 activation_button,
                 appearance,
                 selected_slice: Some(self.selected_slice),
                 continuous_selection: None,
                 continuous_pointer: None,
-                selection_changed_at: Some(now),
                 opacity: 1.0,
                 scale: 1.0,
-                animation_mode: AnimationMode::ReducedMotion,
-                now,
             },
         );
         if response.clicked()

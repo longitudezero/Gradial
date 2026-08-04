@@ -6,6 +6,8 @@ Live-direction revision: 2026-08-03
 
 Hybrid-radius revision: 2026-08-04
 
+Immediate-feedback revision: 2026-08-04
+
 This record covers the first bounded v0.3 slice plus its live-direction and
 hybrid-radius revisions: continuous radial geometry, production-overlay
 feedback, extended edge assist, and a debug-only no-side-effect meter. It
@@ -24,6 +26,9 @@ or application-specific effect.
 - Angle continuously selects the live wedge at every radius. Returning inside
   the outer edge immediately removes continuous mode; moving outside restores
   it without retaining a prior direction or mode.
+- Selection highlighting is immediate in every menu. Direction and mode
+  changes bypass visual throttling; same-wedge value-only updates retain the
+  latest sample and publish at no more than 240 Hz.
 - Release uses the live state: outside commits the current wedge and scalar;
   inside selects the current discrete wedge; center release has no selection.
 - The renderer displays a radial track, a position marker, and a center
@@ -45,7 +50,8 @@ plugin adapter is introduced.
 
 ## Automated checks
 
-The workspace test suite passes with 186 application tests and 60 core tests.
+The workspace test suite passes with 184 debug application tests, 181 release
+application tests, and 60 core tests in each configuration.
 The new coverage verifies:
 
 - normalization at 0%, 50%, and 100%, including clamping and invalid input;
@@ -164,6 +170,21 @@ The run took 51.259 seconds on the same two-display Windows setup. The focused
 hybrid smoke also passed under edge assist at the top-left corner with 0 px of
 physical cursor movement. This run supersedes the native-repaint matrix for
 current interaction behavior.
+
+The immediate-feedback revision then passed focused Windows checks:
+
+| Measure | Result |
+| --- | --- |
+| Ordinary fixed-origin menus | All eight directions passed; maximum first frame 1 ms |
+| Fixed-origin stress | 1,000-event burst; 970 obsolete updates coalesced and only 39 visual samples dispatched |
+| Priority path | Direction and mode transitions bypassed the value-update interval |
+| Hybrid reversal | Continuous W returned inside and released as discrete W |
+| Edge assist | N-to-W live direction change passed with 0 px retained-cursor movement |
+| Lifecycle | 50â€“51 ms close observed |
+
+The full debug checks, strict linting, and release test suites passed after the
+revision. Ordinary value samples are now debug-only log records; direction,
+mode, and terminal transitions remain available at info level.
 
 ## Remaining validation
 

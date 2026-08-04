@@ -3,8 +3,10 @@
 Date: 2026-07-29
 
 This record covers the bounded Milestone 1 renderer slice: persistent
-per-monitor geometry caches, bounded open/selection/close transitions, forced
-hide safety, and the temporary reduced-motion development override.
+per-monitor geometry caches, bounded open/close transitions, forced hide
+safety, and the temporary reduced-motion development override. The original
+35 ms selection transition was superseded on 2026-08-04 after live interaction
+testing; selection feedback is now immediate for every menu.
 
 ## Implemented contract
 
@@ -14,8 +16,7 @@ hide safety, and the temporary reduced-motion development override.
   generated when the overlay pool is built rather than during activation.
 - The first opening frame contains the complete ring at 96% scale and 85%
   opacity. Cubic ease-out reaches the final state at 60 ms.
-- Selection color interpolates over 35 ms and retargets from the currently
-  displayed value.
+- Selection color snaps to the currently tracked wedge without interpolation.
 - Release completes gesture recognition immediately. The click-through overlay
   fades to zero over 50 ms and is then hidden.
 - Pool destruction, display rebuild, and an overlapping new invocation retain
@@ -34,10 +35,9 @@ The complete local gate passes with 50 unit tests. New coverage verifies:
 
 - exact 0/60 ms opening values and the 85% first-frame floor;
 - exact 0/50 ms closing values;
-- the 35 ms selection endpoint;
 - reduced-motion visual snapping without shortened lifecycle timing;
 - four/eight cache entry counts and 24 segments per highlight arc;
-- mid-transition selection retargeting;
+- immediate selection-level replacement;
 - combined parsing of `--reduced-motion`, geometry, and slice-count options.
 
 Formatting and strict Clippy pass with warnings denied. The debug and release

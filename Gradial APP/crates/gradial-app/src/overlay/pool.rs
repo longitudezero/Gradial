@@ -23,7 +23,7 @@ use crate::{
 use super::{
     AnimationMode, FoundationOverlayRenderer, OVERLAY_SIZE_DIP, OverlayRenderFrame,
     OverlayRenderer,
-    animation::{CLOSE_DURATION, FRAME_INTERVAL, PresenceFrame, closing_frame, opening_frame},
+    animation::{CLOSE_DURATION, PresenceFrame, closing_frame, opening_frame},
 };
 
 const REQUIRED_PREWARM_PASSES: u8 = 3;
@@ -52,7 +52,6 @@ struct OverlayViewportState {
     selected_slice: Option<usize>,
     continuous_selection: Option<ContinuousSelection>,
     continuous_pointer: Option<Point>,
-    selection_changed_at: Option<Instant>,
     phase: VisualPhase,
     pending_open_marker: bool,
     pending_first_frame: Option<InvocationSnapshot>,
@@ -67,7 +66,6 @@ impl OverlayViewportState {
         self.selected_slice = None;
         self.continuous_selection = None;
         self.continuous_pointer = None;
-        self.selection_changed_at = None;
         self.phase = VisualPhase::Hidden;
         self.pending_open_marker = false;
         self.pending_first_frame = None;
@@ -224,14 +222,11 @@ impl OverlayPool {
                 }
                 let presence_animating = prepared.repaint_after.is_some();
 
-                let selection_animating = renderer
+                renderer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .render(ui, prepared.render);
-                if selection_animating {
-                    ui.ctx().request_repaint_after_for(FRAME_INTERVAL, viewport_id);
-                }
-                if presence_animating || selection_animating {
+                if presence_animating {
                     request_native_animation_frame(&state, config_revision, index);
                 }
                 if let Some(completed_close) = prepared.completed_close {
@@ -324,7 +319,6 @@ impl OverlayRoute {
             state.selected_slice = None;
             state.continuous_selection = None;
             state.continuous_pointer = None;
-            state.selection_changed_at = Some(started_at);
             state.phase = VisualPhase::Opening { started_at };
             state.pending_open_marker = true;
             state.pending_first_frame = None;
@@ -384,7 +378,6 @@ impl OverlayRoute {
                 state.selected_slice = selected_slice;
                 state.continuous_selection = None;
                 state.continuous_pointer = None;
-                state.selection_changed_at = Some(Instant::now());
                 state.pending_highlight_marker = Some((invocation_id, selected_slice));
                 true
             } else {
@@ -410,9 +403,6 @@ impl OverlayRoute {
                 .filter(|snapshot| snapshot.invocation_id == invocation_id)
                 .map(|snapshot| snapshot.geometry.behavior == ResolvedGeometry::EdgeAssist);
             if let Some(edge_assist) = edge_assist {
-                if state.selected_slice != Some(visual.selection.slice_index) {
-                    state.selection_changed_at = Some(Instant::now());
-                }
                 state.selected_slice = Some(visual.selection.slice_index);
                 state.continuous_selection = visual.armed.then_some(visual.selection);
                 state.continuous_pointer = edge_assist.then_some(visual.pointer_offset_dip);
@@ -711,7 +701,6 @@ fn prepare_overlay_frame(
 
     PreparedOverlayFrame {
         render: OverlayRenderFrame {
-            invocation_id: state.snapshot.as_ref().map(|snapshot| snapshot.invocation_id),
             menu: state.menu.clone(),
             activation_button: state
                 .snapshot
@@ -723,11 +712,8 @@ fn prepare_overlay_frame(
             selected_slice: state.selected_slice,
             continuous_selection: state.continuous_selection,
             continuous_pointer: state.continuous_pointer,
-            selection_changed_at: state.selection_changed_at,
             opacity: presence.opacity,
             scale: presence.scale,
-            animation_mode,
-            now,
         },
         repaint_after: presence.repaint_after,
         completed_close,

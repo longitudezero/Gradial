@@ -164,11 +164,11 @@ reports, evaluate the cohort gates with:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/summarize-continuous-study.ps1
 ```
 
-The overlay opens from 96% scale and 85% opacity over 60 ms, changes selection
-color over 35 ms, and fades out over 50 ms. Gesture recognition and release do
-not wait for those animations. Appearance presets change only drawing size;
-gesture thresholds remain consistent. A temporary development override removes visual
-interpolation while preserving the same lifecycle timing:
+The overlay opens from 96% scale and 85% opacity over 60 ms, highlights the
+current wedge immediately, and fades out over 50 ms. Gesture recognition and
+release do not wait for the lifecycle animations. A temporary development
+override removes opening and closing interpolation while preserving the same
+lifecycle timing:
 
 ```powershell
 cargo run --package gradial-app -- --reduced-motion

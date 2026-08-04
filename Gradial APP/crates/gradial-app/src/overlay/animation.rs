@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 pub(crate) const OPEN_DURATION: Duration = Duration::from_millis(60);
-pub(crate) const SELECTION_DURATION: Duration = Duration::from_millis(35);
 pub(crate) const CLOSE_DURATION: Duration = Duration::from_millis(50);
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
@@ -65,10 +64,6 @@ pub(crate) fn closing_frame(elapsed: Duration, mode: AnimationMode) -> PresenceF
     }
 }
 
-pub(crate) fn selection_progress(elapsed: Duration) -> f32 {
-    duration_progress(elapsed, SELECTION_DURATION)
-}
-
 fn duration_progress(elapsed: Duration, duration: Duration) -> f32 {
     if elapsed >= duration { 1.0 } else { elapsed.as_secs_f32() / duration.as_secs_f32() }
 }
@@ -94,10 +89,7 @@ const fn lerp(start: f32, end: f32, progress: f32) -> f32 {
 mod tests {
     use std::time::Duration;
 
-    use super::{
-        AnimationMode, CLOSE_DURATION, OPEN_DURATION, SELECTION_DURATION, closing_frame,
-        opening_frame, selection_progress,
-    };
+    use super::{AnimationMode, CLOSE_DURATION, OPEN_DURATION, closing_frame, opening_frame};
 
     fn assert_close(actual: f32, expected: f32) {
         assert!((actual - expected).abs() < f32::EPSILON);
@@ -126,13 +118,6 @@ mod tests {
         let last = closing_frame(CLOSE_DURATION, AnimationMode::Standard);
         assert_close(last.opacity, 0.0);
         assert!(last.complete);
-    }
-
-    #[test]
-    fn selection_transition_is_bounded_to_thirty_five_milliseconds() {
-        assert_close(selection_progress(Duration::ZERO), 0.0);
-        assert_close(selection_progress(SELECTION_DURATION), 1.0);
-        assert_close(selection_progress(Duration::from_millis(70)), 1.0);
     }
 
     #[test]

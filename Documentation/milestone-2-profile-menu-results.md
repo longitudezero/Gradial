@@ -37,8 +37,8 @@ label offsets with the configured label strings. It does not rebuild geometry,
 resolve a profile, or read configuration on activation.
 
 The first prepared overlay frame records the selected slice count and complete
-label count. Existing focus, 60 ms opening, 35 ms selection, and 50 ms closing
-contracts remain unchanged.
+label count. Focus plus the 60 ms opening and 50 ms closing contracts remain
+unchanged; selection feedback now follows the current wedge immediately.
 
 ## Debug override boundary
 

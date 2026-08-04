@@ -35,8 +35,8 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
 - Automatic full input-runtime replacement after three missed 250 ms
   heartbeats, and input re-registration after resume, session unlock, or
   Explorer restart.
-- Persistent per-monitor geometry caches and bounded 60/35/50 ms
-  open/selection/close animation state.
+- Persistent per-monitor geometry caches, immediate selection feedback, and
+  bounded 60/50 ms open/close animation state.
 - A validated schema-five configuration with safe in-memory schema-one through
   schema-four migration plus atomic primary/backup
   replacement.
@@ -475,13 +475,14 @@ monitor. The pointer proxy is clamped to the 160-DIP full-scale boundary and
 contains no raw screen coordinate.
 
 The controller evaluates every queued fixed-origin point and edge-assist delta,
-including intermediate outer-edge crossings and direction changes. To prevent
-a high-polling mouse from making rendering and diagnostics lag behind the
-cursor, consecutive continuous visual effects are latest-value coalesced while
-the input queue is drained. A selection clear supersedes a pending visual
-update, and the newest pending update is flushed before release, cancellation,
-or another terminal effect. Shutdown diagnostics record dispatched and
-coalesced counts.
+including intermediate outer-edge crossings and direction changes. Direction
+and discrete/continuous-mode changes bypass visual throttling and are published
+immediately. Same-wedge value-only updates retain only the newest sample and
+are published at no more than 240 Hz. A selection clear supersedes a pending
+visual update, and the newest pending update is flushed before release,
+cancellation, or another terminal effect. Direction/mode transitions remain at
+info level, while ordinary value samples are debug-only. Shutdown diagnostics
+record dispatched, prioritized, and coalesced counts.
 
 ### Continuous usability study
 
@@ -913,8 +914,8 @@ cargo run --package gradial-app -- --slices=4
 cargo run --package gradial-app -- --geometry=edge-assist --slices=8
 ```
 
-`--reduced-motion` removes scale, opacity, and selection-color interpolation
-without changing recognition or close timing. It is a temporary startup
+`--reduced-motion` removes opening and closing scale/opacity interpolation
+without changing recognition or lifecycle timing. It is a temporary startup
 override until appearance configuration is persisted:
 
 ```powershell
@@ -945,8 +946,8 @@ message handled by that child's native subclass positions and shows it with
 no-activation flags. The matching child repaint is independent of the invisible
 root-controller repaint cycle. Showing the native child invalidates it
 immediately; selection and continuous-state changes pair egui's viewport
-request with the same native invalidation. While opening, selection, or closing
-animation remains active, each rendered frame requests another native frame.
+request with the same native invalidation. While opening or closing animation
+remains active, each rendered frame requests another native frame.
 That bounded self-pump prevents a hidden child from waiting until release to
 paint or remaining at its first 85% opacity frame.
 
@@ -955,9 +956,9 @@ four- and eight-slice boundary segments, label offsets, and 24-segment
 highlight arcs. Rendering selects one cache from the frozen menu and pairs its
 offsets with the configured labels; no geometry or profile matching occurs on
 activation's UI path. Display/DPI pool replacement constructs one complete
-cache pair for each replacement child. Selection animation uses fixed-size
-eight-entry state and can retarget from its current color without rebuilding
-geometry.
+cache pair for each replacement child. Selection levels are derived directly
+from the current wedge on every frame, so pointer feedback never waits for an
+interpolation state.
 
 Appearance remains a small copied render-frame value. Accent colors replace
 only the foundation outline, divider, and selection colors. The label theme
@@ -987,10 +988,9 @@ only after all new child windows report the expected DPI.
 ## Animation contract
 
 Opening starts with the complete usable ring at 96% scale and 85% opacity, then
-uses cubic ease-out to reach its final state at 60 ms. A selected slice fades
-between its old and new color over 35 ms. Selection retargeting samples the
-current transition before starting the next one, avoiding a flash or restart
-from zero.
+uses cubic ease-out to reach its final state at 60 ms. Wedge selection changes
+color immediately because it is direct pointer feedback rather than a
+lifecycle animation.
 
 Release finalizes the gesture immediately and starts a 50 ms opacity fade. The
 native overlay remains click-through and non-activating during that fade, then
