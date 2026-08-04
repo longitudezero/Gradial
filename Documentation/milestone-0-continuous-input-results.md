@@ -118,6 +118,25 @@ the requested east wedge and value, and completed the 50 ms close lifecycle in
 52 ms. This run supersedes the prior live-direction matrix for current
 interaction behavior.
 
+After manual edge/corner testing exposed intermittent sleeping native
+viewports, the native-repaint revision completed the standard suite with run ID
+`20260804T120608279Z`:
+
+| Measure | Result |
+| --- | --- |
+| Scenarios | 13 passed, 0 failed |
+| Inert continuous commits | 98 |
+| Rapid edge-assist repaint | 20 consecutive top-left invocations; maximum first frame 6 ms |
+| Opening lifecycle | All 20 rapid invocations reached full opacity before release |
+| Fixed-origin stress | Maximum first frame 1 ms; 858 obsolete visual updates coalesced |
+| Cursor and focus | Edge cursor retained at 0 px; every focus checkpoint passed |
+
+The run took 48.966 seconds on the same two-display Windows setup. Every normal
+smoke invocation now requires its first menu frame before release and within
+100 ms. The rapid scenario also requires the 60 ms opening animation to finish
+before release. This run supersedes the preceding coalescing matrix for current
+interaction and rendering behavior.
+
 ## Remaining validation
 
 Milestone 0's automated implementation work is complete, but its usability

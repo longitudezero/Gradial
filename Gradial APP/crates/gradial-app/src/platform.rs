@@ -360,8 +360,11 @@ pub(crate) fn request_overlay_hide(handle: OverlayWakeHandle) -> Result<()> {
 }
 
 pub(crate) fn request_overlay_repaint(handle: OverlayWakeHandle) -> Result<()> {
-    let window = hwnd_from_handle(handle);
-    // SAFETY: the handle identifies a live Gradial overlay. Invalidating its
+    invalidate_overlay_window(hwnd_from_handle(handle))
+}
+
+fn invalidate_overlay_window(window: HWND) -> Result<()> {
+    // SAFETY: the HWND identifies a live Gradial overlay. Invalidating its
     // client area wakes the visible child even when the root controller is
     // hidden and throttled.
     let invalidated = unsafe { InvalidateRect(Some(window), None, false) };
@@ -489,8 +492,7 @@ fn position_and_show_window(hwnd: HWND, origin: ScreenPoint) -> Result<()> {
             .context("could not position and show the overlay")?;
         let _was_visible = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
-
-    Ok(())
+    invalidate_overlay_window(hwnd).context("could not request the overlay's first frame")
 }
 
 fn hwnd_from_handle(handle: OverlayWakeHandle) -> HWND {

@@ -2,6 +2,8 @@
 
 Date: 2026-07-28
 
+Native repaint wake revision: 2026-08-04
+
 This record covers the first bounded Milestone 1 slice: one prewarmed overlay
 window per active display, signed monitor routing, and cancellation/rebuild on
 display, DPI, or work-area changes. It does not claim the remaining production
@@ -42,6 +44,21 @@ It exercises the real native signal, active-invocation cancellation, hook
 teardown, monitor re-enumeration, deferred-viewport replacement, DPI check,
 input restart, and a subsequent gesture. It does not physically change the
 connected hardware or scaling.
+
+## Native repaint wake revision
+
+Manual continuous-input testing later found that a directly shown edge-assist
+child could remain asleep until release, even though input continued normally.
+Routine logs contained 15 clear examples where the first frame appeared
+109–2,085 ms after activation and exactly 45–55 ms before close, identifying
+release's existing native invalidation as the accidental wake source.
+
+Gradial now invalidates the child immediately after native show, pairs every
+selection or continuous-state repaint with native invalidation, and self-pumps
+native frames only while a bounded animation is active. Standard continuous
+matrix run `20260804T120608279Z` passed 20 rapid top-left invocations with a
+6 ms maximum first-frame latency and completed every opening animation before
+release. All four corner routes also passed normally.
 
 ## Remaining validation
 

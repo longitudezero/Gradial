@@ -936,7 +936,12 @@ Gradial therefore applies and reads back the required styles during prewarming,
 then keeps the viewport hidden until activation. On an open effect, a private
 message handled by that child's native subclass positions and shows it with
 no-activation flags. The matching child repaint is independent of the invisible
-root-controller repaint cycle.
+root-controller repaint cycle. Showing the native child invalidates it
+immediately; selection and continuous-state changes pair egui's viewport
+request with the same native invalidation. While opening, selection, or closing
+animation remains active, each rendered frame requests another native frame.
+That bounded self-pump prevents a hidden child from waiting until release to
+paint or remaining at its first 85% opacity frame.
 
 Each child owns a persistent renderer. During pool construction it caches both
 four- and eight-slice boundary segments, label offsets, and 24-segment
@@ -1124,6 +1129,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 75
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection N -Direction W
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection N -Direction E -PointerBurstEvents 1000
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry edge-assist -ContinuousMeter -ContinuousPercent 50 -ActivationPoint top-left -ChangeFromDirection E -Direction E -InvocationCount 20 -GestureDelayMilliseconds 75 -InterInvocationDelayMilliseconds 5 -RequireOpenAnimationComplete
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint top-left -AllDirections
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint center -Direction SW -InvocationCount 20 -QuickFlick -InterInvocationDelayMilliseconds 10
@@ -1155,6 +1161,10 @@ single continuous-meter invocation and verifies the final live wedge.
 `-PointerBurstEvents 1000` adds an even, no-coalescing Windows pointer burst to
 a single fixed-origin continuous invocation and requires Gradial to report that
 obsolete visual updates were collapsed while retaining the final value.
+Every non-quick smoke invocation must now render its first profile-menu frame
+before release and within 100 ms. `-RequireOpenAnimationComplete` additionally
+requires the 60 ms opening lifecycle to finish before each release; use a
+gesture delay of at least 60 ms.
 `-SimulateDisplayChange` holds M4, posts the same notification used by the
 native rebuild path, verifies the active invocation is cancelled, waits until
 generation 1 is fully rewarmed, and then sends a fresh gesture.

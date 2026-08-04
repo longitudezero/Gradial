@@ -137,6 +137,9 @@ High-polling mice do not enqueue a render/log operation for every physical
 sample. Gradial still evaluates every sample for direction and center-return
 cancellation, but each input-queue drain publishes only its newest continuous
 visual state. Release and cancellation remain ordered after the final sample.
+Each per-monitor native overlay is explicitly woken after show and state
+changes, and active animations keep that native repaint path alive until their
+bounded lifecycle completes.
 
 The debug-only guided study runs the Section 11.3 participant protocol with
 configured actions disabled:
@@ -339,7 +342,8 @@ It writes ignored JSON and CSV evidence under
 `Gradial APP\captures\continuous-matrix`. Automated results deliberately leave
 the eight-participant usability study as `not_run`; the standard suite includes
 a post-arm N-to-W wedge change and a 1,000-event fixed-origin pointer burst on
-the real Windows input path.
+the real Windows input path. It also performs 20 rapid edge-assist invocations
+that must draw within 100 ms and reach full opacity before release.
 
 Run a short, non-qualifying local performance baseline after building the
 release executable:

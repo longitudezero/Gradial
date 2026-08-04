@@ -86,6 +86,8 @@ param(
     [ValidateRange(0, 2000)]
     [int]$PointerBurstEvents = 0,
 
+    [switch]$RequireOpenAnimationComplete,
+
     [switch]$AllDirections,
 
     [ValidateRange(1, 1000)]
@@ -433,6 +435,9 @@ if ($PointerBurstEvents -ne 0) {
     if (-not $ContinuousMeter -or $AllDirections -or $InvocationCount -ne 1) {
         throw "PointerBurstEvents requires one single-direction continuous-meter invocation."
     }
+}
+if ($RequireOpenAnimationComplete -and ($QuickFlick -or $GestureDelayMilliseconds -lt 60)) {
+    throw "RequireOpenAnimationComplete requires a gesture delay of at least 60 ms."
 }
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
     throw "Close the existing Gradial process before running the isolated live smoke check."
@@ -1015,19 +1020,69 @@ if ($profileRecords.Count -lt $expectedInvocations) {
 }
 $invocationRecords = [regex]::Matches(
     $log,
-    "event_code=invocation_started .*geometry=$expectedBehavior .*slice_count=$Slices"
+    "(?m)^(?<time>\S+) .*event_code=invocation_started .*" +
+    "invocation_id=(?<invocation>[0-9a-f-]+) .*" +
+    "geometry=$expectedBehavior .*slice_count=$Slices"
 )
 if ($invocationRecords.Count -lt $expectedInvocations) {
     throw "Expected $expectedInvocations '$expectedBehavior' invocations; observed $($invocationRecords.Count)."
 }
 $menuFrameRecords = [regex]::Matches(
     $log,
-    "event_code=profile_menu_frame_ready .*config_revision=$activeConfigRevision .*" +
+    "(?m)^(?<time>\S+) .*event_code=profile_menu_frame_ready .*" +
+    "config_revision=$activeConfigRevision .*" +
+    "invocation_id=(?<invocation>[0-9a-f-]+) .*" +
     "slice_count=$Slices .*label_count=$Slices"
 )
 $minimumMenuFrames = if ($QuickFlick) { 0 } else { $expectedInvocations }
 if ($menuFrameRecords.Count -lt $minimumMenuFrames) {
     throw "Expected $minimumMenuFrames complete profile-menu frames; observed $($menuFrameRecords.Count)."
+}
+$firstFrameTimes = @{}
+foreach ($record in $menuFrameRecords) {
+    $id = $record.Groups["invocation"].Value
+    if (-not $firstFrameTimes.ContainsKey($id)) {
+        $firstFrameTimes[$id] = [DateTimeOffset]::Parse(
+            $record.Groups["time"].Value,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+}
+$maximumFirstFrameMs = 0.0
+if (-not $QuickFlick) {
+    foreach ($record in $invocationRecords) {
+        $id = $record.Groups["invocation"].Value
+        if (-not $firstFrameTimes.ContainsKey($id)) {
+            throw "Invocation $id did not render a first menu frame."
+        }
+        $startedAt = [DateTimeOffset]::Parse(
+            $record.Groups["time"].Value,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        $firstFrameMs = ($firstFrameTimes[$id] - $startedAt).TotalMilliseconds
+        $maximumFirstFrameMs = [Math]::Max($maximumFirstFrameMs, $firstFrameMs)
+        if ($firstFrameMs -lt 0 -or $firstFrameMs -gt 100) {
+            throw "Invocation $id rendered its first frame after $firstFrameMs ms; the limit is 100 ms."
+        }
+    }
+}
+$openCompletionTimes = @{}
+if ($RequireOpenAnimationComplete) {
+    $openCompletionRecords = [regex]::Matches(
+        $log,
+        "(?m)^(?<time>\S+) .*event_code=open_animation_completed .*" +
+        "config_revision=$activeConfigRevision .*" +
+        "invocation_id=(?<invocation>[0-9a-f-]+) .*duration_ms=60"
+    )
+    foreach ($record in $openCompletionRecords) {
+        $id = $record.Groups["invocation"].Value
+        if (-not $openCompletionTimes.ContainsKey($id)) {
+            $openCompletionTimes[$id] = [DateTimeOffset]::Parse(
+                $record.Groups["time"].Value,
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+    }
 }
 $selectionRecords = if ($ContinuousMeter) {
     [regex]::Matches(
@@ -1049,6 +1104,33 @@ $selectionRecords = if ($ContinuousMeter) {
 if ($selectionRecords.Count -ne $expectedInvocations) {
     $outcomeName = if ($ContinuousMeter) { "continuous commits" } else { "selected gestures" }
     throw "Expected $expectedInvocations $outcomeName; observed $($selectionRecords.Count)."
+}
+if (-not $QuickFlick) {
+    foreach ($record in $selectionRecords) {
+        $id = $record.Groups["invocation"].Value
+        $terminalTime = [DateTimeOffset]::Parse(
+            $record.Groups["time"].Value,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        if (-not $firstFrameTimes.ContainsKey($id) -or $firstFrameTimes[$id] -ge $terminalTime) {
+            throw "Invocation $id did not render before its release outcome."
+        }
+    }
+}
+if ($RequireOpenAnimationComplete) {
+    foreach ($record in $selectionRecords) {
+        $id = $record.Groups["invocation"].Value
+        $terminalTime = [DateTimeOffset]::Parse(
+            $record.Groups["time"].Value,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        if (
+            -not $openCompletionTimes.ContainsKey($id) -or
+            $openCompletionTimes[$id] -ge $terminalTime
+        ) {
+            throw "Invocation $id did not finish its opening animation before release."
+        }
+    }
 }
 if ($ContinuousMeter) {
     $unexpectedDiscreteSelections = [regex]::Matches($log, "event_code=slice_selected")
@@ -1267,6 +1349,7 @@ Write-Host (
     "monitor $MonitorIndex, reduced motion $expectedReducedMotion, " +
     "continuous meter $expectedContinuousMeter at $ContinuousPercent%, " +
     "coalesced visual updates $coalescedUpdates, " +
+    "maximum first-frame latency $maximumFirstFrameMs ms, " +
     "maximum retained-cursor movement $maxCursorDistance px, " +
     "observed close $observedCloseMs ms."
 )

@@ -220,6 +220,7 @@ impl OverlayPool {
                 if let Some(repaint_after) = prepared.repaint_after {
                     ui.ctx().request_repaint_after_for(repaint_after, viewport_id);
                 }
+                let presence_animating = prepared.repaint_after.is_some();
 
                 let selection_animating = renderer
                     .lock()
@@ -227,6 +228,9 @@ impl OverlayPool {
                     .render(ui, prepared.render);
                 if selection_animating {
                     ui.ctx().request_repaint_after_for(FRAME_INTERVAL, viewport_id);
+                }
+                if presence_animating || selection_animating {
+                    request_native_animation_frame(&state, config_revision, index);
                 }
                 if let Some(completed_close) = prepared.completed_close {
                     finish_close(completed_close, &timing_markers);
@@ -358,7 +362,7 @@ impl OverlayRoute {
             invocation_id,
             self.animation_mode.is_reduced()
         );
-        context.request_repaint_of(self.viewport_id);
+        self.request_repaint(context, "overlay_open_repaint_wake_failed", invocation_id);
         Ok(())
     }
 
@@ -386,7 +390,7 @@ impl OverlayRoute {
             }
         };
         if applied {
-            context.request_repaint_of(self.viewport_id);
+            self.request_repaint(context, "selection_repaint_wake_failed", invocation_id);
         }
     }
 
@@ -417,7 +421,7 @@ impl OverlayRoute {
             }
         };
         if applied {
-            context.request_repaint_of(self.viewport_id);
+            self.request_repaint(context, "continuous_repaint_wake_failed", invocation_id);
         }
     }
 
@@ -470,16 +474,19 @@ impl OverlayRoute {
                 self.config_revision,
                 self.animation_mode.is_reduced()
             );
-            context.request_repaint_of(self.viewport_id);
-            if let Err(error) = platform::request_overlay_repaint(self.native_handle) {
-                log::error!(
-                    target: "renderer",
-                    "component=renderer event_code=close_repaint_wake_failed \
-                     result_code=failure config_revision={} invocation_id={invocation_id} \
-                     error={error}",
-                    self.config_revision
-                );
-            }
+            self.request_repaint(context, "close_repaint_wake_failed", invocation_id);
+        }
+    }
+
+    fn request_repaint(&self, context: &Context, failure_event_code: &str, invocation_id: Uuid) {
+        context.request_repaint_of(self.viewport_id);
+        if let Err(error) = platform::request_overlay_repaint(self.native_handle) {
+            log::error!(
+                target: "renderer",
+                "component=renderer event_code={failure_event_code} result_code=failure \
+                 config_revision={} invocation_id={invocation_id} error={error}",
+                self.config_revision,
+            );
         }
     }
 
@@ -666,6 +673,13 @@ fn prepare_overlay_frame(
                         0,
                         "duration_ms=60",
                     );
+                    log::info!(
+                        target: "renderer",
+                        "component=renderer event_code=open_animation_completed result_code=ok \
+                         config_revision={} invocation_id={} duration_ms=60",
+                        snapshot.context.config_revision,
+                        snapshot.invocation_id
+                    );
                 }
             }
             frame
@@ -801,6 +815,25 @@ fn request_native_hide(native_handle: OverlayWakeHandle, forced: bool) -> bool {
             );
             false
         }
+    }
+}
+
+fn request_native_animation_frame(
+    state: &Mutex<OverlayViewportState>,
+    config_revision: u64,
+    monitor_index: usize,
+) {
+    let native_handle =
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).native_handle;
+    let Some(native_handle) = native_handle else {
+        return;
+    };
+    if let Err(error) = platform::request_overlay_repaint(native_handle) {
+        log::error!(
+            target: "renderer",
+            "component=renderer event_code=animation_repaint_wake_failed result_code=failure \
+             config_revision={config_revision} monitor_index={monitor_index} error={error}"
+        );
     }
 }
 

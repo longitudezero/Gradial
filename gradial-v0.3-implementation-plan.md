@@ -258,6 +258,13 @@ During edge assist, the production overlay MUST show a Gradial-owned pointer
 proxy that follows the signed raw-delta virtual pointer. The proxy is clamped
 to the full-scale radius and contains no raw screen coordinate.
 
+Every native per-monitor overlay MUST receive an explicit repaint wake after it
+is shown and after Gradial-owned selection or continuous state changes. While a
+bounded opening, selection, or closing animation remains active, the native
+child MUST continue receiving repaint wakes until the lifecycle completes. The
+hidden root controller is not sufficient evidence that a child viewport was
+woken.
+
 Plugin code MUST NOT run during layout, painting, texture upload, animation, or
 frame presentation. A stalled plugin may stop application effects, but it
 cannot stall pointer highlighting or closing animation.

@@ -37,6 +37,10 @@ function Invoke-ContinuousScenario {
         [string]$Direction = "",
         [string]$ChangeFromDirection = "",
         [int]$PointerBurstEvents = 0,
+        [int]$InvocationCount = 1,
+        [int]$GestureDelayMilliseconds = 25,
+        [int]$InterInvocationDelayMilliseconds = 100,
+        [switch]$RequireOpenAnimationComplete,
         [string]$Notes = ""
     )
 
@@ -48,8 +52,9 @@ function Invoke-ContinuousScenario {
         "-ContinuousMeter",
         "-ContinuousPercent", $Value,
         "-ActivationPoint", $ActivationPoint,
-        "-GestureDelayMilliseconds", "25",
-        "-InterInvocationDelayMilliseconds", "100"
+        "-InvocationCount", $InvocationCount,
+        "-GestureDelayMilliseconds", $GestureDelayMilliseconds,
+        "-InterInvocationDelayMilliseconds", $InterInvocationDelayMilliseconds
     )
     if ([string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
         $arguments += "-AllDirections"
@@ -58,6 +63,9 @@ function Invoke-ContinuousScenario {
     }
     if ($PointerBurstEvents -ne 0) {
         $arguments += @("-PointerBurstEvents", $PointerBurstEvents)
+    }
+    if ($RequireOpenAnimationComplete) {
+        $arguments += "-RequireOpenAnimationComplete"
     }
     $scenarioStarted = [DateTimeOffset]::UtcNow
     $priorPreference = $ErrorActionPreference
@@ -125,6 +133,20 @@ if ($Suite -ne "quick") {
         -ChangeFromDirection "E" `
         -PointerBurstEvents 1000 `
         -Notes "Commits east after 1,000 uncoalesced Windows pointer inputs without visual backlog."
+
+    Invoke-ContinuousScenario `
+        -Id "top-left-eight-rapid-native-repaint-20" `
+        -Slices "8" `
+        -Value 50 `
+        -ActivationPoint "top-left" `
+        -ExpectedInvocations 20 `
+        -Direction "E" `
+        -ChangeFromDirection "E" `
+        -InvocationCount 20 `
+        -GestureDelayMilliseconds 75 `
+        -InterInvocationDelayMilliseconds 5 `
+        -RequireOpenAnimationComplete `
+        -Notes "Twenty rapid edge-assist invocations must render within 100 ms and reach full opacity before release."
 
     foreach ($point in @("top-left", "top-right", "bottom-right", "bottom-left")) {
         Invoke-ContinuousScenario `
@@ -247,6 +269,21 @@ $coverage = @(
             "The fixed-origin pointer burst is excluded from the quick suite."
         } else {
             "A 1,000-event no-coalescing Windows pointer burst committed the live value and reported obsolete visual-update coalescing."
+        }
+    },
+    [pscustomobject]@{
+        requirement = "rapid edge-assist native repaint wake"
+        status = if ($Suite -eq "quick") {
+            "not_run"
+        } elseif ($failed -eq 0) {
+            "passed"
+        } else {
+            "failed"
+        }
+        evidence = if ($Suite -eq "quick") {
+            "The rapid native-repaint scenario is excluded from the quick suite."
+        } else {
+            "Twenty rapid top-left invocations rendered within 100 ms and completed the opening animation before release."
         }
     },
     [pscustomobject]@{
