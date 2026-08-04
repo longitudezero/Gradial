@@ -24,6 +24,51 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
+pub(crate) struct CoordinatorStopToken {
+    cancellation_requested: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+impl CoordinatorStopToken {
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContinuousActionLease {
+    invocation_id: Uuid,
+    busy: Arc<AtomicBool>,
+    cancellation_requested: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+impl ContinuousActionLease {
+    pub(crate) const fn invocation_id(&self) -> Uuid {
+        self.invocation_id
+    }
+
+    pub(crate) fn stop_token(&self) -> CoordinatorStopToken {
+        CoordinatorStopToken {
+            cancellation_requested: Arc::clone(&self.cancellation_requested),
+            shutdown_requested: Arc::clone(&self.shutdown_requested),
+        }
+    }
+}
+
+impl Drop for ContinuousActionLease {
+    fn drop(&mut self) {
+        tray::set_action_running(false);
+        self.busy.store(false, Ordering::Release);
+        platform::request_controller_repaint();
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ActionExecutorHandle {
     commands: Sender<WorkerCommand>,
     busy: Arc<AtomicBool>,
@@ -39,22 +84,10 @@ impl ActionExecutorHandle {
         plan: Arc<ExecutionPlan>,
         target: Arc<InvocationContext>,
     ) -> ActionDispatch {
-        if self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return ActionDispatch::Rejected(failure(
-                ActionErrorCode::ActionBusy,
-                "another action is already running",
-            ));
-        }
-        if self.shutdown_requested.load(Ordering::Acquire) {
-            self.busy.store(false, Ordering::Release);
-            return ActionDispatch::Rejected(failure(
-                ActionErrorCode::ExecutorUnavailable,
-                "the action executor is shutting down",
-            ));
+        if let Err(result) = self.try_claim_coordinator() {
+            return ActionDispatch::Rejected(result);
         }
 
-        self.cancellation_requested.store(false, Ordering::Release);
-        tray::set_action_running(true);
         let request = ExecutionRequest { invocation_id, plan, target };
         match self.commands.try_send(WorkerCommand::Execute(request)) {
             Ok(()) => {
@@ -72,6 +105,19 @@ impl ActionExecutorHandle {
         }
     }
 
+    pub(crate) fn try_acquire_continuous(
+        &self,
+        invocation_id: Uuid,
+    ) -> Result<ContinuousActionLease, ActionResult> {
+        self.try_claim_coordinator()?;
+        Ok(ContinuousActionLease {
+            invocation_id,
+            busy: Arc::clone(&self.busy),
+            cancellation_requested: Arc::clone(&self.cancellation_requested),
+            shutdown_requested: Arc::clone(&self.shutdown_requested),
+        })
+    }
+
     pub(crate) fn cancel_current(&self) -> bool {
         if !self.busy.load(Ordering::Acquire) {
             return false;
@@ -83,6 +129,22 @@ impl ActionExecutorHandle {
 
     pub(crate) fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Acquire)
+    }
+
+    fn try_claim_coordinator(&self) -> Result<(), ActionResult> {
+        if self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err(failure(ActionErrorCode::ActionBusy, "another action is already running"));
+        }
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            self.busy.store(false, Ordering::Release);
+            return Err(failure(
+                ActionErrorCode::ExecutorUnavailable,
+                "the action executor is shutting down",
+            ));
+        }
+        self.cancellation_requested.store(false, Ordering::Release);
+        tray::set_action_running(true);
+        Ok(())
     }
 }
 
@@ -190,11 +252,12 @@ impl ActionExecutor {
         self.config_revision = config_revision;
     }
 
-    fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) {
         let Some(join_handle) = self.join_handle.take() else {
             return;
         };
         let action_was_running = self.handle.is_busy();
+        let shutdown_started = Instant::now();
         self.handle.shutdown_requested.store(true, Ordering::Release);
         self.handle.cancellation_requested.store(true, Ordering::Release);
         self.handle.worker_thread.unpark();
@@ -236,6 +299,19 @@ impl ActionExecutor {
                     self.shutdown_wait.as_millis()
                 );
             }
+        }
+        while self.handle.is_busy() && shutdown_started.elapsed() < self.shutdown_wait {
+            thread::sleep(CANCELLATION_POLL_INTERVAL);
+        }
+        if self.handle.is_busy() {
+            log::error!(
+                target: "actions",
+                "component=actions event_code=action_coordinator_shutdown_timeout \
+                 result_code=failure error_code=shutdown_timeout config_revision={} \
+                 wait_ms={}",
+                self.config_revision,
+                self.shutdown_wait.as_millis()
+            );
         }
         tray::set_action_running(false);
         self.handle.busy.store(false, Ordering::Release);

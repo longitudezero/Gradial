@@ -126,6 +126,10 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   Begin/Update/Commit/Cancel requests, owned permission-filtered snapshots,
   10–60 Hz latest-value coalescing, sequence-gap visibility, and deterministic
   pending-Begin terminal ordering. It has no Lua or operating-system effects.
+- A staged asynchronous continuous coordinator that shares the existing
+  single-action lease, preserves it across direction handoffs, uses separate
+  bounded control and latest-value paths, applies the planned callback limits,
+  and has a scripted fake backend for lifecycle and shutdown verification.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -528,10 +532,48 @@ When release or cancellation wins a race with a pending `Begin`, the decision
 waits: acceptance returns the terminal request immediately after `Begin`,
 while rejection closes the session without a terminal plugin callback.
 
-This slice deliberately does not connect the session to the gesture thread,
-action coordinator, configuration, or a plugin worker. Those boundaries need
-the coordinator lease and fake backend so their handoff and failure behavior
-can be tested together rather than hidden behind a placeholder callback.
+The protocol types do not connect themselves to the gesture thread,
+configuration, or a plugin worker. The staged coordinator below owns the
+session and proves its asynchronous handoff and failure behavior without
+pretending that a real plugin runtime exists.
+
+### Continuous coordinator and fake backend
+
+`gradial-app::continuous_executor` now supplies that next boundary. Starting a
+continuous invocation first acquires the same atomic coordinator claim used by
+built-in discrete execution. Therefore an active discrete action rejects a
+continuous start with `action_busy`, and an active continuous invocation
+rejects discrete dispatch. One lease belongs to the complete held invocation;
+the old segment's `direction_changed` cancel finishes before the replacement
+`Begin`, without clearing the busy claim between them.
+
+The continuous worker owns the runtime-neutral `ContinuousSession` and backend
+callbacks. Ordinary scalar publication uses a single locked latest-value slot,
+not the control queue. Replacements carry an observation count into the core,
+so delivered sequence numbers still reveal skipped samples. Handoff, commit,
+and cancel use a separate bounded eight-item control queue, and completion uses
+one reserved slot. A terminal request cannot be displaced by high-rate value
+publication.
+
+Callback deadlines match the v0.3 plan: 100 ms for `Begin`, 16 ms for `Update`,
+100 ms for `Commit`, and 50 ms for best-effort `Cancel`. The backend receives
+the absolute deadline plus the coordinator cancellation/shutdown token. A
+rejected `Begin` produces no terminal callback. A stalled or faulted active
+callback stops the segment, drops pending ordinary work, and releases the
+lease. Release or cancellation queued while `Begin` is pending follows the
+protocol core's accepted-Begin-then-terminal ordering.
+
+The action executor's existing shutdown path now also waits within its
+two-second boundary for a continuous lease to observe shutdown, send a
+best-effort cancel, and release. Manual **Cancel current action** reaches either
+discrete or continuous work through the same coordinator flag.
+
+The fake backend runs on the real asynchronous worker and scripts acceptance,
+rejection, gates, faults, and deadline stalls while recording every request.
+It is test infrastructure, not a user plugin or production effect backend. The
+continuous executor is compiled but intentionally not started by the app until
+gesture integration and schema-six assignments provide a real continuous
+action snapshot.
 
 ### Continuous usability study
 

@@ -313,6 +313,7 @@ impl ContinuousCommitRequest {
 pub enum ContinuousCancelReason {
     ReturnedToDiscrete,
     DirectionChanged,
+    UserRequested,
     Escape,
     OtherMouseButton,
     InputQueueOverflow,
@@ -569,7 +570,30 @@ impl ContinuousSession {
         value: f64,
         observed_at: Duration,
     ) -> Result<(), ContinuousProtocolError> {
+        self.observe_coalesced(value, observed_at, 1)
+    }
+
+    /// Publishes the latest value after one or more upstream observations.
+    ///
+    /// `observation_count` includes the retained value. Replaced upstream
+    /// values advance the sequence so the backend can detect the gap without
+    /// requiring an event queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero count, invalid scalar, exhausted sequence,
+    /// backward timestamp, or a session whose terminal decision already
+    /// exists.
+    pub fn observe_coalesced(
+        &mut self,
+        value: f64,
+        observed_at: Duration,
+        observation_count: u64,
+    ) -> Result<(), ContinuousProtocolError> {
         validate_sample_value(value)?;
+        if observation_count == 0 {
+            return Err(ContinuousProtocolError::InvalidObservationCount);
+        }
         match self.phase {
             SessionPhase::BeginPending { terminal: None } | SessionPhase::Active => {}
             SessionPhase::BeginPending { terminal: Some(_) } | SessionPhase::Terminated(_) => {
@@ -580,7 +604,7 @@ impl ContinuousSession {
             }
         }
         self.validate_observed_at(observed_at)?;
-        let sequence = self.allocate_sequence()?;
+        let sequence = self.allocate_sequences(observation_count)?;
         self.latest_value = value;
         self.pending_update = Some(PendingObservation { sequence, value, observed_at });
         self.last_observed_at = Some(observed_at);
@@ -704,7 +728,14 @@ impl ContinuousSession {
     }
 
     fn allocate_sequence(&mut self) -> Result<u64, ContinuousProtocolError> {
-        let sequence = self.next_sequence;
+        self.allocate_sequences(1)
+    }
+
+    fn allocate_sequences(&mut self, count: u64) -> Result<u64, ContinuousProtocolError> {
+        let sequence = self
+            .next_sequence
+            .checked_add(count.saturating_sub(1))
+            .ok_or(ContinuousProtocolError::SequenceExhausted)?;
         self.next_sequence =
             sequence.checked_add(1).ok_or(ContinuousProtocolError::SequenceExhausted)?;
         Ok(sequence)
@@ -771,6 +802,8 @@ pub enum ContinuousProtocolError {
     InvalidParameterNumber,
     #[error("continuous sample must be finite and between zero and one")]
     InvalidSampleValue,
+    #[error("continuous observation count must be at least one")]
+    InvalidObservationCount,
     #[error("continuous sequence is exhausted")]
     SequenceExhausted,
     #[error("continuous observation timestamp moved backward")]
@@ -926,6 +959,21 @@ mod tests {
         };
         assert_eq!(update.sample().sequence(), 3);
         assert!((update.sample().delta() - 0.4).abs() < f64::EPSILON);
+
+        session
+            .observe_coalesced(0.9, Duration::from_millis(80), 3)
+            .expect("three upstream observations");
+        let Some(ContinuousRequest::Update(update)) =
+            session.take_due_update(Duration::from_millis(108)).expect("coalesced upstream update")
+        else {
+            panic!("expected upstream-coalesced update");
+        };
+        assert_eq!(update.sample().sequence(), 6);
+        assert_close(update.sample().value(), 0.9);
+        assert_eq!(
+            session.observe_coalesced(1.0, Duration::from_millis(110), 0),
+            Err(ContinuousProtocolError::InvalidObservationCount)
+        );
     }
 
     #[test]

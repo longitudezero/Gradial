@@ -160,6 +160,13 @@ lifecycle with a single latest-value slot, 10–60 Hz cadence, strictly
 increasing samples, exact terminal ordering, and permission-filtered owned
 context. It performs no Lua or operating-system work.
 
+A staged asynchronous executor now proves the next internal boundary. It uses
+the same single-action lease as ordinary shortcuts, keeps that lease across
+direction handoffs, separates terminal controls from its one-value update
+slot, enforces the planned callback deadlines, and is tested with a fake
+accept/reject/stall/fault backend. It is not started by normal Gradial sessions
+until live gesture and schema-six action integration are implemented.
+
 High-polling mice do not enqueue a render/log operation for every physical
 sample. Gradial still evaluates every sample for live direction and radius,
 but each input-queue drain publishes only its newest continuous

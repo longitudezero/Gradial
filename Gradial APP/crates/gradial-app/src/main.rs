@@ -4,6 +4,8 @@ mod action_executor;
 mod action_target;
 mod application;
 mod configuration;
+#[allow(dead_code)] // Staged behind the schema-six interaction integration.
+mod continuous_executor;
 mod continuous_study;
 mod diagnostic_bundle;
 mod diagnostics;
