@@ -41,8 +41,43 @@ struct EventCounters {
     activation_down: u64,
     pointer_moved: u64,
     raw_pointer_delta: u64,
+    continuous_updates_dispatched: u64,
+    continuous_updates_coalesced: u64,
     activation_up: u64,
     cancel: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingContinuousUpdate {
+    invocation_id: uuid::Uuid,
+    visual: ContinuousVisualState,
+    source_qpc: i64,
+}
+
+#[derive(Debug, Default)]
+struct ContinuousUpdateBatch {
+    pending: Option<PendingContinuousUpdate>,
+}
+
+impl ContinuousUpdateBatch {
+    fn defer(
+        &mut self,
+        invocation_id: uuid::Uuid,
+        visual: ContinuousVisualState,
+        source_qpc: i64,
+    ) -> bool {
+        self.pending
+            .replace(PendingContinuousUpdate { invocation_id, visual, source_qpc })
+            .is_some()
+    }
+
+    fn take(&mut self) -> Option<PendingContinuousUpdate> {
+        self.pending.take()
+    }
+
+    fn discard(&mut self) -> bool {
+        self.pending.take().is_some()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -373,9 +408,11 @@ fn run_interaction_thread(
         }
 
         let mut handled_event = false;
+        let mut continuous_batch = ContinuousUpdateBatch::default();
         while let Ok(event) = consumer.pop() {
             handled_event = true;
-            handle_input_event(
+            let source_qpc = event.qpc_timestamp;
+            let effect = process_input_event(
                 event,
                 &mut controller,
                 &mut active,
@@ -384,7 +421,41 @@ fn run_interaction_thread(
                 profile_resolver,
                 debug_options,
             );
+            if let Some(effect) = effect {
+                match effect {
+                    InteractionEffect::ContinuousChanged { invocation_id, visual } => {
+                        if continuous_batch.defer(invocation_id, visual, source_qpc) {
+                            counters.continuous_updates_coalesced =
+                                counters.continuous_updates_coalesced.saturating_add(1);
+                        }
+                    }
+                    InteractionEffect::SelectionChanged { .. } => {
+                        if continuous_batch.discard() {
+                            counters.continuous_updates_coalesced =
+                                counters.continuous_updates_coalesced.saturating_add(1);
+                        }
+                        dispatch_effect(effect, source_qpc, &active, &dispatcher);
+                    }
+                    _ => {
+                        dispatch_pending_continuous(
+                            &mut continuous_batch,
+                            &active,
+                            &dispatcher,
+                            &mut counters,
+                        );
+                        dispatch_effect(effect, source_qpc, &active, &dispatcher);
+                    }
+                }
+            }
+            if matches!(controller.state(), InteractionState::Idle | InteractionState::Faulted) {
+                if continuous_batch.discard() {
+                    counters.continuous_updates_coalesced =
+                        counters.continuous_updates_coalesced.saturating_add(1);
+                }
+                active.clear();
+            }
         }
+        dispatch_pending_continuous(&mut continuous_batch, &active, &dispatcher, &mut counters);
 
         if !handled_event {
             thread::sleep(IDLE_POLL_INTERVAL);
@@ -402,12 +473,37 @@ fn log_interaction_stopped(counters: &EventCounters, config_revision: u64) {
         target: "interaction",
         "component=interaction event_code=interaction_thread_stopped result_code=ok \
          config_revision={config_revision} activation_down_events={} pointer_moved_events={} \
-         activation_up_events={} raw_pointer_delta_events={} cancel_events={}",
+         activation_up_events={} raw_pointer_delta_events={} \
+         continuous_updates_dispatched={} continuous_updates_coalesced={} cancel_events={}",
         counters.activation_down,
         counters.pointer_moved,
         counters.activation_up,
         counters.raw_pointer_delta,
+        counters.continuous_updates_dispatched,
+        counters.continuous_updates_coalesced,
         counters.cancel
+    );
+}
+
+fn dispatch_pending_continuous(
+    batch: &mut ContinuousUpdateBatch,
+    active: &ActiveInvocation,
+    dispatcher: &EffectDispatcher<'_>,
+    counters: &mut EventCounters,
+) {
+    let Some(update) = batch.take() else {
+        return;
+    };
+    counters.continuous_updates_dispatched =
+        counters.continuous_updates_dispatched.saturating_add(1);
+    dispatch_effect(
+        InteractionEffect::ContinuousChanged {
+            invocation_id: update.invocation_id,
+            visual: update.visual,
+        },
+        update.source_qpc,
+        active,
+        dispatcher,
     );
 }
 
@@ -445,7 +541,7 @@ fn handle_runtime_control(
     platform::request_controller_repaint();
 }
 
-fn handle_input_event(
+fn process_input_event(
     event: InputEvent,
     controller: &mut InteractionController,
     active: &mut ActiveInvocation,
@@ -453,9 +549,9 @@ fn handle_input_event(
     dispatcher: &EffectDispatcher<'_>,
     profile_resolver: &ProfileResolver,
     debug_options: DebugInteractionOptions<'_>,
-) {
+) -> Option<InteractionEffect> {
     let source_qpc = event.qpc_timestamp;
-    let effect = match event.kind {
+    match event.kind {
         InputEventKind::ActivationDown { geometry, physical_modifiers, activation_binding } => {
             counters.activation_down = counters.activation_down.saturating_add(1);
             begin_invocation(
@@ -500,13 +596,6 @@ fn handle_input_event(
             counters.cancel = counters.cancel.saturating_add(1);
             controller.cancel(reason)
         }
-    };
-
-    if let Some(effect) = effect {
-        dispatch_effect(effect, source_qpc, active, dispatcher);
-    }
-    if matches!(controller.state(), InteractionState::Idle | InteractionState::Faulted) {
-        active.clear();
     }
 }
 
@@ -1114,8 +1203,9 @@ mod tests {
 
     use gradial_core::{
         ActionDefinition, ActionKind, ActionPlanCompiler, ActionResult, Configuration,
-        InteractionEffect, InteractionOutcome, InvocationContext, InvocationGeometry,
-        InvocationSnapshot, ResolvedMenu, ScreenPoint, SliceCount,
+        ContinuousSelection, ContinuousVisualState, InteractionEffect, InteractionOutcome,
+        InvocationContext, InvocationGeometry, InvocationSnapshot, Point, ResolvedMenu,
+        ScreenPoint, SliceCount,
     };
     use uuid::Uuid;
 
@@ -1123,9 +1213,39 @@ mod tests {
     use crate::diagnostics::TimingMarkers;
 
     use super::{
-        ActionDispatchTrace, ActiveInvocation, heartbeat_is_unresponsive,
+        ActionDispatchTrace, ActiveInvocation, ContinuousUpdateBatch, heartbeat_is_unresponsive,
         log_selected_action_outcome, prepare_selected_action,
     };
+
+    #[test]
+    fn continuous_update_batch_retains_only_the_latest_visual_sample() {
+        let invocation_id = Uuid::from_u128(31);
+        let mut batch = ContinuousUpdateBatch::default();
+        let mut coalesced = 0_u64;
+
+        for index in 0_u16..1_000 {
+            let visual = ContinuousVisualState {
+                selection: ContinuousSelection {
+                    slice_index: usize::from(index % 8),
+                    value: f64::from(index) / 999.0,
+                },
+                pointer_offset_dip: Point::new(f32::from(index), -f32::from(index)),
+                armed: true,
+            };
+            if batch.defer(invocation_id, visual, i64::from(index)) {
+                coalesced += 1;
+            }
+        }
+
+        assert_eq!(coalesced, 999);
+        let latest = batch.take().expect("latest continuous update");
+        assert_eq!(latest.invocation_id, invocation_id);
+        assert_eq!(latest.source_qpc, 999);
+        assert_eq!(latest.visual.selection.slice_index, 7);
+        assert!((latest.visual.selection.value - 1.0).abs() <= f64::EPSILON);
+        assert_eq!(latest.visual.pointer_offset_dip, Point::new(999.0, -999.0));
+        assert!(batch.take().is_none());
+    }
 
     #[test]
     fn heartbeat_faults_only_after_three_missed_intervals() {

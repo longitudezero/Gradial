@@ -83,6 +83,9 @@ param(
 
     [string]$ChangeFromDirection = "",
 
+    [ValidateRange(0, 2000)]
+    [int]$PointerBurstEvents = 0,
+
     [switch]$AllDirections,
 
     [ValidateRange(1, 1000)]
@@ -153,6 +156,9 @@ public static class GradialSmokeNative
     private static extern uint SendInput(uint count, Input[] inputs, int size);
 
     [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int index);
+
+    [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out Point point);
 
     [DllImport("user32.dll")]
@@ -213,6 +219,47 @@ public static class GradialSmokeNative
     public static void SendRelativeMove(int dx, int dy)
     {
         SendMouse(dx, dy, 0, 0x0001u);
+    }
+
+    public static void SendAbsoluteJitterBurst(int targetX, int targetY, int eventCount)
+    {
+        if (eventCount <= 0 || eventCount % 2 != 0) {
+            throw new ArgumentOutOfRangeException(
+                "eventCount",
+                "The pointer burst must contain a positive even number of events."
+            );
+        }
+        var virtualLeft = GetSystemMetrics(76);
+        var virtualTop = GetSystemMetrics(77);
+        var virtualWidth = GetSystemMetrics(78);
+        var virtualHeight = GetSystemMetrics(79);
+        if (virtualWidth <= 1 || virtualHeight <= 1) {
+            throw new InvalidOperationException("Windows reported an invalid virtual desktop.");
+        }
+        var inputs = new Input[eventCount];
+        for (var index = 0; index < eventCount; index++) {
+            var x = targetX + (index % 2 == 0 ? 1 : 0);
+            var normalizedX = (int)Math.Round(
+                (x - virtualLeft) * 65535.0 / (virtualWidth - 1)
+            );
+            var normalizedY = (int)Math.Round(
+                (targetY - virtualTop) * 65535.0 / (virtualHeight - 1)
+            );
+            inputs[index] = new Input {
+                Type = 0,
+                Mouse = new MouseInput {
+                    Dx = normalizedX,
+                    Dy = normalizedY,
+                    MouseData = 0,
+                    Flags = 0xE001u,
+                    Time = 0,
+                    ExtraInfo = UIntPtr.Zero
+                }
+            };
+        }
+        if (SendInput((uint)eventCount, inputs, Marshal.SizeOf(typeof(Input))) != eventCount) {
+            throw new InvalidOperationException("SendInput did not submit the pointer burst.");
+        }
     }
 
     public static bool CloseControllerWindowForProcess(uint processId)
@@ -377,6 +424,14 @@ if (-not [string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
     }
     if (-not $ContinuousMeter -or $AllDirections) {
         throw "ChangeFromDirection requires one continuous-meter direction."
+    }
+}
+if ($PointerBurstEvents -ne 0) {
+    if ($PointerBurstEvents % 2 -ne 0) {
+        throw "PointerBurstEvents must be even so the cursor finishes at the requested point."
+    }
+    if (-not $ContinuousMeter -or $AllDirections -or $InvocationCount -ne 1) {
+        throw "PointerBurstEvents requires one single-direction continuous-meter invocation."
     }
 }
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
@@ -750,6 +805,9 @@ try {
             ($Geometry -eq "auto" -and $resolvedActivationPoint -eq "center")
         )
     )
+    if ($PointerBurstEvents -ne 0 -and -not $continuousUsesFixedOrigin) {
+        throw "PointerBurstEvents validates only the fixed-origin continuous path."
+    }
     $maxCursorDistance = 0.0
     $completedInvocations = 0
     foreach ($gestureDirection in $directions) {
@@ -802,6 +860,14 @@ try {
                 if ($gestureDelay -gt 0) {
                     Start-Sleep -Milliseconds $gestureDelay
                 }
+            }
+            if ($PointerBurstEvents -ne 0) {
+                [GradialSmokeNative]::SendAbsoluteJitterBurst(
+                    $testX + $currentOffsetX,
+                    $testY + $currentOffsetY,
+                    $PointerBurstEvents
+                )
+                Start-Sleep -Milliseconds 100
             }
 
             $cursorDuringGesture = New-Object GradialSmokeNative+Point
@@ -1114,6 +1180,20 @@ if (
 ) {
     throw "The action executor did not complete its bounded shutdown."
 }
+$interactionStop = [regex]::Match(
+    $log,
+    "event_code=interaction_thread_stopped .*" +
+    "pointer_moved_events=(?<pointer>[0-9]+) .*" +
+    "continuous_updates_dispatched=(?<dispatched>[0-9]+) " +
+    "continuous_updates_coalesced=(?<coalesced>[0-9]+)"
+)
+if (-not $interactionStop.Success) {
+    throw "The interaction shutdown record did not contain coalescing diagnostics."
+}
+$coalescedUpdates = [int]$interactionStop.Groups["coalesced"].Value
+if ($PointerBurstEvents -ne 0 -and $coalescedUpdates -eq 0) {
+    throw "The fixed-origin pointer burst did not coalesce any obsolete visual updates."
+}
 foreach ($expectedDirection in $directions) {
     $expectedSlice = $directionSlices[$expectedDirection]
     $observedForSlice = (
@@ -1186,6 +1266,7 @@ Write-Host (
     "$expectedInvocations invocation(s), point $resolvedActivationPoint, " +
     "monitor $MonitorIndex, reduced motion $expectedReducedMotion, " +
     "continuous meter $expectedContinuousMeter at $ContinuousPercent%, " +
+    "coalesced visual updates $coalescedUpdates, " +
     "maximum retained-cursor movement $maxCursorDistance px, " +
     "observed close $observedCloseMs ms."
 )

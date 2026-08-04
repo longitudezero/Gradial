@@ -469,6 +469,14 @@ normalization, so equivalent DIP travel produces the same value on every
 monitor. The pointer proxy is clamped to the 160-DIP full-scale boundary and
 contains no raw screen coordinate.
 
+The controller evaluates every queued fixed-origin point and edge-assist delta,
+including intermediate center-return samples. To prevent a high-polling mouse
+from making rendering and diagnostics lag behind the cursor, consecutive
+continuous visual effects are latest-value coalesced while the input queue is
+drained. A selection clear supersedes a pending visual update, and the newest
+pending update is flushed before release, cancellation, or another terminal
+effect. Shutdown diagnostics record dispatched and coalesced counts.
+
 ### Continuous usability study
 
 Debug builds expose `--continuous-study`. The option implies the inert
@@ -1115,6 +1123,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ReducedMotion
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 75
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection N -Direction W
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -ContinuousMeter -ContinuousPercent 50 -ChangeFromDirection N -Direction E -PointerBurstEvents 1000
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -Geometry fixed-origin -QuickFlick
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint top-left -AllDirections
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-interaction.ps1 -ActivationPoint center -Direction SW -InvocationCount 20 -QuickFlick -InterInvocationDelayMilliseconds 10
@@ -1143,6 +1152,9 @@ selects an entry from Windows' current display list. `-Slices 4` or `-Slices 8`
 selects and validates the corresponding startup geometry.
 `-ChangeFromDirection N -Direction W` adds a deliberate post-arm turn to a
 single continuous-meter invocation and verifies the final live wedge.
+`-PointerBurstEvents 1000` adds an even, no-coalescing Windows pointer burst to
+a single fixed-origin continuous invocation and requires Gradial to report that
+obsolete visual updates were collapsed while retaining the final value.
 `-SimulateDisplayChange` holds M4, posts the same notification used by the
 native rebuild path, verifies the active invocation is cancelled, waits until
 generation 1 is fully rewarmed, and then sends a fresh gesture.

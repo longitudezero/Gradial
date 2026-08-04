@@ -348,6 +348,14 @@ Protocol rules:
 
 ### 4.1 Coalescing and backpressure
 
+Before the plugin runtime exists, Gradial applies the same latest-value
+principle to its own continuous visual feedback. The interaction controller
+still evaluates every queued pointer sample so a transient center return,
+direction change, or cancellation cannot be skipped. While draining a burst,
+only the newest ordinary render sample is published. The newest sample is
+flushed before release or cancellation, and a newer selection-clear event
+supersedes obsolete pending feedback.
+
 The interaction thread publishes the latest complete sample into a
 single-session latest-value slot. It does not enqueue every mouse event.
 

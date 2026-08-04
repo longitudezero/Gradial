@@ -37,7 +37,7 @@ plugin adapter is introduced.
 
 ## Automated checks
 
-The workspace test suite passes with 185 application tests and 58 core tests.
+The workspace test suite passes with 186 application tests and 58 core tests.
 The new coverage verifies:
 
 - normalization at 0%, 50%, and 100%, including clamping and invalid input;
@@ -99,6 +99,24 @@ The live-direction revision then completed the standard suite with run ID
 
 The revised run took 40.978 seconds on the same 1920x1080, 96-DPI display and
 supersedes the direction-lock baseline for current interaction behavior.
+
+The fixed-origin feedback-coalescing revision completed the standard suite
+with run ID `20260804T111919973Z`:
+
+| Measure | Result |
+| --- | --- |
+| Scenarios | 12 passed, 0 failed |
+| Inert continuous commits | 78 |
+| Fixed-origin stress | 1,000-event burst; 890 obsolete visual updates coalesced; final value within 0.02 of the 50% target |
+| Armed direction change | Passed |
+| Every corner under edge assist | Passed |
+| Saved-action isolation and focus checks | Passed |
+
+The run took 41.581 seconds on a two-display Windows setup. Its dedicated
+stress scenario submitted 1,000 no-coalescing Windows pointer inputs, retained
+the requested east wedge and value, and completed the 50 ms close lifecycle in
+52 ms. This run supersedes the prior live-direction matrix for current
+interaction behavior.
 
 ## Remaining validation
 

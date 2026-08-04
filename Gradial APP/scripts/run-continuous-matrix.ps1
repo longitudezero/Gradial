@@ -36,6 +36,7 @@ function Invoke-ContinuousScenario {
         [int]$ExpectedInvocations,
         [string]$Direction = "",
         [string]$ChangeFromDirection = "",
+        [int]$PointerBurstEvents = 0,
         [string]$Notes = ""
     )
 
@@ -54,6 +55,9 @@ function Invoke-ContinuousScenario {
         $arguments += "-AllDirections"
     } else {
         $arguments += @("-Direction", $Direction, "-ChangeFromDirection", $ChangeFromDirection)
+    }
+    if ($PointerBurstEvents -ne 0) {
+        $arguments += @("-PointerBurstEvents", $PointerBurstEvents)
     }
     $scenarioStarted = [DateTimeOffset]::UtcNow
     $priorPreference = $ErrorActionPreference
@@ -110,6 +114,17 @@ if ($Suite -ne "quick") {
         -Direction "W" `
         -ChangeFromDirection "N" `
         -Notes "Arms north, changes to west at the same radius, and commits west."
+
+    Invoke-ContinuousScenario `
+        -Id "center-eight-fixed-origin-pointer-burst-value-50" `
+        -Slices "8" `
+        -Value 50 `
+        -ActivationPoint "center" `
+        -ExpectedInvocations 1 `
+        -Direction "E" `
+        -ChangeFromDirection "E" `
+        -PointerBurstEvents 1000 `
+        -Notes "Commits east after 1,000 uncoalesced Windows pointer inputs without visual backlog."
 
     foreach ($point in @("top-left", "top-right", "bottom-right", "bottom-left")) {
         Invoke-ContinuousScenario `
@@ -217,6 +232,21 @@ $coverage = @(
             "Armed direction switching is excluded from the quick suite."
         } else {
             "A 50% north arm changed to west and committed the west wedge."
+        }
+    },
+    [pscustomobject]@{
+        requirement = "fixed-origin high-polling input coalescing"
+        status = if ($Suite -eq "quick") {
+            "not_run"
+        } elseif ($failed -eq 0) {
+            "passed"
+        } else {
+            "failed"
+        }
+        evidence = if ($Suite -eq "quick") {
+            "The fixed-origin pointer burst is excluded from the quick suite."
+        } else {
+            "A 1,000-event no-coalescing Windows pointer burst committed the live value and reported obsolete visual-update coalescing."
         }
     },
     [pscustomobject]@{

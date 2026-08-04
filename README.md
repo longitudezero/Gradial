@@ -133,6 +133,11 @@ Releasing before 48 DIP cancels. Returning inside the existing 24 DIP center
 radius after arming stops the meter; cancellation does not imply rollback for
 future application plugins.
 
+High-polling mice do not enqueue a render/log operation for every physical
+sample. Gradial still evaluates every sample for direction and center-return
+cancellation, but each input-queue drain publishes only its newest continuous
+visual state. Release and cancellation remain ordered after the final sample.
+
 The debug-only guided study runs the Section 11.3 participant protocol with
 configured actions disabled:
 
@@ -333,7 +338,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-continuous-matri
 It writes ignored JSON and CSV evidence under
 `Gradial APP\captures\continuous-matrix`. Automated results deliberately leave
 the eight-participant usability study as `not_run`; the standard suite includes
-a post-arm N-to-W wedge change on the real Windows input path.
+a post-arm N-to-W wedge change and a 1,000-event fixed-origin pointer burst on
+the real Windows input path.
 
 Run a short, non-qualifying local performance baseline after building the
 release executable:
