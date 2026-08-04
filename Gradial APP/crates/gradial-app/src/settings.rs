@@ -3295,6 +3295,7 @@ impl SettingsState {
                 selected_slice: Some(self.selected_slice),
                 continuous_selection: None,
                 continuous_pointer: None,
+                continuous_full_scale_radius_dip: 160.0,
                 opacity: 1.0,
                 scale: 1.0,
             },

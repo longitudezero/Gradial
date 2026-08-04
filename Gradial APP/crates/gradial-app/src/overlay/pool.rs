@@ -21,8 +21,7 @@ use crate::{
 };
 
 use super::{
-    AnimationMode, FoundationOverlayRenderer, OVERLAY_SIZE_DIP, OverlayRenderFrame,
-    OverlayRenderer,
+    AnimationMode, FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer,
     animation::{CLOSE_DURATION, PresenceFrame, closing_frame, opening_frame},
 };
 
@@ -52,6 +51,7 @@ struct OverlayViewportState {
     selected_slice: Option<usize>,
     continuous_selection: Option<ContinuousSelection>,
     continuous_pointer: Option<Point>,
+    continuous_full_scale_radius_dip: f32,
     phase: VisualPhase,
     pending_open_marker: bool,
     pending_first_frame: Option<InvocationSnapshot>,
@@ -66,6 +66,7 @@ impl OverlayViewportState {
         self.selected_slice = None;
         self.continuous_selection = None;
         self.continuous_pointer = None;
+        self.continuous_full_scale_radius_dip = 160.0;
         self.phase = VisualPhase::Hidden;
         self.pending_open_marker = false;
         self.pending_first_frame = None;
@@ -91,17 +92,20 @@ pub(crate) struct OverlayPool {
     slots: Vec<OverlaySlot>,
     animation_mode: AnimationMode,
     appearance: Appearance,
+    overlay_size_dip: f32,
     config_revision: u64,
     timing_markers: Arc<TimingMarkers>,
     close_coordinator: CloseCoordinator,
 }
 
 impl OverlayPool {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         generation: u64,
         monitors: Vec<MonitorGeometry>,
         animation_mode: AnimationMode,
         appearance: Appearance,
+        overlay_size_dip: f32,
         icons: &Arc<IconManager>,
         config_revision: u64,
         timing_markers: Arc<TimingMarkers>,
@@ -131,9 +135,8 @@ impl OverlayPool {
              slice_counts=4,8 \
              reduced_motion={} accent_red={} accent_green={} accent_blue={} \
              label_theme={} size_preset={} cached_icon_count={} \
-             open_ms=60 selection_ms=35 close_ms=50 \
-             continuous_arm_radius_dip={} continuous_full_scale_radius_dip=160 \
-             overlay_size_dip=400",
+             open_ms=60 selection_ms=0 close_ms=50 \
+             continuous_arm_radius_dip={} overlay_size_dip={overlay_size_dip}",
             slots.len(),
             animation_mode.is_reduced(),
             appearance.accent_color.red,
@@ -150,6 +153,7 @@ impl OverlayPool {
             slots,
             animation_mode,
             appearance,
+            overlay_size_dip,
             config_revision,
             timing_markers,
             close_coordinator,
@@ -186,8 +190,9 @@ impl OverlayPool {
             let timing_markers = Arc::clone(&self.timing_markers);
             let animation_mode = self.animation_mode;
             let appearance = self.appearance;
+            let overlay_size_dip = self.overlay_size_dip;
             let config_revision = self.config_revision;
-            let builder = viewport_builder(&title);
+            let builder = viewport_builder(&title, overlay_size_dip);
 
             context.show_viewport_deferred(viewport_id, builder, move |ui, viewport_class| {
                 if viewport_class == ViewportClass::EmbeddedWindow {
@@ -302,6 +307,7 @@ impl OverlayRoute {
         timing_markers: &TimingMarkers,
         snapshot: &InvocationSnapshot,
         menu: Arc<ResolvedMenu>,
+        continuous_full_scale_radius_dip: f64,
     ) -> Result<()> {
         let started_at = Instant::now();
         let invocation_id = snapshot.invocation_id;
@@ -319,6 +325,8 @@ impl OverlayRoute {
             state.selected_slice = None;
             state.continuous_selection = None;
             state.continuous_pointer = None;
+            state.continuous_full_scale_radius_dip =
+                render_radius_dip(continuous_full_scale_radius_dip);
             state.phase = VisualPhase::Opening { started_at };
             state.pending_open_marker = true;
             state.pending_first_frame = None;
@@ -489,6 +497,14 @@ impl OverlayRoute {
         } else {
             None
         }
+    }
+}
+
+fn render_radius_dip(radius_dip: f64) -> f32 {
+    // The study candidates are deliberately bounded to a range exactly representable by f32.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        radius_dip.clamp(160.0, 300.0) as f32
     }
 }
 
@@ -712,6 +728,7 @@ fn prepare_overlay_frame(
             selected_slice: state.selected_slice,
             continuous_selection: state.continuous_selection,
             continuous_pointer: state.continuous_pointer,
+            continuous_full_scale_radius_dip: state.continuous_full_scale_radius_dip,
             opacity: presence.opacity,
             scale: presence.scale,
         },
@@ -851,12 +868,12 @@ fn record_finished_close(completed: CompletedClose, hidden: bool, timing_markers
     }
 }
 
-fn viewport_builder(title: &str) -> ViewportBuilder {
+fn viewport_builder(title: &str, overlay_size_dip: f32) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title(title)
-        .with_inner_size([OVERLAY_SIZE_DIP, OVERLAY_SIZE_DIP])
-        .with_min_inner_size([OVERLAY_SIZE_DIP, OVERLAY_SIZE_DIP])
-        .with_max_inner_size([OVERLAY_SIZE_DIP, OVERLAY_SIZE_DIP])
+        .with_inner_size([overlay_size_dip, overlay_size_dip])
+        .with_min_inner_size([overlay_size_dip, overlay_size_dip])
+        .with_max_inner_size([overlay_size_dip, overlay_size_dip])
         .with_decorations(false)
         .with_resizable(false)
         .with_transparent(true)

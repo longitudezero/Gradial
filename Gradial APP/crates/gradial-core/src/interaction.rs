@@ -438,6 +438,20 @@ impl InteractionController {
         self.snapshot.as_ref()
     }
 
+    /// Reconfigures the continuous endpoint between invocations. The visible
+    /// arm boundary remains fixed; an active gesture always keeps the endpoint
+    /// it started with.
+    pub fn set_continuous_full_scale_radius_dip(&mut self, radius_dip: f64) -> bool {
+        if self.state != InteractionState::Idle
+            || !radius_dip.is_finite()
+            || radius_dip <= self.config.continuous_arm_radius_dip
+        {
+            return false;
+        }
+        self.config.continuous_full_scale_radius_dip = radius_dip;
+        true
+    }
+
     pub fn activation_down(&mut self, snapshot: InvocationSnapshot) -> Option<InteractionEffect> {
         self.activation_down_with_slice_count(snapshot, self.config.slice_count)
     }
@@ -1039,6 +1053,18 @@ mod tests {
         assert!((continuous_arm_radius_for_size(SizePreset::Compact) - 90.95).abs() < 0.001);
         assert!((continuous_arm_radius_for_size(SizePreset::Standard) - 107.0).abs() < 0.001);
         assert!((continuous_arm_radius_for_size(SizePreset::Large) - 123.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn continuous_endpoint_can_change_only_between_invocations() {
+        let origin = ScreenPoint::new(100, 100);
+        let mut controller = InteractionController::new(GestureConfig::default());
+        assert!(controller.set_continuous_full_scale_radius_dip(250.0));
+        assert!(!controller.set_continuous_full_scale_radius_dip(107.0));
+        controller.activation_down(snapshot(origin)).expect("open");
+        assert!(!controller.set_continuous_full_scale_radius_dip(300.0));
+        controller.activation_up();
+        assert!(controller.set_continuous_full_scale_radius_dip(300.0));
     }
 
     #[test]

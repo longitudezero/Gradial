@@ -8,7 +8,7 @@ pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
 Usage:
-  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--continuous-meter|--continuous-study] [--reduced-motion] [--open-settings] [--skip-onboarding]
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--continuous-meter|--continuous-study|--continuous-distance-study] [--reduced-motion] [--open-settings] [--skip-onboarding]
 
 Geometry modes:
   auto          Use edge assist only when the complete ring would clip.
@@ -22,6 +22,8 @@ Slice counts:
 Continuous input:
   --continuous-meter  Make every direction an inert 0-100% distance meter.
   --continuous-study  Run the guided, anonymous distance usability study.
+  --continuous-distance-study
+                      Compare the 160/200/250/300 DIP full-scale candidates.
 
 Animation:
   --reduced-motion  Remove visual interpolation without changing gesture timing.
@@ -59,6 +61,8 @@ pub(crate) enum ContinuousMeterMode {
     Enabled,
     #[cfg(debug_assertions)]
     Study,
+    #[cfg(debug_assertions)]
+    DistanceStudy,
 }
 
 impl ContinuousMeterMode {
@@ -66,14 +70,25 @@ impl ContinuousMeterMode {
         match self {
             Self::Disabled => false,
             #[cfg(debug_assertions)]
-            Self::Enabled | Self::Study => true,
+            Self::Enabled | Self::Study | Self::DistanceStudy => true,
         }
     }
 
     pub(crate) const fn is_study(self) -> bool {
         #[cfg(debug_assertions)]
         {
-            matches!(self, Self::Study)
+            matches!(self, Self::Study | Self::DistanceStudy)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
+    pub(crate) const fn is_distance_study(self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            matches!(self, Self::DistanceStudy)
         }
         #[cfg(not(debug_assertions))]
         {
@@ -164,6 +179,13 @@ impl StartupOptions {
                         debug_continuous_meter = ContinuousMeterMode::Study;
                         continue;
                     }
+                    if argument == "--continuous-distance-study" {
+                        if debug_continuous_meter.is_enabled() {
+                            bail!("choose only one continuous development mode");
+                        }
+                        debug_continuous_meter = ContinuousMeterMode::DistanceStudy;
+                        continue;
+                    }
                 }
                 bail!("unknown Gradial argument: {argument}");
             }
@@ -176,7 +198,7 @@ impl StartupOptions {
                 || geometry_mode != GeometryMode::Auto)
         {
             bail!(
-                "--continuous-study requires automatic geometry and cannot combine with --slices or --open-settings"
+                "guided continuous studies require automatic geometry and cannot combine with --slices or --open-settings"
             );
         }
 
@@ -304,11 +326,21 @@ mod tests {
         assert_eq!(study.debug_continuous_meter, ContinuousMeterMode::Study);
         assert!(study.debug_continuous_meter.is_study());
 
+        let distance = StartupOptions::parse(["--continuous-distance-study".to_owned()])
+            .expect("continuous distance study");
+        assert_eq!(distance.debug_continuous_meter, ContinuousMeterMode::DistanceStudy);
+        assert!(distance.debug_continuous_meter.is_study());
+        assert!(distance.debug_continuous_meter.is_distance_study());
+
         for arguments in [
             vec!["--continuous-study", "--slices=4"],
             vec!["--continuous-study", "--open-settings"],
             vec!["--continuous-study", "--geometry=fixed-origin"],
             vec!["--continuous-study", "--continuous-meter"],
+            vec!["--continuous-distance-study", "--slices=4"],
+            vec!["--continuous-distance-study", "--open-settings"],
+            vec!["--continuous-distance-study", "--geometry=edge-assist"],
+            vec!["--continuous-distance-study", "--continuous-study"],
         ] {
             let error = StartupOptions::parse(arguments.into_iter().map(str::to_owned))
                 .expect_err("incompatible study options");
@@ -325,6 +357,7 @@ mod tests {
             "--skip-onboarding",
             "--continuous-meter",
             "--continuous-study",
+            "--continuous-distance-study",
         ] {
             let error =
                 StartupOptions::parse([argument.to_owned()]).expect_err("debug-only option");

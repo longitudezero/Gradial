@@ -1,6 +1,6 @@
 # Milestone 0 guided continuous-study results
 
-Date: 2026-08-03
+Date: 2026-08-04
 
 This record covers the guided Section 11.3 participant harness. It makes the
 required human study repeatable and privacy-bounded; it does not claim that the
@@ -46,6 +46,22 @@ leaves the Section 11.3 usability gates unevaluated rather than inferring a
 pass.
 The direction gate uses the v0.2 corner release baseline of at most 3% errors.
 
+## Distance-comparison harness
+
+The debug-only `--continuous-distance-study` mode is now implemented as a
+separate no-side-effect protocol. It guides one E-at-25% attempt at each 100%
+endpointâ€”160, 200, 250, and 300 DIPâ€”while keeping the Standard 107-DIP mode
+boundary unchanged. The measured release and absolute error remain visible
+after each attempt. Once all four are complete, the participant chooses the
+endpoint that felt best.
+
+The selected endpoint is frozen for the complete invocation and drives both
+normalization and the rendered track. A larger prewarmed overlay accommodates
+the 300-DIP candidate. Choosing a preference atomically publishes a private
+schema-one `continuous-distance-study-<session-id>.json` report. It does not
+alter saved configuration, create a speed preset, or enter the main cohort
+summarizer.
+
 ## Automated evidence
 
 Automated coverage verifies:
@@ -78,6 +94,7 @@ No participant dataset has been fabricated. The current status remains:
 | Edge/corner median no more than 20% slower than center | Not evaluated |
 
 The visible outer edge is now the mode boundary (107 DIP at Standard size).
-The candidate 160-DIP full-scale radius remains unfrozen; the next study
-revision will compare the proposed 160, 200, 250, and 300 DIP endpoints before
-a user-facing speed preset is selected.
+The candidate full-scale radius remains unfrozen. The comparison harness is
+available, but its human result has not yet been recorded; production Fast,
+Normal, and Precise presets remain deliberately unimplemented until that
+evidence is reviewed.

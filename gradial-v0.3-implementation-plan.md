@@ -170,11 +170,14 @@ value = clamp((d - a) / (f - a), 0.0, 1.0)
 - Raw cursor coordinates and raw Win32 handles are never included in a
   continuous sample.
 
-The Milestone 0 usability prototype will compare 160, 200, 250, and 300 DIP
-full-scale candidates before selecting user-facing Fast, Normal, and Precise
-presets. Changing that endpoint requires recorded results for precision,
-accidental continuous entry, edge use, live direction switching, and inward
-mode reversal; it does not change the normalized protocol.
+The Milestone 0 usability prototype exposes a separate no-side-effect harness
+that compares 160, 200, 250, and 300 DIP full-scale candidates before
+user-facing Fast, Normal, and Precise presets are selected. The harness keeps
+E and 25% fixed, displays each measured result, and records the participant's
+preference separately from the main cohort report. Changing the production
+endpoint still requires recorded results for precision, accidental continuous
+entry, edge use, live direction switching, and inward mode reversal; it does
+not change the normalized protocol.
 
 ### 3.3 Live mode and direction
 

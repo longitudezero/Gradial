@@ -1038,9 +1038,8 @@ if (
     $log -notmatch (
         "event_code=renderer_geometry_cache_ready .*slice_counts=4,8 " +
         ".*reduced_motion=$expectedReducedMotion .*open_ms=60 " +
-        ".*selection_ms=35 .*close_ms=50 " +
-        ".*continuous_arm_radius_dip=107 " +
-        ".*continuous_full_scale_radius_dip=160 .*overlay_size_dip=400"
+        ".*selection_ms=0 .*close_ms=50 " +
+        ".*continuous_arm_radius_dip=107 .*overlay_size_dip=400"
     )
 ) {
     throw "The renderer cache and animation contract was not initialized as requested."

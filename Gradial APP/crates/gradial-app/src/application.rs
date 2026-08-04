@@ -31,6 +31,22 @@ use crate::{
     tray::{TrayCommand, TrayHealth, TrayIcon},
 };
 
+const DISTANCE_STUDY_OVERLAY_HALF_EXTENT_DIP: u32 = 320;
+
+const fn overlay_half_extent_dip(mode: ContinuousMeterMode) -> u32 {
+    if mode.is_distance_study() {
+        DISTANCE_STUDY_OVERLAY_HALF_EXTENT_DIP
+    } else if mode.is_enabled() {
+        CONTINUOUS_OVERLAY_HALF_EXTENT_DIP
+    } else {
+        DEFAULT_OVERLAY_HALF_EXTENT_DIP
+    }
+}
+
+const fn overlay_size_dip(mode: ContinuousMeterMode) -> f32 {
+    if mode.is_distance_study() { 640.0 } else { 400.0 }
+}
+
 #[derive(Debug)]
 pub(crate) struct ApplicationServices {
     config_store: ConfigStore,
@@ -88,6 +104,7 @@ fn create_continuous_study(
 ) -> ContinuousStudy {
     ContinuousStudy::new(
         startup_options.debug_continuous_meter.is_study(),
+        startup_options.debug_continuous_meter.is_distance_study(),
         binding,
         report_directory,
     )
@@ -190,11 +207,8 @@ impl GradialApp {
             platform::monitor_work_areas().context("could not read the display work areas")?;
         let (debug_menu_override, debug_slice_override) =
             resolve_debug_menu_options(startup_options);
-        let overlay_half_extent_dip = if startup_options.debug_continuous_meter.is_enabled() {
-            CONTINUOUS_OVERLAY_HALF_EXTENT_DIP
-        } else {
-            DEFAULT_OVERLAY_HALF_EXTENT_DIP
-        };
+        let overlay_half_extent_dip =
+            overlay_half_extent_dip(startup_options.debug_continuous_meter);
         log::info!(
             target: "startup",
             "component=app event_code=input_geometry_ready result_code=ok \
@@ -220,6 +234,7 @@ impl GradialApp {
             monitors,
             animation_mode,
             configuration.appearance,
+            overlay_size_dip(startup_options.debug_continuous_meter),
             &icons,
             config_revision,
             Arc::clone(&timing_markers),
@@ -309,6 +324,7 @@ impl GradialApp {
             monitors,
             self.animation_mode,
             self.configuration.appearance,
+            overlay_size_dip(self.debug_continuous_meter),
             &self.icons,
             self.config_revision,
             Arc::clone(&self.timing_markers),
@@ -919,6 +935,7 @@ impl GradialApp {
                 current_monitors,
                 self.animation_mode,
                 self.configuration.appearance,
+                overlay_size_dip(self.debug_continuous_meter),
                 &self.icons,
                 self.config_revision,
                 Arc::clone(&self.timing_markers),
@@ -931,11 +948,7 @@ impl GradialApp {
             geometry_mode: self.geometry_mode,
             monitors: current_monitors,
             activation_binding: self.configuration.activation_binding,
-            overlay_half_extent_dip: if self.debug_continuous_meter.is_enabled() {
-                CONTINUOUS_OVERLAY_HALF_EXTENT_DIP
-            } else {
-                DEFAULT_OVERLAY_HALF_EXTENT_DIP
-            },
+            overlay_half_extent_dip: overlay_half_extent_dip(self.debug_continuous_meter),
         };
         let interaction = match InteractionRuntime::start(
             context.clone(),

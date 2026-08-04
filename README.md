@@ -164,6 +164,20 @@ reports, evaluate the cohort gates with:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/summarize-continuous-study.ps1
 ```
 
+A separate debug-only comparison keeps direction E and the target 25% fixed
+while testing 160, 200, 250, and 300 DIP as the 100% endpoint:
+
+```powershell
+cargo run --package gradial-app -- --continuous-distance-study
+```
+
+It shows the measured release after every trial, then asks which distance felt
+best. The comparison is inert, does not alter profiles or actions, and writes a
+dedicated `continuous-distance-study-<session-id>.json` report beside the
+guided-study reports. These comparison files are intentionally separate from
+the cohort summarizer, and choosing a favorite does not yet create a
+production speed preset.
+
 The overlay opens from 96% scale and 85% opacity over 60 ms, highlights the
 current wedge immediately, and fades out over 50 ms. Gesture recognition and
 release do not wait for the lifecycle animations. A temporary development

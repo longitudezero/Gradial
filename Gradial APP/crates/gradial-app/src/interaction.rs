@@ -139,6 +139,7 @@ struct ActiveInvocation {
     route: Option<usize>,
     practice: bool,
     continuous_meter: bool,
+    continuous_full_scale_radius_dip: Option<f64>,
     study_trial_id: Option<u32>,
 }
 
@@ -146,6 +147,7 @@ struct ActiveInvocation {
 struct DebugInteractionOptions<'a> {
     menu_override: Option<&'a Arc<ResolvedMenu>>,
     continuous_meter: bool,
+    continuous_full_scale_radius_dip: f64,
 }
 
 impl ActiveInvocation {
@@ -158,6 +160,7 @@ impl ActiveInvocation {
         self.route = None;
         self.practice = false;
         self.continuous_meter = false;
+        self.continuous_full_scale_radius_dip = None;
         self.study_trial_id = None;
     }
 }
@@ -373,6 +376,7 @@ fn run_interaction_thread(
     gesture_config: GestureConfig,
     config_revision: u64,
 ) {
+    let default_continuous_full_scale_radius_dip = gesture_config.continuous_full_scale_radius_dip;
     let mut controller = InteractionController::new(gesture_config);
     let mut active = ActiveInvocation::default();
     let mut counters = EventCounters::default();
@@ -391,6 +395,7 @@ fn run_interaction_thread(
     let debug_options = DebugInteractionOptions {
         menu_override: debug_menu_override,
         continuous_meter: debug_continuous_meter,
+        continuous_full_scale_radius_dip: default_continuous_full_scale_radius_dip,
     };
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut runtime_stop_pending = false;
@@ -645,6 +650,7 @@ fn process_input_event(
                 profile_resolver,
                 debug_options.menu_override,
                 debug_options.continuous_meter,
+                debug_options.continuous_full_scale_radius_dip,
             )
         }
         InputEventKind::PointerMoved => {
@@ -716,7 +722,7 @@ fn prepare_selected_action(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn begin_invocation(
     event: InputEvent,
     geometry: gradial_core::InvocationGeometry,
@@ -728,6 +734,7 @@ fn begin_invocation(
     profile_resolver: &ProfileResolver,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
     debug_continuous_meter: bool,
+    debug_continuous_full_scale_radius_dip: f64,
 ) -> Option<InteractionEffect> {
     let snapshot = capture_snapshot(
         event,
@@ -764,6 +771,9 @@ fn begin_invocation(
     });
     let study_setup = dispatcher.continuous_study.invocation_if_enabled();
     let study_trial_id = study_setup.as_ref().map(|setup| setup.trial_id);
+    let continuous_full_scale_radius_dip = study_setup
+        .as_ref()
+        .map_or(debug_continuous_full_scale_radius_dip, |setup| setup.full_scale_radius_dip);
     let practice_menu = dispatcher.onboarding_practice.menu_if_enabled();
     let (menu, menu_source, practice_active) = if let Some(setup) = study_setup {
         (setup.menu, "continuous_study", false)
@@ -775,6 +785,17 @@ fn begin_invocation(
         (Arc::clone(&resolution.menu), "configuration", false)
     };
     let continuous_meter = debug_continuous_meter && !practice_active;
+    if !controller.set_continuous_full_scale_radius_dip(continuous_full_scale_radius_dip) {
+        log::error!(
+            target: "interaction",
+            "component=interaction event_code=continuous_geometry_rejected result_code=failure \
+             config_revision={} invocation_id={} \
+             continuous_full_scale_radius_dip={continuous_full_scale_radius_dip}",
+            snapshot.context.config_revision,
+            snapshot.invocation_id
+        );
+        return None;
+    }
     log::info!(
         target: "profiles",
         "component=profiles event_code=profile_resolved result_code=ok \
@@ -782,7 +803,8 @@ fn begin_invocation(
          decision={} matching_profile_count={} configured_slice_count={} \
          menu_slice_count={} menu_label_count={} menu_source={menu_source} \
          onboarding_practice={practice_active} continuous_meter={continuous_meter} \
-         continuous_study_trial={study_trial_id:?}",
+         continuous_study_trial={study_trial_id:?} \
+         continuous_full_scale_radius_dip={continuous_full_scale_radius_dip}",
         snapshot.context.config_revision,
         snapshot.invocation_id,
         resolution.profile_id,
@@ -816,6 +838,7 @@ fn begin_invocation(
         active.menu = Some(menu);
         active.practice = practice_active;
         active.continuous_meter = continuous_meter;
+        active.continuous_full_scale_radius_dip = Some(continuous_full_scale_radius_dip);
         active.study_trial_id = study_trial_id;
     }
     effect
@@ -880,6 +903,7 @@ fn dispatch_effect(
     let active_profile_id = active.profile_id;
     let active_menu = active.menu.as_ref();
     let continuous_meter = active.continuous_meter;
+    let continuous_full_scale_radius_dip = active.continuous_full_scale_radius_dip;
     let Some((route_index, route)) =
         active_overlay_route(active.route, dispatcher.routes, dispatcher.config_revision)
     else {
@@ -895,6 +919,7 @@ fn dispatch_effect(
                 active_profile_id,
                 active_menu,
                 continuous_meter,
+                continuous_full_scale_radius_dip,
                 route_index,
                 route,
                 dispatcher,
@@ -1197,6 +1222,7 @@ fn dispatch_open(
     active_profile_id: Option<uuid::Uuid>,
     active_menu: Option<&Arc<ResolvedMenu>>,
     continuous_meter: bool,
+    continuous_full_scale_radius_dip: Option<f64>,
     route_index: usize,
     route: &OverlayRoute,
     dispatcher: &EffectDispatcher<'_>,
@@ -1237,9 +1263,13 @@ fn dispatch_open(
         source_qpc,
         &format!("geometry={}", snapshot.geometry.behavior.as_str()),
     );
-    if let Err(error) =
-        route.open(dispatcher.egui_context, dispatcher.timing_markers, snapshot, Arc::clone(menu))
-    {
+    if let Err(error) = route.open(
+        dispatcher.egui_context,
+        dispatcher.timing_markers,
+        snapshot,
+        Arc::clone(menu),
+        continuous_full_scale_radius_dip.unwrap_or(160.0),
+    ) {
         log::error!(
             target: "renderer",
             "component=renderer event_code=overlay_wake_request_failed \

@@ -529,6 +529,25 @@ reports. It recomputes the cohort metrics from accepted attempts and writes a
 JSON summary plus gate CSV. With fewer than eight participants the sample-size
 gate fails and the usability gates remain `not_evaluated`.
 
+### Continuous distance comparison
+
+Debug builds also expose `--continuous-distance-study`. It has the same
+no-side-effect and option-isolation rules as the main study, but is a compact
+personal comparison rather than a cohort usability report. Its four
+center-screen trials all request E at 25% and change only the frozen 100%
+endpoint, in the order 160, 200, 250, and 300 DIP. The just-completed
+measurement and absolute error remain visible between trials. After all four,
+the participant selects the endpoint that felt best.
+
+The active endpoint is frozen into the interaction controller and renderer at
+invocation-down, so a trial cannot change scale mid-gesture. The comparison
+uses a 640-DIP overlay and a 320-DIP geometry extent to keep the longest track
+visible. It atomically writes schema-one
+`continuous-distance-study-<session-id>.json` beside the ordinary study
+reports only after a preference is chosen. The report uses the same privacy
+exclusions, but it is deliberately ignored by
+`summarize-continuous-study.ps1` and does not modify production configuration.
+
 ## Configuration and profile resolution
 
 The configuration model contains one global profile and zero or more
@@ -883,10 +902,11 @@ The default `--geometry=auto` mode uses fixed origin whenever the required
 extent centered at activation-down fits in the monitor work area. Discrete
 invocations retain their 288 DIP square. The continuous meter requests a 400
 DIP square so its 160 DIP track, large appearance scale, and marker remain
-visible. Otherwise Gradial selects edge assist and clamps the visual origin far
-enough inward for the complete overlay to fit. Work-area coordinates remain
-signed, so monitors above or left of the primary display are handled without
-unsigned conversion.
+visible. The four-candidate distance comparison requests a 640 DIP square for
+its 300 DIP track. Otherwise Gradial selects edge assist and clamps the visual
+origin far enough inward for the complete overlay to fit. Work-area
+coordinates remain signed, so monitors above or left of the primary display
+are handled without unsigned conversion.
 
 Comparison overrides are available without changing code:
 

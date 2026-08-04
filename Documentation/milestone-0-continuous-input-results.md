@@ -205,7 +205,10 @@ evaluator are now available and documented in
 `milestone-0-continuous-study-results.md`, but no participant reports have yet
 been collected.
 The visible outer edge is now fixed as the mode boundary, while the full-scale
-distance remains a candidate. The next comparison will measure 160, 200, 250,
-and 300 DIP endpoints before selecting Fast, Normal, and Precise defaults.
+distance remains a candidate. A separate no-side-effect comparison now
+measures 160, 200, 250, and 300 DIP endpoints at E/25%, shows every result, and
+records the participant's preferred distance without changing production
+settings. Its human result is still pending before Fast, Normal, and Precise
+defaults can be selected.
 Mixed-DPI, negative-coordinate, and high-refresh hardware were also unavailable
 in this local run and remain part of later cross-hardware validation.

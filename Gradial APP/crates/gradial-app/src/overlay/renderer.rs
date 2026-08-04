@@ -17,6 +17,7 @@ const ICON_LABEL_RADIUS_DIP: f32 = 106.0;
 const ICON_SIZE_DIP: f32 = 30.0;
 const SELECTED_ARC_STEPS: u8 = 24;
 const SELECTED_ARC_INSET_RADIANS: f32 = 0.035;
+#[cfg(test)]
 const CONTINUOUS_FULL_SCALE_RADIUS_DIP: f32 = 160.0;
 const MAX_SLICE_COUNT: usize = 8;
 
@@ -28,6 +29,7 @@ pub(crate) struct OverlayRenderFrame {
     pub(crate) selected_slice: Option<usize>,
     pub(crate) continuous_selection: Option<ContinuousSelection>,
     pub(crate) continuous_pointer: Option<Point>,
+    pub(crate) continuous_full_scale_radius_dip: f32,
     pub(crate) opacity: f32,
     pub(crate) scale: f32,
 }
@@ -92,7 +94,7 @@ impl OverlayRenderer for FoundationOverlayRenderer {
                 menu.slice_count(),
                 selection,
                 OUTER_RADIUS_DIP * frame.appearance.size_preset.visual_scale(),
-                CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+                frame.continuous_full_scale_radius_dip,
                 opacity,
                 lifecycle_scale,
                 accent,
@@ -661,6 +663,17 @@ mod tests {
         assert_close(large_start.x, 123.05);
         assert_close(large_current.x, 141.525);
         assert_close(large_end.x, 160.0);
+
+        let [study_start, study_current, study_end] = continuous_track_offsets(
+            SliceCount::Eight,
+            ContinuousSelection { slice_index: 2, value: 0.25 },
+            OUTER_RADIUS_DIP,
+            300.0,
+        )
+        .expect("distance-study east continuous track");
+        assert_close(study_start.x, 107.0);
+        assert_close(study_current.x, 155.25);
+        assert_close(study_end.x, 300.0);
 
         assert!(
             continuous_track_offsets(

@@ -24,10 +24,37 @@ use windows::{
 };
 
 const STUDY_SCHEMA_VERSION: u32 = 3;
+const DISTANCE_STUDY_SCHEMA_VERSION: u32 = 1;
 const STUDY_EVENT_CAPACITY: usize = 32;
 const STUDY_SIZE: [f32; 2] = [760.0, 680.0];
 const STUDY_MIN_SIZE: [f32; 2] = [680.0, 600.0];
 const TARGETS: [u8; 4] = [25, 50, 75, 100];
+const DISTANCE_TARGET_PERCENT: u8 = 25;
+const DISTANCE_CANDIDATES_DIP: [u32; 4] = [160, 200, 250, 300];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StudyProtocol {
+    Usability,
+    DistanceComparison,
+}
+
+impl StudyProtocol {
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::Usability => "Gradial continuous-input study",
+            Self::DistanceComparison => "Gradial distance comparison",
+        }
+    }
+
+    const fn subtitle(self) -> &'static str {
+        match self {
+            Self::Usability => "A guided, no-side-effect test of the candidate distance gesture.",
+            Self::DistanceComparison => {
+                "Compare four no-side-effect full-scale distances using the same target."
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +63,7 @@ enum StudyPhase {
     Scalar,
     DirectionChange,
     Cancellation,
+    DistanceComparison,
 }
 
 impl StudyPhase {
@@ -45,6 +73,7 @@ impl StudyPhase {
             Self::Scalar => "Measured target",
             Self::DirectionChange => "Direction-change check",
             Self::Cancellation => "Cancellation check",
+            Self::DistanceComparison => "Distance comparison",
         }
     }
 }
@@ -77,6 +106,7 @@ struct StudyTrial {
     change_from_index: Option<usize>,
     change_after_arm: bool,
     placement: StudyPlacement,
+    full_scale_radius_dip: u32,
 }
 
 impl StudyTrial {
@@ -93,6 +123,7 @@ impl StudyTrial {
 pub(crate) struct StudyInvocationSetup {
     pub(crate) trial_id: u32,
     pub(crate) menu: Arc<ResolvedMenu>,
+    pub(crate) full_scale_radius_dip: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +210,7 @@ struct StudyAttemptRecord {
     requested_change_from_direction: Option<String>,
     requested_change_after_arm: bool,
     requested_target: Option<f64>,
+    requested_full_scale_radius_dip: u32,
     requested_placement: StudyPlacement,
     observed_placement: StudyPlacement,
     placement_matches: bool,
@@ -213,7 +245,9 @@ impl StudyAttemptRecord {
         let absolute_scalar_error =
             observed_value.zip(requested_target).map(|(actual, target)| (actual - target).abs());
         let terminal_is_accepted = match trial.phase {
-            StudyPhase::Practice | StudyPhase::Scalar => observed_value.is_some(),
+            StudyPhase::Practice | StudyPhase::Scalar | StudyPhase::DistanceComparison => {
+                observed_value.is_some()
+            }
             StudyPhase::DirectionChange if trial.change_after_arm => observed_value.is_some(),
             StudyPhase::DirectionChange => {
                 result == "discrete_selected"
@@ -240,6 +274,7 @@ impl StudyAttemptRecord {
             requested_change_from_direction: trial.change_from_direction().map(str::to_owned),
             requested_change_after_arm: trial.change_after_arm,
             requested_target,
+            requested_full_scale_radius_dip: trial.full_scale_radius_dip,
             requested_placement: trial.placement,
             observed_placement: observation.placement,
             placement_matches,
@@ -309,6 +344,30 @@ struct StudyReport {
     summary: StudySummary,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct DistanceStudyReport {
+    schema_version: u32,
+    protocol: &'static str,
+    session_id: Uuid,
+    privacy: StudyPrivacy,
+    direction: &'static str,
+    target: f64,
+    continuous_boundary_dip: f64,
+    candidates_dip: [u32; 4],
+    results: Vec<DistanceStudyResult>,
+    rejected_attempt_count: usize,
+    preferred_full_scale_radius_dip: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct DistanceStudyResult {
+    full_scale_radius_dip: u32,
+    observed_value: f64,
+    absolute_scalar_error: f64,
+    duration_ms: u32,
+    monitor_dpi: u32,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 struct StudyPrivacy {
     identity: &'static str,
@@ -343,11 +402,13 @@ enum StudyStage {
 enum StudyUiEvent {
     Start,
     RetryExport,
+    ChooseDistance(u32),
     Close,
 }
 
 #[derive(Debug)]
 struct StudyState {
+    protocol: StudyProtocol,
     stage: StudyStage,
     session_id: Uuid,
     plan: Vec<StudyTrial>,
@@ -358,14 +419,24 @@ struct StudyState {
     pending_event: Option<StudyUiEvent>,
     export_pending: bool,
     report_path: Option<PathBuf>,
+    preferred_full_scale_radius_dip: Option<u32>,
 }
 
 impl StudyState {
-    fn new(enabled: bool) -> Self {
+    fn new(enabled: bool, distance_comparison: bool) -> Self {
+        let protocol = if distance_comparison {
+            StudyProtocol::DistanceComparison
+        } else {
+            StudyProtocol::Usability
+        };
         Self {
+            protocol,
             stage: if enabled { StudyStage::Intro } else { StudyStage::Closed },
             session_id: Uuid::new_v4(),
-            plan: study_plan(),
+            plan: match protocol {
+                StudyProtocol::Usability => study_plan(),
+                StudyProtocol::DistanceComparison => distance_study_plan(),
+            },
             trial_index: 0,
             attempts: Vec::new(),
             privacy_acknowledged: false,
@@ -373,6 +444,7 @@ impl StudyState {
             pending_event: None,
             export_pending: false,
             report_path: None,
+            preferred_full_scale_radius_dip: None,
         }
     }
 
@@ -387,6 +459,7 @@ impl StudyState {
         self.feedback = None;
         self.export_pending = false;
         self.report_path = None;
+        self.preferred_full_scale_radius_dip = None;
     }
 
     fn record(&mut self, observation: StudyObservation) {
@@ -419,7 +492,7 @@ impl StudyState {
         self.trial_index += 1;
         if self.trial_index >= self.plan.len() {
             self.stage = StudyStage::Results;
-            self.export_pending = true;
+            self.export_pending = self.protocol == StudyProtocol::Usability;
         }
     }
 
@@ -428,17 +501,7 @@ impl StudyState {
             schema_version: STUDY_SCHEMA_VERSION,
             protocol: "gradial-continuous-usability-v3",
             session_id: self.session_id,
-            privacy: StudyPrivacy {
-                identity: "random_session_id_only",
-                excluded_data: [
-                    "participant_name",
-                    "raw_cursor_coordinates",
-                    "application_identity",
-                    "file_paths",
-                    "window_details",
-                    "monitor_device_names",
-                ],
-            },
+            privacy: study_privacy(),
             candidate_geometry_dip: CandidateGeometry {
                 cancel: 24,
                 direction: 36,
@@ -453,6 +516,42 @@ impl StudyState {
             attempts: self.attempts.clone(),
             summary: summarize_attempts(&self.attempts),
         }
+    }
+
+    fn distance_report(&self) -> Option<DistanceStudyReport> {
+        let preference = self
+            .preferred_full_scale_radius_dip
+            .filter(|candidate| DISTANCE_CANDIDATES_DIP.contains(candidate))?;
+        let accepted: Vec<_> = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.phase == StudyPhase::DistanceComparison && attempt.accepted)
+            .collect();
+        let results = accepted
+            .iter()
+            .filter_map(|attempt| {
+                Some(DistanceStudyResult {
+                    full_scale_radius_dip: attempt.requested_full_scale_radius_dip,
+                    observed_value: attempt.observed_value?,
+                    absolute_scalar_error: attempt.absolute_scalar_error?,
+                    duration_ms: attempt.duration_ms,
+                    monitor_dpi: attempt.monitor_dpi,
+                })
+            })
+            .collect();
+        Some(DistanceStudyReport {
+            schema_version: DISTANCE_STUDY_SCHEMA_VERSION,
+            protocol: "gradial-continuous-distance-comparison-v1",
+            session_id: self.session_id,
+            privacy: study_privacy(),
+            direction: "E",
+            target: f64::from(DISTANCE_TARGET_PERCENT) / 100.0,
+            continuous_boundary_dip: 107.0,
+            candidates_dip: DISTANCE_CANDIDATES_DIP,
+            results,
+            rejected_attempt_count: self.attempts.len().saturating_sub(accepted.len()),
+            preferred_full_scale_radius_dip: preference,
+        })
     }
 
     fn render(&mut self, ui: &mut egui::Ui, binding: ActivationBinding) -> Option<StudyUiEvent> {
@@ -475,8 +574,8 @@ impl StudyState {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
-                ui.heading("Gradial continuous-input study");
-                ui.label("A guided, no-side-effect test of the candidate distance gesture.");
+                ui.heading(self.protocol.heading());
+                ui.label(self.protocol.subtitle());
             });
             ui.add_space(18.0);
 
@@ -503,7 +602,8 @@ impl StudyState {
     ) {
         ui.heading("Before you begin");
         ui.label(format!(
-            "The study uses {} and the real production overlay, but every direction is inert.",
+            "The {} uses {} and the real production overlay, but every direction is inert.",
+            if self.protocol == StudyProtocol::DistanceComparison { "comparison" } else { "study" },
             binding_display(binding)
         ));
         ui.add_space(12.0);
@@ -516,20 +616,39 @@ impl StudyState {
         });
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("Cancellation instruction — read once").strong());
-            ui.label("To cancel, return to the center while still holding, then release there.");
-            ui.label(
-                "Cancellation stops further effects; it does not undo effects already produced.",
-            );
+            if self.protocol == StudyProtocol::DistanceComparison {
+                ui.label(RichText::new("How the comparison works").strong());
+                ui.label("• Four trials use E at 25%, changing only the 100% distance.");
+                ui.label("• Keep the pointer comfortably away from every screen edge.");
+                ui.label("• Each measured result remains visible while you continue.");
+                ui.label("• At the end, choose the distance that felt best.");
+            } else {
+                ui.label(RichText::new("Cancellation instruction — read once").strong());
+                ui.label("To cancel, return to the center while still holding, then release there.");
+                ui.label(
+                    "Cancellation stops further effects; it does not undo effects already produced.",
+                );
+            }
         });
         ui.add_space(14.0);
         ui.checkbox(
             &mut self.privacy_acknowledged,
-            "I understand the privacy summary and the cancellation instruction.",
+            if self.protocol == StudyProtocol::DistanceComparison {
+                "I understand the privacy summary and comparison instructions."
+            } else {
+                "I understand the privacy summary and the cancellation instruction."
+            },
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui
-                .add_enabled(self.privacy_acknowledged, egui::Button::new("Start practice"))
+                .add_enabled(
+                    self.privacy_acknowledged,
+                    egui::Button::new(if self.protocol == StudyProtocol::DistanceComparison {
+                        "Start comparison"
+                    } else {
+                        "Start practice"
+                    }),
+                )
                 .clicked()
             {
                 *event = Some(StudyUiEvent::Start);
@@ -598,13 +717,31 @@ impl StudyState {
                     )).size(24.0).strong());
                     ui.label("Use the cancellation method described once at the beginning of the study.");
                 }
+                StudyPhase::DistanceComparison => {
+                    ui.label(RichText::new(format!(
+                        "Direction E  ·  Target 25%  ·  {} DIP at 100%",
+                        trial.full_scale_radius_dip
+                    )).size(24.0).strong());
+                    ui.label(format!(
+                        "Hold {}, move east until the live percentage reads 25%, then release.",
+                        binding_display(binding)
+                    ));
+                }
             }
         });
+        if self.protocol == StudyProtocol::DistanceComparison {
+            ui.add_space(16.0);
+            self.render_distance_result_rows(ui);
+        }
         ui.add_space(16.0);
         ui.weak("The next trial appears automatically after a valid attempt. A misplaced or incomplete attempt is retained but must be retried.");
     }
 
     fn render_results(&self, ui: &mut egui::Ui, event: &mut Option<StudyUiEvent>) {
+        if self.protocol == StudyProtocol::DistanceComparison {
+            self.render_distance_results(ui, event);
+            return;
+        }
         let summary = summarize_attempts(&self.attempts);
         ui.heading("Study complete");
         ui.label("Thank you. The configured actions were never available to this study.");
@@ -666,6 +803,74 @@ impl StudyState {
             }
         });
     }
+
+    fn render_distance_result_rows(&self, ui: &mut egui::Ui) {
+        let accepted: Vec<_> = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.phase == StudyPhase::DistanceComparison && attempt.accepted)
+            .collect();
+        if accepted.is_empty() {
+            return;
+        }
+        ui.label(RichText::new("Measured so far").strong());
+        egui::Grid::new("continuous-distance-results").num_columns(3).spacing([24.0, 6.0]).show(
+            ui,
+            |ui| {
+                ui.strong("100% distance");
+                ui.strong("Measured");
+                ui.strong("Error from 25%");
+                ui.end_row();
+                for attempt in accepted {
+                    ui.label(format!("{} DIP", attempt.requested_full_scale_radius_dip));
+                    ui.label(format_optional_percent(attempt.observed_value));
+                    ui.label(format_optional_percent(attempt.absolute_scalar_error));
+                    ui.end_row();
+                }
+            },
+        );
+    }
+
+    fn render_distance_results(&self, ui: &mut egui::Ui, event: &mut Option<StudyUiEvent>) {
+        ui.heading("Comparison complete");
+        ui.label("All four attempts used the same direction and 25% target.");
+        ui.add_space(14.0);
+        self.render_distance_result_rows(ui);
+        ui.add_space(18.0);
+        if self.preferred_full_scale_radius_dip.is_none() {
+            ui.label(RichText::new("Which distance felt best?").size(18.0).strong());
+            ui.horizontal_wrapped(|ui| {
+                for candidate in DISTANCE_CANDIDATES_DIP {
+                    if ui.button(format!("{candidate} DIP")).clicked() {
+                        *event = Some(StudyUiEvent::ChooseDistance(candidate));
+                    }
+                }
+            });
+        } else if let Some(path) = &self.report_path {
+            ui.label(
+                RichText::new(format!(
+                    "Preferred distance: {} DIP",
+                    self.preferred_full_scale_radius_dip.unwrap_or_default()
+                ))
+                .strong(),
+            );
+            ui.label("Comparison report saved locally:");
+            ui.monospace(path.display().to_string());
+        } else if self.export_pending {
+            ui.label("Saving the comparison report…");
+        } else {
+            ui.colored_label(Color32::from_rgb(239, 113, 113), "The report could not be saved.");
+            if ui.button("Retry export").clicked() {
+                *event = Some(StudyUiEvent::RetryExport);
+            }
+        }
+        ui.add_space(18.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Close comparison").clicked() {
+                *event = Some(StudyUiEvent::Close);
+            }
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -681,13 +886,14 @@ pub(crate) struct ContinuousStudy {
 impl ContinuousStudy {
     pub(crate) fn new(
         enabled: bool,
+        distance_comparison: bool,
         binding: ActivationBinding,
         report_directory: PathBuf,
     ) -> Self {
         let (sender, observations) = bounded(STUDY_EVENT_CAPACITY);
         let current = Arc::new(Mutex::new(None));
         Self {
-            state: Arc::new(Mutex::new(StudyState::new(enabled))),
+            state: Arc::new(Mutex::new(StudyState::new(enabled, distance_comparison))),
             current: Arc::clone(&current),
             observations,
             sink: ContinuousStudySink { current, sender },
@@ -731,6 +937,15 @@ impl ContinuousStudy {
                 self.state().export_pending = true;
                 changed = true;
             }
+            Some(StudyUiEvent::ChooseDistance(candidate)) => {
+                if DISTANCE_CANDIDATES_DIP.contains(&candidate) {
+                    let mut state = self.state();
+                    state.preferred_full_scale_radius_dip = Some(candidate);
+                    state.export_pending = true;
+                    state.feedback = None;
+                    changed = true;
+                }
+            }
             Some(StudyUiEvent::Close) => {
                 self.state().stage = StudyStage::Closed;
                 self.set_current(None);
@@ -757,9 +972,10 @@ impl ContinuousStudy {
         }
         let state = Arc::clone(&self.state);
         let binding = self.binding;
+        let protocol = self.state().protocol;
         context.show_viewport_deferred(
             study_viewport_id(),
-            study_viewport_builder(),
+            study_viewport_builder(protocol),
             move |ui, viewport_class| {
                 if viewport_class == ViewportClass::EmbeddedWindow {
                     log::error!(
@@ -782,6 +998,7 @@ impl ContinuousStudy {
         let setup = self.state().current_trial().map(|trial| StudyInvocationSetup {
             trial_id: trial.id,
             menu: Arc::new(study_menu(trial)),
+            full_scale_radius_dip: f64::from(trial.full_scale_radius_dip),
         });
         self.set_current(setup);
     }
@@ -791,8 +1008,43 @@ impl ContinuousStudy {
     }
 
     fn export_report(&self) {
-        let report = self.state().report();
-        match write_report(&self.report_directory, &report) {
+        let protocol = self.state().protocol;
+        let (result, schema_version, session_id) = match protocol {
+            StudyProtocol::Usability => {
+                let report = self.state().report();
+                (
+                    write_report(
+                        &self.report_directory,
+                        "continuous-study",
+                        report.session_id,
+                        &report,
+                    ),
+                    STUDY_SCHEMA_VERSION,
+                    report.session_id,
+                )
+            }
+            StudyProtocol::DistanceComparison => {
+                let report = self.state().distance_report();
+                match report {
+                    Some(report) => (
+                        write_report(
+                            &self.report_directory,
+                            "continuous-distance-study",
+                            report.session_id,
+                            &report,
+                        ),
+                        DISTANCE_STUDY_SCHEMA_VERSION,
+                        report.session_id,
+                    ),
+                    None => (
+                        Err(anyhow::anyhow!("a preferred distance has not been selected")),
+                        DISTANCE_STUDY_SCHEMA_VERSION,
+                        self.state().session_id,
+                    ),
+                }
+            }
+        };
+        match result {
             Ok(path) => {
                 let mut state = self.state();
                 state.report_path = Some(path);
@@ -801,9 +1053,8 @@ impl ContinuousStudy {
                 log::info!(
                     target: "study",
                     "component=continuous_study event_code=study_report_saved result_code=ok \
-                     config_revision=0 schema_version={STUDY_SCHEMA_VERSION} session_id={} \
-                     participant_identity_collected=false",
-                    report.session_id
+                     config_revision=0 schema_version={schema_version} session_id={session_id} \
+                     protocol={protocol:?} participant_identity_collected=false"
                 );
             }
             Err(error) => {
@@ -840,6 +1091,7 @@ fn study_plan() -> Vec<StudyTrial> {
             change_from_index: None,
             change_after_arm: false,
             placement: StudyPlacement::Center,
+            full_scale_radius_dip: 160,
         });
         next_id += 1;
     }
@@ -864,6 +1116,7 @@ fn study_plan() -> Vec<StudyTrial> {
                     change_from_index: None,
                     change_after_arm: false,
                     placement,
+                    full_scale_radius_dip: 160,
                 });
                 next_id += 1;
             }
@@ -881,6 +1134,7 @@ fn study_plan() -> Vec<StudyTrial> {
             change_from_index: Some(initial_direction),
             change_after_arm,
             placement: StudyPlacement::Center,
+            full_scale_radius_dip: 160,
         });
         next_id += 1;
     }
@@ -893,14 +1147,38 @@ fn study_plan() -> Vec<StudyTrial> {
         change_from_index: None,
         change_after_arm: false,
         placement: StudyPlacement::Center,
+        full_scale_radius_dip: 160,
     });
     trials
+}
+
+fn distance_study_plan() -> Vec<StudyTrial> {
+    DISTANCE_CANDIDATES_DIP
+        .into_iter()
+        .enumerate()
+        .map(|(index, full_scale_radius_dip)| StudyTrial {
+            id: u32::try_from(index + 1).expect("four distance candidates fit u32"),
+            phase: StudyPhase::DistanceComparison,
+            slices: SliceCount::Eight,
+            target_percent: Some(DISTANCE_TARGET_PERCENT),
+            direction_index: 2,
+            change_from_index: None,
+            change_after_arm: false,
+            placement: StudyPlacement::Center,
+            full_scale_radius_dip,
+        })
+        .collect()
 }
 
 fn study_menu(trial: &StudyTrial) -> ResolvedMenu {
     let count = usize::from(slice_count_value(trial.slices));
     let labels: Arc<[String]> = (0..count)
         .map(|index| match trial.target_percent {
+            Some(target) if trial.phase == StudyPhase::DistanceComparison => format!(
+                "{} · {target}% · {} DIP",
+                direction_label(trial.slices, index),
+                trial.full_scale_radius_dip
+            ),
             Some(target) => format!("{} · {target}%", direction_label(trial.slices, index)),
             None => direction_label(trial.slices, index).to_owned(),
         })
@@ -1041,10 +1319,15 @@ fn classify_placement(cursor: ScreenPoint, work_area: ScreenRect, dpi: u32) -> S
     }
 }
 
-fn write_report(directory: &Path, report: &StudyReport) -> Result<PathBuf> {
+fn write_report<T: Serialize>(
+    directory: &Path,
+    prefix: &str,
+    session_id: Uuid,
+    report: &T,
+) -> Result<PathBuf> {
     fs::create_dir_all(directory).context("could not create the study-report directory")?;
-    let destination = directory.join(format!("continuous-study-{}.json", report.session_id));
-    let temporary = directory.join(format!(".continuous-study-{}.tmp", report.session_id));
+    let destination = directory.join(format!("{prefix}-{session_id}.json"));
+    let temporary = directory.join(format!(".{prefix}-{session_id}.tmp"));
     if destination.exists() || temporary.exists() {
         bail!("the anonymous study report already exists");
     }
@@ -1081,6 +1364,20 @@ fn write_report(directory: &Path, report: &StudyReport) -> Result<PathBuf> {
 
 fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+const fn study_privacy() -> StudyPrivacy {
+    StudyPrivacy {
+        identity: "random_session_id_only",
+        excluded_data: [
+            "participant_name",
+            "raw_cursor_coordinates",
+            "application_identity",
+            "file_paths",
+            "window_details",
+            "monitor_device_names",
+        ],
+    }
 }
 
 fn direction_label(slices: SliceCount, index: usize) -> &'static str {
@@ -1142,10 +1439,10 @@ pub(crate) fn study_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("gradial-continuous-study")
 }
 
-fn study_viewport_builder() -> ViewportBuilder {
+fn study_viewport_builder(protocol: StudyProtocol) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_app_id("gradial-continuous-study")
-        .with_title("Gradial continuous-input study")
+        .with_title(protocol.heading())
         .with_inner_size(STUDY_SIZE)
         .with_min_inner_size(STUDY_MIN_SIZE)
         .with_resizable(true)
@@ -1162,8 +1459,9 @@ mod tests {
     use gradial_core::{CancelReason, ScreenPoint, ScreenRect, SliceCount};
 
     use super::{
-        StudyAttemptRecord, StudyObservation, StudyPhase, StudyPlacement, StudyTerminal,
-        classify_placement, study_plan, summarize_attempts, write_report,
+        DISTANCE_CANDIDATES_DIP, DISTANCE_TARGET_PERCENT, StudyAttemptRecord, StudyObservation,
+        StudyPhase, StudyPlacement, StudyTerminal, classify_placement, distance_study_plan,
+        study_plan, summarize_attempts, write_report,
     };
 
     fn observation(
@@ -1290,7 +1588,7 @@ mod tests {
 
     #[test]
     fn complete_guided_session_advances_every_trial_and_builds_a_complete_report() {
-        let mut state = super::StudyState::new(true);
+        let mut state = super::StudyState::new(true, false);
         state.start();
         let plan = state.plan.clone();
         for trial in &plan {
@@ -1308,6 +1606,7 @@ mod tests {
                 StudyPhase::Cancellation => {
                     StudyTerminal::Cancelled { reason: CancelReason::NoSelection }
                 }
+                StudyPhase::DistanceComparison => unreachable!("usability plan has no comparison"),
             };
             state.record(observation(trial.id, trial.placement, terminal));
         }
@@ -1323,11 +1622,53 @@ mod tests {
     }
 
     #[test]
+    fn distance_comparison_freezes_four_endpoints_and_requires_a_preference() {
+        let plan = distance_study_plan();
+        assert_eq!(plan.len(), DISTANCE_CANDIDATES_DIP.len());
+        assert_eq!(
+            plan.iter().map(|trial| trial.full_scale_radius_dip).collect::<Vec<_>>(),
+            DISTANCE_CANDIDATES_DIP
+        );
+        assert!(plan.iter().all(|trial| {
+            trial.phase == StudyPhase::DistanceComparison
+                && trial.slices == SliceCount::Eight
+                && trial.direction_index == 2
+                && trial.target_percent == Some(DISTANCE_TARGET_PERCENT)
+                && trial.placement == StudyPlacement::Center
+        }));
+
+        let mut state = super::StudyState::new(true, true);
+        state.start();
+        for (index, trial) in plan.iter().enumerate() {
+            state.record(observation(
+                trial.id,
+                StudyPlacement::Center,
+                StudyTerminal::Committed {
+                    slice_index: 2,
+                    value: 0.25 + f64::from(u32::try_from(index).expect("small index")) / 100.0,
+                },
+            ));
+        }
+        assert_eq!(state.stage, super::StudyStage::Results);
+        assert!(!state.export_pending, "preference must be chosen before export");
+        assert!(state.distance_report().is_none());
+
+        state.preferred_full_scale_radius_dip = Some(250);
+        let report = state.distance_report().expect("distance report");
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.results.len(), 4);
+        assert_eq!(report.preferred_full_scale_radius_dip, 250);
+        assert_eq!(report.results[0].full_scale_radius_dip, 160);
+        assert!((report.results[3].observed_value - 0.28).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn report_is_atomic_and_contains_no_identity_or_raw_position_fields() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let state = super::StudyState::new(true);
+        let state = super::StudyState::new(true, false);
         let report = state.report();
-        let path = write_report(directory.path(), &report).expect("study report");
+        let path = write_report(directory.path(), "continuous-study", report.session_id, &report)
+            .expect("study report");
         let json = fs::read_to_string(path).expect("report JSON");
         for prohibited in [
             "participant_name_collected",
