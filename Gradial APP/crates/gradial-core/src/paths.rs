@@ -21,6 +21,7 @@ pub struct AppPaths {
     pub continuous_studies: PathBuf,
     pub icons: PathBuf,
     pub logs: PathBuf,
+    pub plugins: PathBuf,
 }
 
 impl AppPaths {
@@ -49,6 +50,7 @@ impl AppPaths {
             continuous_studies: root.join("continuous-studies"),
             icons: root.join("icons"),
             logs: root.join("logs"),
+            plugins: root.join("plugins"),
             root,
         }
     }
@@ -65,6 +67,7 @@ impl AppPaths {
         create_directory(&self.icons)?;
         create_directory(&self.logs)?;
         create_directory(&self.continuous_studies)?;
+        create_directory(&self.plugins)?;
         Ok(())
     }
 }
@@ -92,7 +95,7 @@ mod tests {
     use super::AppPaths;
 
     #[test]
-    fn layout_matches_the_v02_plan() {
+    fn layout_matches_the_current_plan() {
         let paths = AppPaths::from_local_app_data(r"C:\Users\Test\AppData\Local");
 
         assert_eq!(paths.root, std::path::PathBuf::from(r"C:\Users\Test\AppData\Local\Gradial"));
@@ -104,6 +107,7 @@ mod tests {
         assert_eq!(paths.continuous_studies, paths.root.join("continuous-studies"));
         assert_eq!(paths.icons, paths.root.join("icons"));
         assert_eq!(paths.logs, paths.root.join("logs"));
+        assert_eq!(paths.plugins, paths.root.join("plugins"));
     }
 
     #[test]
@@ -118,6 +122,7 @@ mod tests {
         assert!(paths.icons.is_dir());
         assert!(paths.logs.is_dir());
         assert!(paths.continuous_studies.is_dir());
+        assert!(paths.plugins.is_dir());
         assert!(!paths.config.exists());
     }
 }

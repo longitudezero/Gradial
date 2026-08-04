@@ -17,6 +17,7 @@ mod onboarding;
 mod options;
 mod overlay;
 mod platform;
+mod plugin_discovery;
 mod process_launch;
 mod settings;
 mod shell_open;
@@ -32,6 +33,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use gradial_core::AppPaths;
 
+fn log_startup_begin(paths: &AppPaths) {
+    log::info!(
+        target: "startup",
+        "component=app event_code=startup_begin result_code=ok config_revision=0"
+    );
+    plugin_discovery::discover_and_log(&paths.plugins);
+}
+
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.iter().any(|argument| matches!(argument.as_str(), "--help" | "-h")) {
@@ -46,10 +55,7 @@ fn main() -> Result<()> {
 
     let logger =
         diagnostics::initialize(&paths.logs).context("could not initialize local logging")?;
-    log::info!(
-        target: "startup",
-        "component=app event_code=startup_begin result_code=ok config_revision=0"
-    );
+    log_startup_begin(&paths);
     let loaded_configuration = configuration::ConfigStore::new(paths.clone())
         .load_or_initialize()
         .context("could not load Gradial configuration")?;

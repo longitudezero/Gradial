@@ -6,6 +6,7 @@ pub mod continuous;
 pub mod geometry;
 pub mod interaction;
 pub mod paths;
+pub mod plugins;
 pub mod profiles;
 
 pub use actions::{
@@ -44,6 +45,12 @@ pub use interaction::{
     slice_for_delta,
 };
 pub use paths::{AppPaths, AppPathsError};
+pub use plugins::{
+    MAX_PLUGIN_ACTIONS, MAX_PLUGIN_MANIFEST_BYTES, MAX_PLUGIN_PARAMETERS_PER_ACTION,
+    PLUGIN_API_VERSION, PLUGIN_MANIFEST_VERSION, PluginActionKind, PluginManifest,
+    PluginManifestAction, PluginManifestError, PluginParameterDefinition, PluginPermission,
+    parse_plugin_manifest,
+};
 pub use profiles::{
     ProfileMatch, ProfileResolution, ProfileResolver, ProfileTarget, ResolutionDecision,
     ResolvedMenu,

@@ -734,6 +734,41 @@ reports only after a preference is chosen. The report uses the same privacy
 exclusions, but it is deliberately ignored by
 `summarize-continuous-study.ps1` and does not modify production configuration.
 
+## Read-only plugin discovery
+
+Startup creates and scans `%LOCALAPPDATA%\Gradial\plugins` after local logging
+is available and before application services start. Discovery does not load
+Lua, approve permissions, enable a package, mutate plugin files, or connect a
+manifest action to the continuous coordinator.
+
+Each package must be one directory immediately below the plugin root. Its
+directory name must exactly equal the validated manifest ID. The manifest is
+bounded to 64 KiB and uses a closed TOML schema: unknown fields, permissions,
+action kinds, or parameter shapes fail that package. Manifest version 1 is
+required; a different plugin API version remains structurally valid and is
+reported as incompatible. Semantic plugin versions, unique IDs and
+permissions, 10–60 Hz continuous update rates, and boolean/integer/number/
+string/choice parameter constraints are validated without source execution.
+
+Filesystem inspection canonicalizes the owned plugin root and each immediate
+package. Absolute/traversing entry paths, alternate-stream syntax, paths that
+leave the package, symlinks, junctions, other reparse points, native modules,
+and Lua bytecode are rejected. Every `.lua` source must be UTF-8 and at most
+256 KiB; a package may contain at most 256 source files and 1 MiB of Lua source
+in total. Discovery also bounds the managed root to 1,024 entries, one package
+to 4,096 filesystem entries, and package nesting to 32 directories. Files are
+opened through bounded reads so a concurrent size change cannot turn metadata
+validation into an unbounded allocation. Non-source documentation/assets are
+inspected as inert files and are never candidates for the future module loader.
+
+Discovery returns a deterministic package-name-sorted report. Status is
+isolated per directory (`Compatible`, `IncompatibleApi`, or `Invalid`) with a
+stable non-content error code; a bad package cannot abort or hide later
+packages. Routine logs include only sanitized package/plugin identity, version,
+status, source counts, byte counts, and error codes—never TOML or Lua source.
+The later enablement slice must repeat complete validation before creating a
+Lua state, rather than treating this startup report as authorization.
+
 ## Configuration and profile resolution
 
 The configuration model contains one global profile and zero or more

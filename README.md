@@ -347,8 +347,19 @@ an extension is deliberately unavailable in this build: the wedge remains an
 ordinary discrete wedge at every radius, and release still uses only its
 discrete action. Settings retains these portable definitions, shows their
 identity read-only in the action catalog, and excludes them from discrete
-assignment and sequences. Plugin discovery, enablement, execution, and the
-continuous-assignment editor arrive in later v0.3 milestones.
+assignment and sequences.
+
+Startup now performs read-only discovery below
+`%LOCALAPPDATA%\Gradial\plugins`. A strict `plugin.toml` declares identity,
+version, API, entry source, permissions, continuous actions, and bounded
+parameters. Each immediate package directory is independently classified as
+compatible, API-incompatible, or invalid; one malformed package cannot hide a
+healthy one. Discovery canonicalizes every package/source path, rejects
+reparse points and native or bytecode modules, accepts only bounded UTF-8 Lua
+source, and never executes it. There is intentionally no enable switch, Lua
+runtime, permission approval, Settings plugin page, or continuous-assignment
+editor in this slice.
+
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
 current Windows account, so it does not require administrator access. Gradial reports
@@ -443,6 +454,8 @@ bridge, and schema-six configuration evidence are recorded in
 [`Documentation/milestone-1-continuous-live-bridge-results.md`](Documentation/milestone-1-continuous-live-bridge-results.md),
 and
 [`Documentation/milestone-1-schema-six-results.md`](Documentation/milestone-1-schema-six-results.md).
+Read-only plugin manifest and package-discovery evidence is recorded in
+[`Documentation/milestone-2-plugin-discovery-results.md`](Documentation/milestone-2-plugin-discovery-results.md).
 Configuration, snapshot, persistence, and resolver results are recorded in
 [`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).
 Profile-driven gesture and renderer results are recorded in
