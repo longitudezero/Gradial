@@ -154,6 +154,12 @@ at every distance, which suits commands such as Copy or Open. A separate
 global **Continuous travel** control will default to 300 DIP and allow exact
 values from 160 through 400.
 
+The first v0.3 Milestone 1 core is also present but is not connected to actions
+yet. It defines a runtime-neutral, version-one Begin/Update/Commit/Cancel
+lifecycle with a single latest-value slot, 10–60 Hz cadence, strictly
+increasing samples, exact terminal ordering, and permission-filtered owned
+context. It performs no Lua or operating-system work.
+
 High-polling mice do not enqueue a render/log operation for every physical
 sample. Gradial still evaluates every sample for live direction and radius,
 but each input-queue drain publishes only its newest continuous

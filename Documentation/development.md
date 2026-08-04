@@ -122,6 +122,10 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   center/edge/corner validation, anonymous atomic JSON reports, and a cohort
   summarizer that applies the Section 11.3 gates only with at least eight
   complete reports.
+- A runtime-neutral continuous protocol core with version-one
+  Begin/Update/Commit/Cancel requests, owned permission-filtered snapshots,
+  10–60 Hz latest-value coalescing, sequence-gap visibility, and deterministic
+  pending-Begin terminal ordering. It has no Lua or operating-system effects.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -498,6 +502,36 @@ never opens a plugin session; release still dispatches its discrete action if
 one is assigned. Checking it reveals a required compatible continuous-plugin
 action. This control is documented now but is intentionally absent from the
 schema-five editor until the plugin action type exists.
+
+### Runtime-neutral continuous protocol core
+
+`gradial-core::continuous` defines API version 1 without depending on Lua or a
+Windows backend. A `ContinuousActionSnapshot` owns the validated plugin/action
+IDs, generic parameter values, permission-filtered context, and requested
+update rate. The permitted context can contain only an executable path/window
+class pair and an optional window title; it has no PID, HWND, process handle,
+screen coordinate, or mutable invocation reference.
+
+`ContinuousSession::begin` creates a fresh segment and its only `Begin`
+request. Its initial sample is sequence zero. Every observed scalar allocates a
+strictly increasing sequence number, but the session retains only the latest
+undelivered ordinary sample. Consequently, a slow adapter sees sequence gaps
+instead of an unbounded queue. Delivered `delta` is always relative to the
+previously delivered value, and elapsed time begins when the adapter accepts
+`Begin`. Backward observation timestamps fail closed.
+
+The session accepts only finite inclusive `0.0..=1.0` values and 10–60 Hz
+cadences. `Commit` always allocates and preserves an exact final sample even if
+an ordinary update is pending. `Cancel` discards ordinary pending work. Either
+terminal decision is exactly once, and no update can be taken afterward.
+When release or cancellation wins a race with a pending `Begin`, the decision
+waits: acceptance returns the terminal request immediately after `Begin`,
+while rejection closes the session without a terminal plugin callback.
+
+This slice deliberately does not connect the session to the gesture thread,
+action coordinator, configuration, or a plugin worker. Those boundaries need
+the coordinator lease and fake backend so their handoff and failure behavior
+can be tested together rather than hidden behind a placeholder callback.
 
 ### Continuous usability study
 

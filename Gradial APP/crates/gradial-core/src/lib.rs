@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod configuration;
+pub mod continuous;
 pub mod geometry;
 pub mod interaction;
 pub mod paths;
@@ -18,6 +19,15 @@ pub use configuration::{
     APPEARANCE_CONFIG_SCHEMA_VERSION, AccentColor, Appearance, ApplicationProfile,
     CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError, IconFormat, IconReference,
     LEGACY_CONFIG_SCHEMA_VERSION, LabelTheme, Menu, MenuSlice, Profile, ProfileRule, SizePreset,
+};
+pub use continuous::{
+    CONTINUOUS_API_VERSION, ContinuousActionSnapshot, ContinuousBeginRequest,
+    ContinuousCancelReason, ContinuousCancelRequest, ContinuousCommitRequest,
+    ContinuousIdentifierKind, ContinuousProtocolError, ContinuousRequest, ContinuousSample,
+    ContinuousSession, ContinuousSessionState, ContinuousSessionTerminal, ContinuousUpdateRequest,
+    DEFAULT_CONTINUOUS_UPDATE_HZ, MAX_CONTINUOUS_IDENTIFIER_BYTES, MAX_CONTINUOUS_UPDATE_HZ,
+    MIN_CONTINUOUS_UPDATE_HZ, PermittedApplicationContext, PermittedContext, PluginActionId,
+    PluginId, PluginParameters, PluginValue,
 };
 pub use geometry::{Point, SliceCount};
 pub use interaction::{
