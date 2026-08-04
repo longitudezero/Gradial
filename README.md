@@ -154,18 +154,22 @@ at every distance, which suits commands such as Copy or Open. A separate
 global **Continuous travel** control will default to 300 DIP and allow exact
 values from 160 through 400.
 
-The first v0.3 Milestone 1 core is also present but is not connected to actions
-yet. It defines a runtime-neutral, version-one Begin/Update/Commit/Cancel
-lifecycle with a single latest-value slot, 10–60 Hz cadence, strictly
-increasing samples, exact terminal ordering, and permission-filtered owned
-context. It performs no Lua or operating-system work.
+The v0.3 Milestone 1 core defines a runtime-neutral, version-one
+Begin/Update/Commit/Cancel lifecycle with a single latest-value slot, 10–60 Hz
+cadence, strictly increasing samples, exact terminal ordering, and
+permission-filtered owned context. It performs no Lua or operating-system
+work.
 
 A staged asynchronous executor now proves the next internal boundary. It uses
 the same single-action lease as ordinary shortcuts, keeps that lease across
 direction handoffs, separates terminal controls from its one-value update
 slot, enforces the planned callback deadlines, and is tested with a fake
-accept/reject/stall/fault backend. It is not started by normal Gradial sessions
-until live gesture and schema-six action integration are implemented.
+accept/reject/stall/fault backend. The live gesture bridge now starts this
+worker only for the debug inert meter and its studies. It sends the exact
+displayed scalar, suspends without losing the held lease when the pointer
+returns inside, resumes on any unlocked wedge, and validates the captured
+target before `Begin` and while active. Normal configured menus still start no
+continuous worker until schema-six action assignments are implemented.
 
 High-polling mice do not enqueue a render/log operation for every physical
 sample. Gradial still evaluates every sample for live direction and radius,

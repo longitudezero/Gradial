@@ -95,11 +95,8 @@ timing races before the full workspace gates.
 - The nine focused asynchronous coordinator tests passed in ten consecutive
   serial runs.
 
-## Deferred boundary
+## Follow-on boundary
 
-The next slice should adapt live gesture effects to this worker using an inert
-continuous action snapshot. That integration must derive segment handoffs from
-the current unlocked wedge, publish the same scalar shown by the renderer,
-retain discrete release after inward reversal, and validate target freshness
-before `Begin` and while active. It should still use the fake backend; Lua and
-schema six remain later work.
+The live gesture boundary described here was completed in the next bounded
+slice. See [Milestone 1 live continuous bridge results](milestone-1-continuous-live-bridge-results.md).
+Lua and schema six remain later work.

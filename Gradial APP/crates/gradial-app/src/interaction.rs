@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,16 +14,22 @@ use std::sync::atomic::AtomicU8;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
-    ActionPlanCompiler, ActionResult, CancelReason, ContinuousSliceMask, ContinuousVisualState,
+    ActionPlanCompiler, ActionResult, CancelReason, ContinuousActionSnapshot,
+    ContinuousCancelReason, ContinuousSliceMask, ContinuousVisualState,
     DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP, ExecutionPlan, GestureConfig, InputEvent,
     InputEventKind, InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
-    InvocationSnapshot, ProfileResolver, ProfileTarget, ResolvedMenu, monitor_index_for_point,
+    InvocationSnapshot, MAX_CONTINUOUS_UPDATE_HZ, PermittedContext, PluginActionId, PluginId,
+    ProfileResolver, ProfileTarget, ResolvedMenu, monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use crate::{
     action_executor::{ActionDispatch, ActionExecutorHandle},
+    continuous_executor::{
+        ContinuousCompletion, ContinuousCompletionOutcome, ContinuousInvocation,
+        ContinuousSubmitError, ValidatingInertBackend,
+    },
     continuous_study::ContinuousStudySink,
     diagnostics::TimingMarkers,
     input::{HookThread, HookThreadMetrics, InputConfiguration},
@@ -141,6 +148,30 @@ struct ActiveInvocation {
     continuous_meter: bool,
     continuous_full_scale_radius_dip: Option<f64>,
     study_trial_id: Option<u32>,
+    live_continuous: Option<LiveContinuousInvocation>,
+    continuous_unavailable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveContinuousPhase {
+    Active { slice_index: usize },
+    Inactive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveContinuousChange {
+    None,
+    Start,
+    Publish,
+    Handoff,
+    Suspend,
+    Resume,
+}
+
+#[derive(Debug)]
+struct LiveContinuousInvocation {
+    invocation: ContinuousInvocation,
+    phase: LiveContinuousPhase,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +183,7 @@ struct DebugInteractionOptions<'a> {
 
 impl ActiveInvocation {
     fn clear(&mut self) {
+        self.live_continuous = None;
         self.snapshot = None;
         self.profile_id = None;
         self.menu = None;
@@ -162,6 +194,7 @@ impl ActiveInvocation {
         self.continuous_meter = false;
         self.continuous_full_scale_radius_dip = None;
         self.study_trial_id = None;
+        self.continuous_unavailable = false;
     }
 }
 
@@ -430,7 +463,7 @@ fn run_interaction_thread(
         if simulated_failure == 2 || metrics.queue_overflow.swap(false, Ordering::AcqRel) {
             accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::InputQueueOverflow) {
-                dispatch_effect(effect, query_qpc(), &active, &dispatcher);
+                dispatch_effect(effect, query_qpc(), &mut active, &dispatcher);
             }
             if continuous_batch.reset() {
                 counters.continuous_updates_coalesced =
@@ -457,7 +490,7 @@ fn run_interaction_thread(
         {
             accepting_input.store(false, Ordering::Release);
             if let Some(effect) = controller.fault(CancelReason::HookUnresponsive) {
-                dispatch_effect(effect, now, &active, &dispatcher);
+                dispatch_effect(effect, now, &mut active, &dispatcher);
             }
             if continuous_batch.reset() {
                 counters.continuous_updates_coalesced =
@@ -500,7 +533,7 @@ fn run_interaction_thread(
                         if continuous_batch.pending_is_transition() {
                             dispatch_pending_continuous(
                                 &mut continuous_batch,
-                                &active,
+                                &mut active,
                                 &dispatcher,
                                 &mut counters,
                                 false,
@@ -512,17 +545,17 @@ fn run_interaction_thread(
                             counters.continuous_updates_coalesced =
                                 counters.continuous_updates_coalesced.saturating_add(1);
                         }
-                        dispatch_effect(effect, source_qpc, &active, &dispatcher);
+                        dispatch_effect(effect, source_qpc, &mut active, &dispatcher);
                     }
                     _ => {
                         dispatch_pending_continuous(
                             &mut continuous_batch,
-                            &active,
+                            &mut active,
                             &dispatcher,
                             &mut counters,
                             true,
                         );
-                        dispatch_effect(effect, source_qpc, &active, &dispatcher);
+                        dispatch_effect(effect, source_qpc, &mut active, &dispatcher);
                     }
                 }
             }
@@ -536,7 +569,7 @@ fn run_interaction_thread(
         }
         dispatch_pending_continuous(
             &mut continuous_batch,
-            &active,
+            &mut active,
             &dispatcher,
             &mut counters,
             false,
@@ -547,9 +580,15 @@ fn run_interaction_thread(
         }
     }
 
-    dispatch_pending_continuous(&mut continuous_batch, &active, &dispatcher, &mut counters, true);
+    dispatch_pending_continuous(
+        &mut continuous_batch,
+        &mut active,
+        &dispatcher,
+        &mut counters,
+        true,
+    );
     if let Some(effect) = controller.fault(CancelReason::Shutdown) {
-        dispatch_effect(effect, query_qpc(), &active, &dispatcher);
+        dispatch_effect(effect, query_qpc(), &mut active, &dispatcher);
     }
     log_interaction_stopped(&counters, config_revision);
 }
@@ -575,7 +614,7 @@ fn log_interaction_stopped(counters: &EventCounters, config_revision: u64) {
 
 fn dispatch_pending_continuous(
     batch: &mut ContinuousUpdateBatch,
-    active: &ActiveInvocation,
+    active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
     counters: &mut EventCounters,
     force: bool,
@@ -874,7 +913,7 @@ fn route_for_point(point: gradial_core::ScreenPoint, routes: &[OverlayRoute]) ->
 fn dispatch_continuous_effect(
     update: PendingContinuousUpdate,
     transition: bool,
-    active: &ActiveInvocation,
+    active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
 ) {
     let Some((_, route)) =
@@ -882,6 +921,7 @@ fn dispatch_continuous_effect(
     else {
         return;
     };
+    update_live_continuous(update.invocation_id, update.visual, active, dispatcher);
     dispatch_continuous_changed(
         update.invocation_id,
         update.visual,
@@ -896,14 +936,9 @@ fn dispatch_continuous_effect(
 fn dispatch_effect(
     effect: InteractionEffect,
     source_qpc: i64,
-    active: &ActiveInvocation,
+    active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
 ) {
-    let active_snapshot = active.snapshot.as_ref();
-    let active_profile_id = active.profile_id;
-    let active_menu = active.menu.as_ref();
-    let continuous_meter = active.continuous_meter;
-    let continuous_full_scale_radius_dip = active.continuous_full_scale_radius_dip;
     let Some((route_index, route)) =
         active_overlay_route(active.route, dispatcher.routes, dispatcher.config_revision)
     else {
@@ -915,11 +950,11 @@ fn dispatch_effect(
             dispatch_open(
                 invocation_id,
                 source_qpc,
-                active_snapshot,
-                active_profile_id,
-                active_menu,
-                continuous_meter,
-                continuous_full_scale_radius_dip,
+                active.snapshot.as_ref(),
+                active.profile_id,
+                active.menu.as_ref(),
+                active.continuous_meter,
+                active.continuous_full_scale_radius_dip,
                 route_index,
                 route,
                 dispatcher,
@@ -930,21 +965,23 @@ fn dispatch_effect(
             }
         }
         InteractionEffect::SelectionChanged { invocation_id, selected_slice } => {
+            suspend_live_continuous(active, ContinuousCancelReason::ReturnedToDiscrete, dispatcher);
             dispatch_selection_changed(
                 invocation_id,
                 selected_slice,
                 source_qpc,
-                active_snapshot,
+                active.snapshot.as_ref(),
                 route,
                 dispatcher,
             );
         }
         InteractionEffect::ContinuousChanged { invocation_id, visual } => {
+            update_live_continuous(invocation_id, visual, active, dispatcher);
             dispatch_continuous_changed(
                 invocation_id,
                 visual,
                 source_qpc,
-                active_snapshot,
+                active.snapshot.as_ref(),
                 route,
                 dispatcher,
                 true,
@@ -956,14 +993,330 @@ fn dispatch_effect(
     }
 }
 
+fn update_live_continuous(
+    invocation_id: uuid::Uuid,
+    visual: ContinuousVisualState,
+    active: &mut ActiveInvocation,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    reap_live_continuous(active, dispatcher.config_revision);
+    if !active.continuous_meter || active.continuous_unavailable {
+        return;
+    }
+    let phase = active.live_continuous.as_ref().map(|live| live.phase);
+    let change = classify_live_continuous_change(phase, visual);
+    match change {
+        LiveContinuousChange::None => return,
+        LiveContinuousChange::Suspend => {
+            suspend_live_continuous(active, ContinuousCancelReason::ReturnedToDiscrete, dispatcher);
+            return;
+        }
+        LiveContinuousChange::Start
+        | LiveContinuousChange::Publish
+        | LiveContinuousChange::Handoff
+        | LiveContinuousChange::Resume => {}
+    }
+
+    let Some(invocation_snapshot) = active.snapshot.as_ref() else {
+        active.continuous_unavailable = true;
+        return;
+    };
+    let target = Arc::clone(&invocation_snapshot.context);
+    let config_revision = target.config_revision;
+    if change == LiveContinuousChange::Publish {
+        if let Some(live) = active.live_continuous.as_ref()
+            && let Err(error) = live.invocation.handle().publish(visual.selection.value)
+        {
+            log_continuous_submit_failure(invocation_id, config_revision, "value", error);
+        }
+        return;
+    }
+
+    let action_snapshot = match inert_action_snapshot(visual.selection.slice_index) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            active.continuous_unavailable = true;
+            log::error!(
+                target: "continuous",
+                "component=continuous event_code=inert_snapshot_failed result_code=failure \
+                 error_code=config_invalid config_revision={} invocation_id={invocation_id} \
+                 slice_index={} error={error}",
+                invocation_snapshot.context.config_revision,
+                visual.selection.slice_index
+            );
+            return;
+        }
+    };
+    if change == LiveContinuousChange::Start {
+        start_live_continuous(
+            invocation_id,
+            visual,
+            action_snapshot,
+            target,
+            config_revision,
+            active,
+            dispatcher,
+        );
+        return;
+    }
+    let submit_result =
+        match change {
+            LiveContinuousChange::Handoff => active.live_continuous.as_ref().map(|live| {
+                live.invocation.handle().handoff(action_snapshot, visual.selection.value)
+            }),
+            LiveContinuousChange::Resume => active.live_continuous.as_ref().map(|live| {
+                live.invocation.handle().resume(action_snapshot, visual.selection.value)
+            }),
+            LiveContinuousChange::None
+            | LiveContinuousChange::Start
+            | LiveContinuousChange::Publish
+            | LiveContinuousChange::Suspend => None,
+        };
+
+    let Some(submit_result) = submit_result else {
+        return;
+    };
+    match submit_result {
+        Ok(()) => {
+            if let Some(live) = active.live_continuous.as_mut() {
+                live.phase =
+                    LiveContinuousPhase::Active { slice_index: visual.selection.slice_index };
+            }
+        }
+        Err(error) => log_continuous_submit_failure(
+            invocation_id,
+            config_revision,
+            "value_or_direction",
+            error,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_live_continuous(
+    invocation_id: uuid::Uuid,
+    visual: ContinuousVisualState,
+    action_snapshot: ContinuousActionSnapshot,
+    target: Arc<gradial_core::InvocationContext>,
+    config_revision: u64,
+    active: &mut ActiveInvocation,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    let backend = ValidatingInertBackend::new(invocation_id, target);
+    match ContinuousInvocation::start(
+        dispatcher.action_executor,
+        invocation_id,
+        action_snapshot,
+        visual.selection.value,
+        backend,
+    ) {
+        Ok(invocation) => {
+            active.live_continuous = Some(LiveContinuousInvocation {
+                invocation,
+                phase: LiveContinuousPhase::Active { slice_index: visual.selection.slice_index },
+            });
+            log::info!(
+                target: "continuous",
+                "component=continuous event_code=inert_session_started result_code=ok \
+                 config_revision={config_revision} invocation_id={invocation_id} \
+                 slice_index={} normalized_value={:.6}",
+                visual.selection.slice_index,
+                visual.selection.value
+            );
+        }
+        Err(result) => {
+            active.continuous_unavailable = true;
+            log_continuous_start_rejection(invocation_id, config_revision, &result);
+        }
+    }
+}
+
+const fn classify_live_continuous_change(
+    phase: Option<LiveContinuousPhase>,
+    visual: ContinuousVisualState,
+) -> LiveContinuousChange {
+    if !visual.armed {
+        return match phase {
+            Some(LiveContinuousPhase::Active { .. }) => LiveContinuousChange::Suspend,
+            None | Some(LiveContinuousPhase::Inactive) => LiveContinuousChange::None,
+        };
+    }
+    match phase {
+        None => LiveContinuousChange::Start,
+        Some(LiveContinuousPhase::Inactive) => LiveContinuousChange::Resume,
+        Some(LiveContinuousPhase::Active { slice_index })
+            if slice_index == visual.selection.slice_index =>
+        {
+            LiveContinuousChange::Publish
+        }
+        Some(LiveContinuousPhase::Active { .. }) => LiveContinuousChange::Handoff,
+    }
+}
+
+fn suspend_live_continuous(
+    active: &mut ActiveInvocation,
+    reason: ContinuousCancelReason,
+    dispatcher: &EffectDispatcher<'_>,
+) {
+    reap_live_continuous(active, dispatcher.config_revision);
+    let Some(live) = active.live_continuous.as_mut() else {
+        return;
+    };
+    if live.phase == LiveContinuousPhase::Inactive {
+        return;
+    }
+    let handle = live.invocation.handle();
+    match handle.suspend(reason) {
+        Ok(()) => live.phase = LiveContinuousPhase::Inactive,
+        Err(error) => log_continuous_submit_failure(
+            active.snapshot.as_ref().map_or(uuid::Uuid::nil(), |snapshot| snapshot.invocation_id),
+            active
+                .snapshot
+                .as_ref()
+                .map_or(dispatcher.config_revision, |snapshot| snapshot.context.config_revision),
+            "suspend",
+            error,
+        ),
+    }
+}
+
+fn finalize_live_continuous(
+    outcome: InteractionOutcome,
+    active: &mut ActiveInvocation,
+    dispatcher: &EffectDispatcher<'_>,
+) -> bool {
+    reap_live_continuous(active, dispatcher.config_revision);
+    let Some(live) = active.live_continuous.as_ref() else {
+        return false;
+    };
+    let handle = live.invocation.handle();
+    let result = match outcome {
+        InteractionOutcome::ContinuousCommitted { value, .. } => handle.commit(value),
+        InteractionOutcome::Selected { .. } => {
+            match (active.execution_plan.as_ref(), active.snapshot.as_ref()) {
+                (Some(plan), Some(snapshot)) if !active.continuous_meter => {
+                    handle.finish_discrete(Arc::clone(plan), Arc::clone(&snapshot.context))
+                }
+                _ => handle.cancel(ContinuousCancelReason::ReturnedToDiscrete),
+            }
+        }
+        InteractionOutcome::Cancelled { reason } => handle.cancel(map_cancel_reason(reason)),
+    };
+    let transferred = matches!(outcome, InteractionOutcome::Selected { .. })
+        && active.execution_plan.is_some()
+        && !active.continuous_meter
+        && result.is_ok();
+    if let Err(error) = result {
+        let invocation_id =
+            active.snapshot.as_ref().map_or(uuid::Uuid::nil(), |snapshot| snapshot.invocation_id);
+        let config_revision = active
+            .snapshot
+            .as_ref()
+            .map_or(dispatcher.config_revision, |snapshot| snapshot.context.config_revision);
+        log_continuous_submit_failure(invocation_id, config_revision, "terminal", error);
+    }
+    transferred
+}
+
+fn reap_live_continuous(active: &mut ActiveInvocation, fallback_revision: u64) {
+    let completion =
+        active.live_continuous.as_mut().and_then(|live| live.invocation.try_completion());
+    let Some(completion) = completion else {
+        return;
+    };
+    log_live_continuous_completion(&completion, fallback_revision);
+    active.live_continuous = None;
+    active.continuous_unavailable = true;
+}
+
+fn inert_action_snapshot(
+    slice_index: usize,
+) -> Result<ContinuousActionSnapshot, gradial_core::ContinuousProtocolError> {
+    ContinuousActionSnapshot::new(
+        PluginId::new("org.gradial.inert-meter")?,
+        PluginActionId::new(format!("slice-{slice_index}"))?,
+        PermittedContext::default(),
+        BTreeMap::default(),
+        MAX_CONTINUOUS_UPDATE_HZ,
+    )
+}
+
+fn map_cancel_reason(reason: CancelReason) -> ContinuousCancelReason {
+    match reason {
+        CancelReason::Escape => ContinuousCancelReason::Escape,
+        CancelReason::OtherMouseButton => ContinuousCancelReason::OtherMouseButton,
+        CancelReason::NoSelection | CancelReason::ReturnedToCenter => {
+            ContinuousCancelReason::ReturnedToDiscrete
+        }
+        CancelReason::InputQueueOverflow => ContinuousCancelReason::InputQueueOverflow,
+        CancelReason::HookUnresponsive => ContinuousCancelReason::HookUnresponsive,
+        CancelReason::InputReregistration => ContinuousCancelReason::InputReregistration,
+        CancelReason::DisplayTopologyChange => ContinuousCancelReason::DisplayTopologyChange,
+        CancelReason::Shutdown => ContinuousCancelReason::Shutdown,
+    }
+}
+
+fn log_continuous_start_rejection(
+    invocation_id: uuid::Uuid,
+    config_revision: u64,
+    result: &ActionResult,
+) {
+    let error_code = match result {
+        ActionResult::Failure { code, .. } => code.as_str(),
+        ActionResult::Cancelled => "cancelled",
+        ActionResult::Success => "invalid_executor_result",
+    };
+    log::warn!(
+        target: "continuous",
+        "component=continuous event_code=inert_session_start_rejected result_code=failure \
+         error_code={error_code} config_revision={config_revision} \
+         invocation_id={invocation_id}"
+    );
+}
+
+fn log_continuous_submit_failure(
+    invocation_id: uuid::Uuid,
+    config_revision: u64,
+    operation: &str,
+    error: ContinuousSubmitError,
+) {
+    log::warn!(
+        target: "continuous",
+        "component=continuous event_code=inert_session_submit_failed result_code=failure \
+         config_revision={config_revision} invocation_id={invocation_id} \
+         operation={operation} error={error}"
+    );
+}
+
+fn log_live_continuous_completion(completion: &ContinuousCompletion, fallback_revision: u64) {
+    let result_code = match &completion.outcome {
+        ContinuousCompletionOutcome::Committed
+        | ContinuousCompletionOutcome::DiscreteDispatched => "ok",
+        ContinuousCompletionOutcome::Cancelled(_) => "cancelled",
+        ContinuousCompletionOutcome::BeginRejected
+        | ContinuousCompletionOutcome::DiscreteRejected(_)
+        | ContinuousCompletionOutcome::Failed => "failure",
+    };
+    log::info!(
+        target: "continuous",
+        "component=continuous event_code=inert_session_completed result_code={result_code} \
+         config_revision={fallback_revision} invocation_id={} outcome={:?} \
+         backend_failure={:?}",
+        completion.invocation_id,
+        completion.outcome,
+        completion.backend_failure
+    );
+}
+
 fn dispatch_close(
     invocation_id: uuid::Uuid,
     outcome: InteractionOutcome,
     source_qpc: i64,
-    active: &ActiveInvocation,
+    active: &mut ActiveInvocation,
     route: &OverlayRoute,
     dispatcher: &EffectDispatcher<'_>,
 ) {
+    let live_discrete_transfer = finalize_live_continuous(outcome, active, dispatcher);
     let active_snapshot = active.snapshot.as_ref();
     let config_revision = active_snapshot
         .map_or(dispatcher.config_revision, |snapshot| snapshot.context.config_revision);
@@ -990,7 +1343,7 @@ fn dispatch_close(
             if active.practice {
                 dispatcher.onboarding_practice.selected(slice_index);
                 platform::request_controller_repaint();
-            } else {
+            } else if !live_discrete_transfer {
                 log_selected_action_outcome(
                     invocation_id,
                     active.action_id,
@@ -1002,6 +1355,14 @@ fn dispatch_close(
                         release_qpc: source_qpc,
                     },
                     config_revision,
+                );
+            } else {
+                log::info!(
+                    target: "actions",
+                    "component=actions event_code=continuous_discrete_transfer_requested \
+                     result_code=ok config_revision={config_revision} \
+                     invocation_id={invocation_id} slice_index={slice_index} \
+                     action_executed=false"
                 );
             }
         }
@@ -1364,6 +1725,7 @@ mod tests {
 
     use super::{
         ActionDispatchTrace, ActiveInvocation, CONTINUOUS_VISUAL_INTERVAL, ContinuousUpdateBatch,
+        LiveContinuousChange, LiveContinuousPhase, classify_live_continuous_change,
         heartbeat_is_unresponsive, log_selected_action_outcome, prepare_selected_action,
     };
 
@@ -1433,6 +1795,59 @@ mod tests {
             .take_ready(start + CONTINUOUS_VISUAL_INTERVAL, false)
             .expect("mode transition bypasses interval");
         assert!(mode.transition);
+    }
+
+    #[test]
+    fn live_continuous_bridge_tracks_unlocked_hybrid_transitions() {
+        let visual = |slice_index, value, armed| ContinuousVisualState {
+            selection: ContinuousSelection { slice_index, value },
+            pointer_offset_dip: Point::new(0.0, 0.0),
+            armed,
+        };
+
+        assert_eq!(
+            classify_live_continuous_change(None, visual(2, 0.0, false)),
+            LiveContinuousChange::None
+        );
+        assert_eq!(
+            classify_live_continuous_change(None, visual(2, 0.25, true)),
+            LiveContinuousChange::Start
+        );
+        assert_eq!(
+            classify_live_continuous_change(
+                Some(LiveContinuousPhase::Active { slice_index: 2 }),
+                visual(2, 0.4, true),
+            ),
+            LiveContinuousChange::Publish
+        );
+        assert_eq!(
+            classify_live_continuous_change(
+                Some(LiveContinuousPhase::Active { slice_index: 2 }),
+                visual(4, 0.4, true),
+            ),
+            LiveContinuousChange::Handoff
+        );
+        assert_eq!(
+            classify_live_continuous_change(
+                Some(LiveContinuousPhase::Active { slice_index: 4 }),
+                visual(4, 0.0, false),
+            ),
+            LiveContinuousChange::Suspend
+        );
+        assert_eq!(
+            classify_live_continuous_change(
+                Some(LiveContinuousPhase::Inactive),
+                visual(4, 0.0, false),
+            ),
+            LiveContinuousChange::None
+        );
+        assert_eq!(
+            classify_live_continuous_change(
+                Some(LiveContinuousPhase::Inactive),
+                visual(6, 0.7, true),
+            ),
+            LiveContinuousChange::Resume
+        );
     }
 
     #[test]

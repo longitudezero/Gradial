@@ -1328,6 +1328,73 @@ if ($ContinuousMeter) {
     ) {
         throw "The continuous meter reached the saved-action compilation or dispatch path."
     }
+
+    $armedInvocationRecords = [regex]::Matches(
+        $log,
+        "event_code=continuous_meter_updated .*" +
+        "invocation_id=(?<invocation>[0-9a-f-]+) .*armed=true action_executed=false"
+    )
+    $armedInvocationIds = @(
+        $armedInvocationRecords |
+            ForEach-Object { $_.Groups["invocation"].Value } |
+            Sort-Object -Unique
+    )
+    foreach ($id in $armedInvocationIds) {
+        if (
+            $log -notmatch (
+                "event_code=inert_session_started result_code=ok .*" +
+                "invocation_id=$([regex]::Escape($id))"
+            )
+        ) {
+            throw "Armed invocation $id did not start its inert continuous session."
+        }
+        if (
+            $log -notmatch (
+                "event_code=inert_backend_request_validated result_code=ok .*" +
+                "invocation_id=$([regex]::Escape($id)) stage=Begin"
+            )
+        ) {
+            throw "Armed invocation $id did not validate and deliver Begin."
+        }
+    }
+
+    if (-not $ReturnInsideBeforeRelease) {
+        foreach ($record in $selectionRecords) {
+            $id = $record.Groups["invocation"].Value
+            if (
+                $log -notmatch (
+                    "event_code=inert_backend_request_validated result_code=ok .*" +
+                    "invocation_id=$([regex]::Escape($id)) stage=Commit"
+                )
+            ) {
+                throw "Continuous invocation $id did not validate and deliver Commit."
+            }
+        }
+    }
+    if ($ReturnInsideBeforeRelease) {
+        foreach ($record in $selectionRecords) {
+            $id = $record.Groups["invocation"].Value
+            if (
+                $log -notmatch (
+                    "event_code=inert_backend_request_validated result_code=ok .*" +
+                    "invocation_id=$([regex]::Escape($id)) stage=Cancel " +
+                    "cancel_reason=ReturnedToDiscrete"
+                )
+            ) {
+                throw "Hybrid invocation $id did not suspend with returned-to-discrete."
+            }
+        }
+    }
+    if ($ChangeFromDirection -and $ChangeFromDirection -ne $Direction) {
+        $directionHandoffs = [regex]::Matches(
+            $log,
+            "event_code=inert_backend_request_validated result_code=ok .*" +
+            "stage=Cancel cancel_reason=DirectionChanged"
+        )
+        if ($directionHandoffs.Count -lt $expectedInvocations) {
+            throw "The inert backend did not observe every unlocked direction handoff."
+        }
+    }
 } else {
     $actionOutcomeRecords = [regex]::Matches(
         $log,

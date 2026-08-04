@@ -130,6 +130,10 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   single-action lease, preserves it across direction handoffs, uses separate
   bounded control and latest-value paths, applies the planned callback limits,
   and has a scripted fake backend for lifecycle and shutdown verification.
+- A live bridge from the debug inert meter to that coordinator, including
+  exact visual-scalar publication, unlocked direction handoff, inactive lease
+  retention after inward reversal, direct discrete-worker lease transfer, and
+  captured-target validation.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -570,10 +574,57 @@ discrete or continuous work through the same coordinator flag.
 
 The fake backend runs on the real asynchronous worker and scripts acceptance,
 rejection, gates, faults, and deadline stalls while recording every request.
-It is test infrastructure, not a user plugin or production effect backend. The
-continuous executor is compiled but intentionally not started by the app until
-gesture integration and schema-six assignments provide a real continuous
-action snapshot.
+It is test infrastructure, not a user plugin or production effect backend.
+
+### Live continuous gesture bridge
+
+The debug inert meter and its guided studies now exercise the coordinator on
+the real interaction thread. This is deliberately narrower than configured
+continuous actions: every wedge uses a host-created inert snapshot, and the
+backend validates lifecycle data but performs no operating-system or plugin
+effect. Normal profile invocations still provide an empty continuous-slice
+mask and never start this worker.
+
+Each coalesced `ContinuousChanged` effect supplies both the overlay and worker
+from the same `ContinuousVisualState.selection.value`; the backend therefore
+receives the exact normalized scalar requested for display. The overlay can
+refresh at its existing 240 Hz cap while the session publishes at no more than
+60 Hz through the one-value slot. No renderer sample is reconstructed from a
+different cursor path.
+
+The live bridge follows the unlocked hybrid interaction exactly:
+
+- first crossing beyond the visible wedge starts `Begin`;
+- value changes in the same wedge replace the latest ordinary sample;
+- changing wedges sends `Cancel(direction_changed)` before a fresh `Begin`;
+- moving inward sends `Cancel(returned_to_discrete)` but retains the invocation
+  lease in an inactive state;
+- moving outward again, in any eligible wedge, starts a fresh segment without
+  reacquiring the lease;
+- releasing outside commits the exact final displayed scalar;
+- releasing inside remains an inert discrete selection in the debug meter.
+
+The inactive lease prevents another action from entering between inward
+reversal and release. A tested transfer path can consume that lease directly
+when a future configured hybrid wedge releases its ordinary discrete action;
+it enqueues the compiled plan without a second busy claim, so the invocation
+cannot reject itself with `action_busy`. The debug meter never compiles or
+uses that plan and remains side-effect free.
+
+The validating inert backend applies the full existing target identity and
+integrity check before `Begin`, then the lightweight HWND/PID/foreground
+freshness check for `Update` and `Commit`. A stale active target stops with
+`Cancel(target_stale)`. `Cancel` remains deliverable even after the target is
+gone. Queue, cancellation, fault, and shutdown behavior continues to use the
+same bounded worker rules described above.
+
+Closing or clearing the interaction-owned invocation never joins the plugin
+worker. The owner submits its terminal control and drops the join handle; the
+worker retains the lease until its callback completes or reaches its deadline.
+If cleanup finds the bounded control queue full, it also raises the shared
+cancellation flag before detaching. A failed or timed-out handoff cancel ends
+the invocation and releases the lease without starting the replacement
+segment.
 
 ### Continuous usability study
 

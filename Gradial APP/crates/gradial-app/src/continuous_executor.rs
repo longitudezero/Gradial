@@ -10,12 +10,17 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     ActionErrorCode, ActionResult, ContinuousActionSnapshot, ContinuousCancelReason,
-    ContinuousRequest, ContinuousSession,
+    ContinuousRequest, ContinuousSession, ExecutionPlan, InvocationContext,
 };
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::action_executor::{ActionExecutorHandle, ContinuousActionLease, CoordinatorStopToken};
+use crate::{
+    action_executor::{
+        ActionDispatch, ActionExecutorHandle, ContinuousActionLease, CoordinatorStopToken,
+    },
+    action_target, tray,
+};
 
 const CONTROL_CAPACITY: usize = 8;
 const COMPLETION_CAPACITY: usize = 1;
@@ -39,11 +44,13 @@ pub(crate) enum ContinuousBackendFailure {
     Faulted(ContinuousBackendStage),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContinuousCompletionOutcome {
     Committed,
     Cancelled(ContinuousCancelReason),
     BeginRejected,
+    DiscreteDispatched,
+    DiscreteRejected(ActionResult),
     Failed,
 }
 
@@ -62,6 +69,8 @@ pub(crate) enum ContinuousBackendError {
     TimedOut,
     #[error("continuous callback faulted")]
     Faulted,
+    #[error("the captured continuous target became stale")]
+    TargetStale,
     #[error("continuous callback was interrupted")]
     Interrupted,
 }
@@ -96,6 +105,86 @@ pub(crate) trait ContinuousBackend: Send + 'static {
         request: &ContinuousRequest,
         context: ContinuousBackendContext<'_>,
     ) -> Result<(), ContinuousBackendError>;
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatingInertBackend {
+    invocation_id: Uuid,
+    target: Arc<InvocationContext>,
+}
+
+impl ValidatingInertBackend {
+    pub(crate) fn new(invocation_id: Uuid, target: Arc<InvocationContext>) -> Self {
+        Self { invocation_id, target }
+    }
+}
+
+impl ContinuousBackend for ValidatingInertBackend {
+    fn dispatch(
+        &mut self,
+        request: &ContinuousRequest,
+        context: ContinuousBackendContext<'_>,
+    ) -> Result<(), ContinuousBackendError> {
+        if !matches!(request, ContinuousRequest::Cancel(_)) && context.should_stop() {
+            return Err(ContinuousBackendError::Interrupted);
+        }
+        if Instant::now() >= context.deadline() {
+            return Err(ContinuousBackendError::TimedOut);
+        }
+        let validation = match request {
+            ContinuousRequest::Begin(_) => action_target::validate(&self.target),
+            ContinuousRequest::Update(_) | ContinuousRequest::Commit(_) => {
+                action_target::validate_freshness(&self.target)
+            }
+            ContinuousRequest::Cancel(_) => Ok(()),
+        };
+        validation.map_err(|failure| {
+            let stage = stage_for(request);
+            log::warn!(
+                target: "continuous",
+                "component=continuous event_code=inert_target_validation_failed \
+                 result_code=failure config_revision={} invocation_id={} \
+                 stage={stage:?} reason={failure:?}",
+                self.target.config_revision,
+                self.invocation_id
+            );
+            if stage == ContinuousBackendStage::Begin {
+                ContinuousBackendError::Rejected
+            } else if failure == action_target::TargetValidationFailure::StaleTarget {
+                ContinuousBackendError::TargetStale
+            } else {
+                ContinuousBackendError::Faulted
+            }
+        })?;
+
+        match request {
+            ContinuousRequest::Update(_) => log::debug!(
+                target: "continuous",
+                "component=continuous event_code=inert_backend_request_validated \
+                 result_code=ok config_revision={} invocation_id={} stage=Update",
+                self.target.config_revision,
+                self.invocation_id
+            ),
+            ContinuousRequest::Cancel(cancel) => log::info!(
+                target: "continuous",
+                "component=continuous event_code=inert_backend_request_validated \
+                 result_code=ok config_revision={} invocation_id={} stage=Cancel \
+                 cancel_reason={:?}",
+                self.target.config_revision,
+                self.invocation_id,
+                cancel.reason()
+            ),
+            ContinuousRequest::Begin(_) | ContinuousRequest::Commit(_) => log::info!(
+                target: "continuous",
+                "component=continuous event_code=inert_backend_request_validated \
+                 result_code=ok config_revision={} invocation_id={} stage={:?}",
+                self.target.config_revision,
+                self.invocation_id,
+                stage_for(request)
+            ),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -154,9 +243,11 @@ impl LatestObservationSlot {
 
 #[derive(Debug)]
 enum ContinuousControl {
-    Handoff { session_id: Uuid, snapshot: ContinuousActionSnapshot, value: f64 },
+    Resume { session_id: Uuid, snapshot: ContinuousActionSnapshot, value: f64 },
+    Suspend { reason: ContinuousCancelReason },
     Commit { value: f64 },
     Cancel { reason: ContinuousCancelReason },
+    FinishDiscrete { plan: Arc<ExecutionPlan>, target: Arc<InvocationContext> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -175,6 +266,7 @@ pub(crate) struct ContinuousInvocationHandle {
     latest: Arc<LatestObservationSlot>,
     terminal_requested: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    stop_token: CoordinatorStopToken,
     worker_thread: Thread,
 }
 
@@ -198,11 +290,25 @@ impl ContinuousInvocationHandle {
         if self.is_closed_for_input() {
             return Err(ContinuousSubmitError::Closed);
         }
-        self.send_control(ContinuousControl::Handoff {
-            session_id: Uuid::new_v4(),
-            snapshot,
-            value,
-        })
+        self.send_control(ContinuousControl::Resume { session_id: Uuid::new_v4(), snapshot, value })
+    }
+
+    pub(crate) fn resume(
+        &self,
+        snapshot: ContinuousActionSnapshot,
+        value: f64,
+    ) -> Result<(), ContinuousSubmitError> {
+        self.handoff(snapshot, value)
+    }
+
+    pub(crate) fn suspend(
+        &self,
+        reason: ContinuousCancelReason,
+    ) -> Result<(), ContinuousSubmitError> {
+        if self.is_closed_for_input() {
+            return Err(ContinuousSubmitError::Closed);
+        }
+        self.send_control(ContinuousControl::Suspend { reason })
     }
 
     pub(crate) fn commit(&self, value: f64) -> Result<(), ContinuousSubmitError> {
@@ -215,6 +321,14 @@ impl ContinuousInvocationHandle {
         reason: ContinuousCancelReason,
     ) -> Result<(), ContinuousSubmitError> {
         self.send_terminal(ContinuousControl::Cancel { reason })
+    }
+
+    pub(crate) fn finish_discrete(
+        &self,
+        plan: Arc<ExecutionPlan>,
+        target: Arc<InvocationContext>,
+    ) -> Result<(), ContinuousSubmitError> {
+        self.send_terminal(ContinuousControl::FinishDiscrete { plan, target })
     }
 
     fn send_terminal(&self, control: ContinuousControl) -> Result<(), ContinuousSubmitError> {
@@ -296,6 +410,8 @@ impl ContinuousInvocation {
         let worker_closed = Arc::clone(&closed);
         let initial = SegmentStart { session_id: Uuid::new_v4(), snapshot, value: initial_value };
         let clock_origin = Instant::now();
+        let worker_action_executor = action_executor.clone();
+        let worker_stop_token = stop_token.clone();
 
         let join_handle = thread::Builder::new()
             .name("gradial-continuous-executor".to_owned())
@@ -305,7 +421,8 @@ impl ContinuousInvocation {
                     initial,
                     backend,
                     lease,
-                    &stop_token,
+                    &worker_action_executor,
+                    &worker_stop_token,
                     &controls,
                     &worker_latest,
                     &completion_sender,
@@ -326,6 +443,7 @@ impl ContinuousInvocation {
             latest,
             terminal_requested,
             closed,
+            stop_token,
             worker_thread,
         };
         Ok(Self { handle, completions, join_handle: Some(join_handle) })
@@ -335,10 +453,15 @@ impl ContinuousInvocation {
         self.handle.clone()
     }
 
-    pub(crate) fn try_completion(&self) -> Option<ContinuousCompletion> {
-        self.completions.try_recv().ok()
+    pub(crate) fn try_completion(&mut self) -> Option<ContinuousCompletion> {
+        let completion = self.completions.try_recv().ok();
+        if completion.is_some() {
+            let _detached = self.join_handle.take();
+        }
+        completion
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_for_completion(
         &mut self,
         timeout: Duration,
@@ -350,6 +473,7 @@ impl ContinuousInvocation {
         completion
     }
 
+    #[cfg(test)]
     fn join(&mut self) {
         if let Some(join_handle) = self.join_handle.take() {
             let _worker_result = join_handle.join();
@@ -360,8 +484,14 @@ impl ContinuousInvocation {
 impl Drop for ContinuousInvocation {
     fn drop(&mut self) {
         if self.join_handle.is_some() {
-            let _cancel = self.handle.cancel(ContinuousCancelReason::Shutdown);
-            self.join();
+            if matches!(
+                self.handle.cancel(ContinuousCancelReason::Shutdown),
+                Err(ContinuousSubmitError::QueueFull)
+            ) {
+                self.handle.stop_token.request_cancellation();
+                self.handle.worker_thread.unpark();
+            }
+            let _detached = self.join_handle.take();
         }
     }
 }
@@ -376,15 +506,18 @@ struct SegmentStart {
 #[derive(Debug)]
 enum SegmentResult {
     Handoff(SegmentStart),
+    Inactive,
+    DispatchDiscrete { plan: Arc<ExecutionPlan>, target: Arc<InvocationContext> },
     Complete(ContinuousCompletion),
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_worker<B: ContinuousBackend>(
     invocation_id: Uuid,
-    mut segment: SegmentStart,
+    segment: SegmentStart,
     mut backend: B,
     lease: ContinuousActionLease,
+    action_executor: &ActionExecutorHandle,
     stop_token: &CoordinatorStopToken,
     controls: &Receiver<ContinuousControl>,
     latest: &LatestObservationSlot,
@@ -393,25 +526,122 @@ fn run_worker<B: ContinuousBackend>(
     policy: ContinuousExecutionPolicy,
 ) {
     debug_assert_eq!(lease.invocation_id(), invocation_id);
+    let mut lease = Some(lease);
+    let mut active_segment = Some(segment);
     loop {
-        match run_segment(
-            invocation_id,
-            segment,
-            &mut backend,
-            stop_token,
-            controls,
-            latest,
-            clock_origin,
-            policy,
-        ) {
-            SegmentResult::Handoff(replacement) => segment = replacement,
+        let result = active_segment.take().map_or_else(
+            || run_inactive(invocation_id, stop_token, controls, latest, policy),
+            |current| {
+                run_segment(
+                    invocation_id,
+                    current,
+                    &mut backend,
+                    stop_token,
+                    controls,
+                    latest,
+                    clock_origin,
+                    policy,
+                )
+            },
+        );
+        match result {
+            SegmentResult::Handoff(replacement) => active_segment = Some(replacement),
+            SegmentResult::Inactive => {
+                let _discarded = latest.take();
+            }
+            SegmentResult::DispatchDiscrete { plan, target } => {
+                let config_revision = plan.config_revision();
+                let action_id = plan.root_action_id();
+                let dispatch = lease.take().map_or_else(
+                    || {
+                        ActionDispatch::Rejected(failure(
+                            ActionErrorCode::ExecutorUnavailable,
+                            "the continuous action lease is unavailable",
+                        ))
+                    },
+                    |owned_lease| {
+                        action_executor.try_dispatch_from_continuous(
+                            owned_lease,
+                            invocation_id,
+                            plan,
+                            target,
+                        )
+                    },
+                );
+                let outcome = match dispatch {
+                    ActionDispatch::Accepted => {
+                        log::info!(
+                            target: "continuous",
+                            "component=continuous event_code=discrete_lease_transferred \
+                             result_code=ok config_revision={config_revision} \
+                             invocation_id={invocation_id} action_id={action_id}"
+                        );
+                        ContinuousCompletionOutcome::DiscreteDispatched
+                    }
+                    ActionDispatch::Rejected(result) => {
+                        let error_code = match &result {
+                            ActionResult::Failure { code, .. } => code.as_str(),
+                            ActionResult::Cancelled => "cancelled",
+                            ActionResult::Success => "invalid_executor_result",
+                        };
+                        log::warn!(
+                            target: "continuous",
+                            "component=continuous event_code=discrete_lease_transfer_rejected \
+                             result_code=failure error_code={error_code} \
+                             config_revision={config_revision} invocation_id={invocation_id} \
+                             action_id={action_id}"
+                        );
+                        tray::record_action_result(&result, config_revision);
+                        ContinuousCompletionOutcome::DiscreteRejected(result)
+                    }
+                };
+                let completion =
+                    ContinuousCompletion { invocation_id, outcome, backend_failure: None };
+                let _sent = completions.send(completion);
+                break;
+            }
             SegmentResult::Complete(completion) => {
+                drop(lease.take());
                 let _sent = completions.send(completion);
                 break;
             }
         }
     }
     drop(lease);
+}
+
+fn run_inactive(
+    invocation_id: Uuid,
+    stop_token: &CoordinatorStopToken,
+    controls: &Receiver<ContinuousControl>,
+    latest: &LatestObservationSlot,
+    policy: ContinuousExecutionPolicy,
+) -> SegmentResult {
+    loop {
+        if let Some(reason) = stop_reason(stop_token) {
+            return SegmentResult::Complete(cancelled_completion(invocation_id, reason, None));
+        }
+        if let Ok(control) = controls.try_recv() {
+            return match control {
+                ContinuousControl::Resume { session_id, snapshot, value } => {
+                    SegmentResult::Handoff(SegmentStart { session_id, snapshot, value })
+                }
+                ContinuousControl::Suspend { .. } => SegmentResult::Inactive,
+                ContinuousControl::Commit { .. } => SegmentResult::Complete(failed_completion(
+                    invocation_id,
+                    ContinuousBackendFailure::Faulted(ContinuousBackendStage::Commit),
+                )),
+                ContinuousControl::Cancel { reason } => {
+                    SegmentResult::Complete(cancelled_completion(invocation_id, reason, None))
+                }
+                ContinuousControl::FinishDiscrete { plan, target } => {
+                    SegmentResult::DispatchDiscrete { plan, target }
+                }
+            };
+        }
+        let _discarded = latest.take();
+        thread::park_timeout(policy.poll_interval);
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -447,20 +677,29 @@ fn run_segment<B: ContinuousBackend>(
         apply_latest(&mut session, latest, clock_origin);
     }
 
-    let mut pending_handoff = None;
+    let mut pending_transition = None;
     if session.terminal().is_none()
         && let Ok(control) = controls.try_recv()
     {
         match control {
-            ContinuousControl::Handoff { session_id, snapshot, value } => {
+            ContinuousControl::Resume { session_id, snapshot, value } => {
                 let _pending = session.cancel(ContinuousCancelReason::DirectionChanged);
-                pending_handoff = Some(SegmentStart { session_id, snapshot, value });
+                pending_transition =
+                    Some(SegmentResult::Handoff(SegmentStart { session_id, snapshot, value }));
+            }
+            ContinuousControl::Suspend { reason } => {
+                let _pending = session.cancel(reason);
+                pending_transition = Some(SegmentResult::Inactive);
             }
             ContinuousControl::Commit { value } => {
                 let _pending = session.commit(value, elapsed(clock_origin));
             }
             ContinuousControl::Cancel { reason } => {
                 let _pending = session.cancel(reason);
+            }
+            ContinuousControl::FinishDiscrete { plan, target } => {
+                let _pending = session.cancel(ContinuousCancelReason::ReturnedToDiscrete);
+                pending_transition = Some(SegmentResult::DispatchDiscrete { plan, target });
             }
         }
     }
@@ -474,7 +713,7 @@ fn run_segment<B: ContinuousBackend>(
     };
     if let Some(request) = terminal {
         let delivery = call_backend(backend, &request, stop_token, policy).err();
-        if let Some(replacement) = pending_handoff {
+        if let Some(transition) = pending_transition {
             if let Some(reason) = stop_reason(stop_token) {
                 return SegmentResult::Complete(cancelled_completion(
                     invocation_id,
@@ -482,7 +721,14 @@ fn run_segment<B: ContinuousBackend>(
                     delivery.map(|error| backend_failure(ContinuousBackendStage::Cancel, error)),
                 ));
             }
-            return SegmentResult::Handoff(replacement);
+            if let Some(error) = delivery {
+                return SegmentResult::Complete(cancelled_completion(
+                    invocation_id,
+                    cancel_reason_for_request(&request),
+                    Some(backend_failure(ContinuousBackendStage::Cancel, error)),
+                ));
+            }
+            return transition;
         }
         return SegmentResult::Complete(terminal_completion(
             invocation_id,
@@ -499,7 +745,7 @@ fn run_segment<B: ContinuousBackend>(
 
         if let Ok(control) = controls.try_recv() {
             match control {
-                ContinuousControl::Handoff { session_id, snapshot, value } => {
+                ContinuousControl::Resume { session_id, snapshot, value } => {
                     let result = finish_cancel(
                         invocation_id,
                         &mut session,
@@ -511,13 +757,31 @@ fn run_segment<B: ContinuousBackend>(
                     if stop_reason(stop_token).is_some() {
                         return result;
                     }
-                    if matches!(result, SegmentResult::Complete(_)) {
+                    if cancellation_delivery_succeeded(&result) {
                         return SegmentResult::Handoff(SegmentStart {
                             session_id,
                             snapshot,
                             value,
                         });
                     }
+                    return result;
+                }
+                ContinuousControl::Suspend { reason } => {
+                    let result = finish_cancel(
+                        invocation_id,
+                        &mut session,
+                        reason,
+                        backend,
+                        stop_token,
+                        policy,
+                    );
+                    if stop_reason(stop_token).is_some() {
+                        return result;
+                    }
+                    if cancellation_delivery_succeeded(&result) {
+                        return SegmentResult::Inactive;
+                    }
+                    return result;
                 }
                 ContinuousControl::Commit { value } => {
                     let Ok(Some(request)) = session.commit(value, elapsed(clock_origin)) else {
@@ -544,6 +808,23 @@ fn run_segment<B: ContinuousBackend>(
                         policy,
                     );
                 }
+                ContinuousControl::FinishDiscrete { plan, target } => {
+                    let result = finish_cancel(
+                        invocation_id,
+                        &mut session,
+                        ContinuousCancelReason::ReturnedToDiscrete,
+                        backend,
+                        stop_token,
+                        policy,
+                    );
+                    if stop_reason(stop_token).is_some() {
+                        return result;
+                    }
+                    if cancellation_delivery_succeeded(&result) {
+                        return SegmentResult::DispatchDiscrete { plan, target };
+                    }
+                    return result;
+                }
             }
         }
 
@@ -562,10 +843,15 @@ fn run_segment<B: ContinuousBackend>(
                         );
                     }
                     let failure = backend_failure(ContinuousBackendStage::Update, error);
+                    let cancel_reason = if error == ContinuousBackendError::TargetStale {
+                        ContinuousCancelReason::TargetStale
+                    } else {
+                        ContinuousCancelReason::PluginFaulted
+                    };
                     let _stopped = finish_cancel(
                         invocation_id,
                         &mut session,
-                        ContinuousCancelReason::PluginFaulted,
+                        cancel_reason,
                         backend,
                         stop_token,
                         policy,
@@ -582,6 +868,19 @@ fn run_segment<B: ContinuousBackend>(
             }
         }
         thread::park_timeout(policy.poll_interval);
+    }
+}
+
+fn cancellation_delivery_succeeded(result: &SegmentResult) -> bool {
+    matches!(result, SegmentResult::Complete(ContinuousCompletion { backend_failure: None, .. }))
+}
+
+fn cancel_reason_for_request(request: &ContinuousRequest) -> ContinuousCancelReason {
+    match request {
+        ContinuousRequest::Cancel(cancel) => cancel.reason(),
+        ContinuousRequest::Begin(_)
+        | ContinuousRequest::Update(_)
+        | ContinuousRequest::Commit(_) => ContinuousCancelReason::PluginFaulted,
     }
 }
 
@@ -717,6 +1016,7 @@ fn backend_failure(
         ContinuousBackendError::TimedOut => ContinuousBackendFailure::TimedOut(stage),
         ContinuousBackendError::Rejected
         | ContinuousBackendError::Faulted
+        | ContinuousBackendError::TargetStale
         | ContinuousBackendError::Interrupted => ContinuousBackendFailure::Faulted(stage),
     }
 }
@@ -783,7 +1083,7 @@ mod tests {
     use super::{
         ContinuousBackend, ContinuousBackendContext, ContinuousBackendError,
         ContinuousBackendFailure, ContinuousBackendStage, ContinuousCompletion,
-        ContinuousCompletionOutcome, ContinuousInvocation,
+        ContinuousCompletionOutcome, ContinuousInvocation, ValidatingInertBackend,
     };
     use crate::action_executor::{ActionDispatch, ActionExecutor};
 
@@ -791,6 +1091,7 @@ mod tests {
     enum FakeResponse {
         Success,
         Fault,
+        TargetStale,
         Stall,
         Wait(Arc<AtomicBool>),
         WaitReject(Arc<AtomicBool>),
@@ -812,6 +1113,7 @@ mod tests {
             match self.responses.pop_front().unwrap_or(FakeResponse::Success) {
                 FakeResponse::Success => Ok(()),
                 FakeResponse::Fault => Err(ContinuousBackendError::Faulted),
+                FakeResponse::TargetStale => Err(ContinuousBackendError::TargetStale),
                 FakeResponse::Stall => loop {
                     if context.should_stop() {
                         return Err(ContinuousBackendError::Interrupted);
@@ -955,6 +1257,25 @@ mod tests {
     }
 
     #[test]
+    fn inert_backend_rejects_a_stale_target_before_begin_is_accepted() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        let invocation_id = Uuid::from_u128(25);
+        let target = Arc::new(gradial_core::InvocationContext::default());
+        let backend = ValidatingInertBackend::new(invocation_id, Arc::clone(&target));
+        let mut invocation = ContinuousInvocation::start(
+            &executor.handle(),
+            invocation_id,
+            snapshot("stale"),
+            0.2,
+            backend,
+        )
+        .expect("continuous invocation");
+
+        assert_eq!(finish(&mut invocation).outcome, ContinuousCompletionOutcome::BeginRejected);
+        assert!(!executor.handle().is_busy());
+    }
+
+    #[test]
     fn handoff_cancels_old_segment_before_new_begin_without_releasing_lease() {
         let executor = ActionExecutor::start(1).expect("executor");
         let (backend, calls) = fake_backend([]);
@@ -988,6 +1309,124 @@ mod tests {
         };
         assert_eq!(commit.session_id(), second.session_id());
         assert_eq!(finish(&mut invocation).outcome, ContinuousCompletionOutcome::Committed);
+    }
+
+    #[test]
+    fn failed_handoff_cancel_releases_the_lease_without_starting_a_replacement() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        let (backend, calls) = fake_backend([FakeResponse::Success, FakeResponse::Fault]);
+        let mut invocation = ContinuousInvocation::start(
+            &executor.handle(),
+            Uuid::from_u128(34),
+            snapshot("west"),
+            0.3,
+            backend,
+        )
+        .expect("continuous invocation");
+        assert!(matches!(wait_call(&calls), ContinuousRequest::Begin(_)));
+
+        invocation.handle().handoff(snapshot("south"), 0.6).expect("handoff");
+        let ContinuousRequest::Cancel(cancel) = wait_call(&calls) else {
+            panic!("expected old cancel");
+        };
+        assert_eq!(cancel.reason(), ContinuousCancelReason::DirectionChanged);
+        let completion = finish(&mut invocation);
+        assert_eq!(
+            completion.outcome,
+            ContinuousCompletionOutcome::Cancelled(ContinuousCancelReason::DirectionChanged)
+        );
+        assert_eq!(
+            completion.backend_failure,
+            Some(ContinuousBackendFailure::Faulted(ContinuousBackendStage::Cancel))
+        );
+        assert!(calls.try_recv().is_err());
+        assert!(!executor.handle().is_busy());
+    }
+
+    #[test]
+    fn inward_suspend_keeps_the_lease_and_can_resume_on_an_unlocked_wedge() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        let (backend, calls) = fake_backend([]);
+        let mut invocation = ContinuousInvocation::start(
+            &executor.handle(),
+            Uuid::from_u128(35),
+            snapshot("west"),
+            0.3,
+            backend,
+        )
+        .expect("continuous invocation");
+        let ContinuousRequest::Begin(first) = wait_call(&calls) else {
+            panic!("expected first begin");
+        };
+
+        invocation.handle().suspend(ContinuousCancelReason::ReturnedToDiscrete).expect("suspend");
+        let ContinuousRequest::Cancel(cancel) = wait_call(&calls) else {
+            panic!("expected inward cancel");
+        };
+        assert_eq!(cancel.session_id(), first.session_id());
+        assert_eq!(cancel.reason(), ContinuousCancelReason::ReturnedToDiscrete);
+        assert!(executor.handle().is_busy());
+        assert!(invocation.try_completion().is_none());
+        assert!(matches!(
+            executor.handle().try_dispatch(
+                Uuid::from_u128(36),
+                delay_plan(10),
+                Arc::new(gradial_core::InvocationContext::default()),
+            ),
+            ActionDispatch::Rejected(gradial_core::ActionResult::Failure {
+                code: ActionErrorCode::ActionBusy,
+                ..
+            })
+        ));
+
+        invocation.handle().resume(snapshot("south"), 0.6).expect("resume");
+        let ContinuousRequest::Begin(second) = wait_call(&calls) else {
+            panic!("expected resumed begin");
+        };
+        assert_ne!(second.session_id(), first.session_id());
+        assert_eq!(second.action_id().as_str(), "south");
+
+        invocation.handle().commit(0.8).expect("commit resumed segment");
+        assert!(matches!(wait_call(&calls), ContinuousRequest::Commit(_)));
+        assert_eq!(finish(&mut invocation).outcome, ContinuousCompletionOutcome::Committed);
+    }
+
+    #[test]
+    fn inactive_invocation_transfers_its_lease_to_the_discrete_worker() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        let (backend, calls) = fake_backend([]);
+        let invocation_id = Uuid::from_u128(37);
+        let mut invocation = ContinuousInvocation::start(
+            &executor.handle(),
+            invocation_id,
+            snapshot("west"),
+            0.3,
+            backend,
+        )
+        .expect("continuous invocation");
+        assert!(matches!(wait_call(&calls), ContinuousRequest::Begin(_)));
+        invocation.handle().suspend(ContinuousCancelReason::ReturnedToDiscrete).expect("suspend");
+        assert!(matches!(wait_call(&calls), ContinuousRequest::Cancel(_)));
+
+        invocation
+            .handle()
+            .finish_discrete(delay_plan(10), Arc::new(gradial_core::InvocationContext::default()))
+            .expect("transfer discrete action");
+        assert_eq!(
+            finish(&mut invocation).outcome,
+            ContinuousCompletionOutcome::DiscreteDispatched
+        );
+
+        for _ in 0..100 {
+            if let Some(completion) = executor.try_completion() {
+                assert_eq!(completion.invocation_id, invocation_id);
+                assert_eq!(completion.result, gradial_core::ActionResult::Success);
+                assert!(!executor.handle().is_busy());
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("transferred discrete action did not complete");
     }
 
     #[test]
@@ -1060,6 +1499,33 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_stalled_invocation_never_joins_on_the_interaction_owner() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        let (backend, calls) = fake_backend([FakeResponse::Stall]);
+        let invocation = ContinuousInvocation::start(
+            &executor.handle(),
+            Uuid::from_u128(53),
+            snapshot("detached"),
+            0.2,
+            backend,
+        )
+        .expect("continuous invocation");
+        assert!(matches!(wait_call(&calls), ContinuousRequest::Begin(_)));
+
+        let drop_started = Instant::now();
+        drop(invocation);
+        assert!(drop_started.elapsed() < Duration::from_millis(50));
+
+        for _ in 0..200 {
+            if !executor.handle().is_busy() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("detached stalled invocation did not release its lease");
+    }
+
+    #[test]
     fn rapid_publications_deliver_only_latest_value_with_a_sequence_gap() {
         let executor = ActionExecutor::start(1).expect("executor");
         let (backend, calls) = fake_backend([]);
@@ -1090,14 +1556,21 @@ mod tests {
 
     #[test]
     fn stalled_and_faulted_updates_cancel_the_session_and_release_the_lease() {
-        for (response, expected) in [
+        for (response, expected, cancel_reason) in [
             (
                 FakeResponse::Stall,
                 ContinuousBackendFailure::TimedOut(ContinuousBackendStage::Update),
+                ContinuousCancelReason::PluginFaulted,
             ),
             (
                 FakeResponse::Fault,
                 ContinuousBackendFailure::Faulted(ContinuousBackendStage::Update),
+                ContinuousCancelReason::PluginFaulted,
+            ),
+            (
+                FakeResponse::TargetStale,
+                ContinuousBackendFailure::Faulted(ContinuousBackendStage::Update),
+                ContinuousCancelReason::TargetStale,
             ),
         ] {
             let executor = ActionExecutor::start(1).expect("executor");
@@ -1116,7 +1589,7 @@ mod tests {
             let ContinuousRequest::Cancel(cancel) = wait_call(&calls) else {
                 panic!("expected fault cancel");
             };
-            assert_eq!(cancel.reason(), ContinuousCancelReason::PluginFaulted);
+            assert_eq!(cancel.reason(), cancel_reason);
             let completion = finish(&mut invocation);
             assert_eq!(completion.outcome, ContinuousCompletionOutcome::Failed);
             assert_eq!(completion.backend_failure, Some(expected));

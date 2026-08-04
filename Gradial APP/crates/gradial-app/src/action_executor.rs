@@ -37,6 +37,10 @@ impl CoordinatorStopToken {
     pub(crate) fn shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::Acquire)
     }
+
+    pub(crate) fn request_cancellation(&self) {
+        self.cancellation_requested.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug)]
@@ -45,6 +49,7 @@ pub(crate) struct ContinuousActionLease {
     busy: Arc<AtomicBool>,
     cancellation_requested: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    release_on_drop: bool,
 }
 
 impl ContinuousActionLease {
@@ -58,10 +63,17 @@ impl ContinuousActionLease {
             shutdown_requested: Arc::clone(&self.shutdown_requested),
         }
     }
+
+    fn hand_off_to_discrete(&mut self) {
+        self.release_on_drop = false;
+    }
 }
 
 impl Drop for ContinuousActionLease {
     fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
         tray::set_action_running(false);
         self.busy.store(false, Ordering::Release);
         platform::request_controller_repaint();
@@ -115,7 +127,48 @@ impl ActionExecutorHandle {
             busy: Arc::clone(&self.busy),
             cancellation_requested: Arc::clone(&self.cancellation_requested),
             shutdown_requested: Arc::clone(&self.shutdown_requested),
+            release_on_drop: true,
         })
+    }
+
+    pub(crate) fn try_dispatch_from_continuous(
+        &self,
+        mut lease: ContinuousActionLease,
+        invocation_id: Uuid,
+        plan: Arc<ExecutionPlan>,
+        target: Arc<InvocationContext>,
+    ) -> ActionDispatch {
+        if lease.invocation_id != invocation_id
+            || !Arc::ptr_eq(&lease.busy, &self.busy)
+            || !Arc::ptr_eq(&lease.cancellation_requested, &self.cancellation_requested)
+            || !Arc::ptr_eq(&lease.shutdown_requested, &self.shutdown_requested)
+        {
+            return ActionDispatch::Rejected(failure(
+                ActionErrorCode::ExecutorUnavailable,
+                "the continuous action lease does not belong to this executor",
+            ));
+        }
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return ActionDispatch::Rejected(failure(
+                ActionErrorCode::ExecutorUnavailable,
+                "the action executor is shutting down",
+            ));
+        }
+        if self.cancellation_requested.load(Ordering::Acquire) {
+            return ActionDispatch::Rejected(ActionResult::Cancelled);
+        }
+
+        let request = ExecutionRequest { invocation_id, plan, target };
+        match self.commands.try_send(WorkerCommand::Execute(request)) {
+            Ok(()) => {
+                lease.hand_off_to_discrete();
+                self.worker_thread.unpark();
+                ActionDispatch::Accepted
+            }
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => ActionDispatch::Rejected(
+                failure(ActionErrorCode::ExecutorUnavailable, "the action executor is unavailable"),
+            ),
+        }
     }
 
     pub(crate) fn cancel_current(&self) -> bool {
