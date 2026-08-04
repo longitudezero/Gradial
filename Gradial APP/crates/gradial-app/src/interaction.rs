@@ -14,9 +14,9 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     ActionPlanCompiler, ActionResult, CancelReason, ContinuousSliceMask, ContinuousVisualState,
-    ExecutionPlan, GestureConfig, InputEvent, InputEventKind, InteractionController,
-    InteractionEffect, InteractionOutcome, InteractionState, InvocationSnapshot, ProfileResolver,
-    ProfileTarget, ResolvedMenu, monitor_index_for_point,
+    DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP, ExecutionPlan, GestureConfig, InputEvent,
+    InputEventKind, InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
+    InvocationSnapshot, ProfileResolver, ProfileTarget, ResolvedMenu, monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -1268,7 +1268,8 @@ fn dispatch_open(
         dispatcher.timing_markers,
         snapshot,
         Arc::clone(menu),
-        continuous_full_scale_radius_dip.unwrap_or(160.0),
+        continuous_full_scale_radius_dip
+            .unwrap_or(f64::from(DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP)),
     ) {
         log::error!(
             target: "renderer",

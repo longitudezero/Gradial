@@ -48,6 +48,9 @@ param(
     [ValidateRange(0, 100)]
     [int]$ContinuousPercent = 75,
 
+    [ValidateRange(160, 400)]
+    [int]$ContinuousFullScaleDip = 300,
+
     [switch]$ReturnInsideBeforeRelease,
 
     [switch]$QuickFlick,
@@ -519,7 +522,7 @@ try {
     }
     $effectiveDpi = [GradialSmokeNative]::EffectiveDpiAt($testX, $testY)
     $gestureDistanceDip = if ($ContinuousMeter) {
-        107.0 + (160.0 - 107.0) * ($ContinuousPercent / 100.0)
+        107.0 + ($ContinuousFullScaleDip - 107.0) * ($ContinuousPercent / 100.0)
     } else {
         80.0
     }
@@ -527,8 +530,8 @@ try {
     $diagonalDistancePx = $gestureDistancePx / [Math]::Sqrt(2.0)
     # A one-pixel cardinal bias keeps the 0% target on the armed side of the
     # inclusive threshold after DPI conversion and integer cursor quantization.
-    # Diagonals use nearest rounding to minimize scalar error across the now
-    # deliberately narrow 107-160 DIP candidate range.
+    # Diagonals use nearest rounding to minimize scalar error across the
+    # configured 107-to-full-scale range.
     $continuousBoundaryBias = if ($ContinuousMeter -and $ContinuousPercent -eq 0) {
         1
     } else {
@@ -592,6 +595,7 @@ try {
         $startupArguments += "--skip-onboarding"
         if ($ContinuousMeter) {
             $startupArguments += "--continuous-meter"
+            $startupArguments += "--continuous-full-scale-dip=$ContinuousFullScaleDip"
         }
     }
     if ($ReducedMotion) {
@@ -1022,24 +1026,35 @@ if (
 }
 $expectedDebugOverride = if ($Configuration -eq "debug") { $Slices } else { "none" }
 $expectedContinuousMeter = if ($ContinuousMeter) { "true" } else { "false" }
-$expectedOverlayHalfExtent = if ($ContinuousMeter) { "200" } else { "144" }
+$expectedFullScaleDip = if ($ContinuousMeter) { $ContinuousFullScaleDip.ToString() } else { "300" }
+$expectedOverlayHalfExtent = if ($ContinuousMeter) {
+    ($ContinuousFullScaleDip + 20).ToString()
+} else {
+    "144"
+}
 if (
     $log -notmatch (
         "event_code=input_geometry_ready .*geometry_mode=$Geometry " +
         ".*debug_slice_override=$expectedDebugOverride " +
         ".*debug_continuous_meter=$expectedContinuousMeter " +
-        ".*overlay_half_extent_dip=$expectedOverlayHalfExtent"
+        ".*overlay_half_extent_dip=$expectedOverlayHalfExtent " +
+        ".*continuous_full_scale_radius_dip=$expectedFullScaleDip"
     )
 ) {
     throw "The log does not confirm geometry mode '$Geometry' and the expected menu authority."
 }
 $expectedReducedMotion = if ($ReducedMotion) { "true" } else { "false" }
+$expectedOverlaySize = if ($ContinuousMeter) {
+    (($ContinuousFullScaleDip + 20) * 2).ToString()
+} else {
+    "400"
+}
 if (
     $log -notmatch (
         "event_code=renderer_geometry_cache_ready .*slice_counts=4,8 " +
         ".*reduced_motion=$expectedReducedMotion .*open_ms=60 " +
         ".*selection_ms=0 .*close_ms=50 " +
-        ".*continuous_arm_radius_dip=107 .*overlay_size_dip=400"
+        ".*continuous_arm_radius_dip=107 .*overlay_size_dip=$expectedOverlaySize"
     )
 ) {
     throw "The renderer cache and animation contract was not initialized as requested."
@@ -1423,7 +1438,8 @@ Write-Host (
     "Live $Configuration $Geometry $Slices-slice smoke check passed: " +
     "$expectedInvocations invocation(s), point $resolvedActivationPoint, " +
     "monitor $MonitorIndex, reduced motion $expectedReducedMotion, " +
-    "continuous meter $expectedContinuousMeter at $ContinuousPercent%, " +
+    "continuous meter $expectedContinuousMeter at $ContinuousPercent% " +
+    "with $ContinuousFullScaleDip DIP full scale, " +
     "coalesced visual updates $coalescedUpdates, " +
     "maximum first-frame latency $maximumFirstFrameMs ms, " +
     "maximum retained-cursor movement $maxCursorDistance px, " +

@@ -18,7 +18,7 @@ const ICON_SIZE_DIP: f32 = 30.0;
 const SELECTED_ARC_STEPS: u8 = 24;
 const SELECTED_ARC_INSET_RADIANS: f32 = 0.035;
 #[cfg(test)]
-const CONTINUOUS_FULL_SCALE_RADIUS_DIP: f32 = 160.0;
+const CONTINUOUS_FULL_SCALE_RADIUS_DIP: f32 = 300.0;
 const MAX_SLICE_COUNT: usize = 8;
 
 #[derive(Clone, Debug)]
@@ -30,6 +30,7 @@ pub(crate) struct OverlayRenderFrame {
     pub(crate) continuous_selection: Option<ContinuousSelection>,
     pub(crate) continuous_pointer: Option<Point>,
     pub(crate) continuous_full_scale_radius_dip: f32,
+    pub(crate) continuous_visual_full_scale_radius_dip: f32,
     pub(crate) opacity: f32,
     pub(crate) scale: f32,
 }
@@ -94,7 +95,7 @@ impl OverlayRenderer for FoundationOverlayRenderer {
                 menu.slice_count(),
                 selection,
                 OUTER_RADIUS_DIP * frame.appearance.size_preset.visual_scale(),
-                frame.continuous_full_scale_radius_dip,
+                frame.continuous_visual_full_scale_radius_dip,
                 opacity,
                 lifecycle_scale,
                 accent,
@@ -128,6 +129,9 @@ impl OverlayRenderer for FoundationOverlayRenderer {
                 painter,
                 center,
                 pointer_offset,
+                OUTER_RADIUS_DIP * frame.appearance.size_preset.visual_scale(),
+                frame.continuous_full_scale_radius_dip,
+                frame.continuous_visual_full_scale_radius_dip,
                 opacity,
                 lifecycle_scale,
                 accent,
@@ -154,15 +158,50 @@ fn continuous_pointer_position(center: Pos2, offset: Point, scale: f32) -> Pos2 
     center + Vec2::new(offset.x, offset.y) * scale
 }
 
+fn continuous_visual_pointer_offset(
+    offset: Point,
+    arm_radius_dip: f32,
+    full_scale_radius_dip: f32,
+    visual_full_scale_radius_dip: f32,
+) -> Point {
+    let radius = offset.x.hypot(offset.y);
+    if !radius.is_finite()
+        || !arm_radius_dip.is_finite()
+        || !full_scale_radius_dip.is_finite()
+        || !visual_full_scale_radius_dip.is_finite()
+        || radius <= arm_radius_dip
+        || full_scale_radius_dip <= arm_radius_dip
+        || visual_full_scale_radius_dip >= full_scale_radius_dip
+    {
+        return offset;
+    }
+    let visual_radius = arm_radius_dip
+        + (radius.min(full_scale_radius_dip) - arm_radius_dip)
+            * (visual_full_scale_radius_dip - arm_radius_dip)
+            / (full_scale_radius_dip - arm_radius_dip);
+    let scale = visual_radius / radius;
+    Point::new(offset.x * scale, offset.y * scale)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_continuous_pointer(
     painter: &egui::Painter,
     center: Pos2,
     offset: Point,
+    arm_radius_dip: f32,
+    full_scale_radius_dip: f32,
+    visual_full_scale_radius_dip: f32,
     opacity: f32,
     scale: f32,
     accent: AccentColor,
     theme: ThemeColors,
 ) {
+    let offset = continuous_visual_pointer_offset(
+        offset,
+        arm_radius_dip,
+        full_scale_radius_dip,
+        visual_full_scale_radius_dip,
+    );
     let pointer_position = continuous_pointer_position(center, offset, scale);
     painter.line_segment(
         [center, pointer_position],
@@ -564,9 +603,9 @@ mod tests {
 
     use super::{
         CONTINUOUS_FULL_SCALE_RADIUS_DIP, FoundationOverlayRenderer, OUTER_RADIUS_DIP,
-        continuous_pointer_position, continuous_track_offsets, fitted_icon_rect, half_slice_angle,
-        icon_and_label_offsets, menu_label_layout, selected_accent_color, target_levels,
-        theme_colors,
+        continuous_pointer_position, continuous_track_offsets, continuous_visual_pointer_offset,
+        fitted_icon_rect, half_slice_angle, icon_and_label_offsets, menu_label_layout,
+        selected_accent_color, target_levels, theme_colors,
     };
     use crate::icons::IconVisual;
 
@@ -648,9 +687,9 @@ mod tests {
 
         assert_close(start.x, 107.0);
         assert_close(start.y, 0.0);
-        assert_close(current.x, 133.5);
+        assert_close(current.x, 203.5);
         assert_close(current.y, 0.0);
-        assert_close(end.x, 160.0);
+        assert_close(end.x, 300.0);
         assert_close(end.y, 0.0);
 
         let [large_start, large_current, large_end] = continuous_track_offsets(
@@ -661,19 +700,19 @@ mod tests {
         )
         .expect("large east continuous track");
         assert_close(large_start.x, 123.05);
-        assert_close(large_current.x, 141.525);
-        assert_close(large_end.x, 160.0);
+        assert_close(large_current.x, 211.525);
+        assert_close(large_end.x, 300.0);
 
         let [study_start, study_current, study_end] = continuous_track_offsets(
             SliceCount::Eight,
             ContinuousSelection { slice_index: 2, value: 0.25 },
             OUTER_RADIUS_DIP,
-            300.0,
+            400.0,
         )
         .expect("distance-study east continuous track");
         assert_close(study_start.x, 107.0);
-        assert_close(study_current.x, 155.25);
-        assert_close(study_end.x, 300.0);
+        assert_close(study_current.x, 180.25);
+        assert_close(study_end.x, 400.0);
 
         assert!(
             continuous_track_offsets(
@@ -695,6 +734,23 @@ mod tests {
         );
         assert_close(pointer.x, 120.0);
         assert_close(pointer.y, 320.0);
+
+        let compressed = continuous_visual_pointer_offset(
+            gradial_core::Point::new(400.0, 0.0),
+            107.0,
+            400.0,
+            364.0,
+        );
+        assert_close(compressed.x, 364.0);
+        assert_close(compressed.y, 0.0);
+
+        let inside = continuous_visual_pointer_offset(
+            gradial_core::Point::new(80.0, 0.0),
+            107.0,
+            400.0,
+            364.0,
+        );
+        assert_close(inside.x, 80.0);
     }
 
     #[test]

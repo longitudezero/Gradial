@@ -26,8 +26,9 @@ pub use interaction::{
     DEFAULT_CONTINUOUS_ARM_RADIUS_DIP, DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
     DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, InputEvent, InputEventKind,
     InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
-    InvocationContext, InvocationGeometry, InvocationSnapshot, MonitorGeometry, PhysicalModifiers,
-    ResolvedGeometry, ScreenPoint, ScreenRect, continuous_arm_radius_for_size,
+    InvocationContext, InvocationGeometry, InvocationSnapshot,
+    MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP, MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP, MonitorGeometry,
+    PhysicalModifiers, ResolvedGeometry, ScreenPoint, ScreenRect, continuous_arm_radius_for_size,
     monitor_index_for_point, normalize_continuous_distance, resolve_invocation_geometry,
     slice_for_delta,
 };

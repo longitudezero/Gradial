@@ -837,8 +837,10 @@ mod tests {
         let m4 = mouse(origin, XBUTTON1);
         let (mut discrete, mut discrete_events) =
             callback_state_for_extent(GeometryMode::Auto, 144);
-        let (mut continuous, mut continuous_events) =
-            callback_state_for_extent(GeometryMode::Auto, 200);
+        let (mut continuous, mut continuous_events) = callback_state_for_extent(
+            GeometryMode::Auto,
+            gradial_core::CONTINUOUS_OVERLAY_HALF_EXTENT_DIP,
+        );
 
         assert!(discrete.handle_mouse(WM_XBUTTONDOWN, &m4, 10));
         assert!(continuous.handle_mouse(WM_XBUTTONDOWN, &m4, 11));

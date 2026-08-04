@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use gradial_core::{
-    ActionPlanCompiler, CONTINUOUS_OVERLAY_HALF_EXTENT_DIP, Configuration,
+    ActionPlanCompiler, Configuration, DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
     DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, ProfileResolver, ResolvedMenu,
     continuous_arm_radius_for_size,
 };
@@ -31,20 +31,29 @@ use crate::{
     tray::{TrayCommand, TrayHealth, TrayIcon},
 };
 
-const DISTANCE_STUDY_OVERLAY_HALF_EXTENT_DIP: u32 = 320;
+const CONTINUOUS_OVERLAY_MARGIN_DIP: u32 = 20;
+const FOUNDATION_OVERLAY_SIZE_DIP: f32 = 400.0;
 
-const fn overlay_half_extent_dip(mode: ContinuousMeterMode) -> u32 {
-    if mode.is_distance_study() {
-        DISTANCE_STUDY_OVERLAY_HALF_EXTENT_DIP
-    } else if mode.is_enabled() {
-        CONTINUOUS_OVERLAY_HALF_EXTENT_DIP
+const fn overlay_half_extent_dip(
+    mode: ContinuousMeterMode,
+    continuous_full_scale_radius_dip: u32,
+) -> u32 {
+    if mode.is_enabled() {
+        continuous_full_scale_radius_dip.saturating_add(CONTINUOUS_OVERLAY_MARGIN_DIP)
     } else {
         DEFAULT_OVERLAY_HALF_EXTENT_DIP
     }
 }
 
-const fn overlay_size_dip(mode: ContinuousMeterMode) -> f32 {
-    if mode.is_distance_study() { 640.0 } else { 400.0 }
+fn overlay_size_dip(mode: ContinuousMeterMode, continuous_full_scale_radius_dip: u32) -> f32 {
+    if mode.is_enabled() {
+        let half_extent =
+            u16::try_from(overlay_half_extent_dip(mode, continuous_full_scale_radius_dip))
+                .unwrap_or(u16::MAX);
+        f32::from(half_extent) * 2.0
+    } else {
+        FOUNDATION_OVERLAY_SIZE_DIP
+    }
 }
 
 #[derive(Debug)]
@@ -143,6 +152,7 @@ pub(crate) struct GradialApp {
     geometry_mode: GeometryMode,
     debug_menu_override: Option<Arc<ResolvedMenu>>,
     debug_continuous_meter: ContinuousMeterMode,
+    continuous_full_scale_radius_dip: u32,
     animation_mode: AnimationMode,
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
@@ -171,6 +181,7 @@ pub(crate) struct GradialApp {
 impl GradialApp {
     const REQUIRED_NATIVE_STYLE_PASSES: u8 = 2;
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn new(
         creation_context: &eframe::CreationContext<'_>,
         startup_options: StartupOptions,
@@ -207,14 +218,20 @@ impl GradialApp {
             platform::monitor_work_areas().context("could not read the display work areas")?;
         let (debug_menu_override, debug_slice_override) =
             resolve_debug_menu_options(startup_options);
-        let overlay_half_extent_dip =
-            overlay_half_extent_dip(startup_options.debug_continuous_meter);
+        let continuous_full_scale_radius_dip = startup_options
+            .debug_continuous_full_scale_radius_dip
+            .unwrap_or(DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP);
+        let overlay_half_extent_dip = overlay_half_extent_dip(
+            startup_options.debug_continuous_meter,
+            continuous_full_scale_radius_dip,
+        );
         log::info!(
             target: "startup",
             "component=app event_code=input_geometry_ready result_code=ok \
              config_revision={config_revision} \
              geometry_mode={} debug_slice_override={} debug_continuous_meter={} \
              debug_open_settings={} reduced_motion={} overlay_half_extent_dip={} \
+             continuous_full_scale_radius_dip={} \
              monitor_count={}",
             startup_options.geometry_mode.as_str(),
             debug_slice_override,
@@ -222,6 +239,7 @@ impl GradialApp {
             startup_options.debug_open_settings,
             startup_options.reduced_motion,
             overlay_half_extent_dip,
+            continuous_full_scale_radius_dip,
             monitors.len()
         );
         let animation_mode = if startup_options.reduced_motion {
@@ -234,7 +252,10 @@ impl GradialApp {
             monitors,
             animation_mode,
             configuration.appearance,
-            overlay_size_dip(startup_options.debug_continuous_meter),
+            overlay_size_dip(
+                startup_options.debug_continuous_meter,
+                continuous_full_scale_radius_dip,
+            ),
             &icons,
             config_revision,
             Arc::clone(&timing_markers),
@@ -255,6 +276,7 @@ impl GradialApp {
             geometry_mode: startup_options.geometry_mode,
             debug_menu_override,
             debug_continuous_meter: startup_options.debug_continuous_meter,
+            continuous_full_scale_radius_dip,
             animation_mode,
             overlay_pool,
             interaction: None,
@@ -324,7 +346,7 @@ impl GradialApp {
             monitors,
             self.animation_mode,
             self.configuration.appearance,
-            overlay_size_dip(self.debug_continuous_meter),
+            overlay_size_dip(self.debug_continuous_meter, self.continuous_full_scale_radius_dip),
             &self.icons,
             self.config_revision,
             Arc::clone(&self.timing_markers),
@@ -935,7 +957,10 @@ impl GradialApp {
                 current_monitors,
                 self.animation_mode,
                 self.configuration.appearance,
-                overlay_size_dip(self.debug_continuous_meter),
+                overlay_size_dip(
+                    self.debug_continuous_meter,
+                    self.continuous_full_scale_radius_dip,
+                ),
                 &self.icons,
                 self.config_revision,
                 Arc::clone(&self.timing_markers),
@@ -948,7 +973,10 @@ impl GradialApp {
             geometry_mode: self.geometry_mode,
             monitors: current_monitors,
             activation_binding: self.configuration.activation_binding,
-            overlay_half_extent_dip: overlay_half_extent_dip(self.debug_continuous_meter),
+            overlay_half_extent_dip: overlay_half_extent_dip(
+                self.debug_continuous_meter,
+                self.continuous_full_scale_radius_dip,
+            ),
         };
         let interaction = match InteractionRuntime::start(
             context.clone(),
@@ -966,6 +994,7 @@ impl GradialApp {
                 continuous_arm_radius_dip: continuous_arm_radius_for_size(
                     self.configuration.appearance.size_preset,
                 ),
+                continuous_full_scale_radius_dip: f64::from(self.continuous_full_scale_radius_dip),
                 ..GestureConfig::default()
             },
             self.config_revision,

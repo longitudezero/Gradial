@@ -111,10 +111,10 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   PresentMon displayed-frame correlation, phased resource sampling, and
   explicit evidence-status reporting.
 - The first v0.3 continuous-input prototype: hybrid discrete/continuous wedges,
-  an outer-edge boundary (107 DIP for Standard) with a candidate 160-DIP
-  endpoint, live direction and radius modes, a production-overlay scalar track,
-  an edge-assist pointer proxy, and a debug-only meter that cannot compile or
-  dispatch configured actions.
+  an outer-edge boundary (107 DIP for Standard), a recommended 300-DIP endpoint
+  with a 160-400 DIP development range, live direction and radius modes, a
+  production-overlay scalar track, an edge-assist pointer proxy, and a
+  debug-only meter that cannot compile or dispatch configured actions.
 - A dedicated continuous interaction matrix that checks four/eight directions,
   normalized target values, focus, edge assist, inert execution, and
   machine-readable coverage without fabricating the pending human study.
@@ -451,7 +451,7 @@ configuration or saved action definitions. The pure controller:
 - keeps the selected wedge live at every radius with boundary hysteresis;
 - uses the visible ring's outer edge as the mode boundary: 90.95 DIP for
   Compact, 107 DIP for Standard, and 123.05 DIP for Large;
-- maps that boundary through the candidate 160-DIP endpoint linearly to an
+- maps that boundary through the recommended 300-DIP endpoint linearly to an
   unsigned `0.0..=1.0` scalar;
 - clamps greater distance to `1.0`;
 - commits the final scalar when released outside the boundary;
@@ -471,8 +471,15 @@ selected configured slice normally has an action.
 The normalized value uses the invocation DPI. Edge assist accumulates raw
 physical deltas into the same virtual pointer and divides by that DPI before
 normalization, so equivalent DIP travel produces the same value on every
-monitor. The pointer proxy is clamped to the 160-DIP full-scale boundary and
+monitor. The pointer proxy is clamped to the configured full-scale boundary and
 contains no raw screen coordinate.
+
+`--continuous-full-scale-dip=160..400` overrides the inert meter's whole-DIP
+endpoint and cannot be used without `--continuous-meter` or with either guided
+study. The default is 300 DIP. The overlay and automatic-geometry extent use
+the configured endpoint plus a 20-DIP margin. When the resulting track cannot
+fit at one-to-one scale in the work area, only the visible track and proxy are
+compressed; normalization continues to use the exact configured distance.
 
 The controller evaluates every queued fixed-origin point and edge-assist delta,
 including intermediate outer-edge crossings and direction changes. Direction
@@ -483,6 +490,14 @@ visual update, and the newest pending update is flushed before release,
 cancellation, or another terminal effect. Direction/mode transitions remain at
 info level, while ordinary value samples are debug-only. Shutdown diagnostics
 record dispatched, prioritized, and coalesced counts.
+
+The production v0.3 slice editor will keep discrete and continuous assignment
+separate. **Enable continuous control** defaults off for every wedge. An
+unchecked wedge remains discrete at every radius, displays no percentage, and
+never opens a plugin session; release still dispatches its discrete action if
+one is assigned. Checking it reveals a required compatible continuous-plugin
+action. This control is documented now but is intentionally absent from the
+schema-five editor until the plugin action type exists.
 
 ### Continuous usability study
 
@@ -504,6 +519,9 @@ One anonymous session contains:
   live wedge; and
 - one center-clear cancellation trial after the instruction was shown
   once on the introduction page.
+
+All noncomparison scalar trials use the provisional 300-DIP recommended
+endpoint. The dedicated four-candidate comparison remains unchanged.
 
 The next trial appears only after an accepted terminal outcome. A trial begun
 in the wrong placement category or a scalar trial released before commit is
@@ -900,11 +918,13 @@ from action logs; only the fixed command name is recorded.
 
 The default `--geometry=auto` mode uses fixed origin whenever the required
 extent centered at activation-down fits in the monitor work area. Discrete
-invocations retain their 288 DIP square. The continuous meter requests a 400
-DIP square so its 160 DIP track, large appearance scale, and marker remain
-visible. The four-candidate distance comparison requests a 640 DIP square for
-its 300 DIP track. Otherwise Gradial selects edge assist and clamps the visual
-origin far enough inward for the complete overlay to fit. Work-area
+invocations retain their 288 DIP square. The continuous meter requests a 640
+DIP square for the recommended 300-DIP endpoint and up to 840 DIP for the
+400-DIP maximum. The four-candidate distance comparison requests a 640 DIP
+square for its 300 DIP track. Otherwise Gradial selects edge assist and clamps
+the visual origin far enough inward for the complete overlay to fit. If the
+work area itself is smaller than the viewport, the renderer compresses only
+the visible continuous range while preserving exact input normalization. Work-area
 coordinates remain signed, so monitors above or left of the primary display
 are handled without unsigned conversion.
 

@@ -8,8 +8,10 @@ use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use eframe::egui::{Context, ViewportBuilder, ViewportClass, ViewportId};
 use gradial_core::{
-    Appearance, ContinuousSelection, ContinuousVisualState, InvocationSnapshot, MonitorGeometry,
-    Point, ResolvedGeometry, ResolvedMenu, ScreenPoint, continuous_arm_radius_for_size,
+    Appearance, ContinuousSelection, ContinuousVisualState,
+    DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP, InvocationSnapshot,
+    MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP, MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP, MonitorGeometry,
+    Point, ResolvedGeometry, ResolvedMenu, ScreenPoint, ScreenRect, continuous_arm_radius_for_size,
 };
 use uuid::Uuid;
 
@@ -52,6 +54,7 @@ struct OverlayViewportState {
     continuous_selection: Option<ContinuousSelection>,
     continuous_pointer: Option<Point>,
     continuous_full_scale_radius_dip: f32,
+    continuous_visual_full_scale_radius_dip: f32,
     phase: VisualPhase,
     pending_open_marker: bool,
     pending_first_frame: Option<InvocationSnapshot>,
@@ -66,7 +69,9 @@ impl OverlayViewportState {
         self.selected_slice = None;
         self.continuous_selection = None;
         self.continuous_pointer = None;
-        self.continuous_full_scale_radius_dip = 160.0;
+        self.continuous_full_scale_radius_dip =
+            render_radius_dip(f64::from(DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP));
+        self.continuous_visual_full_scale_radius_dip = self.continuous_full_scale_radius_dip;
         self.phase = VisualPhase::Hidden;
         self.pending_open_marker = false;
         self.pending_first_frame = None;
@@ -327,6 +332,12 @@ impl OverlayRoute {
             state.continuous_pointer = None;
             state.continuous_full_scale_radius_dip =
                 render_radius_dip(continuous_full_scale_radius_dip);
+            state.continuous_visual_full_scale_radius_dip = visible_full_scale_radius_dip(
+                continuous_full_scale_radius_dip,
+                snapshot.geometry.overlay_origin_physical_px,
+                snapshot.context.work_area_physical_px,
+                snapshot.monitor_dpi,
+            );
             state.phase = VisualPhase::Opening { started_at };
             state.pending_open_marker = true;
             state.pending_first_frame = None;
@@ -504,8 +515,35 @@ fn render_radius_dip(radius_dip: f64) -> f32 {
     // The study candidates are deliberately bounded to a range exactly representable by f32.
     #[allow(clippy::cast_possible_truncation)]
     {
-        radius_dip.clamp(160.0, 300.0) as f32
+        radius_dip.clamp(
+            f64::from(MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP),
+            f64::from(MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP),
+        ) as f32
     }
+}
+
+fn visible_full_scale_radius_dip(
+    full_scale_radius_dip: f64,
+    overlay_origin: ScreenPoint,
+    work_area: ScreenRect,
+    monitor_dpi: u32,
+) -> f32 {
+    let available_radius_px = [
+        overlay_origin.x.saturating_sub(work_area.left),
+        work_area.right.saturating_sub(overlay_origin.x),
+        overlay_origin.y.saturating_sub(work_area.top),
+        work_area.bottom.saturating_sub(overlay_origin.y),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or_default()
+    .max(0);
+    let available_radius_dip =
+        f64::from(available_radius_px) * 96.0 / f64::from(monitor_dpi.max(96)) - 20.0;
+    render_radius_dip(
+        full_scale_radius_dip
+            .min(available_radius_dip.max(f64::from(MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP))),
+    )
 }
 
 #[derive(Debug)]
@@ -729,6 +767,7 @@ fn prepare_overlay_frame(
             continuous_selection: state.continuous_selection,
             continuous_pointer: state.continuous_pointer,
             continuous_full_scale_radius_dip: state.continuous_full_scale_radius_dip,
+            continuous_visual_full_scale_radius_dip: state.continuous_visual_full_scale_radius_dip,
             opacity: presence.opacity,
             scale: presence.scale,
         },
@@ -946,13 +985,48 @@ mod tests {
 
     use gradial_core::{ScreenPoint, ScreenRect};
 
-    use super::{VisualPhase, rect_center};
+    use super::{VisualPhase, rect_center, visible_full_scale_radius_dip};
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.0001, "expected {expected}, got {actual}");
+    }
 
     #[test]
     fn monitor_center_preserves_negative_virtual_screen_coordinates() {
         assert_eq!(
             rect_center(ScreenRect::new(-2_560, -1_400, 0, 0)),
             ScreenPoint::new(-1_280, -700)
+        );
+    }
+
+    #[test]
+    fn oversized_continuous_track_compresses_only_its_visible_radius() {
+        assert_close(
+            visible_full_scale_radius_dip(
+                400.0,
+                ScreenPoint::new(960, 540),
+                ScreenRect::new(0, 0, 1_920, 1_080),
+                96,
+            ),
+            400.0,
+        );
+        assert_close(
+            visible_full_scale_radius_dip(
+                400.0,
+                ScreenPoint::new(683, 384),
+                ScreenRect::new(0, 0, 1_366, 768),
+                96,
+            ),
+            364.0,
+        );
+        assert_close(
+            visible_full_scale_radius_dip(
+                400.0,
+                ScreenPoint::new(960, 540),
+                ScreenRect::new(0, 0, 1_920, 1_080),
+                192,
+            ),
+            250.0,
         );
     }
 

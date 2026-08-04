@@ -129,6 +129,30 @@ A continuous extension is valid only as a direct menu-slice assignment. It
 cannot be referenced by a sequence because its lifetime is tied to the held
 activation control rather than the bounded discrete executor.
 
+The menu-slice editor MUST include an **Enable continuous control** checkbox.
+It defaults off. When unchecked, the wedge remains an ordinary discrete wedge
+at every radius: moving beyond the ring does not show a percentage, start a
+plugin session, or change its release behavior. When checked, the editor
+reveals a required compatible continuous-plugin action assignment. Save fails
+with field-specific feedback if the checkbox is on without a valid assignment.
+
+The complete held-gesture contract is authoritative:
+
+| Current position and wedge | State while the activation control remains held | Release result |
+| --- | --- | --- |
+| Inside the 24-DIP center | Selection is clear, but the invocation remains open and may select again | Cancel with no application effect |
+| Outside the center but inside the visible outer edge | Current angle selects a discrete wedge | Dispatch that wedge's discrete action, if assigned |
+| Beyond the outer edge on a continuous-enabled wedge | Current angle selects the wedge and current radius supplies its normalized value | Commit that wedge's continuous action and final value |
+| Beyond the outer edge on an unchecked or unavailable wedge | The wedge remains an ordinary discrete selection; no percentage or continuous session exists | Dispatch that wedge's discrete action, if assigned |
+
+Direction never locks. The selected wedge always follows the current angle.
+Continuous mode never latches: returning inside immediately restores discrete
+mode, moving outside may enter continuous mode again, and entering the center
+only clears the selection. Radial value uses the current straight-line
+distance from the frozen invocation origin, never path length or accumulated
+outward travel. Angle, radius, and inside/outside mode remain independent and
+are recomputed throughout the held gesture.
+
 ### 3.2 Distance mapping
 
 All persisted dimensions use DIP and are converted using the invocation
@@ -139,14 +163,17 @@ monitor's DPI.
 | Existing center cancel radius | 24 DIP |
 | Existing direction-selection radius | 36 DIP |
 | Continuous boundary, Standard menu | 107 DIP (visible outer edge) |
-| Continuous full-scale radius | 160 DIP |
+| Recommended continuous full-scale radius | 300 DIP |
+| User-adjustable full-scale range | 160-400 DIP, inclusive |
 | Default update rate | 30 Hz |
 | Allowed update-rate range | 10–60 Hz |
 
 Angle may change the selected slice throughout the held gesture using the
 existing v0.2 geometry and hysteresis. Angle chooses the wedge. Radial distance
 chooses discrete mode inside the visible outer edge or continuous mode beyond
-it, and then chooses the scalar. Neither dimension nor mode freezes the other.
+it for a continuous-enabled wedge, and then chooses the scalar. Neither
+dimension nor mode freezes the other. Movement back toward the origin reduces
+the value; movement away increases it.
 
 The continuous boundary MUST match the rendered outer edge for the active size
 preset: 90.95 DIP for Compact, 107 DIP for Standard, and 123.05 DIP for Large.
@@ -171,13 +198,12 @@ value = clamp((d - a) / (f - a), 0.0, 1.0)
   continuous sample.
 
 The Milestone 0 usability prototype exposes a separate no-side-effect harness
-that compares 160, 200, 250, and 300 DIP full-scale candidates before
-user-facing Fast, Normal, and Precise presets are selected. The harness keeps
-E and 25% fixed, displays each measured result, and records the participant's
-preference separately from the main cohort report. Changing the production
-endpoint still requires recorded results for precision, accidental continuous
-entry, edge use, live direction switching, and inward mode reversal; it does
-not change the normalized protocol.
+that compares 160, 200, 250, and 300 DIP full-scale candidates. The first
+hands-on comparison preferred 300 DIP, so v0.3 adopts it as the provisional
+recommended default rather than inventing named speed presets. Settings expose
+the exact integer DIP value from 160 through 400 with a slider, numeric field,
+plain-language shorter/faster and longer/finer guidance, and **Reset to
+recommended**. Changing the endpoint does not change the normalized protocol.
 
 ### 3.3 Live mode and direction
 
@@ -283,6 +309,13 @@ During edge assist, the production overlay MUST show a Gradial-owned pointer
 proxy that follows the signed raw-delta virtual pointer. The proxy is clamped
 to the full-scale radius and contains no raw screen coordinate.
 
+If the configured track cannot fit at one-to-one DIP scale within the active
+work area, Gradial MUST preserve the exact configured input distance and
+normalized value. It may compress only the visible portion from the outer-edge
+boundary through the track endpoint, including the edge-assist proxy. The
+percentage remains authoritative; display fitting never silently clamps a
+400-DIP setting to a smaller input distance.
+
 Every native per-monitor overlay MUST receive an explicit repaint wake after it
 is shown and after Gradial-owned selection or continuous state changes. While a
 bounded opening or closing animation remains active, the native child MUST
@@ -310,8 +343,10 @@ selected by the v0.2 invocation geometry.
   overlay pool is rebuilt.
 - Negative virtual-screen coordinates remain valid.
 
-The overlay's prewarmed extent and scissor behavior may expand to display the
-160 DIP track, but window or graphics-device creation remains prohibited during
+The overlay pool prewarms for the configured full-scale distance plus a 20-DIP
+visual margin: 640 DIP square at the recommended 300-DIP setting and at most
+840 DIP square at 400 DIP. Oversized work areas use the adaptive visual rule in
+Section 3.5, and window or graphics-device creation remains prohibited during
 activation.
 
 ## 4. Runtime-neutral plugin protocol
@@ -422,7 +457,14 @@ ActionKind::PluginContinuous {
 separate optional `continuous_action_id`. The new field may reference only a
 `PluginContinuous` action. This explicit second slot permits a Mute discrete
 action and a Volume continuous extension to share one wedge without encoding
-either behavior inside the other.
+either behavior inside the other. `None` is the persisted unchecked state for
+**Enable continuous control**; a valid checked state always contains the
+selected action ID, so schema six does not need a redundant boolean.
+
+The root configuration also gains
+`continuous_full_scale_radius_dip: u32`. Validation accepts 160 through 400,
+the migration/default value is 300, and the value is frozen for the complete
+invocation.
 
 `PluginValue` supports only:
 
@@ -452,14 +494,15 @@ configuration revision at activation.
 
 Allowing an unavailable plugin reference preserves portable configuration
 without treating absent local plugin files as configuration corruption. The
-settings editor shows the affected actions and profiles. The slice's discrete
-action remains usable inside the ring. Crossing outside toward an unavailable
-continuous extension cancels with `plugin_unavailable`.
+settings editor shows the affected actions and profiles. The slice remains
+discrete at every radius while its continuous extension is unavailable; no
+plugin segment begins, and releasing still uses the discrete assignment.
 
 ### 5.2 Migration, import, and export
 
 - Schema-five configuration migrates to schema six in memory with no plugin
-  actions and `continuous_action_id: None` on every menu slice.
+  actions, `continuous_action_id: None` on every menu slice, and a 300-DIP
+  `continuous_full_scale_radius_dip` value.
 - Migration follows the existing explicit-save rule; startup does not rewrite
   a valid legacy file.
 - Import and atomic replacement retain the v0.2 recovery contract.
@@ -806,11 +849,20 @@ The action catalog gains **Plugin continuous action**.
 - Plugin code does not run while editing parameters.
 - The editor shows requested capabilities before assignment.
 - Save uses complete schema-six validation.
-- A menu-slice editor exposes the continuous extension separately from its
-  existing discrete action.
+- A menu-slice editor exposes **Enable continuous control** separately from its
+  existing discrete action. The checkbox defaults off and reveals the
+  continuous-action selector only while checked.
+- An unchecked wedge stays discrete at every radius. A checked wedge requires
+  one enabled compatible continuous action before Settings can save.
 - A missing plugin produces a visible unavailable warning rather than deleting
   either assignment.
 - Continuous actions are not offered in the sequence editor.
+
+The interaction page also exposes **Continuous travel** as an integer slider
+and numeric field from 160 through 400 DIP. It defaults to 300 DIP, explains
+that shorter values respond faster while longer values provide finer control,
+and offers **Reset to recommended**. The value is a global input preference,
+not an application-specific plugin parameter.
 
 The production radial preview visualizes direction, the reversible
 inside/outside mode, and normalized distance but never calls the plugin or
@@ -911,7 +963,7 @@ Before freezing the distance defaults, test at least eight participants using
 four- and eight-slice menus at screen center, edges, and corners.
 
 Participants select displayed target values at 25%, 50%, 75%, and 100%.
-Before choosing presets, each participant also receives matched trials where
+Before confirming the recommended default, each participant also receives matched trials where
 direction and target are held constant while the full-scale endpoint changes
 among 160, 200, 250, and 300 DIP. Candidate order is counterbalanced so
 practice does not systematically favor one endpoint. Record completion time,
@@ -930,11 +982,11 @@ Accept the defaults when:
 - Edge/corner median completion time is no more than 20% slower than
   center-screen completion.
 
-Use the matched endpoint comparison to select two or three named travel presets
-such as Fast, Normal, and Precise. Preserve the exact DIP endpoint internally;
-a custom value may be exposed later. If these gates fail, adjust the endpoint,
-progress rendering, or onboarding and repeat the prototype. Do not compensate
-by exposing application-specific values in the core.
+Use the matched endpoint comparison to validate or revise the provisional
+300-DIP recommendation. Preserve and expose the exact bounded DIP value rather
+than named speed presets. If these gates fail, adjust the recommendation,
+range, progress rendering, or onboarding and repeat the prototype. Do not
+compensate by exposing application-specific values in the core.
 
 ## 12. Test matrix
 
@@ -942,12 +994,16 @@ by exposing application-specific values in the core.
 
 - Distance normalization at the outer-edge boundary, full-scale radius,
   between them, and beyond both bounds.
+- Exact 160-DIP minimum, 300-DIP recommendation, 400-DIP maximum, rejection
+  outside the range, and adaptive visual compression without scalar changes.
 - NaN, infinity, very large deltas, negative coordinates, and every supported
   DPI.
 - Four/eight slice centers, boundaries, hysteresis, live outside direction
   changes, inward restoration of discrete mode, and center selection clearing.
 - Release inside a hybrid wedge selects its discrete action; release outside
   commits its continuous extension; neither result is latched from history.
+- An unchecked wedge remains discrete beyond the outer edge, shows no
+  percentage, opens no plugin session, and dispatches only its discrete action.
 - Monotonic scalar behavior for monotonic outward movement.
 - Deterministic update coalescing and sequence gaps.
 - Begin rejection, callback error, timeout, cancellation, and exact terminal
@@ -1009,7 +1065,7 @@ Deliver:
 - Reversible hybrid radius mode and live-direction state.
 - Production-renderer progress feedback.
 - Bounded virtual-pointer feedback during edge assist.
-- Edge-assist extension to the candidate full-scale radius.
+- Edge-assist extension to the configured full-scale radius.
 - A built-in no-side-effect sample sink.
 - Repeatable direction/distance interaction matrix.
 - The matched 160/200/250/300-DIP comparison and usability study in Section
@@ -1017,9 +1073,9 @@ Deliver:
 
 No Lua or plugin configuration is introduced in this milestone.
 
-Exit only when the visible-edge boundary, selected full-scale presets, visual
-feedback, inward reversal, cancellation, and edge behavior have recorded
-results.
+Exit only when the visible-edge boundary, recommended full-scale default and
+range, visual feedback, inward reversal, cancellation, and edge behavior have
+recorded results.
 
 ### Milestone 1 — Runtime-neutral continuous core
 

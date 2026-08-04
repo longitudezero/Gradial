@@ -123,7 +123,7 @@ The debug-only continuous meter makes every direction an inert hybrid wedge.
 Inside the visible button ring, release follows the normal discrete-selection
 path; crossing its outer edge switches the live wedge to a `0–100%` continuous
 meter. For the standard menu size that boundary is 107 DIP and the current
-candidate endpoint is 160 DIP. Compact and Large boundaries follow their
+recommended endpoint is 300 DIP. Compact and Large boundaries follow their
 visible outer edges. The wedge follows live angle at every radius, while radial
 distance independently chooses discrete or continuous mode and the scalar. The
 meter uses the wider edge-assist extent and never compiles or dispatches the
@@ -133,9 +133,26 @@ saved slice action:
 cargo run --package gradial-app -- --continuous-meter --skip-onboarding
 ```
 
+Debug builds can try any whole-DIP endpoint from 160 through 400 without
+changing saved configuration:
+
+```powershell
+cargo run --package gradial-app -- --continuous-meter --continuous-full-scale-dip=400 --skip-onboarding
+```
+
 Returning across the outer edge removes the meter immediately and restores the
 discrete wedge. Releasing there selects that button; moving outside again
 restores continuous mode. Returning to the center clears the selection.
+The center does not end the held gesture; moving outward can select again, and
+only releasing there cancels. Direction never locks, continuous mode never
+latches, and the value always follows current straight-line distance rather
+than accumulated travel.
+
+The planned v0.3 Settings editor enables continuous control per wedge with a
+checkbox that defaults off. Unchecked wedges remain ordinary discrete actions
+at every distance, which suits commands such as Copy or Open. A separate
+global **Continuous travel** control will default to 300 DIP and allow exact
+values from 160 through 400.
 
 High-polling mice do not enqueue a render/log operation for every physical
 sample. Gradial still evaluates every sample for live direction and radius,

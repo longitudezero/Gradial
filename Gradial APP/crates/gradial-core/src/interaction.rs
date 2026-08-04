@@ -10,11 +10,13 @@ use uuid::Uuid;
 use crate::{Point, SizePreset, SliceCount};
 
 pub const DEFAULT_OVERLAY_HALF_EXTENT_DIP: u32 = 144;
-pub const CONTINUOUS_OVERLAY_HALF_EXTENT_DIP: u32 = 200;
+pub const CONTINUOUS_OVERLAY_HALF_EXTENT_DIP: u32 = 320;
 /// Standard-size menu outer edge and the boundary between discrete and
 /// continuous interaction.
 pub const DEFAULT_CONTINUOUS_ARM_RADIUS_DIP: f64 = 107.0;
-pub const DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP: f64 = 160.0;
+pub const MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP: u32 = 160;
+pub const DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP: u32 = 300;
+pub const MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP: u32 = 400;
 
 /// Matches continuous activation to the visible outer edge of the selected
 /// menu-size preset.
@@ -352,6 +354,11 @@ impl ContinuousSliceMask {
     }
 
     #[must_use]
+    pub const fn from_bits(slice_count: SliceCount, bits: u8) -> Self {
+        Self(bits & Self::all(slice_count).0)
+    }
+
+    #[must_use]
     pub const fn contains(self, slice_index: usize) -> bool {
         if slice_index >= u8::BITS as usize {
             return false;
@@ -384,7 +391,7 @@ impl Default for GestureConfig {
             center_cancel_radius_dip: 24.0,
             selection_entry_radius_dip: 36.0,
             continuous_arm_radius_dip: DEFAULT_CONTINUOUS_ARM_RADIUS_DIP,
-            continuous_full_scale_radius_dip: DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+            continuous_full_scale_radius_dip: f64::from(DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP),
             boundary_hysteresis_degrees: 5.0,
             slice_count: SliceCount::Eight,
         }
@@ -445,6 +452,8 @@ impl InteractionController {
         if self.state != InteractionState::Idle
             || !radius_dip.is_finite()
             || radius_dip <= self.config.continuous_arm_radius_dip
+            || radius_dip < f64::from(MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP)
+            || radius_dip > f64::from(MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP)
         {
             return false;
         }
@@ -1037,6 +1046,8 @@ mod tests {
         assert_scalar(normalize_continuous_distance(f64::INFINITY, 107.0, 160.0), 1.0);
         assert_scalar(normalize_continuous_distance(f64::NAN, 107.0, 160.0), 0.0);
         assert_scalar(normalize_continuous_distance(104.0, 160.0, 48.0), 0.0);
+        assert_scalar(normalize_continuous_distance(203.5, 107.0, 300.0), 0.5);
+        assert_scalar(normalize_continuous_distance(253.5, 107.0, 400.0), 0.5);
         assert_eq!(
             continuous_pointer_offset_dip(
                 ScreenPoint::new(0, 0),
@@ -1061,6 +1072,8 @@ mod tests {
         let mut controller = InteractionController::new(GestureConfig::default());
         assert!(controller.set_continuous_full_scale_radius_dip(250.0));
         assert!(!controller.set_continuous_full_scale_radius_dip(107.0));
+        assert!(!controller.set_continuous_full_scale_radius_dip(159.0));
+        assert!(!controller.set_continuous_full_scale_radius_dip(401.0));
         controller.activation_down(snapshot(origin)).expect("open");
         assert!(!controller.set_continuous_full_scale_radius_dip(300.0));
         controller.activation_up();
@@ -1084,7 +1097,7 @@ mod tests {
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
                 visual: ContinuousVisualState {
-                    selection: ContinuousSelection { slice_index: 2, value: 27.0 / 53.0 },
+                    selection: ContinuousSelection { slice_index: 2, value: 27.0 / 193.0 },
                     pointer_offset_dip: Point::new(134.0, 0.0),
                     armed: true,
                 },
@@ -1099,7 +1112,7 @@ mod tests {
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
                 visual: ContinuousVisualState {
-                    selection: ContinuousSelection { slice_index: 0, value: 27.0 / 53.0 },
+                    selection: ContinuousSelection { slice_index: 0, value: 27.0 / 193.0 },
                     pointer_offset_dip: Point::new(0.0, -134.0),
                     armed: true,
                 },
@@ -1107,12 +1120,12 @@ mod tests {
         );
         assert_eq!(controller.selected_slice(), Some(0));
         assert_eq!(
-            controller.pointer_moved(ScreenPoint::new(-60, 100)),
+            controller.pointer_moved(ScreenPoint::new(-200, 100)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
                 visual: ContinuousVisualState {
                     selection: ContinuousSelection { slice_index: 6, value: 1.0 },
-                    pointer_offset_dip: Point::new(-160.0, 0.0),
+                    pointer_offset_dip: Point::new(-300.0, 0.0),
                     armed: true,
                 },
             })
@@ -1154,6 +1167,36 @@ mod tests {
             Some(InteractionEffect::Close {
                 invocation_id: Uuid::nil(),
                 outcome: InteractionOutcome::Selected { slice_index: 2 },
+            })
+        );
+    }
+
+    #[test]
+    fn unchecked_wedge_remains_discrete_beyond_the_outer_edge() {
+        let origin = ScreenPoint::new(100, 100);
+        let mut controller = InteractionController::new(GestureConfig::default());
+        controller
+            .activation_down_with_behavior(
+                snapshot(origin),
+                SliceCount::Eight,
+                ContinuousSliceMask::from_bits(SliceCount::Eight, 1 << 2),
+            )
+            .expect("east-only continuous open");
+
+        assert_eq!(
+            controller.pointer_moved(ScreenPoint::new(100, -300)),
+            Some(InteractionEffect::SelectionChanged {
+                invocation_id: Uuid::nil(),
+                selected_slice: Some(0),
+            })
+        );
+        assert_eq!(controller.state(), InteractionState::Tracking);
+        assert_eq!(controller.continuous_selection(), None);
+        assert_eq!(
+            controller.activation_up(),
+            Some(InteractionEffect::Close {
+                invocation_id: Uuid::nil(),
+                outcome: InteractionOutcome::Selected { slice_index: 0 },
             })
         );
     }
@@ -1225,7 +1268,7 @@ mod tests {
                 invocation_id: Uuid::nil(),
                 outcome: InteractionOutcome::ContinuousCommitted {
                     slice_index: 4,
-                    value: 27.0 / 53.0,
+                    value: 27.0 / 193.0,
                 },
             })
         );
@@ -1247,12 +1290,12 @@ mod tests {
             .expect("high-DPI open");
 
         assert_eq!(
-            controller.pointer_moved(ScreenPoint::new(-233, -500)),
+            controller.pointer_moved(ScreenPoint::new(-93, -500)),
             Some(InteractionEffect::ContinuousChanged {
                 invocation_id: Uuid::nil(),
                 visual: ContinuousVisualState {
                     selection: ContinuousSelection { slice_index: 2, value: 0.5 },
-                    pointer_offset_dip: Point::new(133.5, 0.0),
+                    pointer_offset_dip: Point::new(203.5, 0.0),
                     armed: true,
                 },
             })
@@ -1463,7 +1506,7 @@ mod tests {
         for ((dx, dy), slice_index, pointer_offset) in [
             ((0, -134), 0, Point::new(0.0, -134.0)),
             ((-134, 134), 6, Point::new(-134.0, 0.0)),
-            ((-1_000, 0), 6, Point::new(-160.0, 0.0)),
+            ((-1_000, 0), 6, Point::new(-300.0, 0.0)),
         ] {
             let Some(InteractionEffect::ContinuousChanged { visual, .. }) =
                 controller.raw_pointer_delta(dx, dy)

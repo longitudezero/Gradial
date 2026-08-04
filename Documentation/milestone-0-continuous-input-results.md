@@ -8,6 +8,8 @@ Hybrid-radius revision: 2026-08-04
 
 Immediate-feedback revision: 2026-08-04
 
+Distance-default revision: 2026-08-04
+
 This record covers the first bounded v0.3 slice plus its live-direction and
 hybrid-radius revisions: continuous radial geometry, production-overlay
 feedback, extended edge assist, and a debug-only no-side-effect meter. It
@@ -21,7 +23,7 @@ or application-specific effect.
   exposes the continuous scalar.
 - The outer-edge boundary is 90.95 DIP for Compact, 107 DIP for Standard, and
   123.05 DIP for Large. Radial travel from that boundary through the current
-  160-DIP endpoint maps linearly to an unsigned `0.0..=1.0` scalar and clamps
+  300-DIP recommended endpoint maps linearly to an unsigned `0.0..=1.0` scalar and clamps
   outside that range.
 - Angle continuously selects the live wedge at every radius. Returning inside
   the outer edge immediately removes continuous mode; moving outside restores
@@ -34,9 +36,11 @@ or application-specific effect.
 - The renderer displays a radial track, a position marker, and a center
   percentage using the production overlay path. Edge assist also displays a
   Gradial-owned pointer proxy from a full-scale-clamped DIP offset.
-- The prewarmed overlay and edge-assist extent expand from the discrete
-  288-DIP square to a 400-DIP square only for the continuous prototype.
-  Existing discrete selection geometry remains unchanged.
+- The prototype accepts whole-DIP endpoints from 160 through 400. Its prewarmed
+  overlay and edge-assist extent expand from the discrete 288-DIP geometry to
+  640 DIP at the 300-DIP default and 840 DIP at the maximum. If the viewport
+  exceeds the work area, only its visible track and proxy compress; the input
+  value continues using the exact configured distance.
 - Debug-only `--continuous-meter` gives each resolved menu slice a continuous
   extension for that invocation. Both continuous commits and inside-ring
   discrete selections are logged as inert evidence and cannot compile or
@@ -50,8 +54,8 @@ plugin adapter is introduced.
 
 ## Automated checks
 
-The workspace test suite passes with 184 debug application tests, 181 release
-application tests, and 60 core tests in each configuration.
+The workspace test suite passes with 187 debug application tests, 183 release
+application tests, and 62 core tests in each configuration.
 The new coverage verifies:
 
 - normalization at 0%, 50%, and 100%, including clamping and invalid input;
@@ -60,8 +64,9 @@ The new coverage verifies:
 - current-radius mode selection without direction or mode latching;
 - equivalent normalized values at different DPI scales;
 - signed edge-assist pointer feedback and full-scale visual clamping;
-- 107/133.5/160-DIP renderer marker positions for Standard size;
-- continuous mode's 200-DIP edge-assist extent while discrete mode retains
+- 107/203.5/300-DIP renderer marker positions for Standard size and the
+  adaptive 400-DIP maximum on smaller or high-DPI work areas;
+- continuous mode's 320-DIP default edge-assist extent while discrete mode retains
   its 144-DIP half extent;
 - rejection of `--continuous-meter` by release builds; and
 - the invariant that neither branch of the inert hybrid meter compiles a saved
@@ -204,11 +209,12 @@ The guided schema-three participant harness and backward-compatible cohort
 evaluator are now available and documented in
 `milestone-0-continuous-study-results.md`, but no participant reports have yet
 been collected.
-The visible outer edge is now fixed as the mode boundary, while the full-scale
-distance remains a candidate. A separate no-side-effect comparison now
+The visible outer edge is fixed as the mode boundary. A separate no-side-effect comparison
 measures 160, 200, 250, and 300 DIP endpoints at E/25%, shows every result, and
 records the participant's preferred distance without changing production
-settings. Its human result is still pending before Fast, Normal, and Precise
-defaults can be selected.
+settings. The first hands-on comparison preferred 300 DIP, so it is now the
+provisional recommended default; this single result does not replace the
+planned participant cohort. The eventual Settings value remains adjustable
+from 160 through 400 DIP rather than using named speed presets.
 Mixed-DPI, negative-coordinate, and high-refresh hardware were also unavailable
 in this local run and remain part of later cross-hardware validation.

@@ -1,14 +1,16 @@
 use anyhow::{Result, bail};
 use gradial_core::GeometryMode;
 #[cfg(debug_assertions)]
-use gradial_core::SliceCount;
+use gradial_core::{
+    MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP, MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP, SliceCount,
+};
 
 #[cfg(debug_assertions)]
 pub(crate) const HELP: &str = "\
 Gradial interaction prototype
 
 Usage:
-  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--continuous-meter|--continuous-study|--continuous-distance-study] [--reduced-motion] [--open-settings] [--skip-onboarding]
+  gradial [--geometry=auto|fixed-origin|edge-assist] [--slices=4|8] [--continuous-meter|--continuous-study|--continuous-distance-study] [--continuous-full-scale-dip=<160-400>] [--reduced-motion] [--open-settings] [--skip-onboarding]
 
 Geometry modes:
   auto          Use edge assist only when the complete ring would clip.
@@ -24,6 +26,8 @@ Continuous input:
   --continuous-study  Run the guided, anonymous distance usability study.
   --continuous-distance-study
                       Compare the 160/200/250/300 DIP full-scale candidates.
+  --continuous-full-scale-dip
+                      Override the inert meter's 100% distance (160-400 DIP).
 
 Animation:
   --reduced-motion  Remove visual interpolation without changing gesture timing.
@@ -104,6 +108,7 @@ pub(crate) struct StartupOptions {
     pub(crate) debug_open_settings: bool,
     pub(crate) debug_skip_onboarding: bool,
     pub(crate) debug_continuous_meter: ContinuousMeterMode,
+    pub(crate) debug_continuous_full_scale_radius_dip: Option<u32>,
     pub(crate) reduced_motion: bool,
 }
 
@@ -112,6 +117,7 @@ impl StartupOptions {
         self.debug_skip_onboarding || self.debug_continuous_meter.is_study()
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut geometry_mode = GeometryMode::Auto;
         #[cfg(debug_assertions)]
@@ -131,6 +137,10 @@ impl StartupOptions {
         let mut debug_continuous_meter = ContinuousMeterMode::Disabled;
         #[cfg(not(debug_assertions))]
         let debug_continuous_meter = ContinuousMeterMode::Disabled;
+        #[cfg(debug_assertions)]
+        let mut debug_continuous_full_scale_radius_dip = None;
+        #[cfg(not(debug_assertions))]
+        let debug_continuous_full_scale_radius_dip = None;
         let mut arguments = arguments.into_iter();
 
         while let Some(argument) = arguments.next() {
@@ -186,6 +196,21 @@ impl StartupOptions {
                         debug_continuous_meter = ContinuousMeterMode::DistanceStudy;
                         continue;
                     }
+                    if let Some(value) = argument.strip_prefix("--continuous-full-scale-dip=") {
+                        debug_continuous_full_scale_radius_dip =
+                            Some(parse_continuous_full_scale_radius(value)?);
+                        continue;
+                    }
+                    if argument == "--continuous-full-scale-dip" {
+                        let value = arguments.next().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "--continuous-full-scale-dip requires an integer from 160 to 400"
+                            )
+                        })?;
+                        debug_continuous_full_scale_radius_dip =
+                            Some(parse_continuous_full_scale_radius(&value)?);
+                        continue;
+                    }
                 }
                 bail!("unknown Gradial argument: {argument}");
             }
@@ -195,11 +220,19 @@ impl StartupOptions {
         if debug_continuous_meter.is_study()
             && (debug_slice_override.is_some()
                 || debug_open_settings
+                || debug_continuous_full_scale_radius_dip.is_some()
                 || geometry_mode != GeometryMode::Auto)
         {
             bail!(
                 "guided continuous studies require automatic geometry and cannot combine with --slices or --open-settings"
             );
+        }
+
+        #[cfg(debug_assertions)]
+        if debug_continuous_full_scale_radius_dip.is_some()
+            && debug_continuous_meter != ContinuousMeterMode::Enabled
+        {
+            bail!("--continuous-full-scale-dip requires --continuous-meter");
         }
 
         Ok(Self {
@@ -208,6 +241,7 @@ impl StartupOptions {
             debug_open_settings,
             debug_skip_onboarding,
             debug_continuous_meter,
+            debug_continuous_full_scale_radius_dip,
             reduced_motion,
         })
     }
@@ -220,6 +254,19 @@ fn parse_slice_count(value: &str) -> Result<SliceCount> {
         "8" => Ok(SliceCount::Eight),
         _ => bail!("invalid slice count {value:?}; expected 4 or 8"),
     }
+}
+
+#[cfg(debug_assertions)]
+fn parse_continuous_full_scale_radius(value: &str) -> Result<u32> {
+    let radius = value.parse::<u32>().map_err(|_| {
+        anyhow::anyhow!("invalid continuous full-scale distance {value:?}; expected 160 to 400 DIP")
+    })?;
+    if !(MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP..=MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP)
+        .contains(&radius)
+    {
+        bail!("invalid continuous full-scale distance {value:?}; expected 160 to 400 DIP");
+    }
+    Ok(radius)
 }
 
 fn parse_geometry_mode(value: &str) -> Result<GeometryMode> {
@@ -247,6 +294,7 @@ mod tests {
         assert!(!options.debug_open_settings);
         assert!(!options.debug_skip_onboarding);
         assert_eq!(options.debug_continuous_meter, ContinuousMeterMode::Disabled);
+        assert_eq!(options.debug_continuous_full_scale_radius_dip, None);
         assert!(!options.reduced_motion);
     }
 
@@ -308,6 +356,7 @@ mod tests {
             "--open-settings".to_owned(),
             "--skip-onboarding".to_owned(),
             "--continuous-meter".to_owned(),
+            "--continuous-full-scale-dip=250".to_owned(),
         ])
         .expect("reduced-motion options");
         assert_eq!(options.geometry_mode, GeometryMode::EdgeAssist);
@@ -315,7 +364,34 @@ mod tests {
         assert!(options.debug_open_settings);
         assert!(options.debug_skip_onboarding);
         assert_eq!(options.debug_continuous_meter, ContinuousMeterMode::Enabled);
+        assert_eq!(options.debug_continuous_full_scale_radius_dip, Some(250));
         assert!(options.reduced_motion);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn continuous_full_scale_override_is_bounded_and_requires_the_inert_meter() {
+        for (arguments, expected) in [
+            (vec!["--continuous-meter", "--continuous-full-scale-dip=160"], 160),
+            (vec!["--continuous-full-scale-dip", "400", "--continuous-meter"], 400),
+        ] {
+            let options = StartupOptions::parse(arguments.into_iter().map(str::to_owned))
+                .expect("valid continuous distance override");
+            assert_eq!(options.debug_continuous_full_scale_radius_dip, Some(expected));
+        }
+
+        for arguments in [
+            vec!["--continuous-full-scale-dip=159", "--continuous-meter"],
+            vec!["--continuous-meter", "--continuous-full-scale-dip=401"],
+            vec!["--continuous-full-scale-dip=300"],
+            vec!["--continuous-study", "--continuous-full-scale-dip=300"],
+        ] {
+            let described_arguments = format!("{arguments:?}");
+            assert!(
+                StartupOptions::parse(arguments.into_iter().map(str::to_owned)).is_err(),
+                "override must reject {described_arguments}"
+            );
+        }
     }
 
     #[test]
@@ -358,6 +434,7 @@ mod tests {
             "--continuous-meter",
             "--continuous-study",
             "--continuous-distance-study",
+            "--continuous-full-scale-dip=300",
         ] {
             let error =
                 StartupOptions::parse([argument.to_owned()]).expect_err("debug-only option");

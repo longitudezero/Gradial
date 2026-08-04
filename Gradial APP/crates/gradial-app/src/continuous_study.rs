@@ -13,8 +13,8 @@ use eframe::egui::{
     ViewportId,
 };
 use gradial_core::{
-    ActivationBinding, CancelReason, InteractionOutcome, InvocationSnapshot, ResolvedMenu,
-    ScreenPoint, ScreenRect, SliceCount,
+    ActivationBinding, CancelReason, DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP, InteractionOutcome,
+    InvocationSnapshot, ResolvedMenu, ScreenPoint, ScreenRect, SliceCount,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -29,6 +29,7 @@ const STUDY_EVENT_CAPACITY: usize = 32;
 const STUDY_SIZE: [f32; 2] = [760.0, 680.0];
 const STUDY_MIN_SIZE: [f32; 2] = [680.0, 600.0];
 const TARGETS: [u8; 4] = [25, 50, 75, 100];
+const USABILITY_FULL_SCALE_RADIUS_DIP: u32 = DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP;
 const DISTANCE_TARGET_PERCENT: u8 = 25;
 const DISTANCE_CANDIDATES_DIP: [u32; 4] = [160, 200, 250, 300];
 
@@ -510,7 +511,7 @@ impl StudyState {
                     standard: 107.0,
                     large: 123.05,
                 },
-                full_scale: 160,
+                full_scale: USABILITY_FULL_SCALE_RADIUS_DIP,
             },
             planned_trials: self.plan.len(),
             attempts: self.attempts.clone(),
@@ -1091,7 +1092,7 @@ fn study_plan() -> Vec<StudyTrial> {
             change_from_index: None,
             change_after_arm: false,
             placement: StudyPlacement::Center,
-            full_scale_radius_dip: 160,
+            full_scale_radius_dip: USABILITY_FULL_SCALE_RADIUS_DIP,
         });
         next_id += 1;
     }
@@ -1116,7 +1117,7 @@ fn study_plan() -> Vec<StudyTrial> {
                     change_from_index: None,
                     change_after_arm: false,
                     placement,
-                    full_scale_radius_dip: 160,
+                    full_scale_radius_dip: USABILITY_FULL_SCALE_RADIUS_DIP,
                 });
                 next_id += 1;
             }
@@ -1134,7 +1135,7 @@ fn study_plan() -> Vec<StudyTrial> {
             change_from_index: Some(initial_direction),
             change_after_arm,
             placement: StudyPlacement::Center,
-            full_scale_radius_dip: 160,
+            full_scale_radius_dip: USABILITY_FULL_SCALE_RADIUS_DIP,
         });
         next_id += 1;
     }
@@ -1147,7 +1148,7 @@ fn study_plan() -> Vec<StudyTrial> {
         change_from_index: None,
         change_after_arm: false,
         placement: StudyPlacement::Center,
-        full_scale_radius_dip: 160,
+        full_scale_radius_dip: USABILITY_FULL_SCALE_RADIUS_DIP,
     });
     trials
 }
@@ -1619,6 +1620,8 @@ mod tests {
         assert_eq!(report.summary.accidental_arms, 0);
         assert_eq!(report.summary.armed_direction_switch_successes, 4);
         assert_eq!(report.summary.cancellation_successes, 1);
+        assert_eq!(report.candidate_geometry_dip.full_scale, 300);
+        assert!(plan.iter().all(|trial| trial.full_scale_radius_dip == 300));
     }
 
     #[test]

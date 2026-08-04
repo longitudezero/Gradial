@@ -62,6 +62,11 @@ schema-one `continuous-distance-study-<session-id>.json` report. It does not
 alter saved configuration, create a speed preset, or enter the main cohort
 summarizer.
 
+One initial hands-on comparison was completed on 2026-08-04 and preferred
+300 DIP. That result establishes the provisional recommended default and the
+prototype now supports manual 160-400 DIP checks. It is recorded as design
+feedback only, not fabricated into the still-unrun eight-participant cohort.
+
 ## Automated evidence
 
 Automated coverage verifies:
@@ -94,7 +99,7 @@ No participant dataset has been fabricated. The current status remains:
 | Edge/corner median no more than 20% slower than center | Not evaluated |
 
 The visible outer edge is now the mode boundary (107 DIP at Standard size).
-The candidate full-scale radius remains unfrozen. The comparison harness is
-available, but its human result has not yet been recorded; production Fast,
-Normal, and Precise presets remain deliberately unimplemented until that
-evidence is reviewed.
+The provisional full-scale recommendation is 300 DIP, with an intended exact
+160-400 DIP user setting. The recommendation remains open to revision after
+the formal cohort; named Fast, Normal, and Precise presets are no longer part
+of the v0.3 design.
