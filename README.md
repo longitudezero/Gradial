@@ -264,9 +264,9 @@ arguments, or target titles. Input is also re-registered after resume, session
 unlock, or an Explorer restart.
 
 First startup opens required onboarding and creates
-`%LOCALAPPDATA%\Gradial\config.json` with schema 5, revision 1, the default M4
+`%LOCALAPPDATA%\Gradial\config.json` with schema 6, revision 1, the default M4
 binding, original blue/light/standard appearance, a global eight-slice profile,
-and an empty action catalog. Onboarding
+an empty action catalog, and a 300-DIP continuous full-scale distance. Onboarding
 does not finish until the user acknowledges that the exact activation chord is
 dedicated while Gradial runs, opens the real radial interaction, selects one
 inert sample slice, and cancels once through the center or Escape. Practice
@@ -274,14 +274,15 @@ uses the production hook, controller, geometry, and overlay but cannot compile
 or dispatch a configured action. Successful completion is saved separately in
 `onboarding-v1.json`; the tray's **Restart onboarding** command replays the
 flow without making a previously completed installation incomplete.
-Existing schema-one through schema-four files are migrated to schema five in
+Existing schema-one through schema-five files are migrated to schema six in
 memory without being rewritten; the next explicit successful save persists
-schema five. Configuration
+schema six. Schema-five migration adds an unchecked continuous assignment to
+every wedge and the 300-DIP default while retaining existing icons. Configuration
 replacement is validated and atomic, preserves the previous valid primary as
 `config.json.bak`, and recovers from that backup without overwriting a broken
 primary. Application-profile rules are resolved at every activation. The
-selected profile's complete menu—including optional action UUIDs and managed
-icon references—is frozen for
+selected profile's complete menu—including separate optional discrete and
+continuous action UUIDs plus managed icon references—is frozen for
 the invocation, so title or configuration changes cannot switch geometry,
 labels, or the selected action while a gesture is open. Delay, keyboard
 shortcut, Unicode text, HTTP/HTTPS URL, existing absolute file/folder open, and
@@ -326,11 +327,11 @@ rename or duplicate every action and safely delete unreferenced actions.
 Sequences provide ordered add, remove, move-up, and move-down controls; only
 additions that avoid cycles and stay within nested depth, executed-step, and
 Delay limits are offered. Closing a dirty draft requires **Discard changes**
-or **Keep editing**. **Import settings…** reads schema-one through schema-five
+or **Keep editing**. **Import settings…** reads schema-one through schema-six
 JSON into the private editor draft, fully validates it, and asks
 before replacing existing unsaved edits. It does not change the running app or
 `config.json` until **Save changes**. **Export current draft…** writes the
-complete valid draft—including unsaved edits—to a schema-five JSON file
+complete valid draft—including unsaved edits—to a schema-six JSON file
 through an atomic adjacent temporary file. When the draft references custom
 icons, export validates each managed source and copies each unique asset into
 an adjacent `icons` directory. Import validates that optional directory and
@@ -340,6 +341,14 @@ Missing adjacent assets do not block a JSON-only import: Settings reports the
 count and the affected directions use placeholders. Imported/exported action
 paths, arguments, labels, and text stay literal and are not rewritten for
 portability.
+Schema six can preserve a `plugin_continuous` action and a wedge's separate
+`continuous_action_id` even when the referenced plugin is not installed. Such
+an extension is deliberately unavailable in this build: the wedge remains an
+ordinary discrete wedge at every radius, and release still uses only its
+discrete action. Settings retains these portable definitions, shows their
+identity read-only in the action catalog, and excludes them from discrete
+assignment and sequences. Plugin discovery, enablement, execution, and the
+continuous-assignment editor arrive in later v0.3 milestones.
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
 current Windows account, so it does not require administrator access. Gradial reports
@@ -427,6 +436,13 @@ Renderer cache and animation results are recorded in
 [`Documentation/milestone-1-renderer-animation-results.md`](Documentation/milestone-1-renderer-animation-results.md).
 The repeatable interaction-matrix contract and current coverage are recorded in
 [`Documentation/milestone-1-interaction-matrix-results.md`](Documentation/milestone-1-interaction-matrix-results.md).
+The runtime-neutral continuous protocol, coordinator lease, live interaction
+bridge, and schema-six configuration evidence are recorded in
+[`Documentation/milestone-1-continuous-protocol-results.md`](Documentation/milestone-1-continuous-protocol-results.md),
+[`Documentation/milestone-1-continuous-coordinator-results.md`](Documentation/milestone-1-continuous-coordinator-results.md),
+[`Documentation/milestone-1-continuous-live-bridge-results.md`](Documentation/milestone-1-continuous-live-bridge-results.md),
+and
+[`Documentation/milestone-1-schema-six-results.md`](Documentation/milestone-1-schema-six-results.md).
 Configuration, snapshot, persistence, and resolver results are recorded in
 [`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).
 Profile-driven gesture and renderer results are recorded in

@@ -116,7 +116,6 @@ Final verification:
 
 ## Deferred boundary
 
-Schema six remains the next missing Milestone 1 boundary: persisted continuous
-plugin-action definitions, per-wedge extension assignments, schema-five
-migration, and unavailable-plugin reference behavior. A real plugin runtime
-is still deferred to Milestone 2.
+At this checkpoint, schema six was the next missing Milestone 1 boundary.
+That boundary was completed by the subsequent schema-six configuration slice;
+a real plugin runtime remains deferred to Milestone 2.

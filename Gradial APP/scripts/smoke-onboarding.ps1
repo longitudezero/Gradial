@@ -282,7 +282,7 @@ try {
             }
     )
     $configuration = [ordered]@{
-        schema_version = 5
+        schema_version = 6
         config_revision = 1
         activation_binding = [ordered]@{
             button = "m4"
@@ -301,6 +301,7 @@ try {
             label_theme = "light"
             size_preset = "standard"
         }
+        continuous_full_scale_radius_dip = 300
         global_profile = [ordered]@{
             id = $profileId
             name = "Onboarding smoke"

@@ -10,8 +10,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use gradial_core::{
     ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,
     APPEARANCE_CONFIG_SCHEMA_VERSION, ActionPlanCompiler, AppPaths, Appearance,
-    CONFIG_SCHEMA_VERSION, Configuration, IconReference, LEGACY_CONFIG_SCHEMA_VERSION,
-    ProfileResolver,
+    CONFIG_SCHEMA_VERSION, Configuration, ICON_CONFIG_SCHEMA_VERSION, IconReference,
+    LEGACY_CONFIG_SCHEMA_VERSION, ProfileResolver,
 };
 use uuid::Uuid;
 use windows::{
@@ -63,7 +63,7 @@ pub(crate) struct ConfigurationWarning {
     pub(crate) backup_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ImportedConfiguration {
     pub(crate) configuration: Configuration,
     pub(crate) migration: Option<ConfigurationMigration>,
@@ -549,6 +549,7 @@ fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFil
                     | ACTION_CONFIG_SCHEMA_VERSION
                     | ACTIVATION_CONFIG_SCHEMA_VERSION
                     | APPEARANCE_CONFIG_SCHEMA_VERSION
+                    | ICON_CONFIG_SCHEMA_VERSION
             )
         });
     if let Some(schema_version) = schema_version
@@ -561,60 +562,8 @@ fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFil
             supported: CONFIG_SCHEMA_VERSION,
         });
     }
-    if migration_from == Some(LEGACY_CONFIG_SCHEMA_VERSION)
-        && schema_one_contains_action_fields(&value)
-    {
-        return Err(ConfigurationFileError::InvalidMigration {
-            path: path.to_path_buf(),
-            from_schema: LEGACY_CONFIG_SCHEMA_VERSION,
-            reason: "schema-one files cannot contain actions or action references",
-        });
-    }
-    if let Some(from_schema) = migration_from
-        && configuration_contains_icon_reference(&value)
-    {
-        return Err(ConfigurationFileError::InvalidMigration {
-            path: path.to_path_buf(),
-            from_schema,
-            reason: "older schemas cannot contain icon references",
-        });
-    }
     if let Some(from_schema) = migration_from {
-        let root =
-            value.as_object_mut().ok_or_else(|| ConfigurationFileError::InvalidMigration {
-                path: path.to_path_buf(),
-                from_schema,
-                reason: "the root must be a JSON object",
-            })?;
-        if from_schema < ACTIVATION_CONFIG_SCHEMA_VERSION && root.contains_key("activation_binding")
-        {
-            return Err(ConfigurationFileError::InvalidMigration {
-                path: path.to_path_buf(),
-                from_schema,
-                reason: "older schemas cannot contain an activation binding",
-            });
-        }
-        if from_schema < APPEARANCE_CONFIG_SCHEMA_VERSION && root.contains_key("appearance") {
-            return Err(ConfigurationFileError::InvalidMigration {
-                path: path.to_path_buf(),
-                from_schema,
-                reason: "older schemas cannot contain appearance settings",
-            });
-        }
-        if from_schema < ACTIVATION_CONFIG_SCHEMA_VERSION {
-            root.insert(
-                "activation_binding".to_owned(),
-                serde_json::to_value(gradial_core::ActivationBinding::default())
-                    .expect("the built-in activation binding is serializable"),
-            );
-        }
-        if from_schema < APPEARANCE_CONFIG_SCHEMA_VERSION {
-            root.insert(
-                "appearance".to_owned(),
-                serde_json::to_value(Appearance::default())
-                    .expect("the built-in appearance is serializable"),
-            );
-        }
+        migrate_configuration_value(path, &mut value, from_schema)?;
     }
     let mut configuration: Configuration = serde_json::from_value(value)
         .map_err(|source| ConfigurationFileError::Parse { path: path.to_path_buf(), source })?;
@@ -629,6 +578,53 @@ fn read_configuration(path: &Path) -> Result<ReadConfiguration, ConfigurationFil
         .validate()
         .map_err(|source| ConfigurationFileError::Invalid { path: path.to_path_buf(), source })?;
     Ok(ReadConfiguration { configuration, migration })
+}
+
+fn migrate_configuration_value(
+    path: &Path,
+    value: &mut serde_json::Value,
+    from_schema: u32,
+) -> Result<(), ConfigurationFileError> {
+    let invalid = |reason| ConfigurationFileError::InvalidMigration {
+        path: path.to_path_buf(),
+        from_schema,
+        reason,
+    };
+    if from_schema == LEGACY_CONFIG_SCHEMA_VERSION && schema_one_contains_action_fields(value) {
+        return Err(invalid("schema-one files cannot contain actions or action references"));
+    }
+    if from_schema < ICON_CONFIG_SCHEMA_VERSION && configuration_contains_icon_reference(value) {
+        return Err(invalid("older schemas cannot contain icon references"));
+    }
+    if configuration_contains_continuous_fields(value) {
+        return Err(invalid("older schemas cannot contain continuous plugin fields"));
+    }
+    let root = value.as_object_mut().ok_or_else(|| invalid("the root must be a JSON object"))?;
+    if from_schema < ACTIVATION_CONFIG_SCHEMA_VERSION && root.contains_key("activation_binding") {
+        return Err(invalid("older schemas cannot contain an activation binding"));
+    }
+    if from_schema < APPEARANCE_CONFIG_SCHEMA_VERSION && root.contains_key("appearance") {
+        return Err(invalid("older schemas cannot contain appearance settings"));
+    }
+    if from_schema < ACTIVATION_CONFIG_SCHEMA_VERSION {
+        root.insert(
+            "activation_binding".to_owned(),
+            serde_json::to_value(gradial_core::ActivationBinding::default())
+                .expect("the built-in activation binding is serializable"),
+        );
+    }
+    if from_schema < APPEARANCE_CONFIG_SCHEMA_VERSION {
+        root.insert(
+            "appearance".to_owned(),
+            serde_json::to_value(Appearance::default())
+                .expect("the built-in appearance is serializable"),
+        );
+    }
+    root.insert(
+        "continuous_full_scale_radius_dip".to_owned(),
+        serde_json::Value::from(gradial_core::DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP),
+    );
+    Ok(())
 }
 
 fn schema_one_contains_action_fields(value: &serde_json::Value) -> bool {
@@ -669,6 +665,39 @@ fn configuration_contains_icon_reference(value: &serde_json::Value) -> bool {
             |profiles| {
                 profiles.iter().any(|application_profile| {
                     application_profile.get("profile").is_some_and(profile_contains_icon)
+                })
+            },
+        )
+}
+
+fn configuration_contains_continuous_fields(value: &serde_json::Value) -> bool {
+    if value.get("continuous_full_scale_radius_dip").is_some()
+        || value.get("actions").and_then(serde_json::Value::as_array).is_some_and(|actions| {
+            actions.iter().any(|action| {
+                action
+                    .get("kind")
+                    .and_then(|kind| kind.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("plugin_continuous")
+            })
+        })
+    {
+        return true;
+    }
+    let profile_contains_continuous = |profile: &serde_json::Value| {
+        profile
+            .get("menu")
+            .and_then(|menu| menu.get("slices"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|slices| {
+                slices.iter().any(|slice| slice.get("continuous_action_id").is_some())
+            })
+    };
+    value.get("global_profile").is_some_and(profile_contains_continuous)
+        || value.get("application_profiles").and_then(serde_json::Value::as_array).is_some_and(
+            |profiles| {
+                profiles.iter().any(|application_profile| {
+                    application_profile.get("profile").is_some_and(profile_contains_continuous)
                 })
             },
         )
@@ -895,13 +924,13 @@ fn wide_path(path: &Path) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use gradial_core::{
         ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,
         APPEARANCE_CONFIG_SCHEMA_VERSION, ActionDefinition, ActionKind, ActivationBinding,
-        AppPaths, Appearance, CONFIG_SCHEMA_VERSION, Configuration, IconFormat, IconReference,
-        LEGACY_CONFIG_SCHEMA_VERSION,
+        AppPaths, Appearance, CONFIG_SCHEMA_VERSION, Configuration, ICON_CONFIG_SCHEMA_VERSION,
+        IconFormat, IconReference, LEGACY_CONFIG_SCHEMA_VERSION,
     };
     use image::{ImageEncoder, codecs::png::PngEncoder};
     use uuid::Uuid;
@@ -941,6 +970,7 @@ mod tests {
         );
         root.remove("activation_binding");
         root.remove("appearance");
+        root.remove("continuous_full_scale_radius_dip");
         root.remove("actions");
         let slices = root
             .get_mut("global_profile")
@@ -964,6 +994,7 @@ mod tests {
         );
         root.remove("activation_binding");
         root.remove("appearance");
+        root.remove("continuous_full_scale_radius_dip");
         serde_json::to_vec_pretty(&value).expect("schema-two bytes")
     }
 
@@ -976,6 +1007,7 @@ mod tests {
             serde_json::Value::from(ACTIVATION_CONFIG_SCHEMA_VERSION),
         );
         root.remove("appearance");
+        root.remove("continuous_full_scale_radius_dip");
         serde_json::to_vec_pretty(&value).expect("schema-three bytes")
     }
 
@@ -983,11 +1015,28 @@ mod tests {
         let mut value =
             serde_json::to_value(Configuration::default()).expect("configuration value");
         value["schema_version"] = serde_json::Value::from(APPEARANCE_CONFIG_SCHEMA_VERSION);
+        value
+            .as_object_mut()
+            .expect("configuration object")
+            .remove("continuous_full_scale_radius_dip");
         serde_json::to_vec_pretty(&value).expect("schema-four bytes")
     }
 
+    fn schema_five_bytes() -> Vec<u8> {
+        let mut configuration = Configuration::default();
+        configuration.global_profile.menu.slices[0].icon =
+            Some(IconReference { asset_id: Uuid::from_u128(55), format: IconFormat::Svg });
+        let mut value = serde_json::to_value(configuration).expect("configuration value");
+        value["schema_version"] = serde_json::Value::from(ICON_CONFIG_SCHEMA_VERSION);
+        value
+            .as_object_mut()
+            .expect("configuration object")
+            .remove("continuous_full_scale_radius_dip");
+        serde_json::to_vec_pretty(&value).expect("schema-five bytes")
+    }
+
     #[test]
-    fn first_load_atomically_initializes_schema_five() {
+    fn first_load_atomically_initializes_schema_six() {
         let (_temporary_directory, paths, store) = store();
         let loaded = store.load_or_initialize().expect("initialize configuration");
 
@@ -1116,6 +1165,10 @@ mod tests {
         assert_eq!(loaded.configuration.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(loaded.configuration.activation_binding, ActivationBinding::default());
         assert_eq!(loaded.configuration.appearance, Appearance::default());
+        assert_eq!(
+            loaded.configuration.continuous_full_scale_radius_dip,
+            gradial_core::DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP
+        );
         assert!(loaded.configuration.actions.is_empty());
         assert!(
             loaded
@@ -1228,6 +1281,101 @@ mod tests {
                 .all(|slice| slice.icon.is_none())
         );
         assert_eq!(fs::read(&paths.config).expect("schema four retained"), schema_four);
+    }
+
+    #[test]
+    fn schema_five_gains_continuous_defaults_only_in_memory_and_keeps_icons() {
+        let (_temporary_directory, paths, store) = store();
+        let schema_five = schema_five_bytes();
+        fs::write(&paths.config, &schema_five).expect("schema-five configuration");
+
+        let loaded = store.load_or_initialize().expect("migrated configuration");
+
+        assert_eq!(loaded.source, ConfigurationSource::Primary);
+        assert_eq!(
+            loaded.migration,
+            Some(ConfigurationMigration {
+                from_schema: ICON_CONFIG_SCHEMA_VERSION,
+                to_schema: CONFIG_SCHEMA_VERSION,
+            })
+        );
+        assert_eq!(
+            loaded.configuration.continuous_full_scale_radius_dip,
+            gradial_core::DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP
+        );
+        assert!(
+            loaded
+                .configuration
+                .global_profile
+                .menu
+                .slices
+                .iter()
+                .all(|slice| slice.continuous_action_id.is_none())
+        );
+        assert!(loaded.configuration.global_profile.menu.slices[0].icon.is_some());
+        assert_eq!(fs::read(&paths.config).expect("schema five retained"), schema_five);
+    }
+
+    #[test]
+    fn schema_five_cannot_smuggle_schema_six_continuous_fields() {
+        let (temporary_directory, _paths, _store) = store();
+        let base: serde_json::Value =
+            serde_json::from_slice(&schema_five_bytes()).expect("schema-five value");
+        let mut with_radius = base.clone();
+        with_radius["continuous_full_scale_radius_dip"] = serde_json::Value::from(300);
+        let mut with_assignment = base.clone();
+        with_assignment["global_profile"]["menu"]["slices"][0]["continuous_action_id"] =
+            serde_json::Value::Null;
+        let mut with_plugin_action = base;
+        with_plugin_action["actions"] = serde_json::to_value([ActionDefinition {
+            id: Uuid::from_u128(91),
+            name: "Measure".to_owned(),
+            kind: ActionKind::PluginContinuous {
+                plugin_id: "org.gradial.meter".to_owned(),
+                plugin_action_id: "measure".to_owned(),
+                parameters: BTreeMap::new(),
+            },
+        }])
+        .expect("plugin action");
+
+        for (name, value) in [
+            ("radius", with_radius),
+            ("assignment", with_assignment),
+            ("plugin-action", with_plugin_action),
+        ] {
+            let path = temporary_directory.path().join(format!("{name}.json"));
+            fs::write(&path, serde_json::to_vec_pretty(&value).expect("schema-five bytes"))
+                .expect("schema-five file");
+            let error = read_configuration(&path).expect_err("smuggled field rejected");
+            assert!(error.to_string().contains("older schemas cannot contain continuous"));
+        }
+    }
+
+    #[test]
+    fn schema_six_keeps_an_unavailable_plugin_reference_loadable() {
+        let (temporary_directory, _paths, _store) = store();
+        let action_id = Uuid::from_u128(91);
+        let mut configuration = Configuration {
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Measure".to_owned(),
+                kind: ActionKind::PluginContinuous {
+                    plugin_id: "org.gradial.not-installed".to_owned(),
+                    plugin_action_id: "measure".to_owned(),
+                    parameters: BTreeMap::new(),
+                },
+            }],
+            ..Configuration::default()
+        };
+        configuration.global_profile.menu.slices[0].continuous_action_id = Some(action_id);
+        let path = temporary_directory.path().join("schema-six.json");
+        fs::write(&path, serde_json::to_vec_pretty(&configuration).expect("schema-six bytes"))
+            .expect("schema-six file");
+
+        let loaded = read_configuration(&path).expect("unavailable plugin reference");
+
+        assert_eq!(loaded.configuration, configuration);
+        assert!(loaded.migration.is_none());
     }
 
     #[test]
@@ -1347,6 +1495,7 @@ mod tests {
         );
         root.remove("activation_binding");
         root.remove("appearance");
+        root.remove("continuous_full_scale_radius_dip");
         let bytes = serde_json::to_vec_pretty(&value).expect("import bytes");
         let source = paths.root.join("private-import.json");
         fs::write(&source, &bytes).expect("import source");

@@ -74,7 +74,7 @@ pub(crate) fn settings_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("gradial-settings")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct SettingsDraft {
     original: Configuration,
     proposed: Configuration,
@@ -514,7 +514,7 @@ impl std::fmt::Debug for PrivatePath {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum SettingsEvent {
     Save(Configuration),
     Import(PrivatePath),
@@ -3009,7 +3009,12 @@ impl SettingsState {
             let initial_sequence_child = configuration
                 .actions
                 .iter()
-                .find(|action| !matches!(action.kind, ActionKind::Sequence { .. }))
+                .find(|action| {
+                    !matches!(
+                        action.kind,
+                        ActionKind::Sequence { .. } | ActionKind::PluginContinuous { .. }
+                    )
+                })
                 .map(|action| action.id);
             ui.menu_button("+ New action", |ui| {
                 for template in NewActionTemplate::ALL {
@@ -3173,6 +3178,22 @@ impl SettingsState {
                         return;
                     };
                     payload_changed = render_sequence_editor(ui, actions, context);
+                }
+                ActionKind::PluginContinuous {
+                    plugin_id,
+                    plugin_action_id,
+                    parameters,
+                } => {
+                    ui.label("Plugin");
+                    ui.monospace(plugin_id.as_str());
+                    ui.add_space(8.0);
+                    ui.label("Plugin action");
+                    ui.monospace(plugin_action_id.as_str());
+                    ui.add_space(8.0);
+                    ui.label(format!("Parameters: {}", parameters.len()));
+                    ui.weak(
+                        "This portable continuous action is retained but remains unavailable until plugin support is installed and enabled.",
+                    );
                 }
             }
             if payload_changed {
@@ -4134,13 +4155,17 @@ fn action_references(configuration: &Configuration, action_id: Uuid) -> ActionRe
         .menu
         .slices
         .iter()
-        .filter(|slice| slice.action_id == Some(action_id))
+        .filter(|slice| {
+            slice.action_id == Some(action_id) || slice.continuous_action_id == Some(action_id)
+        })
         .count();
     let application_references = configuration
         .application_profiles
         .iter()
         .flat_map(|application| &application.profile.menu.slices)
-        .filter(|slice| slice.action_id == Some(action_id))
+        .filter(|slice| {
+            slice.action_id == Some(action_id) || slice.continuous_action_id == Some(action_id)
+        })
         .count();
     let sequence_references = configuration
         .actions
@@ -4181,6 +4206,7 @@ fn action_options(configuration: &Configuration) -> Vec<(Uuid, String)> {
     configuration
         .actions
         .iter()
+        .filter(|action| !matches!(action.kind, ActionKind::PluginContinuous { .. }))
         .map(|action| (action.id, format!("{} — {}", action.name, action_kind_name(&action.kind))))
         .collect()
 }
@@ -4205,14 +4231,16 @@ const fn action_kind_name(kind: &ActionKind) -> &'static str {
         ActionKind::Window { .. } => "Window",
         ActionKind::Delay { .. } => "Delay",
         ActionKind::Sequence { .. } => "Sequence",
+        ActionKind::PluginContinuous { .. } => "Continuous plugin",
     }
 }
 
 fn resolved_menu(menu: &Menu) -> Option<Arc<ResolvedMenu>> {
-    ResolvedMenu::new_with_icons(
+    ResolvedMenu::new_with_continuous_actions(
         menu.resolved_slice_count()?,
         menu.slices.iter().map(|slice| slice.label.clone()).collect(),
         menu.slices.iter().map(|slice| slice.action_id).collect(),
+        menu.slices.iter().map(|slice| slice.continuous_action_id).collect(),
         menu.slices.iter().map(|slice| slice.icon).collect(),
     )
     .map(Arc::new)
@@ -4651,6 +4679,7 @@ fn empty_menu_label_error(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
@@ -4669,14 +4698,39 @@ mod tests {
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
         NewActionTemplate, PayloadEditOutcome, PortableIconSummary, PrivatePath, ProfileTestState,
         SequenceEditorContext, SequenceMetrics, SequenceMove, SettingsDraft, SettingsEvent,
-        SettingsSection, SettingsState, StartAtLoginFeedback, TransferFeedback, action_references,
-        activation_binding_display, add_executable_argument, add_sequence_step,
+        SettingsSection, SettingsState, StartAtLoginFeedback, TransferFeedback, action_options,
+        action_references, activation_binding_display, add_executable_argument, add_sequence_step,
         apply_dialog_outcome, binding_test_selection, countdown_seconds_remaining, create_action,
         create_application_profile, delete_action, delete_application_profile, duplicate_action,
         duplicate_application_profile, map_selected_slice, move_sequence_step,
         normalize_preview_offset, preview_slice_at, remove_executable_argument,
-        remove_sequence_step, resize_menu, resolution_decision_text, validate_draft,
+        remove_sequence_step, resize_menu, resolution_decision_text, resolved_menu, validate_draft,
     };
+
+    #[test]
+    fn unavailable_continuous_actions_are_retained_but_not_offered_as_discrete_actions() {
+        let action_id = Uuid::from_u128(701);
+        let mut configuration = Configuration {
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Portable continuous action".to_owned(),
+                kind: ActionKind::PluginContinuous {
+                    plugin_id: "org.gradial.not-installed".to_owned(),
+                    plugin_action_id: "measure".to_owned(),
+                    parameters: BTreeMap::new(),
+                },
+            }],
+            ..Configuration::default()
+        };
+        configuration.global_profile.menu.slices[0].continuous_action_id = Some(action_id);
+
+        validate_draft(&configuration).expect("portable unavailable action");
+        assert!(action_options(&configuration).is_empty());
+        assert_eq!(action_references(&configuration, action_id).menu_slices, 1);
+        assert!(delete_action(&mut configuration, action_id).is_err());
+        let menu = resolved_menu(&configuration.global_profile.menu).expect("resolved menu");
+        assert_eq!(menu.continuous_action_id(0), Some(action_id));
+    }
     use crate::{
         configuration::ConfigurationMigration,
         diagnostic_bundle::{DiagnosticBundleRequest, DiagnosticSnapshot},
@@ -4717,7 +4771,12 @@ mod tests {
         let mut menu = gradial_core::Menu {
             slice_count: 4,
             slices: ["One", "Two", "Three", "Four"]
-                .map(|label| MenuSlice { label: label.to_owned(), action_id: None, icon: None })
+                .map(|label| MenuSlice {
+                    label: label.to_owned(),
+                    action_id: None,
+                    continuous_action_id: None,
+                    icon: None,
+                })
                 .into(),
         };
         let mut stash = None;

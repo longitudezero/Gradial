@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{Configuration, ConfigurationError};
+use crate::{
+    Configuration, ConfigurationError, MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES, PluginActionId,
+    PluginId, PluginParameters, PluginValue, continuous::plugin_parameters_fit_serialized_limit,
+};
 
 pub const DEFAULT_ACTION_STEP_TIMEOUT_MS: u32 = 5_000;
 pub const MAX_ACTION_SEQUENCE_DURATION_MS: u32 = 30_000;
@@ -16,7 +19,7 @@ pub const MAX_ACTION_SEQUENCE_STEPS: usize = 32;
 pub const MAX_ACTION_SEQUENCE_DEPTH: u8 = 4;
 pub const MAX_TYPED_TEXT_BYTES: usize = 8 * 1_024;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionDefinition {
     pub id: Uuid,
@@ -24,7 +27,7 @@ pub struct ActionDefinition {
     pub kind: ActionKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActionKind {
     SendShortcut {
@@ -53,6 +56,11 @@ pub enum ActionKind {
     },
     Sequence {
         actions: Vec<Uuid>,
+    },
+    PluginContinuous {
+        plugin_id: String,
+        plugin_action_id: String,
+        parameters: PluginParameters,
     },
 }
 
@@ -206,6 +214,40 @@ fn validate_action_fields(definition: &ActionDefinition) -> Result<(), Configura
                 });
             }
         }
+        ActionKind::PluginContinuous { plugin_id, plugin_action_id, parameters } => {
+            validate_plugin_action_fields(definition.id, plugin_id, plugin_action_id, parameters)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_action_fields(
+    action_id: Uuid,
+    plugin_id: &str,
+    plugin_action_id: &str,
+    parameters: &PluginParameters,
+) -> Result<(), ConfigurationError> {
+    PluginId::new(plugin_id).map_err(|_| ConfigurationError::InvalidPluginActionIdentifier {
+        action_id,
+        field: "plugin_id",
+    })?;
+    PluginActionId::new(plugin_action_id).map_err(|_| {
+        ConfigurationError::InvalidPluginActionIdentifier { action_id, field: "plugin_action_id" }
+    })?;
+    if parameters.keys().any(|key| PluginActionId::new(key.as_str()).is_err()) {
+        return Err(ConfigurationError::InvalidPluginParameterKey { action_id });
+    }
+    if parameters
+        .values()
+        .any(|value| matches!(value, PluginValue::Number(number) if !number.is_finite()))
+    {
+        return Err(ConfigurationError::InvalidPluginParameterNumber { action_id });
+    }
+    if !plugin_parameters_fit_serialized_limit(parameters) {
+        return Err(ConfigurationError::PluginParametersTooLarge {
+            action_id,
+            maximum: MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES,
+        });
     }
     Ok(())
 }
@@ -269,14 +311,37 @@ fn validate_profile_menu_references(
     definitions: &BTreeMap<Uuid, &ActionDefinition>,
 ) -> Result<(), ConfigurationError> {
     for (slice_index, slice) in slices.iter().enumerate() {
-        if let Some(action_id) = slice.action_id
-            && !definitions.contains_key(&action_id)
-        {
-            return Err(ConfigurationError::MissingMenuActionReference {
-                profile_id,
-                slice_index,
-                action_id,
-            });
+        if let Some(action_id) = slice.action_id {
+            let Some(definition) = definitions.get(&action_id) else {
+                return Err(ConfigurationError::MissingMenuActionReference {
+                    profile_id,
+                    slice_index,
+                    action_id,
+                });
+            };
+            if matches!(definition.kind, ActionKind::PluginContinuous { .. }) {
+                return Err(ConfigurationError::ContinuousActionAssignedDiscretely {
+                    profile_id,
+                    slice_index,
+                    action_id,
+                });
+            }
+        }
+        if let Some(action_id) = slice.continuous_action_id {
+            let Some(definition) = definitions.get(&action_id) else {
+                return Err(ConfigurationError::MissingMenuContinuousActionReference {
+                    profile_id,
+                    slice_index,
+                    action_id,
+                });
+            };
+            if !matches!(definition.kind, ActionKind::PluginContinuous { .. }) {
+                return Err(ConfigurationError::NonContinuousActionAssignedContinuously {
+                    profile_id,
+                    slice_index,
+                    action_id,
+                });
+            }
         }
     }
     Ok(())
@@ -325,6 +390,13 @@ fn analyze_action(
                     action_id: *child_id,
                 });
             };
+            if matches!(child.kind, ActionKind::PluginContinuous { .. }) {
+                return Err(ConfigurationError::ContinuousActionInSequence {
+                    sequence_id: definition.id,
+                    index,
+                    action_id: *child_id,
+                });
+            }
             let child_metrics = analyze_action(child, next_depth, stack, definitions)?;
             metrics.steps = metrics.steps.saturating_add(child_metrics.steps);
             metrics.delay_ms = metrics.delay_ms.saturating_add(child_metrics.delay_ms);
@@ -419,6 +491,11 @@ impl ActionPlanCompiler {
                 self.flatten(child, steps)?;
             }
             return Ok(());
+        }
+        if matches!(definition.kind, ActionKind::PluginContinuous { .. }) {
+            return Err(ActionPlanError::ContinuousActionRequiresContinuousExecutor {
+                action_id: definition.id,
+            });
         }
         if steps.len() >= MAX_ACTION_SEQUENCE_STEPS {
             return Err(ActionPlanError::StepLimitExceeded { maximum: MAX_ACTION_SEQUENCE_STEPS });
@@ -549,6 +626,9 @@ impl From<&ActionKind> for ExecutionOperation {
             ActionKind::Sequence { .. } => {
                 unreachable!("sequence nodes are flattened before operation compilation")
             }
+            ActionKind::PluginContinuous { .. } => {
+                unreachable!("continuous actions are rejected before discrete plan compilation")
+            }
         }
     }
 }
@@ -557,6 +637,9 @@ impl From<&ActionKind> for ExecutionOperation {
 pub enum ActionPlanError {
     #[error("action {action_id} is not present in the active configuration")]
     ActionNotFound { action_id: Uuid },
+
+    #[error("continuous action {action_id} requires the continuous plugin executor")]
+    ContinuousActionRequiresContinuousExecutor { action_id: Uuid },
 
     #[error(
         "invocation uses configuration revision {invocation}; active action catalog uses {active}"
@@ -612,7 +695,7 @@ pub enum ActionResult {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use uuid::Uuid;
 
@@ -621,10 +704,143 @@ mod tests {
         MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
         MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier,
     };
-    use crate::{Configuration, ConfigurationError, MenuSlice};
+    use crate::{
+        Configuration, ConfigurationError, MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES, MenuSlice,
+        PluginValue,
+    };
 
     fn action(id: u128, kind: ActionKind) -> ActionDefinition {
         ActionDefinition { id: Uuid::from_u128(id), name: format!("Action {id}"), kind }
+    }
+
+    fn plugin_action(id: u128, parameters: BTreeMap<String, PluginValue>) -> ActionDefinition {
+        action(
+            id,
+            ActionKind::PluginContinuous {
+                plugin_id: "org.gradial.meter".to_owned(),
+                plugin_action_id: "measure".to_owned(),
+                parameters,
+            },
+        )
+    }
+
+    #[test]
+    fn unavailable_plugin_reference_is_portable_but_not_a_discrete_plan() {
+        let action_id = Uuid::from_u128(91);
+        let mut parameters = BTreeMap::new();
+        parameters.insert("scale".to_owned(), PluginValue::Number(0.75));
+        parameters.insert("mode".to_owned(), PluginValue::Choice("absolute".to_owned()));
+        let mut configuration = Configuration {
+            actions: vec![plugin_action(91, parameters)],
+            ..Configuration::default()
+        };
+        configuration.global_profile.menu.slices[0].continuous_action_id = Some(action_id);
+
+        configuration.validate().expect("an absent local plugin is not configuration damage");
+        let serialized = serde_json::to_vec_pretty(&configuration).expect("schema-six JSON");
+        let restored: Configuration = serde_json::from_slice(&serialized).expect("schema-six JSON");
+        assert_eq!(restored, configuration);
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("catalog");
+        assert_eq!(
+            compiler.compile_plan(action_id, configuration.config_revision),
+            Err(super::ActionPlanError::ContinuousActionRequiresContinuousExecutor { action_id })
+        );
+    }
+
+    #[test]
+    fn continuous_actions_use_only_the_continuous_wedge_slot_and_never_sequences() {
+        let continuous_id = Uuid::from_u128(91);
+        let discrete_id = Uuid::from_u128(92);
+        let sequence_id = Uuid::from_u128(93);
+        let base = Configuration {
+            actions: vec![
+                plugin_action(91, BTreeMap::new()),
+                action(92, ActionKind::Delay { milliseconds: 10 }),
+                action(93, ActionKind::Sequence { actions: vec![continuous_id] }),
+            ],
+            ..Configuration::default()
+        };
+
+        let mut discrete_slot = base.clone();
+        discrete_slot.global_profile.menu.slices[0].action_id = Some(continuous_id);
+        assert!(matches!(
+            discrete_slot.validate(),
+            Err(ConfigurationError::ContinuousActionAssignedDiscretely { .. })
+        ));
+
+        let mut continuous_slot = base.clone();
+        continuous_slot.global_profile.menu.slices[0].continuous_action_id = Some(discrete_id);
+        assert!(matches!(
+            continuous_slot.validate(),
+            Err(ConfigurationError::NonContinuousActionAssignedContinuously { .. })
+        ));
+
+        assert!(matches!(
+            base.validate(),
+            Err(ConfigurationError::ContinuousActionInSequence {
+                sequence_id: found_sequence,
+                action_id: found_action,
+                ..
+            }) if found_sequence == sequence_id && found_action == continuous_id
+        ));
+    }
+
+    #[test]
+    fn plugin_identifiers_and_parameters_are_host_bounded_before_discovery() {
+        let invalid_kinds = [
+            ActionKind::PluginContinuous {
+                plugin_id: "Uppercase".to_owned(),
+                plugin_action_id: "measure".to_owned(),
+                parameters: BTreeMap::new(),
+            },
+            ActionKind::PluginContinuous {
+                plugin_id: "org.gradial.meter".to_owned(),
+                plugin_action_id: "bad action".to_owned(),
+                parameters: BTreeMap::new(),
+            },
+        ];
+        for kind in invalid_kinds {
+            let configuration =
+                Configuration { actions: vec![action(91, kind)], ..Configuration::default() };
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationError::InvalidPluginActionIdentifier { .. })
+            ));
+        }
+
+        let mut bad_key = BTreeMap::new();
+        bad_key.insert("Bad Key".to_owned(), PluginValue::Boolean(true));
+        let configuration =
+            Configuration { actions: vec![plugin_action(91, bad_key)], ..Configuration::default() };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationError::InvalidPluginParameterKey { .. })
+        ));
+
+        let mut non_finite = BTreeMap::new();
+        non_finite.insert("amount".to_owned(), PluginValue::Number(f64::INFINITY));
+        let configuration = Configuration {
+            actions: vec![plugin_action(91, non_finite)],
+            ..Configuration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationError::InvalidPluginParameterNumber { .. })
+        ));
+
+        let mut oversized = BTreeMap::new();
+        oversized.insert(
+            "text".to_owned(),
+            PluginValue::String("x".repeat(MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES)),
+        );
+        let configuration = Configuration {
+            actions: vec![plugin_action(91, oversized)],
+            ..Configuration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationError::PluginParametersTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -846,8 +1062,12 @@ mod tests {
     fn missing_menu_and_sequence_references_are_rejected() {
         let missing = Uuid::from_u128(99);
         let mut configuration = Configuration::default();
-        configuration.global_profile.menu.slices[2] =
-            MenuSlice { label: "Missing".to_owned(), action_id: Some(missing), icon: None };
+        configuration.global_profile.menu.slices[2] = MenuSlice {
+            label: "Missing".to_owned(),
+            action_id: Some(missing),
+            continuous_action_id: None,
+            icon: None,
+        };
         assert!(matches!(
             configuration.validate(),
             Err(ConfigurationError::MissingMenuActionReference {

@@ -5,9 +5,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use gradial_core::{
-    ActionPlanCompiler, Configuration, DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
-    DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode, GestureConfig, ProfileResolver, ResolvedMenu,
-    continuous_arm_radius_for_size,
+    ActionPlanCompiler, Configuration, DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode,
+    GestureConfig, ProfileResolver, ResolvedMenu, continuous_arm_radius_for_size,
 };
 
 use crate::{
@@ -152,6 +151,7 @@ pub(crate) struct GradialApp {
     geometry_mode: GeometryMode,
     debug_menu_override: Option<Arc<ResolvedMenu>>,
     debug_continuous_meter: ContinuousMeterMode,
+    debug_continuous_full_scale_radius_dip: Option<u32>,
     continuous_full_scale_radius_dip: u32,
     animation_mode: AnimationMode,
     overlay_pool: OverlayPool,
@@ -218,9 +218,10 @@ impl GradialApp {
             platform::monitor_work_areas().context("could not read the display work areas")?;
         let (debug_menu_override, debug_slice_override) =
             resolve_debug_menu_options(startup_options);
-        let continuous_full_scale_radius_dip = startup_options
-            .debug_continuous_full_scale_radius_dip
-            .unwrap_or(DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP);
+        let debug_continuous_full_scale_radius_dip =
+            startup_options.debug_continuous_full_scale_radius_dip;
+        let continuous_full_scale_radius_dip = debug_continuous_full_scale_radius_dip
+            .unwrap_or(configuration.continuous_full_scale_radius_dip);
         let overlay_half_extent_dip = overlay_half_extent_dip(
             startup_options.debug_continuous_meter,
             continuous_full_scale_radius_dip,
@@ -276,6 +277,7 @@ impl GradialApp {
             geometry_mode: startup_options.geometry_mode,
             debug_menu_override,
             debug_continuous_meter: startup_options.debug_continuous_meter,
+            debug_continuous_full_scale_radius_dip,
             continuous_full_scale_radius_dip,
             animation_mode,
             overlay_pool,
@@ -516,13 +518,23 @@ impl GradialApp {
             bail!("saved configuration does not match its validated draft");
         }
 
+        let previous_continuous_full_scale_radius_dip = self.continuous_full_scale_radius_dip;
         self.interaction = None;
         self.profile_resolver = profile_resolver;
         self.action_plan_compiler = action_plan_compiler;
         self.config_revision = saved.config_revision;
+        self.continuous_full_scale_radius_dip = self
+            .debug_continuous_full_scale_radius_dip
+            .unwrap_or(saved.continuous_full_scale_radius_dip);
+        let overlay_size_changed = self.debug_continuous_meter.is_enabled()
+            && self.continuous_full_scale_radius_dip != previous_continuous_full_scale_radius_dip;
         self.configuration = saved.clone();
         self.reconcile_icon_storage(None);
-        self.overlay_pool.set_configuration(saved.config_revision, saved.appearance);
+        if overlay_size_changed {
+            self.replace_pool(context);
+        } else {
+            self.overlay_pool.set_configuration(saved.config_revision, saved.appearance);
+        }
         self.action_executor.set_config_revision(saved.config_revision);
         context.request_repaint();
         Ok(saved)

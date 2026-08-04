@@ -1,9 +1,11 @@
 use std::{
     collections::BTreeMap,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -12,6 +14,7 @@ pub const DEFAULT_CONTINUOUS_UPDATE_HZ: u16 = 30;
 pub const MIN_CONTINUOUS_UPDATE_HZ: u16 = 10;
 pub const MAX_CONTINUOUS_UPDATE_HZ: u16 = 60;
 pub const MAX_CONTINUOUS_IDENTIFIER_BYTES: usize = 96;
+pub const MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES: usize = 16 * 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinuousIdentifierKind {
@@ -138,7 +141,8 @@ impl PermittedContext {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginValue {
     Boolean(bool),
     Integer(i64),
@@ -148,6 +152,32 @@ pub enum PluginValue {
 }
 
 pub type PluginParameters = BTreeMap<String, PluginValue>;
+
+struct ParameterSizeWriter {
+    bytes: usize,
+}
+
+impl Write for ParameterSizeWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buffer.len()) else {
+            return Err(io::Error::other("plugin parameter size overflow"));
+        };
+        if next > MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES {
+            return Err(io::Error::other("plugin parameters exceed the serialized size limit"));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn plugin_parameters_fit_serialized_limit(parameters: &PluginParameters) -> bool {
+    let mut writer = ParameterSizeWriter { bytes: 0 };
+    serde_json::to_writer(&mut writer, parameters).is_ok()
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContinuousActionSnapshot {
@@ -181,6 +211,11 @@ impl ContinuousActionSnapshot {
             .any(|value| matches!(value, PluginValue::Number(number) if !number.is_finite()))
         {
             return Err(ContinuousProtocolError::InvalidParameterNumber);
+        }
+        if !plugin_parameters_fit_serialized_limit(&parameters) {
+            return Err(ContinuousProtocolError::ParametersTooLarge {
+                maximum: MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES,
+            });
         }
         Ok(Self { plugin_id, action_id, context, parameters, update_hz })
     }
@@ -800,6 +835,8 @@ pub enum ContinuousProtocolError {
     InvalidUpdateRate { update_hz: u16 },
     #[error("continuous parameters contain a non-finite number")]
     InvalidParameterNumber,
+    #[error("continuous parameters exceed the {maximum}-byte serialized maximum")]
+    ParametersTooLarge { maximum: usize },
     #[error("continuous sample must be finite and between zero and one")]
     InvalidSampleValue,
     #[error("continuous observation count must be at least one")]
@@ -823,8 +860,8 @@ mod tests {
     use super::{
         CONTINUOUS_API_VERSION, ContinuousActionSnapshot, ContinuousCancelReason,
         ContinuousIdentifierKind, ContinuousProtocolError, ContinuousRequest, ContinuousSession,
-        ContinuousSessionState, ContinuousSessionTerminal, PermittedApplicationContext,
-        PermittedContext, PluginActionId, PluginId, PluginValue,
+        ContinuousSessionState, ContinuousSessionTerminal, MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES,
+        PermittedApplicationContext, PermittedContext, PluginActionId, PluginId, PluginValue,
     };
 
     fn action(update_hz: u16) -> ContinuousActionSnapshot {
@@ -916,6 +953,22 @@ mod tests {
                 30,
             ),
             Err(ContinuousProtocolError::InvalidParameterNumber)
+        ));
+
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "text".to_owned(),
+            PluginValue::String("x".repeat(MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES)),
+        );
+        assert!(matches!(
+            ContinuousActionSnapshot::new(
+                PluginId::new("valid.plugin").expect("plugin"),
+                PluginActionId::new("valid-action").expect("action"),
+                PermittedContext::default(),
+                parameters,
+                30,
+            ),
+            Err(ContinuousProtocolError::ParametersTooLarge { .. })
         ));
 
         assert!(matches!(

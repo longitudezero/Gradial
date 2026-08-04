@@ -125,10 +125,11 @@ fn compile_resolved_menu(profile: &Profile) -> Result<Arc<ResolvedMenu>, Configu
             profile_id: profile.id,
             slice_count: profile.menu.slice_count,
         })?;
-    ResolvedMenu::new_with_icons(
+    ResolvedMenu::new_with_continuous_actions(
         slice_count,
         profile.menu.slices.iter().map(|slice| slice.label.clone()).collect(),
         profile.menu.slices.iter().map(|slice| slice.action_id).collect(),
+        profile.menu.slices.iter().map(|slice| slice.continuous_action_id).collect(),
         profile.menu.slices.iter().map(|slice| slice.icon).collect(),
     )
     .map(Arc::new)
@@ -173,6 +174,7 @@ pub struct ResolvedMenu {
     slice_count: SliceCount,
     labels: Arc<[String]>,
     action_ids: Arc<[Option<Uuid>]>,
+    continuous_action_ids: Arc<[Option<Uuid>]>,
     icons: Arc<[Option<crate::IconReference>]>,
 }
 
@@ -197,10 +199,31 @@ impl ResolvedMenu {
         action_ids: Arc<[Option<Uuid>]>,
         icons: Arc<[Option<crate::IconReference>]>,
     ) -> Option<Self> {
+        let continuous_action_ids = vec![None; slice_count.get()].into();
+        Self::new_with_continuous_actions(
+            slice_count,
+            labels,
+            action_ids,
+            continuous_action_ids,
+            icons,
+        )
+    }
+
+    /// Creates a complete menu including separate discrete and continuous
+    /// assignments plus one optional icon reference per slice.
+    #[must_use]
+    pub fn new_with_continuous_actions(
+        slice_count: SliceCount,
+        labels: Arc<[String]>,
+        action_ids: Arc<[Option<Uuid>]>,
+        continuous_action_ids: Arc<[Option<Uuid>]>,
+        icons: Arc<[Option<crate::IconReference>]>,
+    ) -> Option<Self> {
         (labels.len() == slice_count.get()
             && action_ids.len() == slice_count.get()
+            && continuous_action_ids.len() == slice_count.get()
             && icons.len() == slice_count.get())
-        .then_some(Self { slice_count, labels, action_ids, icons })
+        .then_some(Self { slice_count, labels, action_ids, continuous_action_ids, icons })
     }
 
     #[must_use]
@@ -219,6 +242,11 @@ impl ResolvedMenu {
     }
 
     #[must_use]
+    pub fn continuous_action_id(&self, slice_index: usize) -> Option<Uuid> {
+        self.continuous_action_ids.get(slice_index).copied().flatten()
+    }
+
+    #[must_use]
     pub fn icon(&self, slice_index: usize) -> Option<crate::IconReference> {
         self.icons.get(slice_index).copied().flatten()
     }
@@ -234,6 +262,7 @@ impl ResolvedMenu {
             slice_count,
             labels: labels.iter().map(|label| (*label).to_owned()).collect(),
             action_ids: vec![None; slice_count.get()].into(),
+            continuous_action_ids: vec![None; slice_count.get()].into(),
             icons: vec![None; slice_count.get()].into(),
         }
     }
@@ -318,6 +347,7 @@ fn normalize_case_insensitive(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         path::{Path, PathBuf},
         sync::Arc,
     };
@@ -326,8 +356,9 @@ mod tests {
 
     use super::{ProfileResolver, ProfileTarget, ResolutionDecision};
     use crate::{
-        ApplicationProfile, Configuration, IconFormat, IconReference, Menu, MenuSlice, Profile,
-        ProfileRule, SliceCount, configuration::DEFAULT_GLOBAL_PROFILE_ID,
+        ActionDefinition, ActionKind, ApplicationProfile, Configuration, IconFormat, IconReference,
+        Menu, MenuSlice, Profile, ProfileRule, SliceCount,
+        configuration::DEFAULT_GLOBAL_PROFILE_ID,
     };
 
     fn profile(
@@ -463,7 +494,12 @@ mod tests {
         application_profile.profile.menu = Menu {
             slice_count: 4,
             slices: ["Build", "Search", "Tests", "Terminal"]
-                .map(|label| MenuSlice { label: label.to_owned(), action_id: None, icon: None })
+                .map(|label| MenuSlice {
+                    label: label.to_owned(),
+                    action_id: None,
+                    continuous_action_id: None,
+                    icon: None,
+                })
                 .into(),
         };
         let mut configuration = Configuration {
@@ -471,10 +507,23 @@ mod tests {
             ..Configuration::default()
         };
         let icon = IconReference { asset_id: Uuid::from_u128(88), format: IconFormat::Svg };
+        let continuous_action_id = Uuid::from_u128(89);
         configuration.application_profiles[0].profile.menu.slices[0].icon = Some(icon);
+        configuration.application_profiles[0].profile.menu.slices[0].continuous_action_id =
+            Some(continuous_action_id);
+        configuration.actions.push(ActionDefinition {
+            id: continuous_action_id,
+            name: "Measure".to_owned(),
+            kind: ActionKind::PluginContinuous {
+                plugin_id: "org.gradial.meter".to_owned(),
+                plugin_action_id: "measure".to_owned(),
+                parameters: BTreeMap::new(),
+            },
+        });
         let resolver = ProfileResolver::compile(&configuration).expect("resolver");
         configuration.application_profiles[0].profile.menu.slices[0].label = "Changed".to_owned();
         configuration.application_profiles[0].profile.menu.slices[0].icon = None;
+        configuration.application_profiles[0].profile.menu.slices[0].continuous_action_id = None;
 
         let first =
             resolver.resolve(target(Some(Path::new(r"C:\Apps\Editor.exe")), "", "Document"));
@@ -484,6 +533,7 @@ mod tests {
         assert_eq!(first.menu.slice_count(), SliceCount::Four);
         assert_eq!(first.menu.labels(), ["Build", "Search", "Tests", "Terminal"]);
         assert_eq!(first.menu.icon(0), Some(icon));
+        assert_eq!(first.menu.continuous_action_id(0), Some(continuous_action_id));
         assert!(std::sync::Arc::ptr_eq(&first.menu, &second.menu));
     }
 

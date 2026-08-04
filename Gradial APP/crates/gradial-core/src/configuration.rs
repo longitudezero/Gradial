@@ -6,26 +6,29 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActivationBinding, SliceCount,
+    ActivationBinding, DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+    MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP, MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP, SliceCount,
     actions::{ActionDefinition, ShortcutModifier, validate_actions},
 };
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 5;
+pub const CONFIG_SCHEMA_VERSION: u32 = 6;
 pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const ACTION_CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const ACTIVATION_CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const APPEARANCE_CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const ICON_CONFIG_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_GLOBAL_PROFILE_ID: Uuid =
     Uuid::from_u128(0x6772_6164_6961_4c00_8000_0000_0000_0001);
 
-/// The complete schema-five configuration model.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// The complete schema-six configuration model.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub schema_version: u32,
     pub config_revision: u64,
     pub activation_binding: ActivationBinding,
     pub appearance: Appearance,
+    pub continuous_full_scale_radius_dip: u32,
     pub global_profile: Profile,
     pub application_profiles: Vec<ApplicationProfile>,
     #[serde(default)]
@@ -44,6 +47,15 @@ impl Configuration {
             return Err(ConfigurationError::UnsupportedSchema {
                 found: self.schema_version,
                 supported: CONFIG_SCHEMA_VERSION,
+            });
+        }
+        if !(MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP..=MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP)
+            .contains(&self.continuous_full_scale_radius_dip)
+        {
+            return Err(ConfigurationError::InvalidContinuousFullScaleRadius {
+                radius_dip: self.continuous_full_scale_radius_dip,
+                minimum: MIN_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
+                maximum: MAX_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
             });
         }
 
@@ -82,6 +94,7 @@ impl Default for Configuration {
             config_revision: 0,
             activation_binding: ActivationBinding::default(),
             appearance: Appearance::default(),
+            continuous_full_scale_radius_dip: DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP,
             global_profile: Profile {
                 id: DEFAULT_GLOBAL_PROFILE_ID,
                 name: "Global".to_owned(),
@@ -216,7 +229,12 @@ impl Menu {
         Self {
             slice_count: 8,
             slices: ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-                .map(|label| MenuSlice { label: label.to_owned(), action_id: None, icon: None })
+                .map(|label| MenuSlice {
+                    label: label.to_owned(),
+                    action_id: None,
+                    continuous_action_id: None,
+                    icon: None,
+                })
                 .into(),
         }
     }
@@ -237,6 +255,8 @@ pub struct MenuSlice {
     pub label: String,
     #[serde(default)]
     pub action_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous_action_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<IconReference>,
 }
@@ -341,6 +361,11 @@ pub enum ConfigurationError {
     #[error("unsupported configuration schema {found}; this build supports schema {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
 
+    #[error(
+        "continuous full-scale radius is {radius_dip} DIP; expected {minimum} through {maximum}"
+    )]
+    InvalidContinuousFullScaleRadius { radius_dip: u32, minimum: u32, maximum: u32 },
+
     #[error("profile {profile_id} has an empty name")]
     EmptyProfileName { profile_id: Uuid },
 
@@ -401,6 +426,42 @@ pub enum ConfigurationError {
 
     #[error("profile {profile_id} slice {slice_index} references missing action {action_id}")]
     MissingMenuActionReference { profile_id: Uuid, slice_index: usize, action_id: Uuid },
+
+    #[error(
+        "profile {profile_id} slice {slice_index} references missing continuous action {action_id}"
+    )]
+    MissingMenuContinuousActionReference { profile_id: Uuid, slice_index: usize, action_id: Uuid },
+
+    #[error(
+        "profile {profile_id} slice {slice_index} assigns continuous action {action_id} to the discrete slot"
+    )]
+    ContinuousActionAssignedDiscretely { profile_id: Uuid, slice_index: usize, action_id: Uuid },
+
+    #[error(
+        "profile {profile_id} slice {slice_index} assigns non-continuous action {action_id} to the continuous slot"
+    )]
+    NonContinuousActionAssignedContinuously {
+        profile_id: Uuid,
+        slice_index: usize,
+        action_id: Uuid,
+    },
+
+    #[error("plugin action {action_id} field {field} is not a valid bounded identifier")]
+    InvalidPluginActionIdentifier { action_id: Uuid, field: &'static str },
+
+    #[error("plugin action {action_id} parameter key is not a valid bounded identifier")]
+    InvalidPluginParameterKey { action_id: Uuid },
+
+    #[error("plugin action {action_id} contains a non-finite numeric parameter")]
+    InvalidPluginParameterNumber { action_id: Uuid },
+
+    #[error("plugin action {action_id} parameters exceed the {maximum}-byte serialized maximum")]
+    PluginParametersTooLarge { action_id: Uuid, maximum: usize },
+
+    #[error(
+        "sequence {sequence_id} item {index} references continuous action {action_id}; continuous actions cannot be sequenced"
+    )]
+    ContinuousActionInSequence { sequence_id: Uuid, index: usize, action_id: Uuid },
 
     #[error("sequence {sequence_id} item {index} references missing action {action_id}")]
     MissingSequenceActionReference { sequence_id: Uuid, index: usize, action_id: Uuid },
@@ -466,11 +527,12 @@ mod tests {
     }
 
     #[test]
-    fn default_schema_five_configuration_preserves_foundation_visuals() {
+    fn default_schema_six_configuration_preserves_foundation_visuals() {
         let configuration = Configuration::default();
         configuration.validate().expect("default configuration");
         assert_eq!(configuration.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(configuration.activation_binding, ActivationBinding::default());
+        assert_eq!(configuration.continuous_full_scale_radius_dip, 300);
         assert_eq!(
             configuration.appearance,
             Appearance {
@@ -481,8 +543,37 @@ mod tests {
         );
         assert_eq!(configuration.global_profile.menu.slices.len(), 8);
         assert!(configuration.global_profile.menu.slices.iter().all(|slice| slice.icon.is_none()));
+        assert!(
+            configuration
+                .global_profile
+                .menu
+                .slices
+                .iter()
+                .all(|slice| slice.continuous_action_id.is_none())
+        );
         assert!(configuration.application_profiles.is_empty());
         assert!(configuration.actions.is_empty());
+    }
+
+    #[test]
+    fn continuous_travel_is_bounded_from_160_through_400_dip() {
+        for radius_dip in [160, 300, 400] {
+            let configuration = Configuration {
+                continuous_full_scale_radius_dip: radius_dip,
+                ..Configuration::default()
+            };
+            configuration.validate().expect("bounded travel");
+        }
+        for radius_dip in [0, 159, 401, u32::MAX] {
+            let configuration = Configuration {
+                continuous_full_scale_radius_dip: radius_dip,
+                ..Configuration::default()
+            };
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationError::InvalidContinuousFullScaleRadius { .. })
+            ));
+        }
     }
 
     #[test]

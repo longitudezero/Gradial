@@ -17,8 +17,9 @@ pub use actions::{
 pub use configuration::{
     ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,
     APPEARANCE_CONFIG_SCHEMA_VERSION, AccentColor, Appearance, ApplicationProfile,
-    CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError, IconFormat, IconReference,
-    LEGACY_CONFIG_SCHEMA_VERSION, LabelTheme, Menu, MenuSlice, Profile, ProfileRule, SizePreset,
+    CONFIG_SCHEMA_VERSION, Configuration, ConfigurationError, ICON_CONFIG_SCHEMA_VERSION,
+    IconFormat, IconReference, LEGACY_CONFIG_SCHEMA_VERSION, LabelTheme, Menu, MenuSlice, Profile,
+    ProfileRule, SizePreset,
 };
 pub use continuous::{
     CONTINUOUS_API_VERSION, ContinuousActionSnapshot, ContinuousBeginRequest,
@@ -26,8 +27,8 @@ pub use continuous::{
     ContinuousIdentifierKind, ContinuousProtocolError, ContinuousRequest, ContinuousSample,
     ContinuousSession, ContinuousSessionState, ContinuousSessionTerminal, ContinuousUpdateRequest,
     DEFAULT_CONTINUOUS_UPDATE_HZ, MAX_CONTINUOUS_IDENTIFIER_BYTES, MAX_CONTINUOUS_UPDATE_HZ,
-    MIN_CONTINUOUS_UPDATE_HZ, PermittedApplicationContext, PermittedContext, PluginActionId,
-    PluginId, PluginParameters, PluginValue,
+    MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES, MIN_CONTINUOUS_UPDATE_HZ, PermittedApplicationContext,
+    PermittedContext, PluginActionId, PluginId, PluginParameters, PluginValue,
 };
 pub use geometry::{Point, SliceCount};
 pub use interaction::{

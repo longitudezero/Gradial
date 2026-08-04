@@ -37,8 +37,8 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   Explorer restart.
 - Persistent per-monitor geometry caches, immediate selection feedback, and
   bounded 60/50 ms open/close animation state.
-- A validated schema-five configuration with safe in-memory schema-one through
-  schema-four migration plus atomic primary/backup
+- A validated schema-six configuration with safe in-memory schema-one through
+  schema-five migration plus atomic primary/backup
   replacement.
 - Complete immutable target/display/modifier identity for every invocation.
 - A compiled, deterministic application-profile resolver with explanation
@@ -196,10 +196,11 @@ On first run, Gradial creates:
     logs\
 ```
 
-`config.json` starts at schema 5 and revision 1 with the default unmodified M4
+`config.json` starts at schema 6 and revision 1 with the default unmodified M4
 binding, original blue/light/standard appearance, stable global profile,
-eight-slice menu, and empty action catalog.
-Each menu slice has an optional action UUID and optional managed icon reference.
+eight-slice menu, empty action catalog, and a 300-DIP continuous full-scale
+distance. Each menu slice has separate optional discrete and continuous action
+UUIDs plus an optional managed icon reference.
 A successful later replacement
 preserves the previous valid primary as `config.json.bak`; `config.json.tmp`
 exists only during a save.
@@ -213,9 +214,11 @@ successful completion.
 Existing schema-one files are accepted only when they contain no schema-two
 action fields. Gradial adds the action, binding, and appearance defaults in
 memory. Schema-two files gain binding and appearance; schema-three files gain
-appearance. Schema-one through schema-four all gain no icon assignments. Every
-path validates the complete schema-five model and leaves the original bytes
-untouched.
+appearance. Schema-one through schema-four all gain no icon assignments.
+Schema-five retains its icon assignments while gaining
+`continuous_action_id: None` on every slice and the 300-DIP full-scale value.
+Every path validates the complete schema-six model and leaves the original
+bytes untouched.
 Migration is persisted only through a later explicit, successful save. This
 prevents startup from silently rewriting either a valid legacy file or a file
 containing ambiguous fields.
@@ -233,7 +236,7 @@ chosen icon. Valid sources are atomically copied into managed storage;
 byte-identical existing IDs are reused and differing same-ID bytes reject the
 whole draft import. Files created earlier in a failed import are removed.
 
-Settings export validates the current proposed draft, serializes schema-five
+Settings export validates the current proposed draft, serializes schema-six
 JSON beside a uniquely named temporary file in the selected directory, flushes
 it, and atomically moves it over the selected destination. It may include
 unsaved edits but never changes the active revision. Gradial's three active
@@ -456,7 +459,7 @@ written to routine logs.
 ### Continuous prototype
 
 The debug-only `--continuous-meter` gives every resolved direction an inert
-continuous extension for that invocation. It does not modify schema-five
+continuous extension for that invocation. It does not modify schema-six
 configuration or saved action definitions. The pure controller:
 
 - selects by the existing angle and 36 DIP entry threshold;
@@ -488,10 +491,13 @@ contains no raw screen coordinate.
 
 `--continuous-full-scale-dip=160..400` overrides the inert meter's whole-DIP
 endpoint and cannot be used without `--continuous-meter` or with either guided
-study. The default is 300 DIP. The overlay and automatic-geometry extent use
-the configured endpoint plus a 20-DIP margin. When the resulting track cannot
-fit at one-to-one scale in the work area, only the visible track and proxy are
-compressed; normalization continues to use the exact configured distance.
+study. Without that development override, the endpoint comes from the active
+schema-six configuration; new and migrated configurations use 300 DIP. The
+value is frozen for the invocation. The overlay and automatic-geometry extent
+use the configured endpoint plus a 20-DIP margin. When the resulting track
+cannot fit at one-to-one scale in the work area, only the visible track and
+proxy are compressed; normalization continues to use the exact configured
+distance.
 
 The controller evaluates every queued fixed-origin point and edge-assist delta,
 including intermediate outer-edge crossings and direction changes. Direction
@@ -503,13 +509,48 @@ cancellation, or another terminal effect. Direction/mode transitions remain at
 info level, while ordinary value samples are debug-only. Shutdown diagnostics
 record dispatched, prioritized, and coalesced counts.
 
-The production v0.3 slice editor will keep discrete and continuous assignment
-separate. **Enable continuous control** defaults off for every wedge. An
+The schema-six slice model keeps discrete and continuous assignment separate.
+**Enable continuous control** defaults off for every wedge. An
 unchecked wedge remains discrete at every radius, displays no percentage, and
 never opens a plugin session; release still dispatches its discrete action if
 one is assigned. Checking it reveals a required compatible continuous-plugin
-action. This control is documented now but is intentionally absent from the
-schema-five editor until the plugin action type exists.
+action. The persisted model now supports this state, but the control remains
+absent from the current editor until plugin discovery supplies a compatible
+catalog. Imported plugin actions are retained and identified read-only.
+
+### Schema-six continuous configuration foundation
+
+`ActionKind::PluginContinuous` stores a plugin ID, plugin action ID, and a
+sorted map of generic `PluginValue` parameters. It is a continuous-only leaf:
+the validator rejects it from the existing discrete `action_id`, from every
+sequence depth, and from discrete execution-plan compilation. Conversely,
+`MenuSlice::continuous_action_id` accepts only this action kind. A slice may
+therefore pair a normal discrete action with an independent continuous
+extension without combining their behavior.
+
+Plugin IDs, plugin action IDs, and parameter keys use at most 96 bytes of
+lowercase ASCII letters, digits, `.`, `_`, and `-`. Generic values are tagged
+boolean, signed 64-bit integer, finite number, UTF-8 string, or manifest
+choice. The complete serialized parameter map is limited to 16 KiB both at
+configuration validation and at the runtime-neutral snapshot boundary.
+Manifest-specific keys, required values, choices, and numeric/string ranges
+cannot be checked until the referenced manifest is discovered; that later
+validation remains part of the plugin-runtime milestone.
+
+A structurally valid action whose local plugin is missing or disabled remains
+loadable and exportable. Its UUID is frozen with the resolved menu, but the
+current runtime advertises no available plugin actions, so its wedge receives
+no continuous capability mask. It stays discrete beyond the outer edge and
+release continues to use the independent discrete assignment. Loading or
+importing this reference never scans for, downloads, installs, enables, or
+executes plugin code.
+
+The schema-six root stores `continuous_full_scale_radius_dip` in the inclusive
+160–400 range. Schema-five migration supplies 300 DIP and `None` for every
+continuous wedge assignment while preserving icons and all earlier data.
+Migration remains in memory until an explicit successful save. Older schema
+numbers cannot contain schema-six fields, even as `null`, so version provenance
+continues to fail closed.
 
 ### Runtime-neutral continuous protocol core
 
@@ -745,7 +786,7 @@ executor, and it never logs target-window data. Leaving the tab, discarding,
 saving, or closing disarms the tester; a release already paired with a
 consumed down remains suppressed.
 
-The **Appearance** tab edits one global schema-five value shared by Global and
+The **Appearance** tab edits one global schema-six value shared by Global and
 all application profiles. The accent is stored as three bounded RGB bytes.
 Label theme is a closed light/dark choice, and size is a closed
 compact/standard/large choice. The original `(124, 154, 255)` accent, light
@@ -1429,7 +1470,7 @@ harness opens the real native application chooser, observes its window, and
 cancels it without changing the draft. It then selects the nested sequence and
 observes four expanded steps, depth two, and 275 ms total Delay before
 converting the Global draft to four slices. It exports that complete unsaved
-draft, verifies schema five at the unchanged revision with the exact
+draft, verifies schema six at the unchanged revision with the exact
 appearance, icon reference, literal executable path, working folder, and
 argument rows, verifies the referenced PNG was copied byte-for-byte into the
 adjacent portable `icons` directory, and

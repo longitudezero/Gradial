@@ -825,7 +825,7 @@ try {
     $exportedApplication = $exported.actions |
         Where-Object { $_.id -eq $executableActionId }
     if (
-        $exported.schema_version -ne 5 -or
+        $exported.schema_version -ne 6 -or
         $exported.config_revision -ne 1 -or
         $exported.global_profile.menu.slice_count -ne 4 -or
         @($exported.actions).Count -ne 10 -or
@@ -917,7 +917,7 @@ try {
 
     $saved = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     if (
-        $saved.schema_version -ne 5 -or
+        $saved.schema_version -ne 6 -or
         $saved.config_revision -ne 2 -or
         $saved.global_profile.menu.slice_count -ne 4
     ) {
@@ -1310,7 +1310,7 @@ try {
         "Settings editor smoke check passed: safe Ctrl plus M5 hold-flick-release test, " +
         "recoverable orphan quarantine, private import, appearance and icon previews, " +
         "managed PNG import, portable draft export, private-safe diagnostic bundles, advanced " +
-        "profiles, all action editors, schema-five save, and live reload."
+        "profiles, all action editors, schema-six save, and live reload."
     )
 }
 catch {
