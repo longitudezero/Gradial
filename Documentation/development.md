@@ -171,7 +171,8 @@ Gradial APP\
         check.ps1          Complete local code verification
         check-focus.ps1    Validate the latest completed focus trace
         capture-timing.ps1 Capture ETW markers and presented-frame timings
-        run-performance-report.ps1 Run development or release performance protocol
+        run-performance-report.ps1 Run development or release core performance protocol
+        run-plugin-performance-report.ps1 Compare five plugin runtime states
         run-continuous-matrix.ps1 Run the continuous direction/distance matrix
         summarize-continuous-study.ps1 Evaluate anonymous participant reports
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
@@ -1821,6 +1822,29 @@ keys. Any foreground change or power-plan change invalidates a release run.
 The complete protocol and current-machine development numbers are recorded in
 `Documentation\milestone-3-performance-harness-results.md`.
 
+For the Milestone 4 plugin comparison, build both configurations and run:
+
+```powershell
+cargo build --workspace --all-features
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-performance-report.ps1 -Mode Development -Build Both -MarkersOnly
+```
+
+The runner creates isolated disabled, idle-enabled, active, deliberately slow,
+and faulted packages. It parses process CPU and memory, application and
+displayed-frame timing where available, exact plugin callback/queue timing,
+fixed worker aggregates, hook duration, and input/renderer health. The short
+mode uses ten invocations and three seconds idle per scenario and never
+qualifies release gates. From an elevated, otherwise idle PowerShell, use
+`-Mode Release -Build release` for the five-minute warmup, 1,000-invocation,
+30-minute-idle protocol. Raw evidence is ignored below
+`captures\plugin-performance`. The measurement contract and current short
+baseline are recorded in
+`Documentation\milestone-4-plugin-performance-baseline-results.md`.
+The release-duration run evaluates the enabled-idle working-set contract, but
+keeps its overall result `not_evaluated` until displayed-frame and complete
+input-to-callback latency gates are implemented.
+
 ## Manual interaction check
 
 1. Start `cargo run --package gradial-app`. Complete required onboarding if it
@@ -2072,11 +2096,12 @@ long-run campaigns that were not performed are reported as `not_run`.
 `scripts\check.ps1` runs, in order:
 
 1. PowerShell syntax checks for every script in `scripts`.
-2. The deterministic performance-report percentile/QPC analyzer self-test.
-3. `cargo fmt --all --check`
-4. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-5. `cargo test --workspace --all-features`
-6. `cargo build --workspace --all-features`
+2. The deterministic core and plugin performance-report analyzer self-tests.
+3. The deterministic continuous-study summarizer self-test.
+4. `cargo fmt --all --check`
+5. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+6. `cargo test --workspace --all-features`
+7. `cargo build --workspace --all-features`
 
 The script stops on the first failure.
 

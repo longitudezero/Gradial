@@ -1217,6 +1217,13 @@ Deliver:
 - Trust, permissions, and capability guide.
 - Known limitations matching actual behavior.
 
+The first item is implemented as a versioned two-build campaign over disabled,
+idle-enabled, active, deliberately slow, and faulted fixtures. It captures
+CPU, memory, callback and bounded-lane timing, application/display frame
+evidence, hook duration, and input/renderer health without reading the user's
+configuration. A short development baseline is recorded; the complete
+release-duration run remains required before qualification.
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a

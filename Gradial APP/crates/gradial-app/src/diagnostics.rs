@@ -18,7 +18,7 @@ pub(crate) fn initialize(log_directory: &Path) -> Result<LoggerHandle> {
     let handle = Logger::try_with_str(
         "warn,startup=info,config=info,profiles=info,input=info,interaction=info,\
              actions=info,continuous=info,renderer=info,focus=info,diagnostics=info,tray=info,\
-             settings=info,onboarding=info",
+             settings=info,onboarding=info,plugins=info",
     )?
     .use_utc()
     .log_to_file(

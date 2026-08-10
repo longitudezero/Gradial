@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -41,6 +41,23 @@ const LIFECYCLE_BEGIN_CAPACITY: usize = 1;
 const LIFECYCLE_UPDATE_CAPACITY: usize = 1;
 const LIFECYCLE_TERMINAL_CAPACITY: usize = 1;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+const CALLBACK_TIMING_BUCKET_UPPER_US: [u64; 15] = [
+    25,
+    50,
+    100,
+    250,
+    500,
+    1_000,
+    2_000,
+    4_000,
+    8_000,
+    16_000,
+    32_000,
+    64_000,
+    100_000,
+    250_000,
+    u64::MAX,
+];
 
 type PluginActionCatalog = BTreeMap<(String, String), PluginActionAdmission>;
 type SharedPluginActionCatalog = Arc<RwLock<Arc<PluginActionCatalog>>>;
@@ -208,6 +225,110 @@ impl PluginLifecycleStage {
             Self::Commit => "commit",
             Self::Cancel => "cancel",
         }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Begin => 0,
+            Self::Update => 1,
+            Self::Commit => 2,
+            Self::Cancel => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct FixedTimingHistogram {
+    buckets: [u64; CALLBACK_TIMING_BUCKET_UPPER_US.len()],
+    count: u64,
+    maximum_us: u64,
+}
+
+impl FixedTimingHistogram {
+    fn record(&mut self, duration: Duration) {
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let bucket = CALLBACK_TIMING_BUCKET_UPPER_US
+            .iter()
+            .position(|upper| micros <= *upper)
+            .unwrap_or(CALLBACK_TIMING_BUCKET_UPPER_US.len() - 1);
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.count = self.count.saturating_add(1);
+        self.maximum_us = self.maximum_us.max(micros);
+    }
+
+    fn percentile(&self, percentile: u64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let rank = self.count.saturating_mul(percentile).div_ceil(100).max(1);
+        let mut cumulative = 0_u64;
+        for (index, count) in self.buckets.iter().enumerate() {
+            cumulative = cumulative.saturating_add(*count);
+            if cumulative >= rank {
+                return CALLBACK_TIMING_BUCKET_UPPER_US[index].min(self.maximum_us);
+            }
+        }
+        self.maximum_us
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CallbackStageTiming {
+    queue: FixedTimingHistogram,
+    callback: FixedTimingHistogram,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PluginCallbackTiming {
+    stages: [CallbackStageTiming; 4],
+    all: CallbackStageTiming,
+}
+
+impl PluginCallbackTiming {
+    fn record(
+        &mut self,
+        stage: PluginLifecycleStage,
+        queue_duration: Duration,
+        callback_duration: Duration,
+    ) {
+        let timing = &mut self.stages[stage.index()];
+        timing.queue.record(queue_duration);
+        timing.callback.record(callback_duration);
+        self.all.queue.record(queue_duration);
+        self.all.callback.record(callback_duration);
+    }
+
+    fn log(&self) {
+        Self::log_stage("all", &self.all);
+        for stage in [
+            PluginLifecycleStage::Begin,
+            PluginLifecycleStage::Update,
+            PluginLifecycleStage::Commit,
+            PluginLifecycleStage::Cancel,
+        ] {
+            let timing = &self.stages[stage.index()];
+            Self::log_stage(stage.as_str(), timing);
+        }
+    }
+
+    fn log_stage(stage: &str, timing: &CallbackStageTiming) {
+        log::info!(
+            target: "plugins",
+            "component=plugins event_code=plugin_callback_timing result_code=ok \
+             stage={} callback_count={} p50_callback_us={} p95_callback_us={} \
+             p99_callback_us={} maximum_callback_us={} p50_queue_us={} \
+             p95_queue_us={} p99_queue_us={} maximum_queue_us={}",
+            stage,
+            timing.callback.count,
+            timing.callback.percentile(50),
+            timing.callback.percentile(95),
+            timing.callback.percentile(99),
+            timing.callback.maximum_us,
+            timing.queue.percentile(50),
+            timing.queue.percentile(95),
+            timing.queue.percentile(99),
+            timing.queue.maximum_us
+        );
     }
 }
 
@@ -395,8 +516,15 @@ impl PluginLifecycleTicket {
 
 #[derive(Debug)]
 enum PluginLifecycleCommand {
-    Request { request: Box<ContinuousRequest>, reply: Sender<Result<(), PluginLifecycleError>> },
-    AbortBegin { session_id: Uuid, reason: ContinuousCancelReason },
+    Request {
+        request: Box<ContinuousRequest>,
+        submitted_at: Instant,
+        reply: Sender<Result<(), PluginLifecycleError>>,
+    },
+    AbortBegin {
+        session_id: Uuid,
+        reason: ContinuousCancelReason,
+    },
 }
 
 #[derive(Debug)]
@@ -473,7 +601,11 @@ impl PluginLifecycleClient {
             PluginLifecycleStage::Commit | PluginLifecycleStage::Cancel => &self.terminals,
         };
         let (reply, replies) = bounded(1);
-        let command = PluginLifecycleCommand::Request { request: Box::new(request), reply };
+        let command = PluginLifecycleCommand::Request {
+            request: Box::new(request),
+            submitted_at: Instant::now(),
+            reply,
+        };
         match sender.try_send(command) {
             Ok(()) => Ok(PluginLifecycleTicket { reply: replies }),
             Err(TrySendError::Full(_)) => Err(PluginLifecycleSubmitError::QueueFull(stage)),
@@ -674,6 +806,7 @@ impl PluginWorkerRuntime {
                     worker_loopback_client,
                 );
                 worker.run(&commands, &begins, &updates, &terminals, &worker_shutdown);
+                worker.callback_timing.log();
                 let _sent = stopped_sender.try_send(());
             })
             .context("could not spawn the plugin worker")?;
@@ -814,6 +947,7 @@ struct PluginWorker {
     shortcut_capabilities: ShortcutCapabilityClient,
     notification_capabilities: NotificationCapabilityClient,
     loopback_capabilities: LoopbackCapabilityClient,
+    callback_timing: PluginCallbackTiming,
     aborted_begins: BTreeSet<Uuid>,
     active_session: Option<ActivePluginSession>,
     reconciliation_deferred: bool,
@@ -874,6 +1008,7 @@ impl PluginWorker {
             shortcut_capabilities,
             notification_capabilities,
             loopback_capabilities,
+            callback_timing: PluginCallbackTiming::default(),
             aborted_begins: BTreeSet::new(),
             active_session: None,
             reconciliation_deferred: false,
@@ -1039,8 +1174,10 @@ impl PluginWorker {
     }
 
     fn handle_lifecycle_command(&mut self, command: PluginLifecycleCommand) {
-        let (request, reply) = match command {
-            PluginLifecycleCommand::Request { request, reply } => (*request, reply),
+        let (request, submitted_at, reply) = match command {
+            PluginLifecycleCommand::Request { request, submitted_at, reply } => {
+                (*request, submitted_at, reply)
+            }
             PluginLifecycleCommand::AbortBegin { session_id, reason } => {
                 self.abort_begin(session_id, reason);
                 self.publish_action_catalog();
@@ -1058,17 +1195,25 @@ impl PluginWorker {
                 .as_ref()
                 .map_or_else(|| "none".to_owned(), |active| active.plugin_id.clone()),
         };
+        let callback_started = Instant::now();
+        let queue_duration = callback_started.saturating_duration_since(submitted_at);
         let result = self.dispatch_lifecycle(&request);
+        let callback_duration = callback_started.elapsed();
+        self.callback_timing.record(stage, queue_duration, callback_duration);
         log::info!(
             target: "plugins",
             "component=plugins event_code=plugin_lifecycle result_code={} error_code={} \
-             plugin_id={} session_id={} stage={} active_session={}",
+             plugin_id={} session_id={} stage={} active_session={} queue_wait_us={} \
+             callback_duration_us={} total_duration_us={}",
             if result.is_ok() { "ok" } else { "failure" },
             result.as_ref().err().map_or("none", |error| error.code()),
             plugin_id,
             session_id,
             stage.as_str(),
-            self.active_session.is_some()
+            self.active_session.is_some(),
+            queue_duration.as_micros(),
+            callback_duration.as_micros(),
+            submitted_at.elapsed().as_micros()
         );
         if result.is_err()
             || matches!(stage, PluginLifecycleStage::Commit | PluginLifecycleStage::Cancel)
@@ -1763,6 +1908,21 @@ mod tests {
             cancel = function(session, reason) end,
         }
     ";
+
+    #[test]
+    fn callback_timing_histogram_is_fixed_and_uses_nearest_rank_buckets() {
+        let mut histogram = FixedTimingHistogram::default();
+        for micros in [1, 25, 26, 100, 101, 999, 1_001, 20_000] {
+            histogram.record(Duration::from_micros(micros));
+        }
+
+        assert_eq!(histogram.count, 8);
+        assert_eq!(histogram.percentile(50), 100);
+        assert_eq!(histogram.percentile(95), 20_000);
+        assert_eq!(histogram.percentile(99), 20_000);
+        assert_eq!(histogram.maximum_us, 20_000);
+        assert_eq!(histogram.buckets.iter().sum::<u64>(), histogram.count);
+    }
 
     fn setup() -> (tempfile::TempDir, AppPaths) {
         let temporary = tempfile::tempdir().expect("temporary directory");

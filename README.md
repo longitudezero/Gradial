@@ -510,6 +510,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-repo
 An elevated `-Mode Release` run enables PresentMon and uses the complete
 five-minute warmup, 1,000-invocation, and 30-minute idle protocol.
 
+Compare disabled, idle-enabled, active, deliberately slow, and faulted plugins
+in both development and optimized executables with:
+
+```powershell
+cargo build --workspace --all-features
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-performance-report.ps1 -Mode Development -Build Both -MarkersOnly
+```
+
+This short campaign is diagnostic only. The elevated release form is
+`-Mode Release -Build release`; it captures PresentMon evidence and uses the
+full per-scenario warmup, invocation, and idle protocol.
+
 See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
@@ -603,3 +616,6 @@ recorded in
 Performance protocol, report semantics, and the current non-qualifying
 development baseline are recorded in
 [`Documentation/milestone-3-performance-harness-results.md`](Documentation/milestone-3-performance-harness-results.md).
+The five-state plugin performance protocol, bounded callback timing, and
+current non-qualifying two-build baseline are recorded in
+[`Documentation/milestone-4-plugin-performance-baseline-results.md`](Documentation/milestone-4-plugin-performance-baseline-results.md).

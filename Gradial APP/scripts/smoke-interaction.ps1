@@ -8,6 +8,8 @@ param(
     [ValidateSet("debug", "release")]
     [string]$Configuration = "debug",
 
+    [switch]$UseConfiguredMenu,
+
     [switch]$CaptureTiming,
 
     [switch]$TimingMarkersOnly,
@@ -44,6 +46,8 @@ param(
     [switch]$ReducedMotion,
 
     [switch]$ContinuousMeter,
+
+    [switch]$PluginContinuous,
 
     [ValidateRange(0, 100)]
     [int]$ContinuousPercent = 75,
@@ -396,6 +400,10 @@ if ($Configuration -ne "debug" -and $SimulateInputFault -ne "none") {
 if ($ContinuousMeter -and $Configuration -ne "debug") {
     throw "The inert continuous meter is available only in a debug build."
 }
+if ($ContinuousMeter -and $PluginContinuous) {
+    throw "Choose either the inert continuous meter or the configured plugin route."
+}
+$continuousGesture = $ContinuousMeter -or $PluginContinuous
 $expectedActionModes = @(
     $ExpectDelayExecution,
     $ExpectShortcutExecution,
@@ -408,14 +416,14 @@ $expectedActionModes = @(
 if ($expectedActionModes.Count -gt 1) {
     throw "Choose only one expected action execution mode."
 }
-if ($ContinuousMeter -and $expectedActionModes.Count -ne 0) {
-    throw "The inert continuous meter cannot execute an action fixture."
+if ($continuousGesture -and $expectedActionModes.Count -ne 0) {
+    throw "A continuous gesture cannot also execute a discrete action fixture."
 }
 if (
     $expectedActionModes.Count -eq 1 -and
-    ($Configuration -ne "release" -or $Slices -ne "8")
+    (($Configuration -ne "release" -and -not $UseConfiguredMenu) -or $Slices -ne "8")
 ) {
-    throw "Action execution validation requires the release build and its configured eight-slice menu."
+    throw "Action execution validation requires a configured eight-slice menu."
 }
 if ($Slices -eq "4" -and -not $AllDirections -and $Direction.Length -ne 1) {
     throw "Four-slice validation accepts only N, E, S, or W."
@@ -429,20 +437,20 @@ if (-not [string]::IsNullOrWhiteSpace($ChangeFromDirection)) {
     if ($ChangeFromDirection -notin $allowedChangeDirections) {
         throw "ChangeFromDirection is not valid for the selected slice count."
     }
-    if (-not $ContinuousMeter -or $AllDirections) {
-        throw "ChangeFromDirection requires one continuous-meter direction."
+    if (-not $continuousGesture -or $AllDirections) {
+        throw "ChangeFromDirection requires one continuous direction."
     }
 }
 if ($PointerBurstEvents -ne 0) {
     if ($PointerBurstEvents % 2 -ne 0) {
         throw "PointerBurstEvents must be even so the cursor finishes at the requested point."
     }
-    if (-not $ContinuousMeter -or $AllDirections -or $InvocationCount -ne 1) {
-        throw "PointerBurstEvents requires one single-direction continuous-meter invocation."
+    if (-not $continuousGesture -or $AllDirections -or $InvocationCount -ne 1) {
+        throw "PointerBurstEvents requires one single-direction continuous invocation."
     }
 }
-if ($ReturnInsideBeforeRelease -and (-not $ContinuousMeter -or $AllDirections)) {
-    throw "ReturnInsideBeforeRelease requires one continuous-meter direction."
+if ($ReturnInsideBeforeRelease -and (-not $continuousGesture -or $AllDirections)) {
+    throw "ReturnInsideBeforeRelease requires one continuous direction."
 }
 if ($RequireOpenAnimationComplete -and ($QuickFlick -or $GestureDelayMilliseconds -lt 60)) {
     throw "RequireOpenAnimationComplete requires a gesture delay of at least 60 ms."
@@ -521,7 +529,7 @@ try {
         }
     }
     $effectiveDpi = [GradialSmokeNative]::EffectiveDpiAt($testX, $testY)
-    $gestureDistanceDip = if ($ContinuousMeter) {
+    $gestureDistanceDip = if ($continuousGesture) {
         107.0 + ($ContinuousFullScaleDip - 107.0) * ($ContinuousPercent / 100.0)
     } else {
         80.0
@@ -532,17 +540,17 @@ try {
     # inclusive threshold after DPI conversion and integer cursor quantization.
     # Diagonals use nearest rounding to minimize scalar error across the
     # configured 107-to-full-scale range.
-    $continuousBoundaryBias = if ($ContinuousMeter -and $ContinuousPercent -eq 0) {
+    $continuousBoundaryBias = if ($continuousGesture -and $ContinuousPercent -eq 0) {
         1
     } else {
         0
     }
-    $cardinal = if ($ContinuousMeter) {
+    $cardinal = if ($continuousGesture) {
         [int][Math]::Ceiling($gestureDistancePx) + $continuousBoundaryBias
     } else {
         [int][Math]::Round($gestureDistancePx)
     }
-    $diagonal = if ($ContinuousMeter) {
+    $diagonal = if ($continuousGesture) {
         [int][Math]::Round($diagonalDistancePx)
     } else {
         [int][Math]::Round($diagonalDistancePx)
@@ -591,7 +599,9 @@ try {
 
     $startupArguments = @("--geometry=$Geometry")
     if ($Configuration -eq "debug") {
-        $startupArguments += "--slices=$Slices"
+        if (-not $PluginContinuous -and -not $UseConfiguredMenu) {
+            $startupArguments += "--slices=$Slices"
+        }
         $startupArguments += "--skip-onboarding"
         if ($ContinuousMeter) {
             $startupArguments += "--continuous-meter"
@@ -827,7 +837,7 @@ try {
     }
     $gestureDelay = if ($QuickFlick) { 0 } else { $GestureDelayMilliseconds }
     $continuousUsesFixedOrigin = (
-        $ContinuousMeter -and
+        $continuousGesture -and
         (
             $Geometry -eq "fixed-origin" -or
             ($Geometry -eq "auto" -and $resolvedActivationPoint -eq "center")
@@ -869,7 +879,7 @@ try {
                 if ($continuousUsesFixedOrigin) {
                     $desiredX = $testX + $currentOffsetX
                     $desiredY = $testY + $currentOffsetY
-                    $correctionTolerance = if ($ContinuousMeter) { 0 } else { 1 }
+                    $correctionTolerance = if ($continuousGesture) { 0 } else { 1 }
                     for ($correction = 0; $correction -lt 8; $correction++) {
                         Start-Sleep -Milliseconds 10
                         $correctedCursor = New-Object GradialSmokeNative+Point
@@ -1024,7 +1034,13 @@ if (
 ) {
     throw "The bounded action executor did not initialize with the required safety limits."
 }
-$expectedDebugOverride = if ($Configuration -eq "debug") { $Slices } else { "none" }
+$expectedDebugOverride = if (
+    $Configuration -eq "debug" -and -not $PluginContinuous -and -not $UseConfiguredMenu
+) {
+    $Slices
+} else {
+    "none"
+}
 $expectedContinuousMeter = if ($ContinuousMeter) { "true" } else { "false" }
 $expectedFullScaleDip = if ($ContinuousMeter) { $ContinuousFullScaleDip.ToString() } else { "300" }
 $expectedOverlayHalfExtent = if ($ContinuousMeter) {
@@ -1073,7 +1089,13 @@ $profileRecords = [regex]::Matches(
     "event_code=profile_resolved .*config_revision=$activeConfigRevision .*" +
     "profile_id=[0-9a-f-]+ .*decision=[a-z_]+ .*" +
     "menu_slice_count=$Slices .*menu_label_count=$Slices " +
-    ".*menu_source=" + $(if ($Configuration -eq "debug") { "debug_override" } else { "configuration" })
+    ".*menu_source=" + $(if (
+        $Configuration -eq "debug" -and -not $PluginContinuous -and -not $UseConfiguredMenu
+    ) {
+        "debug_override"
+    } else {
+        "configuration"
+    })
 )
 if ($profileRecords.Count -lt $expectedInvocations) {
     throw "Expected $expectedInvocations profile resolutions; observed $($profileRecords.Count)."
@@ -1144,13 +1166,13 @@ if ($RequireOpenAnimationComplete) {
         }
     }
 }
-$selectionRecords = if ($ContinuousMeter -and -not $ReturnInsideBeforeRelease) {
+$selectionRecords = if ($continuousGesture -and -not $ReturnInsideBeforeRelease) {
     [regex]::Matches(
         $log,
         "(?m)^(?<time>\S+) .*event_code=continuous_meter_committed .*" +
         "invocation_id=(?<invocation>[0-9a-f-]+) .*slice_index=(?<slice>[0-7]) " +
         "normalized_value=(?<value>[0-9]+\.[0-9]+) " +
-        "continuous_meter=true action_executed=false"
+        "continuous_meter=$($ContinuousMeter.ToString().ToLowerInvariant()) action_executed=false"
     )
 } else {
     [regex]::Matches(
@@ -1162,7 +1184,7 @@ $selectionRecords = if ($ContinuousMeter -and -not $ReturnInsideBeforeRelease) {
     )
 }
 if ($selectionRecords.Count -ne $expectedInvocations) {
-    $outcomeName = if ($ContinuousMeter -and -not $ReturnInsideBeforeRelease) {
+    $outcomeName = if ($continuousGesture -and -not $ReturnInsideBeforeRelease) {
         "continuous commits"
     } else {
         "selected gestures"
@@ -1196,7 +1218,7 @@ if ($RequireOpenAnimationComplete) {
         }
     }
 }
-if ($ContinuousMeter -and -not $ReturnInsideBeforeRelease) {
+if ($continuousGesture -and -not $ReturnInsideBeforeRelease) {
     $unexpectedDiscreteSelections = [regex]::Matches($log, "event_code=slice_selected")
     if ($unexpectedDiscreteSelections.Count -ne 0) {
         throw "The continuous meter unexpectedly produced a discrete slice selection."
@@ -1319,7 +1341,7 @@ if ($expectedActionModes.Count -eq 1) {
 elseif ($log -match "action_executed=true") {
     throw "The action-free smoke configuration unexpectedly executed an action."
 }
-if ($ContinuousMeter) {
+if ($continuousGesture) {
     if (
         $log -match (
             "target=actions .*event_code=(?:action_plan_compiled|action_dispatched) .*" +
@@ -1342,18 +1364,19 @@ if ($ContinuousMeter) {
     foreach ($id in $armedInvocationIds) {
         if (
             $log -notmatch (
-                "event_code=inert_session_started result_code=ok .*" +
-                "invocation_id=$([regex]::Escape($id))"
+                "event_code=live_session_started result_code=ok .*" +
+                "invocation_id=$([regex]::Escape($id)) .*backend=" +
+                $(if ($ContinuousMeter) { "inert" } else { "plugin" })
             )
         ) {
-            throw "Armed invocation $id did not start its inert continuous session."
+            throw "Armed invocation $id did not start the expected continuous session."
         }
-        if (
+        if ($ContinuousMeter -and (
             $log -notmatch (
                 "event_code=inert_backend_request_validated result_code=ok .*" +
                 "invocation_id=$([regex]::Escape($id)) stage=Begin"
             )
-        ) {
+        )) {
             throw "Armed invocation $id did not validate and deliver Begin."
         }
     }
@@ -1361,12 +1384,12 @@ if ($ContinuousMeter) {
     if (-not $ReturnInsideBeforeRelease) {
         foreach ($record in $selectionRecords) {
             $id = $record.Groups["invocation"].Value
-            if (
+            if ($ContinuousMeter -and (
                 $log -notmatch (
                     "event_code=inert_backend_request_validated result_code=ok .*" +
                     "invocation_id=$([regex]::Escape($id)) stage=Commit"
                 )
-            ) {
+            )) {
                 throw "Continuous invocation $id did not validate and deliver Commit."
             }
         }
@@ -1374,13 +1397,13 @@ if ($ContinuousMeter) {
     if ($ReturnInsideBeforeRelease) {
         foreach ($record in $selectionRecords) {
             $id = $record.Groups["invocation"].Value
-            if (
+            if ($ContinuousMeter -and (
                 $log -notmatch (
                     "event_code=inert_backend_request_validated result_code=ok .*" +
                     "invocation_id=$([regex]::Escape($id)) stage=Cancel " +
                     "cancel_reason=ReturnedToDiscrete"
                 )
-            ) {
+            )) {
                 throw "Hybrid invocation $id did not suspend with returned-to-discrete."
             }
         }
@@ -1391,8 +1414,39 @@ if ($ContinuousMeter) {
             "event_code=inert_backend_request_validated result_code=ok .*" +
             "stage=Cancel cancel_reason=DirectionChanged"
         )
-        if ($directionHandoffs.Count -lt $expectedInvocations) {
+        if ($ContinuousMeter -and $directionHandoffs.Count -lt $expectedInvocations) {
             throw "The inert backend did not observe every unlocked direction handoff."
+        }
+    }
+    if ($PluginContinuous) {
+        $pluginBegins = [regex]::Matches(
+            $log,
+            "event_code=plugin_callback_timing result_code=ok stage=begin " +
+            "callback_count=(?<count>[0-9]+)"
+        ) | Select-Object -Last 1
+        $pluginCommits = [regex]::Matches(
+            $log,
+            "event_code=plugin_callback_timing result_code=ok stage=commit " +
+            "callback_count=(?<count>[0-9]+)"
+        ) | Select-Object -Last 1
+        $pluginBeginCount = if ($pluginBegins) {
+            [int]$pluginBegins.Groups["count"].Value
+        } else {
+            0
+        }
+        $pluginCommitCount = if ($pluginCommits) {
+            [int]$pluginCommits.Groups["count"].Value
+        } else {
+            0
+        }
+        if (
+            $pluginBeginCount -lt $expectedInvocations -or
+            $pluginCommitCount -lt $expectedInvocations
+        ) {
+            throw (
+                "Plugin lifecycle coverage was incomplete: " +
+                "begin=$pluginBeginCount, commit=$pluginCommitCount."
+            )
         }
     }
 } else {
@@ -1428,8 +1482,8 @@ if (-not $interactionStop.Success) {
     throw "The interaction shutdown record did not contain coalescing diagnostics."
 }
 $coalescedUpdates = [int]$interactionStop.Groups["coalesced"].Value
-if ($ContinuousMeter -and [int]$interactionStop.Groups["prioritized"].Value -eq 0) {
-    throw "The continuous meter did not prioritize any direction or mode transition."
+if ($continuousGesture -and [int]$interactionStop.Groups["prioritized"].Value -eq 0) {
+    throw "The continuous gesture did not prioritize any direction or mode transition."
 }
 if ($PointerBurstEvents -ne 0 -and $coalescedUpdates -eq 0) {
     throw "The fixed-origin pointer burst did not coalesce any obsolete visual updates."

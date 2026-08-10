@@ -16,6 +16,7 @@ try {
     }
 
     & (Join-Path $PSScriptRoot "run-performance-report.ps1") -SelfTest
+    & (Join-Path $PSScriptRoot "run-plugin-performance-report.ps1") -SelfTest
     & (Join-Path $PSScriptRoot "summarize-continuous-study.ps1") -SelfTest
 
     cargo fmt --all --check
