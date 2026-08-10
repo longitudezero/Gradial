@@ -8,7 +8,10 @@ use std::{collections::HashSet, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{MAX_CONTINUOUS_IDENTIFIER_BYTES, MAX_CONTINUOUS_UPDATE_HZ, MIN_CONTINUOUS_UPDATE_HZ};
+use crate::{
+    MAX_CONTINUOUS_IDENTIFIER_BYTES, MAX_CONTINUOUS_UPDATE_HZ, MIN_CONTINUOUS_UPDATE_HZ,
+    continuous::{PluginParameters, PluginValue, plugin_parameters_fit_serialized_limit},
+};
 
 pub const PLUGIN_MANIFEST_VERSION: u16 = 1;
 pub const PLUGIN_API_VERSION: u16 = 1;
@@ -125,6 +128,59 @@ impl PluginParameterDefinition {
             | Self::Number { key, .. }
             | Self::String { key, .. }
             | Self::Choice { key, .. } => key,
+        }
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Boolean { label, .. }
+            | Self::Integer { label, .. }
+            | Self::Number { label, .. }
+            | Self::String { label, .. }
+            | Self::Choice { label, .. } => label,
+        }
+    }
+
+    #[must_use]
+    pub const fn required(&self) -> bool {
+        match self {
+            Self::Boolean { required, .. }
+            | Self::Integer { required, .. }
+            | Self::Number { required, .. }
+            | Self::String { required, .. }
+            | Self::Choice { required, .. } => *required,
+        }
+    }
+
+    /// Returns the manifest default or a deterministic in-range editor value.
+    #[must_use]
+    pub fn initial_value(&self) -> PluginValue {
+        match self {
+            Self::Boolean { default, .. } => PluginValue::Boolean(default.unwrap_or(false)),
+            Self::Integer { default, minimum, .. } => {
+                PluginValue::Integer(default.unwrap_or(*minimum))
+            }
+            Self::Number { default, minimum, .. } => {
+                PluginValue::Number(default.unwrap_or(*minimum))
+            }
+            Self::String { default, minimum_length, .. } => PluginValue::String(
+                default
+                    .clone()
+                    .unwrap_or_else(|| "x".repeat(usize::try_from(*minimum_length).unwrap_or(0))),
+            ),
+            Self::Choice { default, choices, .. } => PluginValue::Choice(
+                default.clone().unwrap_or_else(|| choices.first().cloned().unwrap_or_default()),
+            ),
+        }
+    }
+
+    const fn has_default(&self) -> bool {
+        match self {
+            Self::Boolean { default, .. } => default.is_some(),
+            Self::Integer { default, .. } => default.is_some(),
+            Self::Number { default, .. } => default.is_some(),
+            Self::String { default, .. } | Self::Choice { default, .. } => default.is_some(),
         }
     }
 
@@ -259,8 +315,106 @@ impl PluginManifestAction {
             }
             parameter.validate()?;
         }
+        self.initial_parameters()
+            .map_err(|_error| PluginManifestError::InvalidParameterDefaults)?;
         Ok(())
     }
+
+    /// Builds a valid initial parameter set from the manifest without running
+    /// plugin code. Optional parameters without defaults remain absent.
+    /// Required parameters without defaults receive a deterministic in-range
+    /// editor value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this action was constructed outside the validated
+    /// manifest parser and cannot produce a valid parameter set.
+    pub fn initial_parameters(&self) -> Result<PluginParameters, PluginParameterValidationError> {
+        let parameters = self
+            .parameters
+            .iter()
+            .filter_map(|definition| {
+                initial_parameter_value(definition)
+                    .map(|value| (definition.key().to_owned(), value))
+            })
+            .collect();
+        self.validate_parameters(&parameters)?;
+        Ok(parameters)
+    }
+
+    /// Checks portable action parameters against this manifest declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable error when a key is undeclared, a required value is
+    /// absent, a type differs, a constraint is violated, or the complete map
+    /// exceeds the protocol's serialized limit.
+    pub fn validate_parameters(
+        &self,
+        parameters: &PluginParameters,
+    ) -> Result<(), PluginParameterValidationError> {
+        if !plugin_parameters_fit_serialized_limit(parameters) {
+            return Err(PluginParameterValidationError::SerializedSize);
+        }
+        if parameters
+            .keys()
+            .any(|key| !self.parameters.iter().any(|definition| definition.key() == key))
+        {
+            return Err(PluginParameterValidationError::Undeclared);
+        }
+        for definition in &self.parameters {
+            let Some(value) = parameters.get(definition.key()) else {
+                if definition.required() {
+                    return Err(PluginParameterValidationError::RequiredMissing);
+                }
+                continue;
+            };
+            validate_parameter_value(definition, value)?;
+        }
+        Ok(())
+    }
+}
+
+fn initial_parameter_value(definition: &PluginParameterDefinition) -> Option<PluginValue> {
+    (definition.required() || definition.has_default()).then(|| definition.initial_value())
+}
+
+fn validate_parameter_value(
+    definition: &PluginParameterDefinition,
+    value: &PluginValue,
+) -> Result<(), PluginParameterValidationError> {
+    let valid = match (definition, value) {
+        (PluginParameterDefinition::Boolean { .. }, PluginValue::Boolean(_)) => true,
+        (
+            PluginParameterDefinition::Integer { minimum, maximum, .. },
+            PluginValue::Integer(value),
+        ) => (*minimum..=*maximum).contains(value),
+        (
+            PluginParameterDefinition::Number { minimum, maximum, .. },
+            PluginValue::Number(value),
+        ) => value.is_finite() && (*minimum..=*maximum).contains(value),
+        (
+            PluginParameterDefinition::String { minimum_length, maximum_length, .. },
+            PluginValue::String(value),
+        ) => {
+            let length = value.chars().count();
+            let minimum = usize::try_from(*minimum_length).unwrap_or(usize::MAX);
+            let maximum = usize::try_from(*maximum_length).unwrap_or(0);
+            (minimum..=maximum).contains(&length)
+        }
+        (PluginParameterDefinition::Choice { choices, .. }, PluginValue::Choice(value)) => {
+            choices.contains(value)
+        }
+        (
+            PluginParameterDefinition::Boolean { .. }
+            | PluginParameterDefinition::Integer { .. }
+            | PluginParameterDefinition::Number { .. }
+            | PluginParameterDefinition::String { .. }
+            | PluginParameterDefinition::Choice { .. },
+            _,
+        ) => return Err(PluginParameterValidationError::TypeMismatch),
+    };
+    if valid { Ok(()) } else { Err(PluginParameterValidationError::Constraint) }
 }
 
 fn validate_identifier(value: &str) -> Result<(), ()> {
@@ -343,10 +497,28 @@ pub enum PluginManifestError {
     InvalidParameterRange,
     #[error("plugin_parameter_choices_invalid")]
     InvalidParameterChoices,
+    #[error("plugin_parameter_defaults_invalid")]
+    InvalidParameterDefaults,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PluginParameterValidationError {
+    #[error("plugin_parameter_undeclared")]
+    Undeclared,
+    #[error("plugin_parameter_required_missing")]
+    RequiredMissing,
+    #[error("plugin_parameter_type_mismatch")]
+    TypeMismatch,
+    #[error("plugin_parameter_constraint_invalid")]
+    Constraint,
+    #[error("plugin_parameters_serialized_size_invalid")]
+    SerializedSize,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     const VALID: &str = r#"
@@ -436,6 +608,86 @@ maximum = 120
         assert_eq!(
             parse_plugin_manifest(invalid.as_bytes()),
             Err(PluginManifestError::InvalidParameterRange)
+        );
+    }
+
+    #[test]
+    fn initial_parameters_use_defaults_and_required_in_range_values() {
+        let source = format!(
+            "{VALID}\n[[actions.parameters]]\nkey = \"enabled\"\nlabel = \"Enabled\"\n\
+             type = \"boolean\"\nrequired = true\n\n[[actions.parameters]]\nkey = \"gain\"\n\
+             label = \"Gain\"\ntype = \"number\"\nrequired = true\nminimum = 0.25\n\
+             maximum = 2.0\n\n[[actions.parameters]]\nkey = \"label\"\nlabel = \"Label\"\n\
+             type = \"string\"\nminimum_length = 0\nmaximum_length = 20\n\n\
+             [[actions.parameters]]\nkey = \"mode\"\nlabel = \"Mode\"\ntype = \"choice\"\n\
+             required = true\nchoices = [\"smooth\", \"stepped\"]\n"
+        );
+        let manifest = parse_plugin_manifest(source.as_bytes()).expect("parameter manifest");
+        let action = &manifest.actions[0];
+        let parameters = action.initial_parameters().expect("initial parameters");
+
+        assert_eq!(parameters.get("maximum_steps"), Some(&PluginValue::Integer(12)));
+        assert_eq!(parameters.get("enabled"), Some(&PluginValue::Boolean(false)));
+        assert_eq!(parameters.get("gain"), Some(&PluginValue::Number(0.25)));
+        assert_eq!(parameters.get("mode"), Some(&PluginValue::Choice("smooth".to_owned())));
+        assert!(!parameters.contains_key("label"));
+        assert_eq!(action.validate_parameters(&parameters), Ok(()));
+    }
+
+    #[test]
+    fn action_parameter_validation_rejects_unknown_missing_type_and_range() {
+        let manifest = parse_plugin_manifest(VALID.as_bytes()).expect("valid manifest");
+        let action = &manifest.actions[0];
+
+        assert_eq!(
+            action.validate_parameters(&PluginParameters::new()),
+            Ok(()),
+            "the example parameter is optional"
+        );
+        let mut unknown = PluginParameters::new();
+        unknown.insert("other".to_owned(), PluginValue::Integer(1));
+        assert_eq!(
+            action.validate_parameters(&unknown),
+            Err(PluginParameterValidationError::Undeclared)
+        );
+        let mut wrong_type = PluginParameters::new();
+        wrong_type.insert("maximum_steps".to_owned(), PluginValue::String("12".to_owned()));
+        assert_eq!(
+            action.validate_parameters(&wrong_type),
+            Err(PluginParameterValidationError::TypeMismatch)
+        );
+        let mut outside = PluginParameters::new();
+        outside.insert("maximum_steps".to_owned(), PluginValue::Integer(121));
+        assert_eq!(
+            action.validate_parameters(&outside),
+            Err(PluginParameterValidationError::Constraint)
+        );
+
+        let required_source = VALID
+            .replace("default = 12\nminimum = 1", "required = true\ndefault = 12\nminimum = 1");
+        let required = parse_plugin_manifest(required_source.as_bytes()).expect("required");
+        assert_eq!(
+            required.actions[0].validate_parameters(&PluginParameters::new()),
+            Err(PluginParameterValidationError::RequiredMissing)
+        );
+    }
+
+    #[test]
+    fn rejects_a_default_parameter_map_above_the_runtime_limit() {
+        let default = "x".repeat(4_096);
+        let mut source = VALID.to_owned();
+        for index in 0..4 {
+            write!(
+                source,
+                "\n[[actions.parameters]]\nkey = \"text_{index}\"\nlabel = \"Text {index}\"\n\
+                 type = \"string\"\ndefault = \"{default}\"\nminimum_length = 0\n\
+                 maximum_length = 4096\n"
+            )
+            .expect("manifest fixture");
+        }
+        assert_eq!(
+            parse_plugin_manifest(source.as_bytes()),
+            Err(PluginManifestError::InvalidParameterDefaults)
         );
     }
 

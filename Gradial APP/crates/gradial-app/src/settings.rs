@@ -15,9 +15,10 @@ use gradial_core::{
     ActivationBindingId, Appearance, ApplicationProfile, Configuration, ConfigurationError,
     ExecutionOperation, IconReference, LabelTheme, MAX_ACTION_SEQUENCE_DEPTH,
     MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu,
-    MenuSlice, PhysicalModifiers, PluginPermission, Profile, ProfileResolver, ProfileRule,
-    ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey, SizePreset, SliceCount,
-    WindowCommand, slice_for_delta,
+    MenuSlice, PhysicalModifiers, PluginManifestAction, PluginParameterDefinition,
+    PluginPermission, PluginValue, Profile, ProfileResolver, ProfileRule, ProfileTarget,
+    ResolutionDecision, ResolvedMenu, ShortcutKey, SizePreset, SliceCount, WindowCommand,
+    slice_for_delta,
 };
 #[cfg(debug_assertions)]
 use gradial_core::{AppPaths, ShortcutModifier};
@@ -184,6 +185,14 @@ enum NewActionTemplate {
     Sequence,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PluginActionChoice {
+    plugin_id: String,
+    plugin_name: String,
+    action: PluginManifestAction,
+    loaded: bool,
+}
+
 impl NewActionTemplate {
     const ALL: [Self; 8] = [
         Self::Shortcut,
@@ -329,6 +338,7 @@ enum DraftValidationError {
     SequenceSteps { index: usize, steps: usize },
     SequenceDelay { index: usize, milliseconds: u32 },
     MissingSequenceStep { index: usize, step: usize },
+    InvalidPluginParameters { index: usize },
     InvalidConfiguration,
 }
 
@@ -444,6 +454,9 @@ impl DraftValidationError {
                     step + 1,
                     index + 1
                 )
+            }
+            Self::InvalidPluginParameters { index } => {
+                format!("Fix the plugin parameters for action {} before saving.", index + 1)
             }
             Self::InvalidConfiguration => {
                 "These settings cannot be saved yet. Review the editor fields.".to_owned()
@@ -1483,11 +1496,12 @@ impl SettingsState {
         let draft = self.draft.as_ref()?;
         let path =
             AppPaths::discover().ok()?.root.join("settings-export-smoke").join("settings.json");
-        (self.lifecycle == EditorLifecycle::Editing && validate_draft(&draft.proposed).is_ok())
-            .then(|| SettingsEvent::Export {
-                path: PrivatePath::new(path),
-                configuration: draft.proposed.clone(),
-            })
+        (self.lifecycle == EditorLifecycle::Editing
+            && validate_draft_with_plugins(&draft.proposed, self.plugin_snapshot.as_ref()).is_ok())
+        .then(|| SettingsEvent::Export {
+            path: PrivatePath::new(path),
+            configuration: draft.proposed.clone(),
+        })
     }
 
     #[cfg(debug_assertions)]
@@ -1595,7 +1609,7 @@ impl SettingsState {
         let draft = self.draft.as_ref()?;
         (self.lifecycle == EditorLifecycle::Editing
             && draft.is_dirty()
-            && validate_draft(&draft.proposed).is_ok())
+            && validate_draft_with_plugins(&draft.proposed, self.plugin_snapshot.as_ref()).is_ok())
         .then(|| SettingsEvent::Save(draft.proposed.clone()))
     }
 
@@ -1795,7 +1809,8 @@ impl SettingsState {
             return None;
         };
         let mut event = debug_event;
-        let validation = validate_draft(&draft.proposed);
+        let validation =
+            validate_draft_with_plugins(&draft.proposed, self.plugin_snapshot.as_ref());
         let dirty = draft.is_dirty();
         let previous_section = self.section;
 
@@ -2696,7 +2711,8 @@ impl SettingsState {
             let direction = direction_name(self.selected_slice, selected_count);
             ui.label(RichText::new(direction).strong().size(18.0));
             let action_options = action_options(&draft.proposed);
-            let action_catalog_empty = draft.proposed.actions.is_empty();
+            let continuous_options = continuous_action_options(&draft.proposed);
+            let action_catalog_empty = action_options.is_empty();
             if let Some(slice) =
                 draft.proposed.global_profile.menu.slices.get_mut(self.selected_slice)
             {
@@ -2727,6 +2743,21 @@ impl SettingsState {
                 if action_catalog_empty {
                     ui.add_space(6.0);
                     if ui.link("Create an action first.").clicked() {
+                        self.section = SettingsSection::Actions;
+                    }
+                }
+                ui.add_space(12.0);
+                if render_continuous_assignment(
+                    ui,
+                    ("global_continuous", self.selected_slice),
+                    slice,
+                    &continuous_options,
+                ) {
+                    self.save_feedback = SaveFeedback::None;
+                }
+                if continuous_options.is_empty() {
+                    ui.add_space(6.0);
+                    if ui.link("Create a continuous plugin control first.").clicked() {
                         self.section = SettingsSection::Actions;
                     }
                 }
@@ -2925,6 +2956,7 @@ impl SettingsState {
                 );
                 let action_options = action_options(&draft.proposed);
                 let action_catalog_empty = action_options.is_empty();
+                let continuous_options = continuous_action_options(&draft.proposed);
                 if let Some(menu) = profile_menu_mut(&mut draft.proposed, profile_id)
                     && let Some(slice) = menu.slices.get_mut(self.selected_slice)
                 {
@@ -2956,6 +2988,21 @@ impl SettingsState {
                             }
                         }
                     });
+                    ui.add_space(12.0);
+                    if render_continuous_assignment(
+                        ui,
+                        ("profile_continuous", profile_id, self.selected_slice),
+                        slice,
+                        &continuous_options,
+                    ) {
+                        self.profile_feedback = None;
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    if continuous_options.is_empty()
+                        && ui.link("Create a continuous plugin control first.").clicked()
+                    {
+                        self.section = SettingsSection::Actions;
+                    }
                     ui.add_space(12.0);
                     self.render_slice_icon_editor(ui, profile_id, self.selected_slice, slice);
                 }
@@ -3231,12 +3278,14 @@ impl SettingsState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_action_catalog(&mut self, ui: &mut egui::Ui, configuration: &mut Configuration) {
         let action_rows = configuration
             .actions
             .iter()
             .map(|action| (action.id, action.name.clone(), action_kind_name(&action.kind)))
             .collect::<Vec<_>>();
+        let plugin_action_choices = available_plugin_action_choices(self.plugin_snapshot.as_ref());
         egui::Panel::left("action_catalog").resizable(false).exact_size(280.0).show(ui, |ui| {
             ui.add_space(12.0);
             ui.heading("Actions");
@@ -3253,6 +3302,7 @@ impl SettingsState {
             });
             ui.separator();
             let mut new_action = None;
+            let mut new_plugin_action = None;
             let initial_sequence_child = configuration
                 .actions
                 .iter()
@@ -3275,6 +3325,21 @@ impl SettingsState {
                 if initial_sequence_child.is_none() {
                     ui.weak("Create a regular action before creating a sequence.");
                 }
+                ui.separator();
+                ui.strong("Continuous plugin controls");
+                if plugin_action_choices.is_empty() {
+                    ui.weak("Enable a compatible plugin to create one.");
+                }
+                for choice in &plugin_action_choices {
+                    if ui
+                        .button(format!("{}: {}", choice.plugin_name, choice.action.name))
+                        .on_hover_text(&choice.action.description)
+                        .clicked()
+                    {
+                        new_plugin_action = Some(choice.clone());
+                        ui.close();
+                    }
+                }
             });
             if let Some(template) = new_action {
                 let action_id = Uuid::new_v4();
@@ -3288,6 +3353,33 @@ impl SettingsState {
                     template.label()
                 )));
                 self.save_feedback = SaveFeedback::None;
+            }
+            if let Some(choice) = new_plugin_action {
+                let action_id = Uuid::new_v4();
+                match choice.action.initial_parameters() {
+                    Ok(parameters) => {
+                        create_action(
+                            configuration,
+                            action_id,
+                            &choice.action.name,
+                            ActionKind::PluginContinuous {
+                                plugin_id: choice.plugin_id,
+                                plugin_action_id: choice.action.id,
+                                parameters,
+                            },
+                        );
+                        self.selected_action = Some(action_id);
+                        self.action_feedback = Some(ActionEditorFeedback::Info(
+                            "Continuous plugin control created.".to_owned(),
+                        ));
+                        self.save_feedback = SaveFeedback::None;
+                    }
+                    Err(error) => {
+                        self.action_feedback = Some(ActionEditorFeedback::Error(format!(
+                            "This plugin's parameter defaults are invalid ({error})."
+                        )));
+                    }
+                }
             }
             ui.add_space(8.0);
             let has_selection = self.selected_action.is_some();
@@ -3338,6 +3430,20 @@ impl SettingsState {
                 .and_then(|action| {
                     matches!(action.kind, ActionKind::Sequence { .. })
                         .then(|| SequenceEditorContext::new(configuration.clone(), action_id))
+                });
+            let plugin_action_choice = configuration
+                .actions
+                .iter()
+                .find(|action| action.id == action_id)
+                .and_then(|action| match &action.kind {
+                    ActionKind::PluginContinuous { plugin_id, plugin_action_id, .. } => {
+                        plugin_action_choice(
+                            self.plugin_snapshot.as_ref(),
+                            plugin_id,
+                            plugin_action_id,
+                        )
+                    }
+                    _ => None,
                 });
             let Some(action) = configuration.actions.iter_mut().find(|action| action.id == action_id)
             else {
@@ -3432,15 +3538,59 @@ impl SettingsState {
                     parameters,
                 } => {
                     ui.label("Plugin");
-                    ui.monospace(plugin_id.as_str());
+                    ui.monospace(plugin_action_choice.as_ref().map_or(plugin_id.as_str(), |choice| {
+                        choice.plugin_name.as_str()
+                    }));
+                    ui.weak(plugin_id.as_str());
                     ui.add_space(8.0);
                     ui.label("Plugin action");
-                    ui.monospace(plugin_action_id.as_str());
-                    ui.add_space(8.0);
-                    ui.label(format!("Parameters: {}", parameters.len()));
-                    ui.weak(
-                        "This portable continuous action is retained but remains unavailable until plugin support is installed and enabled.",
+                    ui.label(
+                        RichText::new(plugin_action_choice.as_ref().map_or(
+                            plugin_action_id.as_str(),
+                            |choice| choice.action.name.as_str(),
+                        ))
+                        .strong(),
                     );
+                    ui.weak(plugin_action_id.as_str());
+                    if let Some(choice) = &plugin_action_choice {
+                        if !choice.action.description.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(&choice.action.description);
+                        }
+                        ui.weak(format!("Updates up to {} times per second.", choice.action.update_hz));
+                        if !choice.loaded {
+                            ui.colored_label(
+                                Color32::from_rgb(245, 188, 78),
+                                "This plugin is not currently enabled. The settings are retained, but the distance control will stay inactive.",
+                            );
+                        }
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("Parameters").strong());
+                        payload_changed |= render_plugin_parameter_editor(
+                            ui,
+                            &choice.action,
+                            parameters,
+                        );
+                        if let Err(error) = choice.action.validate_parameters(parameters) {
+                            ui.colored_label(
+                                Color32::from_rgb(239, 113, 113),
+                                format!("Fix these parameter values before saving ({error})."),
+                            );
+                            if ui.button("Reset parameters").clicked()
+                                && let Ok(initial) = choice.action.initial_parameters()
+                            {
+                                *parameters = initial;
+                                payload_changed = true;
+                            }
+                        }
+                    } else {
+                        ui.add_space(8.0);
+                        ui.colored_label(
+                            Color32::from_rgb(245, 188, 78),
+                            "The matching compatible plugin action is unavailable. Gradial will retain this portable action without changing its parameters.",
+                        );
+                        ui.label(format!("Stored parameters: {}", parameters.len()));
+                    }
                 }
             }
             if payload_changed {
@@ -3706,6 +3856,157 @@ impl SequenceEditorContext {
         *actions = steps.to_vec();
         Some(configuration)
     }
+}
+
+fn plugin_action_choice(
+    snapshot: Option<&PluginWorkerSnapshot>,
+    plugin_id: &str,
+    action_id: &str,
+) -> Option<PluginActionChoice> {
+    let snapshot = snapshot?;
+    let plugin = snapshot.plugins.iter().find(|plugin| plugin.plugin_id == plugin_id)?;
+    let action = plugin.actions.iter().find(|action| action.id == action_id)?.clone();
+    let loaded = plugin.status == PluginInventoryStatus::Enabled
+        && snapshot.loaded_plugin_ids.iter().any(|loaded| loaded == plugin_id);
+    Some(PluginActionChoice {
+        plugin_id: plugin.plugin_id.clone(),
+        plugin_name: plugin.display_name.clone(),
+        action,
+        loaded,
+    })
+}
+
+fn available_plugin_action_choices(
+    snapshot: Option<&PluginWorkerSnapshot>,
+) -> Vec<PluginActionChoice> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut choices = snapshot
+        .plugins
+        .iter()
+        .filter(|plugin| {
+            plugin.status == PluginInventoryStatus::Enabled
+                && snapshot.loaded_plugin_ids.iter().any(|loaded| loaded == &plugin.plugin_id)
+        })
+        .flat_map(|plugin| {
+            plugin.actions.iter().cloned().map(|action| PluginActionChoice {
+                plugin_id: plugin.plugin_id.clone(),
+                plugin_name: plugin.display_name.clone(),
+                action,
+                loaded: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| {
+        left.plugin_name
+            .cmp(&right.plugin_name)
+            .then_with(|| left.action.name.cmp(&right.action.name))
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+            .then_with(|| left.action.id.cmp(&right.action.id))
+    });
+    choices
+}
+
+fn render_plugin_parameter_editor(
+    ui: &mut egui::Ui,
+    action: &PluginManifestAction,
+    parameters: &mut std::collections::BTreeMap<String, PluginValue>,
+) -> bool {
+    if action.parameters.is_empty() {
+        ui.weak("This control has no configurable parameters.");
+        return false;
+    }
+    let mut changed = false;
+    for definition in &action.parameters {
+        let key = definition.key().to_owned();
+        let required = definition.required();
+        ui.add_space(8.0);
+        ui.label(RichText::new(definition.label()).strong());
+        let mut present = parameters.contains_key(&key);
+        if !required && ui.checkbox(&mut present, "Use this optional setting").changed() {
+            if present {
+                parameters.insert(key.clone(), definition.initial_value());
+            } else {
+                parameters.remove(&key);
+            }
+            changed = true;
+        }
+        if required && !present {
+            ui.colored_label(Color32::from_rgb(239, 113, 113), "A value is required.");
+            if ui.button("Set initial value").clicked() {
+                parameters.insert(key.clone(), definition.initial_value());
+                present = true;
+                changed = true;
+            }
+        }
+        if !present {
+            continue;
+        }
+        ui.indent(("plugin_parameter", &key), |ui| {
+            let Some(value) = parameters.get_mut(&key) else {
+                return;
+            };
+            changed |= match (definition, value) {
+                (PluginParameterDefinition::Boolean { .. }, PluginValue::Boolean(value)) => {
+                    ui.checkbox(value, "Enabled").changed()
+                }
+                (
+                    PluginParameterDefinition::Integer { minimum, maximum, .. },
+                    PluginValue::Integer(value),
+                ) => ui.add(DragValue::new(value).range(*minimum..=*maximum).speed(1)).changed(),
+                (
+                    PluginParameterDefinition::Number { minimum, maximum, .. },
+                    PluginValue::Number(value),
+                ) => {
+                    let speed = ((*maximum - *minimum).abs() / 100.0).clamp(0.001, 1_000.0);
+                    ui.add(DragValue::new(value).range(*minimum..=*maximum).speed(speed)).changed()
+                }
+                (
+                    PluginParameterDefinition::String { minimum_length, maximum_length, .. },
+                    PluginValue::String(value),
+                ) => {
+                    let edited = ui.text_edit_singleline(value).changed();
+                    let length = value.chars().count();
+                    let valid = (usize::try_from(*minimum_length).unwrap_or(usize::MAX)
+                        ..=usize::try_from(*maximum_length).unwrap_or(0))
+                        .contains(&length);
+                    let count = format!("{length} / {maximum_length} characters");
+                    if valid {
+                        ui.weak(count);
+                    } else {
+                        ui.colored_label(Color32::from_rgb(239, 113, 113), count);
+                    }
+                    edited
+                }
+                (PluginParameterDefinition::Choice { choices, .. }, PluginValue::Choice(value)) => {
+                    let mut edited = false;
+                    ComboBox::from_id_salt(("plugin_parameter_choice", &key))
+                        .selected_text(value.as_str())
+                        .show_ui(ui, |ui| {
+                            for choice in choices {
+                                edited |=
+                                    ui.selectable_value(value, choice.clone(), choice).changed();
+                            }
+                        });
+                    edited
+                }
+                (definition, invalid_value) => {
+                    ui.colored_label(
+                        Color32::from_rgb(239, 113, 113),
+                        "The stored value has the wrong type.",
+                    );
+                    if ui.button("Reset value").clicked() {
+                        *invalid_value = definition.initial_value();
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+        });
+    }
+    changed
 }
 
 fn render_sequence_editor(
@@ -4459,6 +4760,71 @@ fn action_options(configuration: &Configuration) -> Vec<(Uuid, String)> {
         .collect()
 }
 
+fn continuous_action_options(configuration: &Configuration) -> Vec<(Uuid, String)> {
+    configuration
+        .actions
+        .iter()
+        .filter(|action| matches!(action.kind, ActionKind::PluginContinuous { .. }))
+        .map(|action| (action.id, format!("{}: Continuous plugin", action.name)))
+        .collect()
+}
+
+fn render_continuous_assignment(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    slice: &mut MenuSlice,
+    options: &[(Uuid, String)],
+) -> bool {
+    ui.label(RichText::new("Continuous control").strong());
+    let mut enabled = slice.continuous_action_id.is_some();
+    let can_enable = enabled || !options.is_empty();
+    let mut changed = ui
+        .add_enabled(
+            can_enable,
+            egui::Checkbox::new(&mut enabled, "Enable distance beyond this wedge"),
+        )
+        .changed();
+    if changed {
+        set_continuous_assignment_enabled(slice, enabled, options);
+    }
+    if enabled {
+        ui.label("Continuous action");
+        ComboBox::from_id_salt(id_salt)
+            .width(310.0)
+            .selected_text(action_option_text(slice.continuous_action_id, options))
+            .show_ui(ui, |ui| {
+                for (action_id, label) in options {
+                    changed |= ui
+                        .selectable_value(&mut slice.continuous_action_id, Some(*action_id), label)
+                        .changed();
+                }
+            });
+        ui.weak(
+            "Release over the wedge for its normal action. Move beyond it for this distance control; returning to the wedge switches back.",
+        );
+    } else if options.is_empty() {
+        ui.weak("No continuous plugin controls are available in the action catalog.");
+    }
+    changed
+}
+
+fn set_continuous_assignment_enabled(
+    slice: &mut MenuSlice,
+    enabled: bool,
+    options: &[(Uuid, String)],
+) -> bool {
+    let next = if enabled {
+        slice.continuous_action_id.or_else(|| options.first().map(|(action_id, _)| *action_id))
+    } else {
+        None
+    };
+    if slice.continuous_action_id == next {
+        return false;
+    }
+    slice.continuous_action_id = next;
+    true
+}
+
 fn action_option_text(action_id: Option<Uuid>, options: &[(Uuid, String)]) -> String {
     let Some(action_id) = action_id else {
         return "No action".to_owned();
@@ -4628,6 +4994,27 @@ fn validate_draft(configuration: &Configuration) -> Result<(), DraftValidationEr
     Ok(())
 }
 
+fn validate_draft_with_plugins(
+    configuration: &Configuration,
+    snapshot: Option<&PluginWorkerSnapshot>,
+) -> Result<(), DraftValidationError> {
+    validate_draft(configuration)?;
+    for (index, action) in configuration.actions.iter().enumerate() {
+        let ActionKind::PluginContinuous { plugin_id, plugin_action_id, parameters } = &action.kind
+        else {
+            continue;
+        };
+        let Some(choice) = plugin_action_choice(snapshot, plugin_id, plugin_action_id) else {
+            continue;
+        };
+        choice
+            .action
+            .validate_parameters(parameters)
+            .map_err(|_error| DraftValidationError::InvalidPluginParameters { index })?;
+    }
+    Ok(())
+}
+
 fn render_diagnostic_feedback(ui: &mut egui::Ui, feedback: Option<&DiagnosticFeedback>) {
     let Some(feedback) = feedback else {
         return;
@@ -4662,6 +5049,13 @@ fn render_plugin_entry(
     ui.add_space(6.0);
     ui.strong("Requested permissions");
     render_plugin_permissions(ui, &plugin.permissions);
+    if !plugin.actions.is_empty() {
+        ui.add_space(6.0);
+        ui.strong("Continuous controls");
+        for action in &plugin.actions {
+            ui.label(format!("{} ({} Hz)", action.name, action.update_hz));
+        }
+    }
     if let Some(issue_code) = &plugin.issue_code {
         ui.colored_label(Color32::from_rgb(239, 113, 113), plugin_issue_message(issue_code));
     }
@@ -5180,8 +5574,9 @@ mod tests {
     use gradial_core::{
         AccentColor, ActionDefinition, ActionKind, ActivationBinding, ActivationBindingId,
         Appearance, Configuration, IconFormat, IconReference, LabelTheme, MAX_TYPED_TEXT_BYTES,
-        MenuSlice, PhysicalModifiers, PluginPermission, ResolutionDecision, ScreenPoint,
-        ShortcutKey, ShortcutModifier, SizePreset, SliceCount, WindowCommand,
+        MenuSlice, PhysicalModifiers, PluginPermission, PluginValue, ResolutionDecision,
+        ScreenPoint, ShortcutKey, ShortcutModifier, SizePreset, SliceCount, WindowCommand,
+        parse_plugin_manifest,
     };
     use uuid::Uuid;
 
@@ -5191,13 +5586,14 @@ mod tests {
         ProfileTestState, SequenceEditorContext, SequenceMetrics, SequenceMove, SettingsDraft,
         SettingsEvent, SettingsSection, SettingsState, StartAtLoginFeedback, TransferFeedback,
         action_options, action_references, activation_binding_display, add_executable_argument,
-        add_sequence_step, apply_dialog_outcome, binding_test_selection,
-        countdown_seconds_remaining, create_action, create_application_profile, delete_action,
-        delete_application_profile, duplicate_action, duplicate_application_profile,
-        map_selected_slice, move_sequence_step, normalize_preview_offset, plugin_issue_message,
-        plugin_requires_trust_confirmation, plugin_worker_error_message, preview_slice_at,
-        remove_executable_argument, remove_sequence_step, resize_menu, resolution_decision_text,
-        resolved_menu, validate_draft,
+        add_sequence_step, apply_dialog_outcome, available_plugin_action_choices,
+        binding_test_selection, continuous_action_options, countdown_seconds_remaining,
+        create_action, create_application_profile, delete_action, delete_application_profile,
+        duplicate_action, duplicate_application_profile, map_selected_slice, move_sequence_step,
+        normalize_preview_offset, plugin_issue_message, plugin_requires_trust_confirmation,
+        plugin_worker_error_message, preview_slice_at, remove_executable_argument,
+        remove_sequence_step, resize_menu, resolution_decision_text, resolved_menu,
+        set_continuous_assignment_enabled, validate_draft, validate_draft_with_plugins,
     };
 
     #[test]
@@ -5223,6 +5619,144 @@ mod tests {
         assert!(delete_action(&mut configuration, action_id).is_err());
         let menu = resolved_menu(&configuration.global_profile.menu).expect("resolved menu");
         assert_eq!(menu.continuous_action_id(0), Some(action_id));
+    }
+
+    fn parameterized_plugin_snapshot(loaded: bool) -> PluginWorkerSnapshot {
+        let manifest = parse_plugin_manifest(
+            br#"
+manifest_version = 1
+id = "org.gradial.volume"
+name = "Volume"
+version = "1.0.0"
+api_version = 1
+entry = "main.lua"
+permissions = []
+
+[[actions]]
+id = "adjust"
+name = "Adjust volume"
+kind = "continuous"
+description = "Adjust the current volume"
+update_hz = 24
+
+[[actions.parameters]]
+key = "scale"
+label = "Scale"
+type = "number"
+required = true
+default = 1.0
+minimum = 0.1
+maximum = 2.0
+"#,
+        )
+        .expect("plugin manifest");
+        PluginWorkerSnapshot {
+            state_revision: 1,
+            loaded_plugin_ids: if loaded { vec![manifest.id.clone()] } else { Vec::new() },
+            plugins: vec![PluginInventoryEntry {
+                plugin_id: manifest.id,
+                display_name: manifest.name,
+                version: Some(manifest.version),
+                api_version: Some(manifest.api_version),
+                permissions: manifest.permissions,
+                actions: manifest.actions,
+                permissions_approved: true,
+                status: if loaded {
+                    PluginInventoryStatus::Enabled
+                } else {
+                    PluginInventoryStatus::Disabled
+                },
+                issue_code: None,
+            }],
+            scan_error_code: None,
+        }
+    }
+
+    #[test]
+    fn only_loaded_manifest_actions_are_offered_for_creation() {
+        let enabled = parameterized_plugin_snapshot(true);
+        let choices = available_plugin_action_choices(Some(&enabled));
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].plugin_id, "org.gradial.volume");
+        assert_eq!(choices[0].action.id, "adjust");
+        assert_eq!(
+            choices[0].action.initial_parameters().expect("defaults").get("scale"),
+            Some(&PluginValue::Number(1.0))
+        );
+
+        let disabled = parameterized_plugin_snapshot(false);
+        assert!(available_plugin_action_choices(Some(&disabled)).is_empty());
+
+        let mut reload_required = parameterized_plugin_snapshot(true);
+        reload_required.plugins[0].status = PluginInventoryStatus::ReloadRequired;
+        assert!(available_plugin_action_choices(Some(&reload_required)).is_empty());
+    }
+
+    #[test]
+    fn wedge_continuous_toggle_preserves_the_discrete_action() {
+        let discrete_id = Uuid::from_u128(710);
+        let continuous_id = Uuid::from_u128(711);
+        let mut configuration = Configuration {
+            actions: vec![
+                ActionDefinition {
+                    id: discrete_id,
+                    name: "Mute".to_owned(),
+                    kind: ActionKind::Delay { milliseconds: 10 },
+                },
+                ActionDefinition {
+                    id: continuous_id,
+                    name: "Volume".to_owned(),
+                    kind: ActionKind::PluginContinuous {
+                        plugin_id: "org.gradial.volume".to_owned(),
+                        plugin_action_id: "adjust".to_owned(),
+                        parameters: BTreeMap::new(),
+                    },
+                },
+            ],
+            ..Configuration::default()
+        };
+        let options = continuous_action_options(&configuration);
+        let slice = &mut configuration.global_profile.menu.slices[0];
+        slice.action_id = Some(discrete_id);
+
+        assert!(set_continuous_assignment_enabled(slice, true, &options));
+        assert_eq!(slice.action_id, Some(discrete_id));
+        assert_eq!(slice.continuous_action_id, Some(continuous_id));
+        assert!(set_continuous_assignment_enabled(slice, false, &options));
+        assert_eq!(slice.action_id, Some(discrete_id));
+        assert_eq!(slice.continuous_action_id, None);
+    }
+
+    #[test]
+    fn known_manifest_parameters_are_validated_without_blocking_missing_plugins() {
+        let snapshot = parameterized_plugin_snapshot(true);
+        let action_id = Uuid::from_u128(712);
+        let mut parameters = BTreeMap::new();
+        parameters.insert("scale".to_owned(), PluginValue::Number(3.0));
+        let configuration = Configuration {
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Volume".to_owned(),
+                kind: ActionKind::PluginContinuous {
+                    plugin_id: "org.gradial.volume".to_owned(),
+                    plugin_action_id: "adjust".to_owned(),
+                    parameters,
+                },
+            }],
+            ..Configuration::default()
+        };
+
+        assert_eq!(validate_draft_with_plugins(&configuration, None), Ok(()));
+        assert_eq!(
+            validate_draft_with_plugins(&configuration, Some(&snapshot)),
+            Err(DraftValidationError::InvalidPluginParameters { index: 0 })
+        );
+        let mut valid = configuration;
+        let ActionKind::PluginContinuous { parameters, .. } = &mut valid.actions[0].kind else {
+            panic!("continuous action");
+        };
+        parameters.insert("scale".to_owned(), PluginValue::Number(1.5));
+        assert_eq!(validate_draft_with_plugins(&valid, Some(&snapshot)), Ok(()));
     }
     use crate::{
         configuration::ConfigurationMigration,
@@ -5519,6 +6053,7 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
                 api_version: Some(1),
                 permissions: vec![PluginPermission::Notification],
+                actions: Vec::new(),
                 permissions_approved: false,
                 status: PluginInventoryStatus::Disabled,
                 issue_code: None,
@@ -5558,6 +6093,7 @@ mod tests {
             version: Some("1.0.0".to_owned()),
             api_version: Some(1),
             permissions: vec![PluginPermission::InputShortcut],
+            actions: Vec::new(),
             permissions_approved: false,
             status: PluginInventoryStatus::Disabled,
             issue_code: None,

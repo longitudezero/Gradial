@@ -1144,6 +1144,15 @@ and manual authoring steps pass without executing code from a disabled plugin.
 
 ### Milestone 3 — Capabilities and action editing
 
+Implementation note (2026-08-10): the first editor slice is complete. Settings
+now receives compatible manifest action schemas, offers actions from enabled
+plugins for portable continuous-action creation, renders all five bounded
+parameter kinds without executing Lua, and validates known schemas before
+save. Global and application-profile wedges expose a separate continuous
+checkbox and selector without replacing their discrete action. The plugin
+worker repeats manifest parameter validation before Begin. Permission-filtered
+context and all host capability brokers remain later Milestone 3 slices.
+
 Deliver:
 
 - Permission-filtered context.

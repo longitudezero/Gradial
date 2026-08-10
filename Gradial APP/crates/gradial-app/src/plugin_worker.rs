@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, s
 use gradial_core::{
     AppPaths, ContinuousBeginRequest, ContinuousCancelReason, ContinuousCancelRequest,
     ContinuousCommitRequest, ContinuousRequest, ContinuousUpdateRequest, PluginActionId, PluginId,
-    PluginPermission,
+    PluginManifestAction, PluginPermission,
 };
 use gradial_lua::{LuaLifecycleAdapter, LuaSandboxError, LuaSandboxLimits};
 use thiserror::Error;
@@ -96,19 +96,20 @@ impl From<PluginTrustStatus> for PluginInventoryStatus {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PluginInventoryEntry {
     pub(crate) plugin_id: String,
     pub(crate) display_name: String,
     pub(crate) version: Option<String>,
     pub(crate) api_version: Option<u16>,
     pub(crate) permissions: Vec<PluginPermission>,
+    pub(crate) actions: Vec<PluginManifestAction>,
     pub(crate) permissions_approved: bool,
     pub(crate) status: PluginInventoryStatus,
     pub(crate) issue_code: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PluginWorkerSnapshot {
     pub(crate) state_revision: u64,
     pub(crate) loaded_plugin_ids: Vec<String>,
@@ -163,6 +164,8 @@ pub(crate) enum PluginLifecycleError {
     PluginUnavailable,
     #[error("plugin_lifecycle_action_unavailable")]
     ActionUnavailable,
+    #[error("plugin_lifecycle_parameters_invalid")]
+    ParametersInvalid,
     #[error("plugin_lifecycle_begin_aborted")]
     BeginAborted,
     #[error("plugin_lifecycle_session_active")]
@@ -178,6 +181,7 @@ impl PluginLifecycleError {
         match self {
             Self::PluginUnavailable => "plugin_unavailable",
             Self::ActionUnavailable => "action_unavailable",
+            Self::ParametersInvalid => "parameters_invalid",
             Self::BeginAborted => "begin_aborted",
             Self::SessionActive => "session_active",
             Self::SessionNotActive => "session_not_active",
@@ -592,7 +596,7 @@ struct ActivePluginSession {
 
 struct LoadedPlugin {
     adapter: LuaLifecycleAdapter,
-    actions: BTreeMap<String, u16>,
+    actions: BTreeMap<String, PluginManifestAction>,
 }
 
 impl PluginWorker {
@@ -876,9 +880,13 @@ impl PluginWorker {
         let plugin_id = request.plugin_id().as_str().to_owned();
         let plugin =
             self.adapters.get_mut(&plugin_id).ok_or(PluginLifecycleError::PluginUnavailable)?;
-        if !plugin.actions.contains_key(request.action_id().as_str()) {
-            return Err(PluginLifecycleError::ActionUnavailable);
-        }
+        let action = plugin
+            .actions
+            .get(request.action_id().as_str())
+            .ok_or(PluginLifecycleError::ActionUnavailable)?;
+        action
+            .validate_parameters(request.parameters())
+            .map_err(|_error| PluginLifecycleError::ParametersInvalid)?;
         let result = plugin.adapter.begin(request);
         self.map_lua_result(&plugin_id, result)?;
         self.active_session =
@@ -1245,8 +1253,8 @@ impl PluginWorker {
             .adapters
             .iter()
             .flat_map(|(plugin_id, plugin)| {
-                plugin.actions.iter().map(|(action_id, update_hz)| {
-                    ((plugin_id.clone(), action_id.clone()), *update_hz)
+                plugin.actions.iter().map(|(action_id, action)| {
+                    ((plugin_id.clone(), action_id.clone()), action.update_hz)
                 })
             })
             .collect();
@@ -1264,10 +1272,7 @@ impl PluginWorker {
                 let package =
                     report.packages.iter().find(|package| package.directory_name == plugin_id);
                 match package.map(|package| &package.status) {
-                    Some(
-                        PluginPackageStatus::Compatible { manifest, .. }
-                        | PluginPackageStatus::IncompatibleApi { manifest, .. },
-                    ) => {
+                    Some(PluginPackageStatus::Compatible { manifest, .. }) => {
                         let permissions_approved = package.is_some_and(|package| {
                             self.state.permissions_approved(package).unwrap_or(false)
                         });
@@ -1277,7 +1282,21 @@ impl PluginWorker {
                             version: Some(manifest.version.clone()),
                             api_version: Some(manifest.api_version),
                             permissions: manifest.permissions.clone(),
+                            actions: manifest.actions.clone(),
                             permissions_approved,
+                            status: status.into(),
+                            issue_code: None,
+                        }
+                    }
+                    Some(PluginPackageStatus::IncompatibleApi { manifest, .. }) => {
+                        PluginInventoryEntry {
+                            plugin_id,
+                            display_name: manifest.name.clone(),
+                            version: Some(manifest.version.clone()),
+                            api_version: Some(manifest.api_version),
+                            permissions: manifest.permissions.clone(),
+                            actions: Vec::new(),
+                            permissions_approved: false,
                             status: status.into(),
                             issue_code: None,
                         }
@@ -1288,6 +1307,7 @@ impl PluginWorker {
                         version: None,
                         api_version: None,
                         permissions: Vec::new(),
+                        actions: Vec::new(),
                         permissions_approved: false,
                         status: PluginInventoryStatus::Invalid,
                         issue_code: Some(error.to_string()),
@@ -1298,6 +1318,7 @@ impl PluginWorker {
                         version: None,
                         api_version: None,
                         permissions: Vec::new(),
+                        actions: Vec::new(),
                         permissions_approved: false,
                         status: PluginInventoryStatus::Unavailable,
                         issue_code: Some("package_missing".to_owned()),
@@ -1356,7 +1377,7 @@ fn load_plugin(package: &DiscoveredPlugin) -> Result<LoadedPlugin, LuaSandboxErr
     };
     let adapter = LuaLifecycleAdapter::load(sources.clone(), LuaSandboxLimits::default())?;
     let actions =
-        manifest.actions.iter().map(|action| (action.id.clone(), action.update_hz)).collect();
+        manifest.actions.iter().cloned().map(|action| (action.id.clone(), action)).collect();
     Ok(LoadedPlugin { adapter, actions })
 }
 
@@ -1453,6 +1474,24 @@ mod tests {
         fs::write(package.join("main.lua"), METER_SOURCE).expect("example source");
     }
 
+    fn write_required_parameter_package(root: &Path, plugin_id: &str) {
+        let package = root.join(plugin_id);
+        fs::create_dir_all(&package).expect("plugin package");
+        let manifest = format!(
+            "manifest_version = 1\nid = \"{plugin_id}\"\nname = \"Parameterized plugin\"\n\
+             version = \"0.1.0\"\napi_version = 1\nentry = \"main.lua\"\npermissions = []\n\n\
+             [[actions]]\nid = \"measure\"\nname = \"Measure\"\nkind = \"continuous\"\n\
+             update_hz = 30\n\n[[actions.parameters]]\nkey = \"scale\"\nlabel = \"Scale\"\n\
+             type = \"number\"\nrequired = true\nminimum = 0.1\nmaximum = 2.0\n"
+        );
+        fs::write(package.join("plugin.toml"), manifest).expect("plugin manifest");
+        fs::write(
+            package.join("main.lua"),
+            VALID_SOURCE.replace("return {}", "error('begin must not run')"),
+        )
+        .expect("plugin source");
+    }
+
     fn begin_session(plugin_id: &str, session_id: Uuid) -> (ContinuousSession, ContinuousRequest) {
         let action = ContinuousActionSnapshot::new(
             PluginId::new(plugin_id).expect("plugin ID"),
@@ -1545,6 +1584,8 @@ mod tests {
         let client = runtime.lifecycle_client();
 
         assert_eq!(snapshot.loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        assert_eq!(snapshot.plugins[0].actions[0].id, "measure");
+        assert_eq!(snapshot.plugins[0].actions[0].update_hz, 30);
         assert_eq!(
             client.action_update_hz(
                 &PluginId::new(FIRST_PLUGIN).expect("plugin ID"),
@@ -1578,6 +1619,21 @@ mod tests {
 
         assert_eq!(dispatch(&client, update), Err(PluginLifecycleError::SessionNotActive));
         assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![METER_PLUGIN]);
+    }
+
+    #[test]
+    fn manifest_parameter_validation_rejects_begin_before_lua() {
+        let (_temporary, paths) = setup();
+        write_required_parameter_package(&paths.plugins, FIRST_PLUGIN);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let runtime = PluginWorkerRuntime::start(paths).expect("plugin worker");
+        let client = runtime.lifecycle_client();
+        let (_session, begin) = begin_session(FIRST_PLUGIN, Uuid::from_u128(2));
+
+        assert_eq!(dispatch(&client, begin), Err(PluginLifecycleError::ParametersInvalid));
+        let snapshot = snapshot(&runtime);
+        assert_eq!(snapshot.loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        assert_eq!(snapshot.plugins[0].actions[0].parameters.len(), 1);
     }
 
     #[test]

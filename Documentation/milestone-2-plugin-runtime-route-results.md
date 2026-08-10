@@ -100,14 +100,20 @@ documentation tests, and the debug workspace build. The debug suites pass 253
 application, 83 core, and 22 Lua tests. The optimized suites pass 249
 application, 83 core, and 22 Lua tests.
 
-## Deferred boundary
+## Historical deferred boundary
 
-The Settings action catalog still cannot create or edit a plugin continuous
-action, and its menu editor cannot yet assign the separate continuous extension
-slot. Manifest-specific parameter requirements, types, ranges, defaults, and
-choices are not yet validated against portable action parameters. Valid
-schema-six references imported or written outside the current editor can run.
+At the time of this Milestone 2 result, the Settings action catalog could not
+create or edit a plugin continuous action, and its menu editor could not assign
+the separate continuous extension slot. Manifest-specific parameter
+requirements, types, ranges, defaults, and choices were not yet validated
+against portable action parameters. Valid schema-six references imported or
+written outside the editor could run.
 
 Permission-filtered context, `input.shortcut`, notifications, loopback network,
 generic parameter controls, dependency summaries, and all examples that
 produce external effects remain Milestone 3 work.
+
+This historical editor boundary was completed by
+`milestone-3-plugin-action-editor-results.md`. Permission-filtered context,
+host capabilities, dependency summaries, and external-effect examples remain
+deferred.

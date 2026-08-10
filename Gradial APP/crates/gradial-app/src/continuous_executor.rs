@@ -326,6 +326,7 @@ fn map_plugin_lifecycle_error(
     match error {
         PluginLifecycleError::PluginUnavailable
         | PluginLifecycleError::ActionUnavailable
+        | PluginLifecycleError::ParametersInvalid
         | PluginLifecycleError::SessionActive
             if matches!(request, ContinuousRequest::Begin(_)) =>
         {
@@ -337,6 +338,7 @@ fn map_plugin_lifecycle_error(
         }
         PluginLifecycleError::PluginUnavailable
         | PluginLifecycleError::ActionUnavailable
+        | PluginLifecycleError::ParametersInvalid
         | PluginLifecycleError::SessionActive
         | PluginLifecycleError::SessionNotActive
         | PluginLifecycleError::Lua(_) => ContinuousBackendError::Faulted,

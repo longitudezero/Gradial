@@ -141,10 +141,14 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   invocation-down, admits only enabled manifest actions, uses the manifest
   update cadence, revalidates the captured target, and dispatches bounded Lua
   Begin/Update/Commit/Cancel callbacks off the interaction thread.
+- Manifest-backed continuous action authoring with typed, bounded parameter
+  controls and a separate per-wedge continuous checkbox for Global and every
+  application profile.
 
 Configuration editing currently covers activation, the global menu, the
-complete action catalog including sequences, and exact-executable application
-profiles with their independent menus and complete matching rules. Required
+complete discrete and continuous action catalog including sequences, and
+exact-executable application profiles with their independent menus and
+complete matching rules. Required
 onboarding, v1 appearance, and per-slice custom icons are complete. A release logs the
 chosen slice, compiles its assigned plan, and submits it to the coordinator.
 Every schema-two action family can execute through its bounded backend.
@@ -533,10 +537,10 @@ The schema-six slice model keeps discrete and continuous assignment separate.
 **Enable continuous control** defaults off for every wedge. An
 unchecked wedge remains discrete at every radius, displays no percentage, and
 never opens a plugin session; release still dispatches its discrete action if
-one is assigned. Checking it reveals a required compatible continuous-plugin
-action. The persisted model now supports this state, but the control remains
-absent from the current editor until plugin discovery supplies a compatible
-catalog. Imported plugin actions are retained and identified read-only.
+one is assigned. Checking it reveals a required continuous-plugin action
+selector. The Menu and Profiles editors offer this checkbox whenever the draft
+contains at least one continuous action. The normal click action remains
+unchanged when continuous control is enabled or disabled.
 
 ### Schema-six continuous configuration foundation
 
@@ -553,9 +557,11 @@ lowercase ASCII letters, digits, `.`, `_`, and `-`. Generic values are tagged
 boolean, signed 64-bit integer, finite number, UTF-8 string, or manifest
 choice. The complete serialized parameter map is limited to 16 KiB both at
 configuration validation and at the runtime-neutral snapshot boundary.
-Manifest-specific keys, required values, choices, and numeric/string ranges
-cannot be checked until the referenced manifest is discovered; that later
-validation remains part of the plugin-runtime milestone.
+When the referenced compatible manifest is available, Settings checks its
+declared keys, required values, exact types, choices, numeric/string ranges,
+defaults, and the complete serialized limit before save. The worker repeats
+the same validation before Lua Begin. Missing manifests remain portable and do
+not prevent unrelated edits, imports, or exports.
 
 A structurally valid action whose local plugin is missing or disabled remains
 loadable and exportable. Its UUID is frozen with the resolved menu, but the
@@ -945,20 +951,22 @@ unavailable. File scans, Lua work, and state writes never run on the input,
 interaction, renderer, or action-executor threads.
 
 The worker exposes an immutable inventory snapshot containing display metadata,
-requested permissions, effective status, whether the current permissions were
-approved, and safe issue codes. A manual rescan repeats discovery and trust
-reconciliation without constructing a Lua state. If package changes revoke an
-adapter's effective enabled status, rescan unloads it immediately. Enable also
-checks current permission approval before constructing the candidate, so an
-unapproved package cannot execute source even when a caller bypasses the UI.
+requested permissions, declarative continuous-action schemas, effective
+status, whether the current permissions were approved, and safe issue codes. A
+manual rescan repeats discovery and trust reconciliation without constructing
+a Lua state. If package changes revoke an adapter's effective enabled status,
+rescan unloads it immediately. Enable also checks current permission approval
+before constructing the candidate, so an unapproved package cannot execute
+source even when a caller bypasses the UI.
 
 ## Plugins Settings page
 
 The **Plugins** page polls worker tickets without blocking the renderer. It
 shows each discovered or remembered package's name, ID, version, plugin API,
-requested permissions, effective status, and a stable user-safe problem
-message. **Rescan plugins**, **Enable**, **Disable**, and **Reload** are disabled
-while one worker request is pending. **Open plugins folder** uses the managed
+requested permissions, declared continuous controls and update rates,
+effective status, and a stable user-safe problem message. **Rescan plugins**,
+**Enable**, **Disable**, and **Reload** are disabled while one worker request is
+pending. **Open plugins folder** uses the managed
 `%LOCALAPPDATA%\Gradial\plugins` directory and does not expose arbitrary paths
 to the shell.
 
@@ -987,12 +995,14 @@ The runtime-neutral continuous core remains responsible for coalescing samples
 before this boundary; the worker never accumulates mouse-rate update history.
 
 The worker owns one global active-session record containing only its opaque
-session UUID and plugin ID. Begin selects an already admitted adapter and
-establishes ownership only after Lua accepts the session. Update and terminal
-requests must match that owner. Commit and Cancel clear worker ownership before
-calling Lua; the lifecycle adapter independently removes its private Lua table
-before invoking the terminal callback. Unknown, duplicate, and post-terminal
-requests fail without reaching Lua.
+session UUID and plugin ID. Begin selects an already admitted adapter, requires
+an exact declared action, validates its frozen parameters against that action's
+manifest schema, and establishes ownership only after Lua accepts the session.
+Update and terminal requests must match that owner. Commit and Cancel clear
+worker ownership before calling Lua; the lifecycle adapter independently
+removes its private Lua table before invoking the terminal callback. Unknown,
+duplicate, invalid-parameter, and post-terminal requests fail without reaching
+Lua.
 
 Any callback execution, resource-limit, or return-shape failure that faults the
 adapter immediately clears worker ownership, unloads the adapter, and attempts
@@ -1036,10 +1046,10 @@ accepts, so it cannot leave an orphan session.
 
 This slice exposes no host capability. In particular, Lua receives an empty
 permission-filtered application/title context even if a manifest requests
-those permissions. Creating plugin actions, validating and editing generic
-manifest parameters, assigning continuous extensions in Settings, and all
-operating-system capabilities remain Milestone 3 work. Valid schema-six
-references imported or written outside the current editor can execute now.
+those permissions. Settings can now create actions for enabled manifest
+controls, edit their generic parameters without running plugin code, and
+assign them independently beyond any Global or application-profile wedge. All
+operating-system capabilities remain later Milestone 3 work.
 
 ## Configuration and profile resolution
 
@@ -1113,8 +1123,13 @@ complete configuration, updates the existing prewarmed pool's appearance, and
 restarts input against the new revision without rebuilding geometry caches.
 
 The **Menu** tab can switch between four and eight clockwise directions, edit
-each label, assign or clear any action in the validated catalog, and choose,
-replace, or remove one PNG/SVG icon per direction. The native icon chooser
+each label, assign or clear any discrete action in the validated catalog, and
+choose, replace, or remove one PNG/SVG icon per direction. Each wedge also has
+an independent **Enable distance beyond this wedge** checkbox and continuous
+action selector. Releasing over the wedge runs its normal action; moving beyond
+the outer edge runs the continuous extension; returning to the wedge switches
+back to the normal action. Changing the checkbox never replaces the normal
+action. The native icon chooser
 accepts only those two source types. Import rejects empty or unreadable files,
 sources over 256 KiB, dimensions outside 1–512 logical pixels, invalid
 PNG/SVG data, and SVG document/embedded-image/text features. Accepted bytes
@@ -1178,12 +1193,21 @@ empty profile-menu labels, empty optional predicates, and invalid title
 patterns receive field-specific save messages.
 
 The **Actions** tab lists the complete catalog. Its **New action** menu creates
-every leaf type: keyboard shortcut, Unicode text, website, file/folder,
-application, Delay, and invocation-window command, plus reusable sequences. It
-can rename or duplicate every action type. Creation and duplication generate
-new UUIDs and readable unique names. A sequence can be created after at least
-one regular action exists, and begins with one valid step so it never creates
-an invalid empty draft node.
+every discrete leaf type: keyboard shortcut, Unicode text, website,
+file/folder, application, Delay, and invocation-window command, plus reusable
+sequences. It also lists every action declared by a currently enabled,
+compatible plugin. Choosing one creates a portable continuous action with a
+new UUID and manifest defaults. The action editor renders booleans, bounded
+integers/numbers, bounded strings, and closed choices directly from the
+manifest; optional parameters have an explicit inclusion checkbox. Plugin code
+does not run while any parameter is edited. A disabled compatible plugin keeps
+its existing actions editable but inactive. Missing or incompatible plugin
+actions retain their stored parameter maps without rewriting them.
+
+The catalog can rename or duplicate every action type. Creation and
+duplication generate new UUIDs and readable unique names. A sequence can be
+created after at least one regular action exists, and begins with one valid
+step so it never creates an invalid empty draft node.
 
 The shortcut recorder accepts one supported non-modifier physical key plus the
 exact left/right Ctrl, Alt, Shift, and Windows modifiers held for it. It stores
@@ -1237,8 +1261,9 @@ kind of references so the user can clear them. An unreferenced action can be
 deleted without rewriting any other configuration data.
 
 **Save changes** is enabled only for a dirty draft whose required labels,
-configuration references, profile rules, action catalog, and bounded action
-plans all validate and compile. The application repeats that validation before
+configuration references, profile rules, action catalog, available manifest
+parameters, and bounded action plans all validate and compile. The application
+repeats portable configuration validation before
 disk mutation, performs the existing atomic save/backup procedure, and updates
 the retained resolver, action compiler, overlay revision, executor revision,
 and interaction runtime only after replacement succeeds. A failed save keeps
