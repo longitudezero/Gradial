@@ -11,9 +11,9 @@ pub mod profiles;
 
 pub use actions::{
     ActionDefinition, ActionErrorCode, ActionKind, ActionPlanCompiler, ActionPlanError,
-    ActionResult, DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation, ExecutionPlan, ExecutionStep,
-    MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS,
-    MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
+    ActionResult, ContinuousActionBinding, DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation,
+    ExecutionPlan, ExecutionStep, MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS,
+    MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
 };
 pub use configuration::{
     ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,

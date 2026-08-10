@@ -9,8 +9,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    Configuration, ConfigurationError, MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES, PluginActionId,
-    PluginId, PluginParameters, PluginValue, continuous::plugin_parameters_fit_serialized_limit,
+    Configuration, ConfigurationError, ContinuousActionSnapshot, ContinuousProtocolError,
+    MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES, PermittedContext, PluginActionId, PluginId,
+    PluginParameters, PluginValue, continuous::plugin_parameters_fit_serialized_limit,
 };
 
 pub const DEFAULT_ACTION_STEP_TIMEOUT_MS: u32 = 5_000;
@@ -428,6 +429,47 @@ pub struct ActionPlanCompiler {
     definitions: BTreeMap<Uuid, ActionDefinition>,
 }
 
+/// A validated, configuration-frozen continuous action before local plugin
+/// availability and its manifest-owned update cadence are applied.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContinuousActionBinding {
+    plugin_id: PluginId,
+    action_id: PluginActionId,
+    parameters: PluginParameters,
+}
+
+impl ContinuousActionBinding {
+    #[must_use]
+    pub const fn plugin_id(&self) -> &PluginId {
+        &self.plugin_id
+    }
+
+    #[must_use]
+    pub const fn action_id(&self) -> &PluginActionId {
+        &self.action_id
+    }
+
+    /// Combines portable configuration with local manifest admission data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest-provided update cadence is outside
+    /// the continuous protocol's supported range.
+    pub fn into_snapshot(
+        self,
+        context: PermittedContext,
+        update_hz: u16,
+    ) -> Result<ContinuousActionSnapshot, ContinuousProtocolError> {
+        ContinuousActionSnapshot::new(
+            self.plugin_id,
+            self.action_id,
+            context,
+            self.parameters,
+            update_hz,
+        )
+    }
+}
+
 impl ActionPlanCompiler {
     /// Builds a compiler only from a completely valid active configuration.
     ///
@@ -475,6 +517,44 @@ impl ActionPlanCompiler {
             steps: steps.into(),
             per_step_timeout_ms: DEFAULT_ACTION_STEP_TIMEOUT_MS,
             maximum_duration_ms: MAX_ACTION_SEQUENCE_DURATION_MS,
+        })
+    }
+
+    /// Freezes one configured continuous action without consulting local
+    /// plugin state. The caller must separately admit the referenced manifest
+    /// action and apply its update cadence before beginning a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the action is absent, the invocation revision is
+    /// stale, or the referenced action is not continuous.
+    pub fn compile_continuous_action(
+        &self,
+        action_id: Uuid,
+        invocation_config_revision: u64,
+    ) -> Result<ContinuousActionBinding, ActionPlanError> {
+        if invocation_config_revision != self.config_revision {
+            return Err(ActionPlanError::ConfigRevisionMismatch {
+                invocation: invocation_config_revision,
+                active: self.config_revision,
+            });
+        }
+        let Some(definition) = self.definitions.get(&action_id) else {
+            return Err(ActionPlanError::ActionNotFound { action_id });
+        };
+        let ActionKind::PluginContinuous { plugin_id, plugin_action_id, parameters } =
+            &definition.kind
+        else {
+            return Err(ActionPlanError::DiscreteActionRequiresDiscreteExecutor { action_id });
+        };
+        let plugin_id = PluginId::new(plugin_id.clone())
+            .map_err(|_| ActionPlanError::ContinuousActionInvalid { action_id })?;
+        let plugin_action_id = PluginActionId::new(plugin_action_id.clone())
+            .map_err(|_| ActionPlanError::ContinuousActionInvalid { action_id })?;
+        Ok(ContinuousActionBinding {
+            plugin_id,
+            action_id: plugin_action_id,
+            parameters: parameters.clone(),
         })
     }
 
@@ -641,6 +721,12 @@ pub enum ActionPlanError {
     #[error("continuous action {action_id} requires the continuous plugin executor")]
     ContinuousActionRequiresContinuousExecutor { action_id: Uuid },
 
+    #[error("discrete action {action_id} requires the discrete action executor")]
+    DiscreteActionRequiresDiscreteExecutor { action_id: Uuid },
+
+    #[error("continuous action {action_id} is invalid after configuration validation")]
+    ContinuousActionInvalid { action_id: Uuid },
+
     #[error(
         "invocation uses configuration revision {invocation}; active action catalog uses {active}"
     )]
@@ -706,7 +792,7 @@ mod tests {
     };
     use crate::{
         Configuration, ConfigurationError, MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES, MenuSlice,
-        PluginValue,
+        PermittedContext, PluginValue,
     };
 
     fn action(id: u128, kind: ActionKind) -> ActionDefinition {
@@ -744,6 +830,41 @@ mod tests {
         assert_eq!(
             compiler.compile_plan(action_id, configuration.config_revision),
             Err(super::ActionPlanError::ContinuousActionRequiresContinuousExecutor { action_id })
+        );
+        let binding = compiler
+            .compile_continuous_action(action_id, configuration.config_revision)
+            .expect("continuous binding");
+        assert_eq!(binding.plugin_id().as_str(), "org.gradial.meter");
+        assert_eq!(binding.action_id().as_str(), "measure");
+        let (session, request) = crate::ContinuousSession::begin(
+            Uuid::from_u128(900),
+            binding.into_snapshot(PermittedContext::default(), 24).expect("manifest cadence"),
+            0.5,
+        )
+        .expect("continuous session");
+        assert_eq!(session.update_interval(), std::time::Duration::from_nanos(41_666_667));
+        let crate::ContinuousRequest::Begin(request) = request else {
+            panic!("expected Begin");
+        };
+        assert_eq!(request.parameters().get("scale"), Some(&PluginValue::Number(0.75)));
+    }
+
+    #[test]
+    fn continuous_compilation_rejects_discrete_actions_and_stale_revisions() {
+        let action_id = Uuid::from_u128(1);
+        let configuration = Configuration {
+            config_revision: 7,
+            actions: vec![action(1, ActionKind::Delay { milliseconds: 10 })],
+            ..Configuration::default()
+        };
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        assert_eq!(
+            compiler.compile_continuous_action(action_id, 7),
+            Err(super::ActionPlanError::DiscreteActionRequiresDiscreteExecutor { action_id })
+        );
+        assert_eq!(
+            compiler.compile_continuous_action(action_id, 6),
+            Err(super::ActionPlanError::ConfigRevisionMismatch { invocation: 6, active: 7 })
         );
     }
 

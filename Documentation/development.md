@@ -134,6 +134,13 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   exact visual-scalar publication, unlocked direction handoff, inactive lease
   retention after inward reversal, direct discrete-worker lease transfer, and
   captured-target validation.
+- Canonical local Lua package discovery, atomic machine-local trust state,
+  explicit approval/enable/reload/disable controls, one bounded plugin worker,
+  and one restricted Lua state per admitted plugin.
+- A production continuous-plugin route that freezes configured parameters at
+  invocation-down, admits only enabled manifest actions, uses the manifest
+  update cadence, revalidates the captured target, and dispatches bounded Lua
+  Begin/Update/Commit/Cancel callbacks off the interaction thread.
 
 Configuration editing currently covers activation, the global menu, the
 complete action catalog including sequences, and exact-executable application
@@ -182,7 +189,8 @@ validation belong there as they are introduced.
 
 `gradial-lua` owns no filesystem or Windows APIs. It accepts an immutable
 source image from discovery and provides the explicit, bounded Lua load path.
-The application does not call that path until a later enablement slice.
+Only the dedicated application plugin worker calls that path after explicit
+local approval and enablement.
 
 `gradial-app` owns Windows integration and rendering. Its renderer is behind the
 small `OverlayRenderer` interface so the production interaction code does not
@@ -997,16 +1005,41 @@ package now needs reload or permission review, but replacement and trust-state
 reconciliation are deferred until Commit or Cancel has completed. Settings
 enable, disable, reload, approval, and explicit fault operations return
 `session_active` rather than tearing down private Lua state without its terminal
-callback. The later live coordinator connection will translate such requests
-into Cancel followed by retry, as required by the full plan.
+callback. Reload and Disable from Settings now ask the interaction runtime to
+cancel its continuous coordinator first, wait until the bounded terminal
+callback completes, and only then submit the worker operation. A short bounded
+retry covers an already-detached terminal callback racing with the request.
 
 The checked-in `examples/plugins/org.gradial.example.meter` package requests no
 permissions and stores its latest scalar only in private session state. Worker
 tests load its real manifest and source and complete Begin, Update, and Commit.
 
-The application still does not connect plugin actions to the live coordinator
-or expose any host capability. Production-enabled adapters therefore remain
-idle after validation until the next live bridge slice.
+## Live continuous plugin route
+
+The compiled action catalog can freeze a `PluginContinuous` definition into a
+runtime-neutral binding without consulting local machine state. At invocation
+down, the interaction runtime combines each resolved menu slice's binding with
+the worker's immutable catalog of currently admitted manifest actions. Only a
+matching enabled plugin/action pair becomes continuous-capable; a missing,
+disabled, faulted, reloading, or undeclared reference remains an ordinary
+discrete wedge at every radius. The action parameters and manifest-owned
+10–60 Hz cadence are frozen for that invocation.
+
+The plugin backend uses the existing continuous action lease and callback
+deadlines. It performs full target validation before Begin, lightweight target
+freshness checks before Update and Commit, and never lets target loss prevent a
+best-effort Cancel. Worker rejection and Lua faults map to the coordinator's
+stable rejected, timed-out, stale-target, interrupted, or faulted outcomes. A
+Begin that times out while queued is explicitly aborted through the reserved
+terminal lane; the worker either rejects it before Lua or cancels it after Lua
+accepts, so it cannot leave an orphan session.
+
+This slice exposes no host capability. In particular, Lua receives an empty
+permission-filtered application/title context even if a manifest requests
+those permissions. Creating plugin actions, validating and editing generic
+manifest parameters, assigning continuous extensions in Settings, and all
+operating-system capabilities remain Milestone 3 work. Valid schema-six
+references imported or written outside the current editor can execute now.
 
 ## Configuration and profile resolution
 

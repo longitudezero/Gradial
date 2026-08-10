@@ -787,6 +787,14 @@ impl SettingsEditor {
         state.plugin_feedback = Some(PluginFeedback::Error(plugin_submit_error_message(error)));
     }
 
+    pub(crate) fn plugin_cancellation_failed(&self) {
+        let mut state = self.state();
+        state.plugin_pending = None;
+        state.plugin_feedback = Some(PluginFeedback::Error(
+            "Gradial could not safely stop the active continuous action. Try again.".to_owned(),
+        ));
+    }
+
     pub(crate) fn plugins_folder_result(&self, opened: bool) {
         self.state().plugin_feedback = Some(if opened {
             PluginFeedback::Info("Plugins folder opened.".to_owned())
@@ -2191,8 +2199,9 @@ impl SettingsState {
                      edits require Reload before they become active.",
                 );
                 ui.weak(
-                    "Plugin actions are not connected to menus yet; enabled plugins remain idle \
-                     after validation in this milestone.",
+                    "Enabled plugin controls already assigned by an imported configuration can \
+                     run beyond a wedge. Creating or editing those controls in Settings is not \
+                     available yet.",
                 );
 
                 let Some(snapshot) = snapshot.as_ref() else {

@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -27,7 +27,8 @@ use crate::{
     overlay::{AnimationMode, OverlayPool},
     platform,
     plugin_worker::{
-        PluginWorkerOperation, PluginWorkerRuntime, PluginWorkerSnapshotTicket, PluginWorkerTicket,
+        PluginWorkerError, PluginWorkerOperation, PluginWorkerRuntime, PluginWorkerSnapshotTicket,
+        PluginWorkerTicket,
     },
     settings::{PluginSettingsAction, SettingsEditor, SettingsEvent, settings_viewport_id},
     start_at_login::{StartAtLoginAction, StartAtLoginService},
@@ -145,6 +146,21 @@ enum PendingPluginRequest {
         operation: PluginWorkerOperation,
         plugin_id: String,
         enable_after_approval: bool,
+        session_retry_count: u8,
+    },
+    AwaitingContinuousCancellation {
+        operation: PluginWorkerOperation,
+        plugin_id: String,
+        enable_after_approval: bool,
+        reason: gradial_core::ContinuousCancelReason,
+        session_retry_count: u8,
+    },
+    RetryOperation {
+        operation: PluginWorkerOperation,
+        plugin_id: String,
+        enable_after_approval: bool,
+        session_retry_count: u8,
+        not_before: Instant,
     },
 }
 
@@ -483,6 +499,39 @@ impl GradialApp {
                     self.config_revision
                 );
             }
+            RuntimeEvent::ContinuousCancellationReady(reason) => {
+                let Some(PendingPluginRequest::AwaitingContinuousCancellation {
+                    operation,
+                    plugin_id,
+                    enable_after_approval,
+                    reason: expected_reason,
+                    session_retry_count,
+                }) = self.pending_plugin_request.take()
+                else {
+                    log::warn!(
+                        target: "plugins",
+                        "component=plugins event_code=unexpected_plugin_cancellation_ready \
+                         result_code=failure reason={reason:?}"
+                    );
+                    return;
+                };
+                if reason != expected_reason {
+                    self.settings.plugin_cancellation_failed();
+                    log::error!(
+                        target: "plugins",
+                        "component=plugins event_code=plugin_cancellation_reason_mismatch \
+                         result_code=failure expected={expected_reason:?} actual={reason:?}"
+                    );
+                    return;
+                }
+                self.submit_plugin_operation(
+                    context,
+                    operation,
+                    plugin_id,
+                    enable_after_approval,
+                    session_retry_count,
+                );
+            }
         }
     }
 
@@ -559,6 +608,54 @@ impl GradialApp {
             return;
         }
         self.settings.plugin_operation_started(operation, &plugin_id);
+        let cancellation_reason = match operation {
+            PluginWorkerOperation::Reload => {
+                Some(gradial_core::ContinuousCancelReason::ReloadRequested)
+            }
+            PluginWorkerOperation::Disable => {
+                Some(gradial_core::ContinuousCancelReason::PluginDisabled)
+            }
+            PluginWorkerOperation::ApprovePermissions
+            | PluginWorkerOperation::Enable
+            | PluginWorkerOperation::MarkFaulted => None,
+        };
+        if let (Some(reason), Some(interaction)) = (cancellation_reason, self.interaction.as_ref())
+        {
+            match interaction.cancel_continuous(reason) {
+                Ok(()) => {
+                    self.pending_plugin_request =
+                        Some(PendingPluginRequest::AwaitingContinuousCancellation {
+                            operation,
+                            plugin_id,
+                            enable_after_approval,
+                            reason,
+                            session_retry_count: 0,
+                        });
+                    context.request_repaint_after(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    self.settings.plugin_cancellation_failed();
+                    log::error!(
+                        target: "plugins",
+                        "component=plugins event_code=plugin_management_cancel_submit_failed \
+                         result_code=failure operation={} error={error}",
+                        operation.as_str()
+                    );
+                }
+            }
+            return;
+        }
+        self.submit_plugin_operation(context, operation, plugin_id, enable_after_approval, 0);
+    }
+
+    fn submit_plugin_operation(
+        &mut self,
+        context: &eframe::egui::Context,
+        operation: PluginWorkerOperation,
+        plugin_id: String,
+        enable_after_approval: bool,
+        session_retry_count: u8,
+    ) {
         match self.plugin_worker.request(operation, plugin_id.clone()) {
             Ok(ticket) => {
                 self.pending_plugin_request = Some(PendingPluginRequest::Operation {
@@ -566,6 +663,7 @@ impl GradialApp {
                     operation,
                     plugin_id,
                     enable_after_approval,
+                    session_retry_count,
                 });
                 context.request_repaint_after(Duration::from_millis(50));
             }
@@ -573,6 +671,7 @@ impl GradialApp {
         }
     }
 
+    #[allow(clippy::too_many_lines, reason = "polls the closed plugin request state machine")]
     fn poll_plugin_worker(&mut self, context: &eframe::egui::Context) {
         let Some(pending) = self.pending_plugin_request.take() else {
             return;
@@ -598,6 +697,7 @@ impl GradialApp {
                 operation,
                 plugin_id,
                 enable_after_approval,
+                session_retry_count,
             } => match ticket.try_result() {
                 None => {
                     self.pending_plugin_request = Some(PendingPluginRequest::Operation {
@@ -605,6 +705,7 @@ impl GradialApp {
                         operation,
                         plugin_id,
                         enable_after_approval,
+                        session_retry_count,
                     });
                     context.request_repaint_after(Duration::from_millis(50));
                 }
@@ -627,12 +728,70 @@ impl GradialApp {
                     self.begin_plugin_snapshot(context, false);
                     context.request_repaint_of(settings_viewport_id());
                 }
+                Some(Err(PluginWorkerError::SessionActive))
+                    if matches!(
+                        operation,
+                        PluginWorkerOperation::Reload | PluginWorkerOperation::Disable
+                    ) && session_retry_count < 20 =>
+                {
+                    self.pending_plugin_request = Some(PendingPluginRequest::RetryOperation {
+                        operation,
+                        plugin_id,
+                        enable_after_approval,
+                        session_retry_count: session_retry_count.saturating_add(1),
+                        not_before: Instant::now() + Duration::from_millis(10),
+                    });
+                    context.request_repaint_after(Duration::from_millis(10));
+                }
                 Some(Err(error)) => {
                     self.settings.plugin_operation_failed(error);
                     self.begin_plugin_snapshot(context, false);
                     context.request_repaint_of(settings_viewport_id());
                 }
             },
+            PendingPluginRequest::AwaitingContinuousCancellation {
+                operation,
+                plugin_id,
+                enable_after_approval,
+                reason,
+                session_retry_count,
+            } => {
+                self.pending_plugin_request =
+                    Some(PendingPluginRequest::AwaitingContinuousCancellation {
+                        operation,
+                        plugin_id,
+                        enable_after_approval,
+                        reason,
+                        session_retry_count,
+                    });
+                context.request_repaint_after(Duration::from_millis(10));
+            }
+            PendingPluginRequest::RetryOperation {
+                operation,
+                plugin_id,
+                enable_after_approval,
+                session_retry_count,
+                not_before,
+            } => {
+                if Instant::now() < not_before {
+                    self.pending_plugin_request = Some(PendingPluginRequest::RetryOperation {
+                        operation,
+                        plugin_id,
+                        enable_after_approval,
+                        session_retry_count,
+                        not_before,
+                    });
+                    context.request_repaint_after(Duration::from_millis(10));
+                } else {
+                    self.submit_plugin_operation(
+                        context,
+                        operation,
+                        plugin_id,
+                        enable_after_approval,
+                        session_retry_count,
+                    );
+                }
+            }
         }
     }
 
@@ -1185,6 +1344,7 @@ impl GradialApp {
             Arc::clone(&self.profile_resolver),
             Arc::clone(&self.action_plan_compiler),
             self.action_executor.handle(),
+            self.plugin_worker.lifecycle_client(),
             self.onboarding.practice(),
             self.continuous_study.sink(),
             self.debug_menu_override.clone(),

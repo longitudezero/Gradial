@@ -28,14 +28,16 @@ use crate::{
     action_executor::{ActionDispatch, ActionExecutorHandle},
     continuous_executor::{
         ContinuousCompletion, ContinuousCompletionOutcome, ContinuousInvocation,
-        ContinuousSubmitError, ValidatingInertBackend,
+        ContinuousSubmitError, PluginContinuousBackend, ValidatingInertBackend,
     },
     continuous_study::ContinuousStudySink,
     diagnostics::TimingMarkers,
     input::{HookThread, HookThreadMetrics, InputConfiguration},
     onboarding::OnboardingPractice,
     overlay::OverlayRoute,
-    platform, tray,
+    platform,
+    plugin_worker::PluginLifecycleClient,
+    tray,
 };
 
 const INPUT_QUEUE_CAPACITY: usize = 4_096;
@@ -149,6 +151,7 @@ struct ActiveInvocation {
     continuous_full_scale_radius_dip: Option<f64>,
     study_trial_id: Option<u32>,
     live_continuous: Option<LiveContinuousInvocation>,
+    continuous_actions: Vec<Option<ContinuousActionSnapshot>>,
     continuous_unavailable: bool,
 }
 
@@ -174,6 +177,14 @@ struct LiveContinuousInvocation {
     phase: LiveContinuousPhase,
 }
 
+#[derive(Debug)]
+struct PendingRuntimeCancellation {
+    invocation: Option<ContinuousInvocation>,
+    reason: ContinuousCancelReason,
+    terminal_submitted: bool,
+    completion_ready: bool,
+}
+
 #[derive(Clone, Copy)]
 struct DebugInteractionOptions<'a> {
     menu_override: Option<&'a Arc<ResolvedMenu>>,
@@ -184,6 +195,7 @@ struct DebugInteractionOptions<'a> {
 impl ActiveInvocation {
     fn clear(&mut self) {
         self.live_continuous = None;
+        self.continuous_actions.clear();
         self.snapshot = None;
         self.profile_id = None;
         self.menu = None;
@@ -207,6 +219,7 @@ struct EffectDispatcher<'a> {
     action_executor: &'a ActionExecutorHandle,
     onboarding_practice: &'a OnboardingPractice,
     continuous_study: &'a ContinuousStudySink,
+    plugin_lifecycle: &'a PluginLifecycleClient,
     qpc_frequency: i64,
     config_revision: u64,
 }
@@ -215,6 +228,7 @@ struct EffectDispatcher<'a> {
 enum RuntimeControl {
     DisplayTopologyChanged,
     ReregisterInput,
+    CancelContinuous(ContinuousCancelReason),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +236,7 @@ pub(crate) enum RuntimeEvent {
     DisplayRebuildReady,
     InputRecoveryReady,
     InputFaulted,
+    ContinuousCancellationReady(ContinuousCancelReason),
 }
 
 #[derive(Debug)]
@@ -247,6 +262,7 @@ impl InteractionRuntime {
         profile_resolver: Arc<ProfileResolver>,
         action_plan_compiler: Arc<ActionPlanCompiler>,
         action_executor: ActionExecutorHandle,
+        plugin_lifecycle: PluginLifecycleClient,
         onboarding_practice: OnboardingPractice,
         continuous_study: ContinuousStudySink,
         debug_menu_override: Option<Arc<ResolvedMenu>>,
@@ -287,6 +303,7 @@ impl InteractionRuntime {
                     &profile_resolver,
                     &action_plan_compiler,
                     &action_executor,
+                    &plugin_lifecycle,
                     &onboarding_practice,
                     &continuous_study,
                     debug_menu_override.as_ref(),
@@ -322,6 +339,12 @@ impl InteractionRuntime {
         self.control_sender
             .try_send(RuntimeControl::ReregisterInput)
             .context("could not request input re-registration")
+    }
+
+    pub(crate) fn cancel_continuous(&self, reason: ContinuousCancelReason) -> Result<()> {
+        self.control_sender
+            .try_send(RuntimeControl::CancelContinuous(reason))
+            .context("could not request continuous cancellation")
     }
 
     pub(crate) fn try_event(&self) -> Option<RuntimeEvent> {
@@ -402,6 +425,7 @@ fn run_interaction_thread(
     profile_resolver: &ProfileResolver,
     action_plan_compiler: &ActionPlanCompiler,
     action_executor: &ActionExecutorHandle,
+    plugin_lifecycle: &PluginLifecycleClient,
     onboarding_practice: &OnboardingPractice,
     continuous_study: &ContinuousStudySink,
     debug_menu_override: Option<&Arc<ResolvedMenu>>,
@@ -422,6 +446,7 @@ fn run_interaction_thread(
         action_executor,
         onboarding_practice,
         continuous_study,
+        plugin_lifecycle,
         qpc_frequency,
         config_revision,
     };
@@ -432,6 +457,7 @@ fn run_interaction_thread(
     };
     let hook_timeout_qpc = qpc_frequency.saturating_mul(HOOK_UNRESPONSIVE_AFTER_MS) / 1_000;
     let mut runtime_stop_pending = false;
+    let mut pending_runtime_cancellation = None;
     let mut continuous_batch = ContinuousUpdateBatch::default();
 
     while !shutdown.load(Ordering::Acquire) {
@@ -441,19 +467,28 @@ fn run_interaction_thread(
         let simulated_failure = 0_u8;
 
         if let Ok(control) = controls.try_recv() {
-            handle_runtime_control(
+            let stops_runtime = handle_runtime_control(
                 control,
                 &mut controller,
                 &mut active,
+                &mut pending_runtime_cancellation,
                 event_sender,
                 &dispatcher,
             );
-            if continuous_batch.reset() {
-                counters.continuous_updates_coalesced =
-                    counters.continuous_updates_coalesced.saturating_add(1);
+            if stops_runtime {
+                if continuous_batch.reset() {
+                    counters.continuous_updates_coalesced =
+                        counters.continuous_updates_coalesced.saturating_add(1);
+                }
+                runtime_stop_pending = true;
             }
-            runtime_stop_pending = true;
         }
+
+        poll_runtime_continuous_cancellation(
+            &mut pending_runtime_cancellation,
+            event_sender,
+            config_revision,
+        );
 
         if runtime_stop_pending {
             thread::sleep(IDLE_POLL_INTERVAL);
@@ -635,9 +670,19 @@ fn handle_runtime_control(
     control: RuntimeControl,
     controller: &mut InteractionController,
     active: &mut ActiveInvocation,
+    pending_runtime_cancellation: &mut Option<PendingRuntimeCancellation>,
     event_sender: &Sender<RuntimeEvent>,
     dispatcher: &EffectDispatcher<'_>,
-) {
+) -> bool {
+    if let RuntimeControl::CancelContinuous(reason) = control {
+        begin_runtime_continuous_cancellation(
+            reason,
+            active,
+            pending_runtime_cancellation,
+            dispatcher.config_revision,
+        );
+        return false;
+    }
     let (reason, event, event_code) = match control {
         RuntimeControl::DisplayTopologyChanged => (
             CancelReason::DisplayTopologyChange,
@@ -649,6 +694,7 @@ fn handle_runtime_control(
             RuntimeEvent::InputRecoveryReady,
             "input_reregistration_started",
         ),
+        RuntimeControl::CancelContinuous(_) => unreachable!(),
     };
     if let Some(effect) = controller.fault(reason) {
         dispatch_effect(effect, query_qpc(), active, dispatcher);
@@ -663,6 +709,71 @@ fn handle_runtime_control(
         log_runtime_event_error(error, dispatcher.config_revision);
     }
     platform::request_controller_repaint();
+    true
+}
+
+fn begin_runtime_continuous_cancellation(
+    reason: ContinuousCancelReason,
+    active: &mut ActiveInvocation,
+    pending: &mut Option<PendingRuntimeCancellation>,
+    config_revision: u64,
+) {
+    reap_live_continuous(active, config_revision);
+    active.continuous_unavailable = true;
+    let Some(live) = active.live_continuous.take() else {
+        *pending = Some(PendingRuntimeCancellation {
+            invocation: None,
+            reason,
+            terminal_submitted: true,
+            completion_ready: true,
+        });
+        return;
+    };
+    let terminal_submitted = match live.invocation.handle().cancel(reason) {
+        Ok(()) | Err(ContinuousSubmitError::Closed) => true,
+        Err(ContinuousSubmitError::QueueFull) => false,
+        Err(ContinuousSubmitError::InvalidValue) => unreachable!(),
+    };
+    *pending = Some(PendingRuntimeCancellation {
+        invocation: Some(live.invocation),
+        reason,
+        terminal_submitted,
+        completion_ready: false,
+    });
+}
+
+fn poll_runtime_continuous_cancellation(
+    pending: &mut Option<PendingRuntimeCancellation>,
+    event_sender: &Sender<RuntimeEvent>,
+    config_revision: u64,
+) {
+    let Some(cancellation) = pending.as_mut() else {
+        return;
+    };
+    if !cancellation.terminal_submitted {
+        let invocation = cancellation.invocation.as_ref().expect("active cancellation");
+        cancellation.terminal_submitted = match invocation.handle().cancel(cancellation.reason) {
+            Ok(()) | Err(ContinuousSubmitError::Closed) => true,
+            Err(ContinuousSubmitError::QueueFull) => false,
+            Err(ContinuousSubmitError::InvalidValue) => unreachable!(),
+        };
+    }
+    if !cancellation.completion_ready {
+        let invocation = cancellation.invocation.as_mut().expect("active cancellation");
+        let Some(completion) = invocation.try_completion() else {
+            return;
+        };
+        log_live_continuous_completion(&completion, config_revision);
+        cancellation.completion_ready = true;
+    }
+    match event_sender.try_send(RuntimeEvent::ContinuousCancellationReady(cancellation.reason)) {
+        Ok(()) => *pending = None,
+        Err(TrySendError::Full(_)) => {}
+        Err(error @ TrySendError::Disconnected(_)) => {
+            log_runtime_event_error(error, config_revision);
+            *pending = None;
+        }
+    }
 }
 
 fn process_input_event(
@@ -860,11 +971,18 @@ fn begin_invocation(
         event.qpc_timestamp,
         &format!("geometry={}", geometry.behavior.as_str()),
     );
-    let continuous_slices = if continuous_meter {
-        ContinuousSliceMask::all(menu.slice_count())
-    } else {
-        ContinuousSliceMask::none()
-    };
+    let continuous_actions = freeze_continuous_actions(
+        &menu,
+        dispatcher.action_plan_compiler,
+        dispatcher.plugin_lifecycle,
+        snapshot.context.config_revision,
+        continuous_meter,
+    );
+    let continuous_bits =
+        continuous_actions.iter().enumerate().fold(0_u8, |bits, (slice_index, action)| {
+            if action.is_some() { bits | (1_u8 << slice_index) } else { bits }
+        });
+    let continuous_slices = ContinuousSliceMask::from_bits(menu.slice_count(), continuous_bits);
     let effect = controller.activation_down_with_behavior(
         snapshot.clone(),
         menu.slice_count(),
@@ -875,12 +993,67 @@ fn begin_invocation(
         active.route = route_for_point(snapshot.cursor_physical_px, dispatcher.routes);
         active.snapshot = Some(snapshot);
         active.menu = Some(menu);
+        active.continuous_actions = continuous_actions;
         active.practice = practice_active;
         active.continuous_meter = continuous_meter;
         active.continuous_full_scale_radius_dip = Some(continuous_full_scale_radius_dip);
         active.study_trial_id = study_trial_id;
     }
     effect
+}
+
+fn freeze_continuous_actions(
+    menu: &ResolvedMenu,
+    compiler: &ActionPlanCompiler,
+    plugin_lifecycle: &PluginLifecycleClient,
+    config_revision: u64,
+    continuous_meter: bool,
+) -> Vec<Option<ContinuousActionSnapshot>> {
+    (0..menu.slice_count().get())
+        .map(|slice_index| {
+            if continuous_meter {
+                return inert_action_snapshot(slice_index).ok();
+            }
+            let action_id = menu.continuous_action_id(slice_index)?;
+            let binding = match compiler.compile_continuous_action(action_id, config_revision) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    log::error!(
+                        target: "continuous",
+                        "component=continuous event_code=continuous_action_compile_failed \
+                         result_code=failure error_code=config_invalid \
+                         config_revision={config_revision} action_id={action_id} error={error}"
+                    );
+                    return None;
+                }
+            };
+            let Some(update_hz) =
+                plugin_lifecycle.action_update_hz(binding.plugin_id(), binding.action_id())
+            else {
+                log::debug!(
+                    target: "continuous",
+                    "component=continuous event_code=continuous_action_unavailable \
+                     result_code=unavailable config_revision={config_revision} \
+                     action_id={action_id} plugin_id={} plugin_action_id={}",
+                    binding.plugin_id().as_str(),
+                    binding.action_id().as_str()
+                );
+                return None;
+            };
+            match binding.into_snapshot(PermittedContext::default(), update_hz) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    log::error!(
+                        target: "continuous",
+                        "component=continuous event_code=continuous_snapshot_failed \
+                         result_code=failure error_code=config_invalid \
+                         config_revision={config_revision} action_id={action_id} error={error}"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 fn capture_snapshot(
@@ -1000,7 +1173,7 @@ fn update_live_continuous(
     dispatcher: &EffectDispatcher<'_>,
 ) {
     reap_live_continuous(active, dispatcher.config_revision);
-    if !active.continuous_meter || active.continuous_unavailable {
+    if active.continuous_unavailable {
         return;
     }
     let phase = active.live_continuous.as_ref().map(|live| live.phase);
@@ -1032,20 +1205,19 @@ fn update_live_continuous(
         return;
     }
 
-    let action_snapshot = match inert_action_snapshot(visual.selection.slice_index) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            active.continuous_unavailable = true;
-            log::error!(
-                target: "continuous",
-                "component=continuous event_code=inert_snapshot_failed result_code=failure \
-                 error_code=config_invalid config_revision={} invocation_id={invocation_id} \
-                 slice_index={} error={error}",
-                invocation_snapshot.context.config_revision,
-                visual.selection.slice_index
-            );
-            return;
-        }
+    let Some(action_snapshot) =
+        active.continuous_actions.get(visual.selection.slice_index).cloned().flatten()
+    else {
+        active.continuous_unavailable = true;
+        log::error!(
+            target: "continuous",
+            "component=continuous event_code=frozen_snapshot_missing result_code=failure \
+             error_code=config_invalid config_revision={} invocation_id={invocation_id} \
+             slice_index={}",
+            invocation_snapshot.context.config_revision,
+            visual.selection.slice_index
+        );
+        return;
     };
     if change == LiveContinuousChange::Start {
         start_live_continuous(
@@ -1102,14 +1274,28 @@ fn start_live_continuous(
     active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
 ) {
-    let backend = ValidatingInertBackend::new(invocation_id, target);
-    match ContinuousInvocation::start(
-        dispatcher.action_executor,
-        invocation_id,
-        action_snapshot,
-        visual.selection.value,
-        backend,
-    ) {
+    let start = if active.continuous_meter {
+        ContinuousInvocation::start(
+            dispatcher.action_executor,
+            invocation_id,
+            action_snapshot,
+            visual.selection.value,
+            ValidatingInertBackend::new(invocation_id, target),
+        )
+    } else {
+        ContinuousInvocation::start(
+            dispatcher.action_executor,
+            invocation_id,
+            action_snapshot,
+            visual.selection.value,
+            PluginContinuousBackend::new(
+                invocation_id,
+                target,
+                dispatcher.plugin_lifecycle.clone(),
+            ),
+        )
+    };
+    match start {
         Ok(invocation) => {
             active.live_continuous = Some(LiveContinuousInvocation {
                 invocation,
@@ -1117,11 +1303,12 @@ fn start_live_continuous(
             });
             log::info!(
                 target: "continuous",
-                "component=continuous event_code=inert_session_started result_code=ok \
+                "component=continuous event_code=live_session_started result_code=ok \
                  config_revision={config_revision} invocation_id={invocation_id} \
-                 slice_index={} normalized_value={:.6}",
+                 slice_index={} normalized_value={:.6} backend={}",
                 visual.selection.slice_index,
-                visual.selection.value
+                visual.selection.value,
+                if active.continuous_meter { "inert" } else { "plugin" }
             );
         }
         Err(result) => {
@@ -1299,7 +1486,7 @@ fn log_live_continuous_completion(completion: &ContinuousCompletion, fallback_re
     };
     log::info!(
         target: "continuous",
-        "component=continuous event_code=inert_session_completed result_code={result_code} \
+        "component=continuous event_code=live_session_completed result_code={result_code} \
          config_revision={fallback_revision} invocation_id={} outcome={:?} \
          backend_failure={:?}",
         completion.invocation_id,
@@ -1707,6 +1894,7 @@ const fn heartbeat_is_unresponsive(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         sync::Arc,
         thread,
         time::{Duration, Instant},
@@ -1714,19 +1902,21 @@ mod tests {
 
     use gradial_core::{
         ActionDefinition, ActionKind, ActionPlanCompiler, ActionResult, Configuration,
-        ContinuousSelection, ContinuousVisualState, InteractionEffect, InteractionOutcome,
-        InvocationContext, InvocationGeometry, InvocationSnapshot, Point, ResolvedMenu,
-        ScreenPoint, SliceCount,
+        ContinuousSelection, ContinuousSession, ContinuousVisualState, InteractionEffect,
+        InteractionOutcome, InvocationContext, InvocationGeometry, InvocationSnapshot, PluginValue,
+        Point, ProfileResolver, ProfileTarget, ResolvedMenu, ScreenPoint, SliceCount,
     };
     use uuid::Uuid;
 
     use crate::action_executor::ActionExecutor;
     use crate::diagnostics::TimingMarkers;
+    use crate::plugin_worker::PluginLifecycleClient;
 
     use super::{
         ActionDispatchTrace, ActiveInvocation, CONTINUOUS_VISUAL_INTERVAL, ContinuousUpdateBatch,
         LiveContinuousChange, LiveContinuousPhase, classify_live_continuous_change,
-        heartbeat_is_unresponsive, log_selected_action_outcome, prepare_selected_action,
+        freeze_continuous_actions, heartbeat_is_unresponsive, log_selected_action_outcome,
+        prepare_selected_action,
     };
 
     #[test]
@@ -1847,6 +2037,70 @@ mod tests {
                 visual(6, 0.7, true),
             ),
             LiveContinuousChange::Resume
+        );
+    }
+
+    #[test]
+    fn invocation_freezes_only_enabled_manifest_continuous_actions() {
+        let action_id = Uuid::from_u128(80);
+        let mut parameters = BTreeMap::new();
+        parameters.insert("scale".to_owned(), PluginValue::Number(0.75));
+        let mut configuration = Configuration {
+            config_revision: 9,
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Meter".to_owned(),
+                kind: ActionKind::PluginContinuous {
+                    plugin_id: "org.gradial.meter".to_owned(),
+                    plugin_action_id: "measure".to_owned(),
+                    parameters,
+                },
+            }],
+            ..Configuration::default()
+        };
+        configuration.global_profile.menu.slices[0].continuous_action_id = Some(action_id);
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        let resolver = ProfileResolver::compile(&configuration).expect("profiles");
+        let resolution = resolver.resolve(ProfileTarget {
+            executable_path: None,
+            window_class: "",
+            window_title: "",
+        });
+        let enabled = PluginLifecycleClient::with_test_action("org.gradial.meter", "measure", 24);
+
+        let snapshots = freeze_continuous_actions(
+            &resolution.menu,
+            &compiler,
+            &enabled,
+            configuration.config_revision,
+            false,
+        );
+        assert!(snapshots[0].is_some());
+        assert!(snapshots[1..].iter().all(Option::is_none));
+        let (session, begin) = ContinuousSession::begin(
+            Uuid::from_u128(81),
+            snapshots[0].clone().expect("enabled snapshot"),
+            0.25,
+        )
+        .expect("session");
+        assert_eq!(session.update_interval(), Duration::from_nanos(41_666_667));
+        let gradial_core::ContinuousRequest::Begin(begin) = begin else {
+            panic!("expected Begin");
+        };
+        assert_eq!(begin.parameters().get("scale"), Some(&PluginValue::Number(0.75)));
+
+        let unavailable =
+            PluginLifecycleClient::with_test_action("org.gradial.other", "measure", 30);
+        assert!(
+            freeze_continuous_actions(
+                &resolution.menu,
+                &compiler,
+                &unavailable,
+                configuration.config_revision,
+                false,
+            )
+            .iter()
+            .all(Option::is_none)
         );
     }
 

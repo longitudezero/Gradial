@@ -1117,14 +1117,15 @@ Exit only when a fake backend can complete, reject, stall, fault, and cancel
 
 ### Milestone 2 — Local Lua runtime
 
-Implementation note (2026-08-10): the dedicated worker now owns a bounded,
-single-session Begin/Update/Commit/Cancel command bridge. Begin, Update, and
-terminal work have independent one-slot lanes, with terminal work selected
-first; callback faults unload and durably fault the adapter. Code-free rescans
-observed during a session defer teardown until its terminal callback. A
-checked-in permission-free example exercises the boundary. Connecting the
-existing live continuous coordinator to this client remains the final Milestone 2 runtime
-slice.
+Implementation note (2026-08-10): the dedicated worker owns a bounded,
+single-session Begin/Update/Commit/Cancel bridge with independent Begin, Update,
+and terminal lanes. The live continuous coordinator now freezes enabled
+manifest actions and their update cadence at invocation-down, validates target
+freshness, and dispatches the callbacks through that bridge. Timed-out queued
+Begins are explicitly aborted. Reload and Disable cancel and await the active
+terminal callback before the worker operation. Capabilities, permission-filtered
+application/title context, generic parameter controls, and plugin-action
+authoring remain Milestone 3 work.
 
 Deliver:
 

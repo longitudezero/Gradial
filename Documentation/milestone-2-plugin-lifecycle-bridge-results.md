@@ -82,3 +82,7 @@ the debug workspace build. The debug suites pass 249 application, 81 core, and
 No production radial invocation submits lifecycle work yet. Manifest action
 catalog exposure, generic parameter editing, live coordinator routing, and all
 host capabilities remain separate slices.
+
+This historical boundary was completed by
+`milestone-2-plugin-runtime-route-results.md`; generic parameter editing and
+host capabilities remain deferred.

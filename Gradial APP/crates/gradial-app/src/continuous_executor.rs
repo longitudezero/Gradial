@@ -12,6 +12,7 @@ use gradial_core::{
     ActionErrorCode, ActionResult, ContinuousActionSnapshot, ContinuousCancelReason,
     ContinuousRequest, ContinuousSession, ExecutionPlan, InvocationContext,
 };
+use gradial_lua::LuaSandboxError;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -19,7 +20,9 @@ use crate::{
     action_executor::{
         ActionDispatch, ActionExecutorHandle, ContinuousActionLease, CoordinatorStopToken,
     },
-    action_target, tray,
+    action_target,
+    plugin_worker::{PluginLifecycleClient, PluginLifecycleError, PluginLifecycleSubmitError},
+    tray,
 };
 
 const CONTROL_CAPACITY: usize = 8;
@@ -184,6 +187,159 @@ impl ContinuousBackend for ValidatingInertBackend {
             ),
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PluginContinuousBackend {
+    invocation_id: Uuid,
+    target: Arc<InvocationContext>,
+    client: PluginLifecycleClient,
+}
+
+impl PluginContinuousBackend {
+    pub(crate) fn new(
+        invocation_id: Uuid,
+        target: Arc<InvocationContext>,
+        client: PluginLifecycleClient,
+    ) -> Self {
+        Self { invocation_id, target, client }
+    }
+
+    fn abort_pending_begin(&self, request: &ContinuousRequest, reason: ContinuousCancelReason) {
+        if !matches!(request, ContinuousRequest::Begin(_)) {
+            return;
+        }
+        if let Err(error) = self.client.abort_begin(request.session_id(), reason) {
+            log::error!(
+                target: "continuous",
+                "component=continuous event_code=plugin_begin_abort_submit_failed \
+                 result_code=failure error_code={error} config_revision={} \
+                 invocation_id={} session_id={}",
+                self.target.config_revision,
+                self.invocation_id,
+                request.session_id()
+            );
+        }
+    }
+}
+
+impl ContinuousBackend for PluginContinuousBackend {
+    fn dispatch(
+        &mut self,
+        request: &ContinuousRequest,
+        context: ContinuousBackendContext<'_>,
+    ) -> Result<(), ContinuousBackendError> {
+        if !matches!(request, ContinuousRequest::Cancel(_)) && context.should_stop() {
+            return Err(ContinuousBackendError::Interrupted);
+        }
+        if Instant::now() >= context.deadline() {
+            return Err(ContinuousBackendError::TimedOut);
+        }
+        validate_plugin_target(self.invocation_id, &self.target, request)?;
+
+        let ticket = self
+            .client
+            .request(request.clone())
+            .map_err(|error| map_plugin_submit_error(error, request, context))?;
+        loop {
+            if let Some(result) = ticket.try_result() {
+                return result.map_err(|error| map_plugin_lifecycle_error(error, request));
+            }
+            if !matches!(request, ContinuousRequest::Cancel(_)) && context.should_stop() {
+                let reason = if context.shutdown_requested() {
+                    ContinuousCancelReason::Shutdown
+                } else {
+                    ContinuousCancelReason::UserRequested
+                };
+                self.abort_pending_begin(request, reason);
+                return Err(ContinuousBackendError::Interrupted);
+            }
+            let now = Instant::now();
+            if now >= context.deadline() {
+                self.abort_pending_begin(request, ContinuousCancelReason::PluginFaulted);
+                return Err(ContinuousBackendError::TimedOut);
+            }
+            thread::park_timeout(
+                WORKER_POLL_INTERVAL.min(context.deadline().saturating_duration_since(now)),
+            );
+        }
+    }
+}
+
+fn validate_plugin_target(
+    invocation_id: Uuid,
+    target: &InvocationContext,
+    request: &ContinuousRequest,
+) -> Result<(), ContinuousBackendError> {
+    let validation = match request {
+        ContinuousRequest::Begin(_) => action_target::validate(target),
+        ContinuousRequest::Update(_) | ContinuousRequest::Commit(_) => {
+            action_target::validate_freshness(target)
+        }
+        ContinuousRequest::Cancel(_) => Ok(()),
+    };
+    validation.map_err(|failure| {
+        let stage = stage_for(request);
+        log::warn!(
+            target: "continuous",
+            "component=continuous event_code=plugin_target_validation_failed \
+             result_code=failure config_revision={} invocation_id={} \
+             stage={stage:?} reason={failure:?}",
+            target.config_revision,
+            invocation_id
+        );
+        if stage == ContinuousBackendStage::Begin {
+            ContinuousBackendError::Rejected
+        } else if failure == action_target::TargetValidationFailure::StaleTarget {
+            ContinuousBackendError::TargetStale
+        } else {
+            ContinuousBackendError::Faulted
+        }
+    })
+}
+
+fn map_plugin_submit_error(
+    error: PluginLifecycleSubmitError,
+    request: &ContinuousRequest,
+    context: ContinuousBackendContext<'_>,
+) -> ContinuousBackendError {
+    match error {
+        PluginLifecycleSubmitError::ShuttingDown if context.shutdown_requested() => {
+            ContinuousBackendError::Interrupted
+        }
+        PluginLifecycleSubmitError::QueueFull(_)
+            if matches!(request, ContinuousRequest::Begin(_)) =>
+        {
+            ContinuousBackendError::Rejected
+        }
+        PluginLifecycleSubmitError::QueueFull(_)
+        | PluginLifecycleSubmitError::Unavailable
+        | PluginLifecycleSubmitError::ShuttingDown => ContinuousBackendError::Faulted,
+    }
+}
+
+fn map_plugin_lifecycle_error(
+    error: PluginLifecycleError,
+    request: &ContinuousRequest,
+) -> ContinuousBackendError {
+    match error {
+        PluginLifecycleError::PluginUnavailable
+        | PluginLifecycleError::ActionUnavailable
+        | PluginLifecycleError::SessionActive
+            if matches!(request, ContinuousRequest::Begin(_)) =>
+        {
+            ContinuousBackendError::Rejected
+        }
+        PluginLifecycleError::BeginAborted => ContinuousBackendError::Interrupted,
+        PluginLifecycleError::Lua(LuaSandboxError::DeadlineExceeded) => {
+            ContinuousBackendError::TimedOut
+        }
+        PluginLifecycleError::PluginUnavailable
+        | PluginLifecycleError::ActionUnavailable
+        | PluginLifecycleError::SessionActive
+        | PluginLifecycleError::SessionNotActive
+        | PluginLifecycleError::Lua(_) => ContinuousBackendError::Faulted,
     }
 }
 
@@ -673,8 +829,6 @@ fn run_segment<B: ContinuousBackend>(
 
     if let Some(reason) = stop_reason(stop_token) {
         let _pending = session.cancel(reason);
-    } else {
-        apply_latest(&mut session, latest, clock_origin);
     }
 
     let mut pending_transition = None;
@@ -737,6 +891,8 @@ fn run_segment<B: ContinuousBackend>(
             stop_token,
         ));
     }
+
+    apply_latest(&mut session, latest, clock_origin, accepted_at);
 
     loop {
         if let Some(reason) = stop_reason(stop_token) {
@@ -828,7 +984,7 @@ fn run_segment<B: ContinuousBackend>(
             }
         }
 
-        apply_latest(&mut session, latest, clock_origin);
+        apply_latest(&mut session, latest, clock_origin, accepted_at);
         match session.take_due_update(elapsed(clock_origin)) {
             Ok(Some(request)) => {
                 if let Err(error) = call_backend(backend, &request, stop_token, policy) {
@@ -888,9 +1044,11 @@ fn apply_latest(
     session: &mut ContinuousSession,
     latest: &LatestObservationSlot,
     clock_origin: Instant,
+    accepted_at: Duration,
 ) {
     if let Some(observation) = latest.take() {
-        let observed_at = observation.observed_at.saturating_duration_since(clock_origin);
+        let observed_at =
+            observation.observed_at.saturating_duration_since(clock_origin).max(accepted_at);
         let _observed =
             session.observe_coalesced(observation.value, observed_at, observation.count);
     }
@@ -1084,8 +1242,13 @@ mod tests {
         ContinuousBackend, ContinuousBackendContext, ContinuousBackendError,
         ContinuousBackendFailure, ContinuousBackendStage, ContinuousCompletion,
         ContinuousCompletionOutcome, ContinuousInvocation, ValidatingInertBackend,
+        map_plugin_lifecycle_error, map_plugin_submit_error,
     };
     use crate::action_executor::{ActionDispatch, ActionExecutor};
+    use crate::plugin_worker::{
+        PluginLifecycleError, PluginLifecycleStage, PluginLifecycleSubmitError,
+    };
+    use gradial_lua::LuaSandboxError;
 
     #[derive(Clone, Debug)]
     enum FakeResponse {
@@ -1167,6 +1330,45 @@ mod tests {
             30,
         )
         .expect("snapshot")
+    }
+
+    #[test]
+    fn plugin_bridge_errors_map_to_the_coordinator_contract() {
+        let (_session, begin) =
+            gradial_core::ContinuousSession::begin(Uuid::from_u128(400), snapshot("measure"), 0.25)
+                .expect("begin request");
+        let mut executor = ActionExecutor::start(1).expect("executor");
+        let lease = executor
+            .handle()
+            .try_acquire_continuous(Uuid::from_u128(401))
+            .expect("continuous lease");
+        let stop_token = lease.stop_token();
+        let context = ContinuousBackendContext {
+            deadline: Instant::now() + Duration::from_secs(1),
+            stop_token: &stop_token,
+        };
+
+        assert_eq!(
+            map_plugin_lifecycle_error(PluginLifecycleError::ActionUnavailable, &begin),
+            ContinuousBackendError::Rejected
+        );
+        assert_eq!(
+            map_plugin_lifecycle_error(
+                PluginLifecycleError::Lua(LuaSandboxError::DeadlineExceeded),
+                &begin,
+            ),
+            ContinuousBackendError::TimedOut
+        );
+        assert_eq!(
+            map_plugin_submit_error(
+                PluginLifecycleSubmitError::QueueFull(PluginLifecycleStage::Begin),
+                &begin,
+                context,
+            ),
+            ContinuousBackendError::Rejected
+        );
+        drop(lease);
+        executor.shutdown();
     }
 
     fn delay_plan(milliseconds: u32) -> Arc<gradial_core::ExecutionPlan> {
@@ -1455,6 +1657,31 @@ mod tests {
     }
 
     #[test]
+    fn latest_value_published_during_begin_is_observed_after_acceptance() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        let gate = Arc::new(AtomicBool::new(false));
+        let (backend, calls) = fake_backend([FakeResponse::Wait(Arc::clone(&gate))]);
+        let mut invocation = ContinuousInvocation::start(
+            &executor.handle(),
+            Uuid::from_u128(41),
+            snapshot("pending-value"),
+            0.2,
+            backend,
+        )
+        .expect("continuous invocation");
+        assert!(matches!(wait_call(&calls), ContinuousRequest::Begin(_)));
+        invocation.handle().publish(0.8).expect("pending value");
+        gate.store(true, Ordering::Release);
+        let ContinuousRequest::Update(update) = wait_call(&calls) else {
+            panic!("expected update after Begin acceptance");
+        };
+        assert!((update.sample().value() - 0.8).abs() < f64::EPSILON);
+        invocation.handle().commit(0.8).expect("commit");
+        assert!(matches!(wait_call(&calls), ContinuousRequest::Commit(_)));
+        assert_eq!(finish(&mut invocation).outcome, ContinuousCompletionOutcome::Committed);
+    }
+
+    #[test]
     fn begin_rejection_has_no_terminal_callback_and_releases_the_lease() {
         let executor = ActionExecutor::start(1).expect("executor");
         let gate = Arc::new(AtomicBool::new(false));
@@ -1584,6 +1811,7 @@ mod tests {
             )
             .expect("continuous invocation");
             assert!(matches!(wait_call(&calls), ContinuousRequest::Begin(_)));
+            thread::sleep(Duration::from_millis(5));
             invocation.handle().publish(0.8).expect("publish");
             assert!(matches!(wait_call(&calls), ContinuousRequest::Update(_)));
             let ContinuousRequest::Cancel(cancel) = wait_call(&calls) else {

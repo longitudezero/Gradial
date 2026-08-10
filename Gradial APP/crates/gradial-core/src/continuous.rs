@@ -372,6 +372,22 @@ pub struct ContinuousCancelRequest {
 }
 
 impl ContinuousCancelRequest {
+    /// Creates a standalone best-effort cancellation request for a Begin that
+    /// may still be waiting in a runtime queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the nil session identifier.
+    pub fn new(
+        session_id: Uuid,
+        reason: ContinuousCancelReason,
+    ) -> Result<Self, ContinuousProtocolError> {
+        if session_id.is_nil() {
+            return Err(ContinuousProtocolError::InvalidSessionId);
+        }
+        Ok(Self { session_id, reason })
+    }
+
     #[must_use]
     pub const fn session_id(self) -> Uuid {
         self.session_id
@@ -859,9 +875,10 @@ mod tests {
 
     use super::{
         CONTINUOUS_API_VERSION, ContinuousActionSnapshot, ContinuousCancelReason,
-        ContinuousIdentifierKind, ContinuousProtocolError, ContinuousRequest, ContinuousSession,
-        ContinuousSessionState, ContinuousSessionTerminal, MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES,
-        PermittedApplicationContext, PermittedContext, PluginActionId, PluginId, PluginValue,
+        ContinuousCancelRequest, ContinuousIdentifierKind, ContinuousProtocolError,
+        ContinuousRequest, ContinuousSession, ContinuousSessionState, ContinuousSessionTerminal,
+        MAX_PLUGIN_PARAMETERS_SERIALIZED_BYTES, PermittedApplicationContext, PermittedContext,
+        PluginActionId, PluginId, PluginValue,
     };
 
     fn action(update_hz: u16) -> ContinuousActionSnapshot {
@@ -913,6 +930,21 @@ mod tests {
         assert_eq!(application.window_class(), "ExampleWindow");
         assert_eq!(request.context().window_title(), Some("Frozen title"));
         assert_eq!(request.parameters().get("amount"), Some(&PluginValue::Number(0.5)));
+    }
+
+    #[test]
+    fn standalone_cancel_requests_require_a_real_session_id() {
+        assert_eq!(
+            ContinuousCancelRequest::new(Uuid::nil(), ContinuousCancelReason::PluginFaulted),
+            Err(ContinuousProtocolError::InvalidSessionId)
+        );
+        let request = ContinuousCancelRequest::new(
+            Uuid::from_u128(77),
+            ContinuousCancelReason::ReloadRequested,
+        )
+        .expect("standalone cancel");
+        assert_eq!(request.session_id(), Uuid::from_u128(77));
+        assert_eq!(request.reason(), ContinuousCancelReason::ReloadRequested);
     }
 
     #[test]
