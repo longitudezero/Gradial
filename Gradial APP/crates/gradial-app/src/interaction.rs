@@ -18,8 +18,9 @@ use gradial_core::{
     ContinuousCancelReason, ContinuousSliceMask, ContinuousVisualState,
     DEFAULT_CONTINUOUS_FULL_SCALE_RADIUS_DIP, ExecutionPlan, GestureConfig, InputEvent,
     InputEventKind, InteractionController, InteractionEffect, InteractionOutcome, InteractionState,
-    InvocationSnapshot, MAX_CONTINUOUS_UPDATE_HZ, PermittedContext, PluginActionId, PluginId,
-    ProfileResolver, ProfileTarget, ResolvedMenu, monitor_index_for_point,
+    InvocationContext, InvocationSnapshot, MAX_CONTINUOUS_UPDATE_HZ, PermittedApplicationContext,
+    PermittedContext, PluginActionId, PluginId, ProfileResolver, ProfileTarget, ResolvedMenu,
+    monitor_index_for_point,
 };
 use rtrb::{Consumer, RingBuffer};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -36,7 +37,7 @@ use crate::{
     onboarding::OnboardingPractice,
     overlay::OverlayRoute,
     platform,
-    plugin_worker::PluginLifecycleClient,
+    plugin_worker::{PluginActionAdmission, PluginLifecycleClient},
     tray,
 };
 
@@ -975,6 +976,7 @@ fn begin_invocation(
         &menu,
         dispatcher.action_plan_compiler,
         dispatcher.plugin_lifecycle,
+        snapshot.context.as_ref(),
         snapshot.context.config_revision,
         continuous_meter,
     );
@@ -1006,6 +1008,7 @@ fn freeze_continuous_actions(
     menu: &ResolvedMenu,
     compiler: &ActionPlanCompiler,
     plugin_lifecycle: &PluginLifecycleClient,
+    invocation_context: &InvocationContext,
     config_revision: u64,
     continuous_meter: bool,
 ) -> Vec<Option<ContinuousActionSnapshot>> {
@@ -1027,8 +1030,8 @@ fn freeze_continuous_actions(
                     return None;
                 }
             };
-            let Some(update_hz) =
-                plugin_lifecycle.action_update_hz(binding.plugin_id(), binding.action_id())
+            let Some(admission) =
+                plugin_lifecycle.action_admission(binding.plugin_id(), binding.action_id())
             else {
                 log::debug!(
                     target: "continuous",
@@ -1040,7 +1043,8 @@ fn freeze_continuous_actions(
                 );
                 return None;
             };
-            match binding.into_snapshot(PermittedContext::default(), update_hz) {
+            let context = permitted_plugin_context(invocation_context, admission);
+            match binding.into_snapshot(context, admission.update_hz()) {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     log::error!(
@@ -1054,6 +1058,22 @@ fn freeze_continuous_actions(
             }
         })
         .collect()
+}
+
+fn permitted_plugin_context(
+    invocation: &InvocationContext,
+    admission: PluginActionAdmission,
+) -> PermittedContext {
+    let application = if admission.permits_context_application() {
+        invocation.executable_path.clone().map(|executable_path| {
+            PermittedApplicationContext::new(executable_path, invocation.window_class.clone())
+        })
+    } else {
+        None
+    };
+    let window_title =
+        admission.permits_context_window_title().then(|| invocation.window_title.clone());
+    PermittedContext::new(application, window_title)
 }
 
 fn capture_snapshot(
@@ -1902,15 +1922,17 @@ mod tests {
 
     use gradial_core::{
         ActionDefinition, ActionKind, ActionPlanCompiler, ActionResult, Configuration,
-        ContinuousSelection, ContinuousSession, ContinuousVisualState, InteractionEffect,
-        InteractionOutcome, InvocationContext, InvocationGeometry, InvocationSnapshot, PluginValue,
-        Point, ProfileResolver, ProfileTarget, ResolvedMenu, ScreenPoint, SliceCount,
+        ContinuousActionSnapshot, ContinuousBeginRequest, ContinuousRequest, ContinuousSelection,
+        ContinuousSession, ContinuousVisualState, InteractionEffect, InteractionOutcome,
+        InvocationContext, InvocationGeometry, InvocationSnapshot, PermittedContext,
+        PluginPermission, PluginValue, Point, ProfileResolver, ProfileTarget, ResolvedMenu,
+        ScreenPoint, SliceCount,
     };
     use uuid::Uuid;
 
     use crate::action_executor::ActionExecutor;
     use crate::diagnostics::TimingMarkers;
-    use crate::plugin_worker::PluginLifecycleClient;
+    use crate::plugin_worker::{PluginActionAdmission, PluginLifecycleClient};
 
     use super::{
         ActionDispatchTrace, ActiveInvocation, CONTINUOUS_VISUAL_INTERVAL, ContinuousUpdateBatch,
@@ -1918,6 +1940,19 @@ mod tests {
         freeze_continuous_actions, heartbeat_is_unresponsive, log_selected_action_outcome,
         prepare_selected_action,
     };
+
+    fn begin_from_snapshot(
+        snapshot: ContinuousActionSnapshot,
+        session_id: u128,
+    ) -> ContinuousBeginRequest {
+        let (_session, request) =
+            ContinuousSession::begin(Uuid::from_u128(session_id), snapshot, 0.0)
+                .expect("continuous session");
+        let ContinuousRequest::Begin(begin) = request else {
+            panic!("expected Begin");
+        };
+        begin
+    }
 
     #[test]
     fn continuous_update_batch_retains_only_the_latest_visual_sample() {
@@ -2072,6 +2107,7 @@ mod tests {
             &resolution.menu,
             &compiler,
             &enabled,
+            &InvocationContext::default(),
             configuration.config_revision,
             false,
         );
@@ -2096,12 +2132,135 @@ mod tests {
                 &resolution.menu,
                 &compiler,
                 &unavailable,
+                &InvocationContext::default(),
                 configuration.config_revision,
                 false,
             )
             .iter()
             .all(Option::is_none)
         );
+    }
+
+    #[test]
+    fn invocation_context_exposes_only_admitted_manifest_fields() {
+        let action_id = Uuid::from_u128(82);
+        let mut configuration = Configuration {
+            config_revision: 10,
+            actions: vec![ActionDefinition {
+                id: action_id,
+                name: "Context meter".to_owned(),
+                kind: ActionKind::PluginContinuous {
+                    plugin_id: "org.gradial.context-meter".to_owned(),
+                    plugin_action_id: "measure".to_owned(),
+                    parameters: BTreeMap::new(),
+                },
+            }],
+            ..Configuration::default()
+        };
+        configuration.global_profile.menu.slices[0].continuous_action_id = Some(action_id);
+        let compiler = ActionPlanCompiler::from_configuration(&configuration).expect("compiler");
+        let resolver = ProfileResolver::compile(&configuration).expect("profiles");
+        let resolution = resolver.resolve(ProfileTarget {
+            executable_path: None,
+            window_class: "",
+            window_title: "",
+        });
+        let invocation = InvocationContext {
+            foreground_window: 44,
+            foreground_pid: 55,
+            process_start_time: 66,
+            executable_path: Some(r"C:\Program Files\Example\example.exe".into()),
+            window_class: "ExampleWindow".to_owned(),
+            window_title: "Private project title".to_owned(),
+            monitor_device_name: r"\\.\DISPLAY1".to_owned(),
+            config_revision: configuration.config_revision,
+            ..InvocationContext::default()
+        };
+
+        let application_only = PluginLifecycleClient::with_test_action_and_permissions(
+            "org.gradial.context-meter",
+            "measure",
+            30,
+            &[PluginPermission::ContextApplication],
+        );
+        let application_begin = begin_from_snapshot(
+            freeze_continuous_actions(
+                &resolution.menu,
+                &compiler,
+                &application_only,
+                &invocation,
+                configuration.config_revision,
+                false,
+            )[0]
+            .clone()
+            .expect("application snapshot"),
+            83,
+        );
+        let application = application_begin.context().application().expect("application");
+        assert_eq!(
+            application.executable_path(),
+            std::path::Path::new(r"C:\Program Files\Example\example.exe")
+        );
+        assert_eq!(application.window_class(), "ExampleWindow");
+        assert_eq!(application_begin.context().window_title(), None);
+
+        let title_only = PluginLifecycleClient::with_test_action_and_permissions(
+            "org.gradial.context-meter",
+            "measure",
+            30,
+            &[PluginPermission::ContextWindowTitle],
+        );
+        let title_begin = begin_from_snapshot(
+            freeze_continuous_actions(
+                &resolution.menu,
+                &compiler,
+                &title_only,
+                &invocation,
+                configuration.config_revision,
+                false,
+            )[0]
+            .clone()
+            .expect("title snapshot"),
+            84,
+        );
+        assert!(title_begin.context().application().is_none());
+        assert_eq!(title_begin.context().window_title(), Some("Private project title"));
+
+        let no_context =
+            PluginLifecycleClient::with_test_action("org.gradial.context-meter", "measure", 30);
+        let empty_begin = begin_from_snapshot(
+            freeze_continuous_actions(
+                &resolution.menu,
+                &compiler,
+                &no_context,
+                &invocation,
+                configuration.config_revision,
+                false,
+            )[0]
+            .clone()
+            .expect("context-free snapshot"),
+            85,
+        );
+        assert_eq!(empty_begin.context(), &PermittedContext::default());
+    }
+
+    #[test]
+    fn unavailable_application_path_is_omitted_even_when_permitted() {
+        let admission = PluginActionAdmission::new_for_test(
+            30,
+            &[PluginPermission::ContextApplication, PluginPermission::ContextWindowTitle],
+        );
+        let context = super::permitted_plugin_context(
+            &InvocationContext {
+                executable_path: None,
+                window_class: "ExampleWindow".to_owned(),
+                window_title: String::new(),
+                ..InvocationContext::default()
+            },
+            admission,
+        );
+        assert!(context.application().is_none());
+        assert_eq!(context.window_title(), Some(""));
     }
 
     #[test]

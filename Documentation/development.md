@@ -1029,11 +1029,36 @@ tests load its real manifest and source and complete Begin, Update, and Commit.
 The compiled action catalog can freeze a `PluginContinuous` definition into a
 runtime-neutral binding without consulting local machine state. At invocation
 down, the interaction runtime combines each resolved menu slice's binding with
-the worker's immutable catalog of currently admitted manifest actions. Only a
-matching enabled plugin/action pair becomes continuous-capable; a missing,
-disabled, faulted, reloading, or undeclared reference remains an ordinary
-discrete wedge at every radius. The action parameters and manifest-owned
-10–60 Hz cadence are frozen for that invocation.
+the worker's immutable catalog of currently admitted manifest actions. Each
+catalog entry keeps the action's manifest-owned 10–60 Hz cadence and approved
+context-permission flags in one atomic admission record. Only a matching
+enabled plugin/action pair becomes continuous-capable; a missing, disabled,
+faulted, reloading, permission-review, or undeclared reference remains an
+ordinary discrete wedge at every radius.
+
+The same invocation-down target snapshot used for profile and action identity
+is filtered before it enters a continuous action snapshot:
+
+- without `context.application`, `context.application` is absent;
+- with `context.application`, it contains only the frozen executable path and
+  window class, and remains absent if the executable path could not be read;
+- without `context.window_title`, `context.window_title` is absent; and
+- with `context.window_title`, it contains the frozen title, including a valid
+  empty title.
+
+The permitted context has no HWND, PID, process handle, process start time,
+cursor or monitor data, modifier state, activation binding, configuration
+object, or another plugin's data. Lua receives absent optional values as
+`nil`. The complete filtered context, action parameters, and cadence are owned
+by the invocation; later foreground or title changes cannot alter them.
+
+Admission is published only from the worker's loaded adapters. Disablement,
+faulting, and an observed permission change remove the action and its context
+permissions together. A permission change discovered during an active session
+uses the existing bounded deferred-reconciliation rule: the already delivered
+frozen context cannot be revoked retroactively, and the adapter is removed as
+soon as its terminal callback completes. Gradial does not watch plugin files,
+so an on-disk edit is observed only by a requested rescan or operation.
 
 The plugin backend uses the existing continuous action lease and callback
 deadlines. It performs full target validation before Begin, lightweight target
@@ -1044,12 +1069,12 @@ Begin that times out while queued is explicitly aborted through the reserved
 terminal lane; the worker either rejects it before Lua or cancels it after Lua
 accepts, so it cannot leave an orphan session.
 
-This slice exposes no host capability. In particular, Lua receives an empty
-permission-filtered application/title context even if a manifest requests
-those permissions. Settings can now create actions for enabled manifest
-controls, edit their generic parameters without running plugin code, and
-assign them independently beyond any Global or application-profile wedge. All
-operating-system capabilities remain later Milestone 3 work.
+This slice exposes no host capability. Context permissions reveal only the
+owned immutable values above and cannot request an operating-system effect.
+Settings can create actions for enabled manifest controls, edit their generic
+parameters without running plugin code, and assign them independently beyond
+any Global or application-profile wedge. All operating-system capability
+brokers remain later Milestone 3 work.
 
 ## Configuration and profile resolution
 

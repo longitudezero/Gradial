@@ -36,8 +36,42 @@ const LIFECYCLE_UPDATE_CAPACITY: usize = 1;
 const LIFECYCLE_TERMINAL_CAPACITY: usize = 1;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
-type PluginActionCatalog = BTreeMap<(String, String), u16>;
+type PluginActionCatalog = BTreeMap<(String, String), PluginActionAdmission>;
 type SharedPluginActionCatalog = Arc<RwLock<Arc<PluginActionCatalog>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PluginActionAdmission {
+    update_hz: u16,
+    context_application: bool,
+    context_window_title: bool,
+}
+
+impl PluginActionAdmission {
+    fn new(update_hz: u16, permissions: &[PluginPermission]) -> Self {
+        Self {
+            update_hz,
+            context_application: permissions.contains(&PluginPermission::ContextApplication),
+            context_window_title: permissions.contains(&PluginPermission::ContextWindowTitle),
+        }
+    }
+
+    pub(crate) const fn update_hz(self) -> u16 {
+        self.update_hz
+    }
+
+    pub(crate) const fn permits_context_application(self) -> bool {
+        self.context_application
+    }
+
+    pub(crate) const fn permits_context_window_title(self) -> bool {
+        self.context_window_title
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(update_hz: u16, permissions: &[PluginPermission]) -> Self {
+        Self::new(update_hz, permissions)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code, reason = "the Plugins page and coordinator will submit all operations")]
@@ -364,11 +398,23 @@ pub(crate) struct PluginLifecycleClient {
 impl PluginLifecycleClient {
     #[cfg(test)]
     pub(crate) fn with_test_action(plugin_id: &str, action_id: &str, update_hz: u16) -> Self {
+        Self::with_test_action_and_permissions(plugin_id, action_id, update_hz, &[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_action_and_permissions(
+        plugin_id: &str,
+        action_id: &str,
+        update_hz: u16,
+        permissions: &[PluginPermission],
+    ) -> Self {
         let (begins, _begin_receiver) = bounded(1);
         let (updates, _update_receiver) = bounded(1);
         let (terminals, _terminal_receiver) = bounded(1);
-        let action_catalog =
-            BTreeMap::from([((plugin_id.to_owned(), action_id.to_owned()), update_hz)]);
+        let action_catalog = BTreeMap::from([(
+            (plugin_id.to_owned(), action_id.to_owned()),
+            PluginActionAdmission::new(update_hz, permissions),
+        )]);
         Self {
             begins,
             updates,
@@ -400,11 +446,11 @@ impl PluginLifecycleClient {
         }
     }
 
-    pub(crate) fn action_update_hz(
+    pub(crate) fn action_admission(
         &self,
         plugin_id: &PluginId,
         action_id: &PluginActionId,
-    ) -> Option<u16> {
+    ) -> Option<PluginActionAdmission> {
         let catalog = self.action_catalog.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         catalog.get(&(plugin_id.as_str().to_owned(), action_id.as_str().to_owned())).copied()
     }
@@ -597,6 +643,7 @@ struct ActivePluginSession {
 struct LoadedPlugin {
     adapter: LuaLifecycleAdapter,
     actions: BTreeMap<String, PluginManifestAction>,
+    permissions: Vec<PluginPermission>,
 }
 
 impl PluginWorker {
@@ -1254,7 +1301,10 @@ impl PluginWorker {
             .iter()
             .flat_map(|(plugin_id, plugin)| {
                 plugin.actions.iter().map(|(action_id, action)| {
-                    ((plugin_id.clone(), action_id.clone()), action.update_hz)
+                    (
+                        (plugin_id.clone(), action_id.clone()),
+                        PluginActionAdmission::new(action.update_hz, &plugin.permissions),
+                    )
                 })
             })
             .collect();
@@ -1378,7 +1428,7 @@ fn load_plugin(package: &DiscoveredPlugin) -> Result<LoadedPlugin, LuaSandboxErr
     let adapter = LuaLifecycleAdapter::load(sources.clone(), LuaSandboxLimits::default())?;
     let actions =
         manifest.actions.iter().cloned().map(|action| (action.id.clone(), action)).collect();
-    Ok(LoadedPlugin { adapter, actions })
+    Ok(LoadedPlugin { adapter, actions, permissions: manifest.permissions.clone() })
 }
 
 fn log_operation(
@@ -1575,7 +1625,12 @@ mod tests {
     #[test]
     fn startup_constructs_only_effectively_enabled_adapters() {
         let (_temporary, paths) = setup();
-        write_package(&paths.plugins, FIRST_PLUGIN, &[], VALID_SOURCE);
+        write_package(
+            &paths.plugins,
+            FIRST_PLUGIN,
+            &["context.application", "context.window_title"],
+            VALID_SOURCE,
+        );
         write_package(&paths.plugins, SECOND_PLUGIN, &[], "this is invalid Lua");
         prepare_state(&paths, &[(FIRST_PLUGIN, true), (SECOND_PLUGIN, false)]);
 
@@ -1586,15 +1641,17 @@ mod tests {
         assert_eq!(snapshot.loaded_plugin_ids, vec![FIRST_PLUGIN]);
         assert_eq!(snapshot.plugins[0].actions[0].id, "measure");
         assert_eq!(snapshot.plugins[0].actions[0].update_hz, 30);
-        assert_eq!(
-            client.action_update_hz(
+        let admission = client
+            .action_admission(
                 &PluginId::new(FIRST_PLUGIN).expect("plugin ID"),
                 &PluginActionId::new("measure").expect("action ID"),
-            ),
-            Some(30)
-        );
+            )
+            .expect("admitted action");
+        assert_eq!(admission.update_hz(), 30);
+        assert!(admission.permits_context_application());
+        assert!(admission.permits_context_window_title());
         assert_eq!(
-            client.action_update_hz(
+            client.action_admission(
                 &PluginId::new(SECOND_PLUGIN).expect("plugin ID"),
                 &PluginActionId::new("measure").expect("action ID"),
             ),
@@ -1838,6 +1895,11 @@ mod tests {
         prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
         let runtime = PluginWorkerRuntime::start(paths.clone()).expect("plugin worker");
         assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(FIRST_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("measure").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        assert!(!admission.permits_context_application());
         write_package(&paths.plugins, FIRST_PLUGIN, &["context.application"], VALID_SOURCE);
 
         assert_eq!(
@@ -1845,6 +1907,7 @@ mod tests {
             Err(PluginWorkerError::StateTransition(PluginStateTransitionError::ApprovalRequired))
         );
         assert!(snapshot(&runtime).loaded_plugin_ids.is_empty());
+        assert_eq!(client.action_admission(&plugin_id, &action_id), None);
         assert_eq!(
             persisted_status(&paths, FIRST_PLUGIN),
             PluginTrustStatus::PermissionReviewRequired

@@ -743,6 +743,37 @@ mod tests {
     }
 
     #[test]
+    fn absent_context_permissions_are_nil_in_lua() {
+        let source = source(
+            r"
+                assert(context.application == nil)
+                assert(context.window_title == nil)
+                return {}
+            ",
+            "",
+            "",
+            "",
+        );
+        let mut adapter = LuaLifecycleAdapter::load(image(&source), LuaSandboxLimits::default())
+            .expect("adapter");
+        let snapshot = ContinuousActionSnapshot::new(
+            PluginId::new("org.gradial.meter").expect("plugin ID"),
+            PluginActionId::new("set-value").expect("action ID"),
+            PermittedContext::default(),
+            BTreeMap::new(),
+            30,
+        )
+        .expect("action");
+        let (_session, request) =
+            ContinuousSession::begin(Uuid::from_u128(9), snapshot, 0.0).expect("begin request");
+        let ContinuousRequest::Begin(request) = request else {
+            panic!("expected begin request");
+        };
+
+        adapter.begin(&request).expect("begin without context permissions");
+    }
+
+    #[test]
     fn session_tables_are_isolated_and_terminal_calls_are_once_only() {
         let source = source(
             "return { identity = context.session_id, updates = 0 }",

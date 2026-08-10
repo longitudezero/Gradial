@@ -90,10 +90,12 @@ documentation tests, and the debug workspace build. The debug suites pass 257
 application, 86 core, and 22 Lua tests. The optimized suites pass 253
 application, 86 core, and 22 Lua tests.
 
-## Deferred boundary
+## Boundary at completion
 
-Lua still receives an empty permitted context and no operating-system service.
-Permission-filtered application/title context, `input.shortcut`, notification,
-and `network.loopback` brokers, capability revocation/rate/timeout evidence,
-dependency summaries, and external-effect examples remain later Milestone 3
-work.
+When this editor slice completed, Lua still received an empty permitted context
+and no operating-system service. Permission-filtered application/title context
+was completed by the later
+[permission-filtered context slice](milestone-3-permission-filtered-context-results.md).
+`input.shortcut`, notification, and `network.loopback` brokers, capability
+revocation/rate/timeout evidence, dependency summaries, and external-effect
+examples remain later Milestone 3 work.
