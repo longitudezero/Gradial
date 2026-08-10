@@ -86,11 +86,12 @@ directory/ID mismatch, UTF-8 enforcement, native-module rejection, individual
 and aggregate source bounds, source-count/root-entry/nesting limits,
 unavailable roots, and Windows directory-reparse rejection.
 
-## Deferred boundary
+## Superseded deferred boundary
 
-This slice adds no Lua dependency or state, module loading, callbacks,
-enablement, permission approval, `plugins-state.json`, capability broker,
-Settings plugin page, rescan control, continuous action catalog connection, or
-configuration mutation. Newly discovered source has no execution path. The
-enablement slice must repeat full path, manifest, and source validation before
-it can create a plugin runtime.
+The frozen source loader, Lua sandbox/lifecycle adapter, and atomic
+`plugins-state.json` trust model originally deferred by this report are now
+implemented in later isolated slices. Capability brokers, the Settings plugin
+page, a plugin worker, rescan/reload controls, and live continuous catalog
+connection remain deferred. Newly discovered source still has no production
+execution path, and enable/reload must repeat complete discovery before a Lua
+state can be admitted.

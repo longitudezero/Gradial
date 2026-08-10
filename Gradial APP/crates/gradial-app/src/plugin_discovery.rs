@@ -13,15 +13,46 @@ use gradial_lua::{
     MAX_PLUGIN_SOURCE_FILE_BYTES, MAX_PLUGIN_SOURCE_FILES, MAX_PLUGIN_SOURCE_SET_BYTES,
     PluginSourceImage, PluginSourceImageError,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PluginPackageFingerprint([u8; 32]);
+
+impl PluginPackageFingerprint {
+    pub(crate) fn to_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+}
+
+impl std::fmt::Debug for PluginPackageFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PluginPackageFingerprint(<sha256>)")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PluginPackageStatus {
-    Compatible { manifest: PluginManifest, sources: PluginSourceImage },
-    IncompatibleApi { manifest: PluginManifest, sources: PluginSourceImage, supported: u16 },
+    Compatible {
+        manifest: PluginManifest,
+        sources: PluginSourceImage,
+        fingerprint: PluginPackageFingerprint,
+    },
+    IncompatibleApi {
+        manifest: PluginManifest,
+        sources: PluginSourceImage,
+        fingerprint: PluginPackageFingerprint,
+        supported: u16,
+    },
     Invalid(PluginDiscoveryError),
 }
 
@@ -98,11 +129,6 @@ pub(crate) fn discover_plugins(root: &Path) -> PluginDiscoveryReport {
     PluginDiscoveryReport { packages, root_error: None }
 }
 
-pub(crate) fn discover_and_log(root: &Path) {
-    let report = discover_plugins(root);
-    log_discovery_report(&report);
-}
-
 pub(crate) fn log_discovery_report(report: &PluginDiscoveryReport) {
     let (compatible, incompatible, invalid) = report.counts();
     if let Some(error) = report.root_error {
@@ -123,7 +149,7 @@ pub(crate) fn log_discovery_report(report: &PluginDiscoveryReport) {
     );
     for package in &report.packages {
         match &package.status {
-            PluginPackageStatus::Compatible { manifest, sources } => log::info!(
+            PluginPackageStatus::Compatible { manifest, sources, .. } => log::info!(
                 target: "plugins",
                 "component=plugins event_code=plugin_discovered result_code=compatible \
                  plugin_id={} plugin_version={} source_files={} source_bytes={}",
@@ -132,17 +158,19 @@ pub(crate) fn log_discovery_report(report: &PluginDiscoveryReport) {
                 sources.file_count(),
                 sources.total_bytes()
             ),
-            PluginPackageStatus::IncompatibleApi { manifest, sources, supported } => log::warn!(
-                target: "plugins",
-                "component=plugins event_code=plugin_discovered result_code=incompatible_api \
-                 plugin_id={} plugin_api_version={} supported_api_version={} source_files={} \
-                 source_bytes={}",
-                manifest.id,
-                manifest.api_version,
-                supported,
-                sources.file_count(),
-                sources.total_bytes()
-            ),
+            PluginPackageStatus::IncompatibleApi { manifest, sources, supported, .. } => {
+                log::warn!(
+                    target: "plugins",
+                    "component=plugins event_code=plugin_discovered result_code=incompatible_api \
+                     plugin_id={} plugin_api_version={} supported_api_version={} source_files={} \
+                     source_bytes={}",
+                    manifest.id,
+                    manifest.api_version,
+                    supported,
+                    sources.file_count(),
+                    sources.total_bytes()
+                );
+            }
             PluginPackageStatus::Invalid(error) => log::warn!(
                 target: "plugins",
                 "component=plugins event_code=plugin_discovered result_code=invalid \
@@ -160,12 +188,13 @@ fn inspect_package(
     metadata: &Metadata,
 ) -> PluginPackageStatus {
     match inspect_package_inner(canonical_root, package_root, directory_name, metadata) {
-        Ok((manifest, sources)) if manifest.api_version == PLUGIN_API_VERSION => {
-            PluginPackageStatus::Compatible { manifest, sources }
+        Ok((manifest, sources, fingerprint)) if manifest.api_version == PLUGIN_API_VERSION => {
+            PluginPackageStatus::Compatible { manifest, sources, fingerprint }
         }
-        Ok((manifest, sources)) => PluginPackageStatus::IncompatibleApi {
+        Ok((manifest, sources, fingerprint)) => PluginPackageStatus::IncompatibleApi {
             manifest,
             sources,
+            fingerprint,
             supported: PLUGIN_API_VERSION,
         },
         Err(error) => PluginPackageStatus::Invalid(error),
@@ -177,7 +206,7 @@ fn inspect_package_inner(
     package_root: &Path,
     directory_name: &str,
     metadata: &Metadata,
-) -> Result<(PluginManifest, PluginSourceImage), PluginDiscoveryError> {
+) -> Result<(PluginManifest, PluginSourceImage, PluginPackageFingerprint), PluginDiscoveryError> {
     if directory_name.contains(':') {
         return Err(PluginDiscoveryError::UnsafePath);
     }
@@ -205,15 +234,17 @@ fn inspect_package_inner(
         return Err(PluginDiscoveryError::DirectoryIdMismatch);
     }
 
-    let sources = inventory_sources(&canonical_package, package_root, &manifest.entry)?;
-    Ok((manifest, sources))
+    let (sources, source_fingerprint) =
+        inventory_sources(&canonical_package, package_root, &manifest.entry)?;
+    let fingerprint = package_fingerprint(&manifest_bytes, source_fingerprint);
+    Ok((manifest, sources, fingerprint))
 }
 
 fn inventory_sources(
     canonical_package: &Path,
     package_root: &Path,
     entry_path: &str,
-) -> Result<PluginSourceImage, PluginDiscoveryError> {
+) -> Result<(PluginSourceImage, [u8; 32]), PluginDiscoveryError> {
     let mut pending = vec![(package_root.to_path_buf(), 0usize)];
     let mut files = Vec::new();
     let mut total_bytes = 0usize;
@@ -285,7 +316,42 @@ fn inventory_sources(
         }
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    PluginSourceImage::from_files(entry_path, files).map_err(map_source_image_error)
+    let fingerprint = source_fingerprint(&files)?;
+    let sources =
+        PluginSourceImage::from_files(entry_path, files).map_err(map_source_image_error)?;
+    Ok((sources, fingerprint))
+}
+
+fn source_fingerprint(files: &[(PathBuf, Vec<u8>)]) -> Result<[u8; 32], PluginDiscoveryError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"gradial-plugin-sources-v1\0");
+    for (path, bytes) in files {
+        let normalized = path
+            .components()
+            .map(|component| component.as_os_str().to_str().ok_or(PluginDiscoveryError::UnsafePath))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/");
+        hash_bounded_field(&mut hasher, normalized.as_bytes());
+        hash_bounded_field(&mut hasher, bytes);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn package_fingerprint(
+    manifest_bytes: &[u8],
+    source_fingerprint: [u8; 32],
+) -> PluginPackageFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(b"gradial-plugin-package-v1\0");
+    hash_bounded_field(&mut hasher, manifest_bytes);
+    hasher.update(source_fingerprint);
+    PluginPackageFingerprint(hasher.finalize().into())
+}
+
+fn hash_bounded_field(hasher: &mut Sha256, bytes: &[u8]) {
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    hasher.update(length.to_le_bytes());
+    hasher.update(bytes);
 }
 
 fn validate_regular_package_file(
@@ -559,7 +625,7 @@ update_hz = 30
             .packages
             .iter()
             .find_map(|package| match &package.status {
-                PluginPackageStatus::Compatible { manifest, sources }
+                PluginPackageStatus::Compatible { manifest, sources, .. }
                     if manifest.id == "frozen.source" =>
                 {
                     Some(sources.clone())

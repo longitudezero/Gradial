@@ -22,6 +22,9 @@ pub struct AppPaths {
     pub icons: PathBuf,
     pub logs: PathBuf,
     pub plugins: PathBuf,
+    pub plugins_state: PathBuf,
+    pub plugins_state_backup: PathBuf,
+    pub plugins_state_temporary: PathBuf,
 }
 
 impl AppPaths {
@@ -51,6 +54,9 @@ impl AppPaths {
             icons: root.join("icons"),
             logs: root.join("logs"),
             plugins: root.join("plugins"),
+            plugins_state: root.join("plugins-state.json"),
+            plugins_state_backup: root.join("plugins-state.json.bak"),
+            plugins_state_temporary: root.join("plugins-state.json.tmp"),
             root,
         }
     }
@@ -108,6 +114,9 @@ mod tests {
         assert_eq!(paths.icons, paths.root.join("icons"));
         assert_eq!(paths.logs, paths.root.join("logs"));
         assert_eq!(paths.plugins, paths.root.join("plugins"));
+        assert_eq!(paths.plugins_state, paths.root.join("plugins-state.json"));
+        assert_eq!(paths.plugins_state_backup, paths.root.join("plugins-state.json.bak"));
+        assert_eq!(paths.plugins_state_temporary, paths.root.join("plugins-state.json.tmp"));
     }
 
     #[test]

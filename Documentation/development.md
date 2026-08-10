@@ -196,6 +196,7 @@ On first run, Gradial creates:
 %LOCALAPPDATA%\Gradial\
     config.json
     onboarding-v1.json
+    plugins-state.json
     icons\
         quarantine\
     logs\
@@ -216,6 +217,11 @@ schema-one marker with `completed: true` suppresses onboarding at startup;
 missing, invalid, unsupported, or incomplete marker content safely requires
 the flow again. `onboarding-v1.json.tmp` is used only while atomically writing
 successful completion.
+
+`plugins-state.json` is a separate machine-local schema-one trust document.
+Its `.tmp` and `.bak` companions provide write-through atomic replacement and
+recovery without mixing enablement or permission approval into portable menu
+configuration.
 
 Existing schema-one files are accepted only when they contain no schema-two
 action fields. Gradial adds the action, binding, and appearance defaults in
@@ -774,9 +780,52 @@ packages. Routine logs include only sanitized package/plugin identity, version,
 status, source counts, byte counts, and error codes—never TOML or Lua source.
 Compatible discovery captures accepted Lua bytes in an immutable source image.
 Changing a package file afterward cannot change that image or make the future
-module loader reopen it. The later enablement slice must still repeat complete
+module loader reopen it. An enable/reload operation must still repeat complete
 validation and create a new image before creating a Lua state, rather than
 treating an earlier startup report as authorization.
+
+## Atomic local plugin trust state
+
+Startup loads and reconciles a bounded schema-one `plugins-state.json` after
+read-only discovery. This file is machine-local and separate from portable
+`config.json`. It stores only a revision, per-plugin enabled/faulted flags, the
+canonical approved permission names, and the last successfully loaded manifest
+identity plus a package SHA-256 fingerprint. It contains no Lua or TOML source,
+plugin path, action parameter, credential, window context, or capability
+payload.
+
+The package fingerprint covers the exact bounded manifest and every accepted
+Lua path and byte in deterministic order. It is used only for change
+detection. A changed permission set is a trust change: reconciliation disables
+an enabled record immediately and reports `permission_review_required` until
+the new canonical set is explicitly approved. Other manifest or source edits
+preserve approval but report `reload_required`; a rescan never loads them.
+Missing, invalid, or incompatible packages are unavailable and an enabled
+persisted record is disabled fail-closed.
+
+Runtime admission must use the reconciled effective status for the current
+discovered package. The persisted `enabled` flag is historical state, not
+standalone authorization: `reload_required`, `permission_review_required`,
+faulted, unavailable, and incompatible records must never construct or retain
+a Lua state.
+
+Permission approval and successful enablement are separate transitions.
+Approval alone always leaves the record disabled. The successful-load
+transition is callable only after repeated package and API validation, bounded
+Lua entry evaluation, and lifecycle callback validation. There is no such
+production caller in this slice, so startup can initialize, recover,
+reconcile, and disable state but cannot enable or execute a plugin. Fault state
+is persisted; disable or a later validated successful reload clears it.
+
+The state file is capped at 512 KiB and 1,024 plugin records, rejects unknown
+JSON fields, future schemas, malformed IDs, unordered/duplicate permissions,
+invalid fingerprints, and impossible enabled-without-loaded states. Saves
+advance a checked revision, flush a temporary file, and use Windows
+write-through replacement while retaining the previous valid primary as
+`plugins-state.json.bak`. A broken primary recovers from the valid backup
+without overwriting either file. If neither copy is usable, Gradial retains the
+evidence and continues with an empty in-memory state, which disables all
+plugins. Stale writers and interrupted saves cannot replace newer state.
 
 ## Inert Lua sandbox foundation
 
@@ -848,8 +897,9 @@ unknown session requests are rejected as host protocol errors without blaming
 the plugin.
 
 This remains an inert testable host API. Application startup has no lifecycle
-adapter call site, and enablement, approvals, Settings, capability functions,
-plugin workers, and continuous-coordinator integration remain absent.
+adapter call site, and the enable/reload transitions have no production
+caller. Settings controls, capability functions, plugin workers, and
+continuous-coordinator integration remain absent.
 
 ## Configuration and profile resolution
 

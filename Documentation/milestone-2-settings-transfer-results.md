@@ -46,10 +46,11 @@ writes a uniquely named adjacent temporary file, flushes it, and atomically
 moves it over the selected destination. A failed operation removes only that
 exact temporary file and leaves an existing destination untouched.
 
-Export cannot target Gradial's active `config.json`, `config.json.bak`, or
-`config.json.tmp`, including a differently cased spelling of those Windows
-paths. The export operation does not advance the revision, update the running
-application, or create a configuration backup.
+Export cannot target Gradial's active `config.json`, `config.json.bak`,
+`config.json.tmp`, or the corresponding primary/backup/temporary plugin-state
+paths, including a differently cased spelling of those Windows paths. The
+export operation does not advance the revision, update the running application,
+or create a configuration backup.
 
 ## Privacy and failure behavior
 

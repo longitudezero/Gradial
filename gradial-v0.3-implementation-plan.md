@@ -522,9 +522,12 @@ outside portable `config.json`:
     plugins\
 ```
 
-`plugins-state.json` contains enabled state, approved permissions, last loaded
-manifest identity, and fault status. It contains no plugin parameters or
-credentials.
+`plugins-state.json` contains a checked revision, enabled state, approved
+permissions, last loaded manifest identity and deterministic package
+fingerprint, and fault status. It contains no plugin source, paths, parameters,
+credentials, context, or capability payloads. A bounded `.tmp`/`.bak` atomic
+recovery pair fails closed to an empty disabled in-memory state when neither
+copy is valid.
 
 ## 6. Lua plugin package
 

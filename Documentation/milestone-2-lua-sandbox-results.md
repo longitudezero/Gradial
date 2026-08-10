@@ -109,6 +109,7 @@ and the same 13 Lua-host tests.
 
 The callback-validation and isolated execution portion originally deferred by
 this report is now implemented by `LuaLifecycleAdapter`; see
-`milestone-2-lua-lifecycle-results.md`. Coordinator integration, plugin
-workers, enablement/approval state, Settings, and external capabilities remain
-deferred. The application still has no normal Lua-loading call site.
+`milestone-2-lua-lifecycle-results.md`. The atomic trust-state model is also
+now present, but coordinator integration, plugin workers, enablement/approval
+UI, and external capabilities remain deferred. The application still has no
+normal Lua-loading call site.

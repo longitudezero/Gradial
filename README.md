@@ -358,15 +358,27 @@ healthy one. Discovery canonicalizes every package/source path, rejects
 reparse points and native or bytecode modules, accepts only bounded UTF-8 Lua
 source, freezes accepted bytes, and never executes them during discovery.
 
+Gradial also initializes a separate, machine-local
+`%LOCALAPPDATA%\Gradial\plugins-state.json`. It records only revisioned
+enabled/faulted state, approved permission names, and the identity/fingerprint
+of the last successfully loaded package. Permission changes disable an enabled
+record until reviewed; ordinary manifest or Lua edits retain approval but are
+marked as requiring manual reload. Atomic `.tmp`/`.bak` recovery fails closed
+to an empty disabled state and never stores source, paths, parameters, or
+credentials. No UI or runtime currently calls the approval or successful-load
+transitions.
+
 The separate `gradial-lua` foundation embeds vendored Lua 5.4 for an explicit
 future enablement path. A fresh state exposes only reviewed basic functions,
 `math`, `string`, `table`, `utf8`, and the rooted/cached
 `gradial.require("lib.mapping")` source loader. It has no filesystem-backed
 loader or OS capability and enforces memory, instruction, and wall-time limits.
-Gradial does not currently call this load path during normal operation, so
-discovered packages still execute zero code. There is intentionally no enable
-switch, permission approval, Settings plugin page, callback adapter, or
-continuous-assignment editor yet.
+Its strict lifecycle adapter validates and bounds `begin`, `update`, `commit`,
+and `cancel` with private session state and immutable host values. Gradial does
+not call either Lua path during normal operation, so discovered packages still
+execute zero code. There is intentionally no enable switch, permission-review
+UI, Settings plugin page, plugin worker, capability broker, or live continuous
+assignment yet.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the

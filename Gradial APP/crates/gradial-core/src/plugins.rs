@@ -5,7 +5,7 @@
 
 use std::{collections::HashSet, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{MAX_CONTINUOUS_IDENTIFIER_BYTES, MAX_CONTINUOUS_UPDATE_HZ, MIN_CONTINUOUS_UPDATE_HZ};
@@ -54,7 +54,7 @@ pub enum PluginActionKind {
     Continuous,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum PluginPermission {
     #[serde(rename = "context.application")]
     ContextApplication,

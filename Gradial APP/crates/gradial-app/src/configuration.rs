@@ -414,6 +414,9 @@ impl ConfigStore {
             &self.paths.config_temporary,
             &self.paths.onboarding,
             &self.paths.onboarding_temporary,
+            &self.paths.plugins_state,
+            &self.paths.plugins_state_backup,
+            &self.paths.plugins_state_temporary,
         ]
         .into_iter()
         .any(|protected| windows_paths_equal(path, protected))
@@ -1802,6 +1805,9 @@ mod tests {
             &paths.config_temporary,
             &paths.onboarding,
             &paths.onboarding_temporary,
+            &paths.plugins_state,
+            &paths.plugins_state_backup,
+            &paths.plugins_state_temporary,
         ] {
             assert_eq!(
                 store.export_draft(&draft, protected, &draft),
