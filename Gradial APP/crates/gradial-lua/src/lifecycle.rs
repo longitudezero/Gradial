@@ -874,6 +874,36 @@ mod tests {
     }
 
     #[test]
+    fn ten_thousand_terminal_sessions_keep_lua_memory_bounded() {
+        let source = source(
+            "return { value = initial.value, updates = 0 }",
+            "session.value = sample.value; session.updates = session.updates + 1",
+            "session.value = sample.value",
+            "session.reason = reason",
+        );
+        let mut adapter = LuaLifecycleAdapter::load(image(&source), LuaSandboxLimits::default())
+            .expect("adapter");
+        let mut post_warmup_memory = 0;
+
+        for index in 0_u128..10_000 {
+            let (mut session, begin) = begin_request(Uuid::from_u128(index + 1));
+            adapter.begin(&begin).expect("begin");
+            adapter.update(&update_request(&mut session, 0.6)).expect("update");
+            adapter.commit(&commit_request(&mut session, 0.8)).expect("commit");
+            if index == 999 {
+                post_warmup_memory = adapter.used_memory();
+            }
+        }
+
+        let final_memory = adapter.used_memory();
+        assert_eq!(adapter.active_session_count(), 0);
+        assert!(
+            final_memory.saturating_sub(post_warmup_memory) <= 1024 * 1024,
+            "Lua memory grew from {post_warmup_memory} to {final_memory} bytes"
+        );
+    }
+
+    #[test]
     fn absent_context_permissions_are_nil_in_lua() {
         let source = source(
             r"

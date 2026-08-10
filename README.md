@@ -523,6 +523,20 @@ This short campaign is diagnostic only. The elevated release form is
 `-Mode Release -Build release`; it captures PresentMon evidence and uses the
 full per-scenario warmup, invocation, and idle protocol.
 
+Run the qualifying real-plugin continuous soak after building the optimized
+executable:
+
+```powershell
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-continuous-soak.ps1
+```
+
+It drives 10,000 production M4 gestures, validates every plugin lifecycle
+segment and clean shutdown, preserves rotated evidence outside Gradial's
+bounded logs, and enforces at most 10 MiB working-set p95 growth after the
+first 1,000 sessions. Shorter `-InvocationCount` runs are diagnostic and do
+not qualify the gate.
+
 See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
@@ -619,3 +633,6 @@ development baseline are recorded in
 The five-state plugin performance protocol, bounded callback timing, and
 current non-qualifying two-build baseline are recorded in
 [`Documentation/milestone-4-plugin-performance-baseline-results.md`](Documentation/milestone-4-plugin-performance-baseline-results.md).
+The qualifying 10,000-session real-plugin soak, renderer font-cache fix, and
+post-warm-up memory evidence are recorded in
+[`Documentation/milestone-4-plugin-continuous-soak-results.md`](Documentation/milestone-4-plugin-continuous-soak-results.md).

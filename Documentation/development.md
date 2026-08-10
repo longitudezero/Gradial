@@ -2091,6 +2091,39 @@ exit codes, timings, and a coverage table. Missing mixed-DPI, negative-origin,
 or high-refresh hardware is reported as `unavailable`; physical events and
 long-run campaigns that were not performed are reported as `not_run`.
 
+## Plugin continuous soak
+
+The release-only plugin soak drives 10,000 real synthetic M4 invocations
+through the production hook, overlay, continuous coordinator, plugin worker,
+and Lua lifecycle. It archives completed log rotations outside Gradial's
+bounded five-file retention and validates every Begin/Update/Commit/Cancel
+segment, coalescing, health record, and shutdown component.
+
+Build the release executable first, then run from `Gradial APP`:
+
+```powershell
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-continuous-soak.ps1
+```
+
+Only exactly 10,000 invocations qualify. The memory gate compares working-set
+p95 for sessions 1,000-1,999 with the last 1,000 sessions and permits at most
+10 MiB growth. Shorter runs can be requested with `-InvocationCount`; they
+exercise all functional contracts but report the overall result as
+`not_evaluated`.
+
+Overlay text uses the appearance preset as its stable font rasterization
+scale. Opening and closing still animate radial geometry and opacity, but MUST
+NOT multiply `FontId` sizes by the continuously varying lifecycle scale. Egui's
+glyph cache keys include font size, so doing so creates effectively unique
+glyphs across invocations and grows the font atlas. The renderer regression
+test and 10,000-session memory gate protect this boundary.
+
+The qualifying current-machine run observed 10,000 sessions, 29,966 callbacks,
+zero lifecycle or health failures, and 3.270 MiB post-warm-up working-set p95
+growth. Exact protocol and evidence are recorded in
+`Documentation/milestone-4-plugin-continuous-soak-results.md`.
+
 ## Checks
 
 `scripts\check.ps1` runs, in order:

@@ -27,6 +27,12 @@ param(
 
     [string]$PhaseFile,
 
+    [string]$ProgressFile,
+
+    [string]$LogEvidenceDirectory,
+
+    [switch]$SummaryValidationOnly,
+
     [string]$ForegroundProcessFile,
 
     [string]$TimingOutputDirectory,
@@ -95,11 +101,14 @@ param(
     [ValidateRange(0, 2000)]
     [int]$PointerBurstEvents = 0,
 
+    [ValidateRange(0, 1000)]
+    [int]$PointerBurstSettleMilliseconds = 100,
+
     [switch]$RequireOpenAnimationComplete,
 
     [switch]$AllDirections,
 
-    [ValidateRange(1, 1000)]
+    [ValidateRange(1, 10000)]
     [int]$InvocationCount = 1,
 
     [ValidateRange(0, 1000)]
@@ -445,8 +454,12 @@ if ($PointerBurstEvents -ne 0) {
     if ($PointerBurstEvents % 2 -ne 0) {
         throw "PointerBurstEvents must be even so the cursor finishes at the requested point."
     }
-    if (-not $continuousGesture -or $AllDirections -or $InvocationCount -ne 1) {
-        throw "PointerBurstEvents requires one single-direction continuous invocation."
+    if (
+        -not $continuousGesture -or
+        $AllDirections -or
+        ($InvocationCount -ne 1 -and -not $SummaryValidationOnly)
+    ) {
+        throw "PointerBurstEvents requires a single direction; repeated bursts are reserved for summary-only soak validation."
     }
 }
 if ($ReturnInsideBeforeRelease -and (-not $continuousGesture -or $AllDirections)) {
@@ -454,6 +467,12 @@ if ($ReturnInsideBeforeRelease -and (-not $continuousGesture -or $AllDirections)
 }
 if ($RequireOpenAnimationComplete -and ($QuickFlick -or $GestureDelayMilliseconds -lt 60)) {
     throw "RequireOpenAnimationComplete requires a gesture delay of at least 60 ms."
+}
+if (
+    $SummaryValidationOnly -and
+    (-not $PluginContinuous -or -not $LogEvidenceDirectory -or $AllDirections)
+) {
+    throw "SummaryValidationOnly requires PluginContinuous, LogEvidenceDirectory, and one direction."
 }
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
     throw "Close the existing Gradial process before running the isolated live smoke check."
@@ -467,13 +486,88 @@ $foregroundWindow = [GradialSmokeNative]::GetForegroundWindow()
 $foregroundProcess = [GradialSmokeNative]::ForegroundProcessId()
 $m4IsDown = $false
 $gradial = $null
+$gradialExitCode = $null
 $timingCapture = $null
+$archivedLogHashes = @{}
+$logEvidenceSequence = 0
 
 function Set-PerformancePhase {
     param([string]$Name)
 
     if ($PhaseFile) {
         Set-Content -LiteralPath $PhaseFile -Value $Name -Encoding utf8
+    }
+}
+
+function Set-InvocationProgress {
+    param([int]$Completed)
+
+    if (
+        $ProgressFile -and
+        ($Completed -eq 0 -or $Completed % 25 -eq 0 -or $Completed -eq $InvocationCount)
+    ) {
+        Set-Content -LiteralPath $ProgressFile -Value $Completed -Encoding ascii
+    }
+}
+
+function Save-LogEvidence {
+    param(
+        [string]$Label,
+        [bool]$IncludeCurrent
+    )
+
+    if (-not $LogEvidenceDirectory) {
+        return
+    }
+    New-Item -ItemType Directory -Path $LogEvidenceDirectory -Force | Out-Null
+    $sourceDirectory = Join-Path $env:LOCALAPPDATA "Gradial\logs"
+    if (-not (Test-Path -LiteralPath $sourceDirectory)) {
+        return
+    }
+    $parts = Get-ChildItem -LiteralPath $sourceDirectory -Filter "gradial*.log" |
+        Sort-Object LastWriteTime, Name
+    foreach ($part in $parts) {
+        if (-not $IncludeCurrent -and $part.Name -match "CURRENT") {
+            continue
+        }
+        $source = [IO.File]::Open(
+            $part.FullName,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        )
+        try {
+            $memory = [IO.MemoryStream]::new()
+            try {
+                $source.CopyTo($memory)
+                $bytes = $memory.ToArray()
+            }
+            finally {
+                $memory.Dispose()
+            }
+        }
+        finally {
+            $source.Dispose()
+        }
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace(
+                "-",
+                ""
+            ).ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+        if ($script:archivedLogHashes.ContainsKey($hash)) {
+            continue
+        }
+        $script:archivedLogHashes[$hash] = $true
+        $script:logEvidenceSequence++
+        $destination = Join-Path $LogEvidenceDirectory (
+            "{0:D6}-{1}-{2}-{3}" -f $script:logEvidenceSequence, $Label, $hash.Substring(0, 16), $part.Name
+        )
+        [IO.File]::WriteAllBytes($destination, $bytes)
     }
 }
 
@@ -629,6 +723,8 @@ try {
     Set-PerformancePhase "startup"
     $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
     $startupLog = Get-Content -Raw -LiteralPath $logPath
+    Set-InvocationProgress 0
+    Save-LogEvidence "startup" $true
     $responsiveBeforeRecovery = (
         [regex]::Matches($startupLog, "event_code=hook_thread_responsive")
     ).Count
@@ -876,7 +972,7 @@ try {
                 )
                 $currentOffsetX = $targetVector[0]
                 $currentOffsetY = $targetVector[1]
-                if ($continuousUsesFixedOrigin) {
+                if ($continuousUsesFixedOrigin -and -not $SummaryValidationOnly) {
                     $desiredX = $testX + $currentOffsetX
                     $desiredY = $testY + $currentOffsetY
                     $correctionTolerance = if ($continuousGesture) { 0 } else { 1 }
@@ -907,7 +1003,7 @@ try {
                 )
                 $currentOffsetX = $insideVector[0]
                 $currentOffsetY = $insideVector[1]
-                if ($continuousUsesFixedOrigin) {
+                if ($continuousUsesFixedOrigin -and -not $SummaryValidationOnly) {
                     $desiredX = $testX + $currentOffsetX
                     $desiredY = $testY + $currentOffsetY
                     for ($correction = 0; $correction -lt 8; $correction++) {
@@ -932,7 +1028,9 @@ try {
                     $testY + $currentOffsetY,
                     $PointerBurstEvents
                 )
-                Start-Sleep -Milliseconds 100
+                if ($PointerBurstSettleMilliseconds -gt 0) {
+                    Start-Sleep -Milliseconds $PointerBurstSettleMilliseconds
+                }
             }
 
             $cursorDuringGesture = New-Object GradialSmokeNative+Point
@@ -945,6 +1043,10 @@ try {
             [GradialSmokeNative]::SendM4($false)
             $m4IsDown = $false
             $completedInvocations++
+            Set-InvocationProgress $completedInvocations
+            if ($SummaryValidationOnly -and $completedInvocations % 100 -eq 0) {
+                Save-LogEvidence "rotation" $false
+            }
             if (
                 $completedInvocations -lt ($directions.Count * $InvocationCount) -and
                 $InterInvocationDelayMilliseconds -gt 0
@@ -1003,7 +1105,12 @@ finally {
         if (-not $gradial.WaitForExit(5000)) {
             Stop-Process -Id $gradial.Id -Force
         }
+        $gradial.Refresh()
+        if ($gradial.HasExited) {
+            $gradialExitCode = $gradial.ExitCode
+        }
     }
+    Save-LogEvidence "shutdown" $true
     if ($timingCapture -and -not $timingCapture.HasExited) {
         if (-not $timingCapture.WaitForExit(($CaptureDurationSeconds + 5) * 1000)) {
             Stop-Process -Id $timingCapture.Id -Force
@@ -1013,6 +1120,76 @@ finally {
 
 $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
 $log = Get-Content -LiteralPath $logPath -Raw
+if ($SummaryValidationOnly) {
+    $expectedInvocations = $directions.Count * $InvocationCount
+    $interactionStop = [regex]::Match(
+        $log,
+        "event_code=interaction_thread_stopped .*" +
+        "activation_down_events=(?<down>[0-9]+) .*" +
+        "activation_up_events=(?<up>[0-9]+) .*" +
+        "continuous_updates_dispatched=(?<dispatched>[0-9]+) " +
+        "continuous_updates_prioritized=(?<prioritized>[0-9]+) " +
+        "continuous_updates_coalesced=(?<coalesced>[0-9]+) cancel_events=(?<cancel>[0-9]+)"
+    )
+    if (
+        -not $interactionStop.Success -or
+        [int]$interactionStop.Groups["down"].Value -ne $expectedInvocations -or
+        [int]$interactionStop.Groups["up"].Value -ne $expectedInvocations -or
+        [int]$interactionStop.Groups["cancel"].Value -ne 0 -or
+        [int]$interactionStop.Groups["dispatched"].Value -eq 0 -or
+        [int]$interactionStop.Groups["prioritized"].Value -eq 0 -or
+        ($PointerBurstEvents -gt 0 -and [int]$interactionStop.Groups["coalesced"].Value -eq 0)
+    ) {
+        throw "The summary-only interaction counters did not satisfy the soak contract."
+    }
+    if ($gradialExitCode -ne 0) {
+        throw "Gradial did not exit cleanly; exit code was $gradialExitCode."
+    }
+    $stageCounts = @{}
+    foreach ($stage in @("begin", "update", "commit", "cancel")) {
+        $record = [regex]::Match(
+            $log,
+            "event_code=plugin_callback_timing result_code=ok stage=$stage " +
+            "callback_count=(?<count>[0-9]+) .*histogram_bucket_count=(?<buckets>[0-9]+) " +
+            "result_ok_count=(?<ok>[0-9]+) result_failure_count=(?<failed>[0-9]+) " +
+            "active_session_at_shutdown=(?<active>true|false)"
+        )
+        if (
+            -not $record.Success -or
+            [int]$record.Groups["buckets"].Value -ne 15 -or
+            [int]$record.Groups["failed"].Value -ne 0 -or
+            $record.Groups["active"].Value -ne "false"
+        ) {
+            throw "The summary-only plugin timing record for $stage was incomplete."
+        }
+        $stageCounts[$stage] = [int]$record.Groups["ok"].Value
+    }
+    if (
+        $stageCounts.begin -lt $expectedInvocations -or
+        ($stageCounts.commit + $stageCounts.cancel) -ne $stageCounts.begin
+    ) {
+        throw (
+            "Plugin lifecycle totals were not exact: begin=$($stageCounts.begin), " +
+            "commit=$($stageCounts.commit), cancel=$($stageCounts.cancel)."
+        )
+    }
+    foreach ($eventCode in @(
+        "action_executor_stopped",
+        "interaction_thread_stopped",
+        "hook_thread_stopped",
+        "plugin_worker_stopped"
+    )) {
+        if ($log -notmatch "event_code=$eventCode .*result_code=ok") {
+            throw "The summary-only run did not retain $eventCode."
+        }
+    }
+    Write-Host (
+        "Live $Configuration plugin continuous summary smoke check passed: " +
+        "$expectedInvocations invocation(s), $($stageCounts.update) Update callback(s), " +
+        "$($interactionStop.Groups['coalesced'].Value) coalesced visual update(s), exit code 0."
+    )
+    return
+}
 $configurationRecord = [regex]::Match(
     $log,
     "event_code=config_loaded .*config_revision=(?<revision>[1-9][0-9]*) " +

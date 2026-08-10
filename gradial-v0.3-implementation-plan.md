@@ -1224,6 +1224,18 @@ evidence, hook duration, and input/renderer health without reading the user's
 configuration. A short development baseline is recorded; the complete
 release-duration run remains required before qualification.
 
+The second item is implemented as a release-only production-route campaign
+that preserves all rotated lifecycle evidence outside Gradial's bounded log
+retention, validates terminal integrity and coalescing, and compares sessions
+1,000-1,999 with the final 1,000-session memory window. The qualifying
+2026-08-10 run completed 10,000 real plugin sessions with zero invalid
+sessions, post-terminal updates, callback failures, input/renderer failures,
+or unclean shutdowns. Working-set p95 grew by 3.270 MiB against the 10 MiB
+limit. The gate also found and fixed unbounded egui glyph-cache growth caused
+by applying continuously varying presence-animation scale to font sizes;
+fonts now use stable appearance-preset sizes while geometry and opacity retain
+the animation. The 10,000-session continuous-soak item is complete.
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a

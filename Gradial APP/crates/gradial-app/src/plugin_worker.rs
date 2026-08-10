@@ -276,6 +276,8 @@ impl FixedTimingHistogram {
 struct CallbackStageTiming {
     queue: FixedTimingHistogram,
     callback: FixedTimingHistogram,
+    result_ok_count: u64,
+    result_failure_count: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -290,16 +292,27 @@ impl PluginCallbackTiming {
         stage: PluginLifecycleStage,
         queue_duration: Duration,
         callback_duration: Duration,
+        succeeded: bool,
     ) {
         let timing = &mut self.stages[stage.index()];
         timing.queue.record(queue_duration);
         timing.callback.record(callback_duration);
+        if succeeded {
+            timing.result_ok_count = timing.result_ok_count.saturating_add(1);
+        } else {
+            timing.result_failure_count = timing.result_failure_count.saturating_add(1);
+        }
         self.all.queue.record(queue_duration);
         self.all.callback.record(callback_duration);
+        if succeeded {
+            self.all.result_ok_count = self.all.result_ok_count.saturating_add(1);
+        } else {
+            self.all.result_failure_count = self.all.result_failure_count.saturating_add(1);
+        }
     }
 
-    fn log(&self) {
-        Self::log_stage("all", &self.all);
+    fn log(&self, active_session_at_shutdown: bool) {
+        Self::log_stage("all", &self.all, active_session_at_shutdown);
         for stage in [
             PluginLifecycleStage::Begin,
             PluginLifecycleStage::Update,
@@ -307,17 +320,19 @@ impl PluginCallbackTiming {
             PluginLifecycleStage::Cancel,
         ] {
             let timing = &self.stages[stage.index()];
-            Self::log_stage(stage.as_str(), timing);
+            Self::log_stage(stage.as_str(), timing, active_session_at_shutdown);
         }
     }
 
-    fn log_stage(stage: &str, timing: &CallbackStageTiming) {
+    fn log_stage(stage: &str, timing: &CallbackStageTiming, active_session_at_shutdown: bool) {
         log::info!(
             target: "plugins",
             "component=plugins event_code=plugin_callback_timing result_code=ok \
              stage={} callback_count={} p50_callback_us={} p95_callback_us={} \
              p99_callback_us={} maximum_callback_us={} p50_queue_us={} \
-             p95_queue_us={} p99_queue_us={} maximum_queue_us={}",
+             p95_queue_us={} p99_queue_us={} maximum_queue_us={} \
+             histogram_bucket_count={} result_ok_count={} result_failure_count={} \
+             active_session_at_shutdown={}",
             stage,
             timing.callback.count,
             timing.callback.percentile(50),
@@ -327,7 +342,11 @@ impl PluginCallbackTiming {
             timing.queue.percentile(50),
             timing.queue.percentile(95),
             timing.queue.percentile(99),
-            timing.queue.maximum_us
+            timing.queue.maximum_us,
+            CALLBACK_TIMING_BUCKET_UPPER_US.len(),
+            timing.result_ok_count,
+            timing.result_failure_count,
+            active_session_at_shutdown
         );
     }
 }
@@ -806,7 +825,7 @@ impl PluginWorkerRuntime {
                     worker_loopback_client,
                 );
                 worker.run(&commands, &begins, &updates, &terminals, &worker_shutdown);
-                worker.callback_timing.log();
+                worker.callback_timing.log(worker.active_session.is_some());
                 let _sent = stopped_sender.try_send(());
             })
             .context("could not spawn the plugin worker")?;
@@ -1199,7 +1218,7 @@ impl PluginWorker {
         let queue_duration = callback_started.saturating_duration_since(submitted_at);
         let result = self.dispatch_lifecycle(&request);
         let callback_duration = callback_started.elapsed();
-        self.callback_timing.record(stage, queue_duration, callback_duration);
+        self.callback_timing.record(stage, queue_duration, callback_duration, result.is_ok());
         log::info!(
             target: "plugins",
             "component=plugins event_code=plugin_lifecycle result_code={} error_code={} \
@@ -1922,6 +1941,30 @@ mod tests {
         assert_eq!(histogram.percentile(99), 20_000);
         assert_eq!(histogram.maximum_us, 20_000);
         assert_eq!(histogram.buckets.iter().sum::<u64>(), histogram.count);
+    }
+
+    #[test]
+    fn callback_timing_tracks_results_without_retaining_sessions() {
+        let mut timing = PluginCallbackTiming::default();
+        timing.record(
+            PluginLifecycleStage::Begin,
+            Duration::from_micros(5),
+            Duration::from_micros(10),
+            true,
+        );
+        timing.record(
+            PluginLifecycleStage::Begin,
+            Duration::from_micros(6),
+            Duration::from_micros(11),
+            false,
+        );
+
+        let begin = &timing.stages[PluginLifecycleStage::Begin.index()];
+        assert_eq!(begin.callback.count, 2);
+        assert_eq!(begin.result_ok_count, 1);
+        assert_eq!(begin.result_failure_count, 1);
+        assert_eq!(timing.all, *begin);
+        assert_eq!(begin.callback.buckets.len(), CALLBACK_TIMING_BUCKET_UPPER_US.len());
     }
 
     fn setup() -> (tempfile::TempDir, AppPaths) {

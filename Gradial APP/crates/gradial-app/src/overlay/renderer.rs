@@ -76,7 +76,8 @@ impl OverlayRenderer for FoundationOverlayRenderer {
         let painter = ui.painter();
         let opacity = frame.opacity.clamp(0.0, 1.0);
         let lifecycle_scale = frame.scale.clamp(0.0, 1.0);
-        let scale = lifecycle_scale * frame.appearance.size_preset.visual_scale();
+        let (scale, text_scale) =
+            overlay_scales(lifecycle_scale, frame.appearance.size_preset.visual_scale());
         let theme = theme_colors(frame.appearance.label_theme);
         let accent = frame.appearance.accent_color;
 
@@ -120,7 +121,7 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             center,
             geometry,
             menu,
-            SliceContentStyle { opacity, scale, theme },
+            SliceContentStyle { opacity, scale, text_scale, theme },
             &self.icons,
         );
 
@@ -148,7 +149,7 @@ impl OverlayRenderer for FoundationOverlayRenderer {
             center,
             Align2::CENTER_CENTER,
             center_label,
-            FontId::proportional(11.0 * scale),
+            FontId::proportional(11.0 * text_scale),
             faded(theme.center_label, opacity),
         );
     }
@@ -418,7 +419,7 @@ fn draw_slice_content(
     style: SliceContentStyle,
     icons: &IconManager,
 ) {
-    let SliceContentStyle { opacity, scale, theme } = style;
+    let SliceContentStyle { opacity, scale, text_scale, theme } = style;
     for (index, (offset, label)) in menu_label_layout(geometry, menu.labels()).enumerate() {
         if let Some(reference) = menu.icon(index) {
             let (icon_offset, label_offset) = icon_and_label_offsets(offset);
@@ -435,7 +436,7 @@ fn draw_slice_content(
                     );
                 }
                 IconVisual::Placeholder => {
-                    draw_icon_placeholder(painter, icon_rect, opacity, scale, theme);
+                    draw_icon_placeholder(painter, icon_rect, opacity, scale, text_scale, theme);
                 }
             }
             draw_label(
@@ -444,6 +445,7 @@ fn draw_slice_content(
                 label,
                 opacity,
                 scale,
+                text_scale,
                 theme,
                 Some(theme.label_background.unwrap_or(theme.center)),
                 10.0,
@@ -456,6 +458,7 @@ fn draw_slice_content(
             label,
             opacity,
             scale,
+            text_scale,
             theme,
             theme.label_background,
             12.0,
@@ -467,6 +470,7 @@ fn draw_slice_content(
 struct SliceContentStyle {
     opacity: f32,
     scale: f32,
+    text_scale: f32,
     theme: ThemeColors,
 }
 
@@ -491,6 +495,7 @@ fn draw_icon_placeholder(
     rect: Rect,
     opacity: f32,
     scale: f32,
+    text_scale: f32,
     theme: ThemeColors,
 ) {
     painter.rect_filled(rect, egui::CornerRadius::same(5), faded(theme.center, opacity));
@@ -504,7 +509,7 @@ fn draw_icon_placeholder(
         rect.center(),
         Align2::CENTER_CENTER,
         "?",
-        FontId::proportional(16.0 * scale),
+        FontId::proportional(16.0 * text_scale),
         faded(theme.label, opacity),
     );
 }
@@ -516,13 +521,14 @@ fn draw_label(
     label: &str,
     opacity: f32,
     scale: f32,
+    text_scale: f32,
     theme: ThemeColors,
     background: Option<Color32>,
     font_size: f32,
 ) {
     let color = faded(theme.label, opacity);
     if let Some(background) = background {
-        let font = FontId::monospace(font_size * scale);
+        let font = FontId::monospace(font_size * text_scale);
         let galley = painter.layout_no_wrap(label.to_owned(), font, color);
         let label_rect =
             Rect::from_center_size(center, galley.size()).expand2(Vec2::new(5.0, 2.5) * scale);
@@ -530,7 +536,17 @@ fn draw_label(
         painter.galley(label_rect.center() - galley.size() / 2.0, galley, color);
         return;
     }
-    painter.text(center, Align2::CENTER_CENTER, label, FontId::monospace(font_size * scale), color);
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        label,
+        FontId::monospace(font_size * text_scale),
+        color,
+    );
+}
+
+fn overlay_scales(lifecycle_scale: f32, preset_scale: f32) -> (f32, f32) {
+    (lifecycle_scale * preset_scale, preset_scale)
 }
 
 fn menu_label_layout<'a>(
@@ -605,7 +621,7 @@ mod tests {
         CONTINUOUS_FULL_SCALE_RADIUS_DIP, FoundationOverlayRenderer, OUTER_RADIUS_DIP,
         continuous_pointer_position, continuous_track_offsets, continuous_visual_pointer_offset,
         fitted_icon_rect, half_slice_angle, icon_and_label_offsets, menu_label_layout,
-        selected_accent_color, target_levels, theme_colors,
+        overlay_scales, selected_accent_color, target_levels, theme_colors,
     };
     use crate::icons::IconVisual;
 
@@ -632,6 +648,17 @@ mod tests {
         assert_eq!(renderer.cached_geometry_counts(SliceCount::Eight), (8, 8, 8));
         assert!(renderer.geometry.four.selected_arcs.iter().all(|arc| arc.len() == 24));
         assert!(renderer.geometry.eight.selected_arcs.iter().all(|arc| arc.len() == 24));
+    }
+
+    #[test]
+    fn presence_animation_does_not_create_transient_font_sizes() {
+        let (opening_geometry, opening_text) = overlay_scales(0.96, 1.15);
+        let (visible_geometry, visible_text) = overlay_scales(1.0, 1.15);
+
+        assert_close(opening_geometry, 1.104);
+        assert_close(visible_geometry, 1.15);
+        assert_close(opening_text, 1.15);
+        assert_close(visible_text, 1.15);
     }
 
     #[test]

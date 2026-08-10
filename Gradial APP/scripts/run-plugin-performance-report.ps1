@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Development", "Release")]
+    [ValidateSet("Development", "Release", "Soak")]
     [string]$Mode = "Development",
 
     [ValidateSet("Both", "debug", "release")]
@@ -11,6 +11,9 @@ param(
 
     [ValidateRange(0, 15)]
     [int]$MonitorIndex = 0,
+
+    [ValidateRange(1, 10000)]
+    [int]$SoakInvocationCount = 10000,
 
     [switch]$MarkersOnly,
 
@@ -211,8 +214,11 @@ function Get-PluginLifecycleSamples {
         "active_session=(?:true|false) queue_wait_us=(?<queue>[0-9]+) " +
         "callback_duration_us=(?<callback>[0-9]+) total_duration_us=(?<total>[0-9]+)"
     )
+    $ordinal = 0
     foreach ($match in [regex]::Matches($Log, $pattern)) {
+        $ordinal++
         $samples += [pscustomobject]@{
+            ordinal = $ordinal
             result = $match.Groups["result"].Value
             error_code = $match.Groups["error"].Value
             plugin_id = $match.Groups["plugin"].Value
@@ -236,12 +242,35 @@ function Get-PluginTimingSummaries {
         "p95_callback_us=(?<callback95>[0-9]+) p99_callback_us=(?<callback99>[0-9]+) " +
         "maximum_callback_us=(?<callbackMax>[0-9]+) p50_queue_us=(?<queue50>[0-9]+) " +
         "p95_queue_us=(?<queue95>[0-9]+) p99_queue_us=(?<queue99>[0-9]+) " +
-        "maximum_queue_us=(?<queueMax>[0-9]+)"
+        "maximum_queue_us=(?<queueMax>[0-9]+)" +
+        "(?: histogram_bucket_count=(?<buckets>[0-9]+)" +
+        " result_ok_count=(?<ok>[0-9]+) result_failure_count=(?<failed>[0-9]+)" +
+        " active_session_at_shutdown=(?<active>true|false))?"
     )
     foreach ($match in [regex]::Matches($Log, $pattern)) {
         $summaries += [pscustomobject]@{
             stage = $match.Groups["stage"].Value
             callback_count = [int64]$match.Groups["count"].Value
+            histogram_bucket_count = if ($match.Groups["buckets"].Success) {
+                [int]$match.Groups["buckets"].Value
+            } else {
+                $null
+            }
+            result_ok_count = if ($match.Groups["ok"].Success) {
+                [int64]$match.Groups["ok"].Value
+            } else {
+                $null
+            }
+            result_failure_count = if ($match.Groups["failed"].Success) {
+                [int64]$match.Groups["failed"].Value
+            } else {
+                $null
+            }
+            active_session_at_shutdown = if ($match.Groups["active"].Success) {
+                $match.Groups["active"].Value -eq "true"
+            } else {
+                $null
+            }
             callback = [ordered]@{
                 sample_count = [int64]$match.Groups["count"].Value
                 mean = $null
@@ -261,6 +290,62 @@ function Get-PluginTimingSummaries {
         }
     }
     return @($summaries)
+}
+
+function Get-LifecycleIntegrity {
+    param(
+        [object[]]$Samples,
+        [int]$ExpectedSessions
+    )
+
+    $invalidSessions = 0
+    $updatesAfterTerminal = 0
+    $resultFailures = @($Samples | Where-Object result -ne "ok").Count
+    $beginCount = @($Samples | Where-Object stage -eq "begin").Count
+    $updateCount = @($Samples | Where-Object stage -eq "update").Count
+    $commitCount = @($Samples | Where-Object stage -eq "commit").Count
+    $cancelCount = @($Samples | Where-Object stage -eq "cancel").Count
+    $groups = @($Samples | Group-Object session_id)
+    foreach ($group in $groups) {
+        $ordered = @($group.Group | Sort-Object ordinal)
+        $begins = @($ordered | Where-Object stage -eq "begin")
+        $terminals = @($ordered | Where-Object { $_.stage -in @("commit", "cancel") })
+        if (
+            $begins.Count -ne 1 -or
+            $terminals.Count -ne 1 -or
+            $terminals[0].ordinal -le $begins[0].ordinal
+        ) {
+            $invalidSessions++
+            continue
+        }
+        $terminalOrdinal = $terminals[0].ordinal
+        $updatesAfterTerminal += @(
+            $ordered | Where-Object {
+                $_.stage -eq "update" -and $_.ordinal -gt $terminalOrdinal
+            }
+        ).Count
+    }
+    $passed = (
+        $groups.Count -ge $ExpectedSessions -and
+        $beginCount -eq $groups.Count -and
+        ($commitCount + $cancelCount) -eq $groups.Count -and
+        $updateCount -gt 0 -and
+        $resultFailures -eq 0 -and
+        $invalidSessions -eq 0 -and
+        $updatesAfterTerminal -eq 0
+    )
+    return [ordered]@{
+        minimum_expected_sessions = $ExpectedSessions
+        observed_sessions = $groups.Count
+        begin_count = $beginCount
+        update_count = $updateCount
+        commit_count = $commitCount
+        cancel_count = $cancelCount
+        result_failure_count = $resultFailures
+        invalid_session_count = $invalidSessions
+        updates_after_terminal = $updatesAfterTerminal
+        result = if ($passed) { "pass" } else { "fail" }
+    }
 }
 
 function Join-ByteArrays {
@@ -325,6 +410,35 @@ function Write-Utf8File {
     )
 
     [IO.File]::WriteAllText($Path, $Contents, [Text.UTF8Encoding]::new($false))
+}
+
+function Remove-TemporaryScenarioRoot {
+    param([string]$Path)
+
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    $systemTemporary = Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())
+    if (
+        $resolved -and
+        $resolved.Path.StartsWith($systemTemporary.Path, [StringComparison]::OrdinalIgnoreCase) -and
+        (Split-Path -Leaf $resolved.Path).StartsWith("gradial-plugin-performance-")
+    ) {
+        Remove-Item -LiteralPath $resolved.Path -Recurse -Force
+    }
+}
+
+function Read-UniqueLogEvidence {
+    param([IO.FileInfo[]]$Parts)
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $builder = [Text.StringBuilder]::new()
+    foreach ($part in $Parts) {
+        foreach ($line in [IO.File]::ReadLines($part.FullName)) {
+            if ($seen.Add($line)) {
+                [void]$builder.AppendLine($line)
+            }
+        }
+    }
+    return $builder.ToString()
 }
 
 function New-PluginFixture {
@@ -542,6 +656,8 @@ function Get-ScenarioResult {
     $stdoutPath = Join-Path $scenarioDirectory "interaction.stdout.txt"
     $stderrPath = Join-Path $scenarioDirectory "interaction.stderr.txt"
     $resourcePath = Join-Path $scenarioDirectory "resources.csv"
+    $progressPath = Join-Path $scenarioDirectory "completed-invocations.txt"
+    $soakLogEvidenceDirectory = Join-Path $scenarioDirectory "log-evidence"
     $originalLocalAppData = $env:LOCALAPPDATA
     $child = $null
     $resources = @()
@@ -579,13 +695,25 @@ function Get-ScenarioResult {
             "-InterInvocationDelayMilliseconds", $Preset.inter_invocation_delay_ms,
             "-WarmupSeconds", $Preset.warmup_seconds,
             "-PostInvocationIdleSeconds", $Preset.idle_seconds,
-            "-CaptureTiming",
-            "-CaptureDurationSeconds", $captureDuration,
             "-MonitorIndex", $TargetMonitor,
             "-ProcessIdFile", ('"' + $processIdFile + '"'),
-            "-PhaseFile", ('"' + $phaseFile + '"'),
-            "-TimingOutputDirectory", ('"' + $captureDirectory + '"')
+            "-PhaseFile", ('"' + $phaseFile + '"')
         )
+        if ($Preset.soak) {
+            $arguments += @(
+                "-SummaryValidationOnly",
+                "-ProgressFile", ('"' + $progressPath + '"'),
+                "-LogEvidenceDirectory", ('"' + $soakLogEvidenceDirectory + '"'),
+                "-PointerBurstEvents", $Preset.pointer_burst_events,
+                "-PointerBurstSettleMilliseconds", $Preset.pointer_burst_settle_ms
+            )
+        } else {
+            $arguments += @(
+                "-CaptureTiming",
+                "-CaptureDurationSeconds", $captureDuration,
+                "-TimingOutputDirectory", ('"' + $captureDirectory + '"')
+            )
+        }
         if ($Scenario -in @("active", "slow")) {
             $arguments += @("-PluginContinuous", "-ContinuousPercent", "75")
         } else {
@@ -636,9 +764,17 @@ function Get-ScenarioResult {
                 } else {
                     "startup"
                 }
+                $completedInvocations = 0
+                if (Test-Path -LiteralPath $progressPath) {
+                    [int]::TryParse(
+                        (Get-Content -Raw -LiteralPath $progressPath).Trim(),
+                        [ref]$completedInvocations
+                    ) | Out-Null
+                }
                 $resources += [pscustomobject]@{
                     captured_at = $now.ToString("o")
                     phase = $phase
+                    completed_invocations = $completedInvocations
                     working_set_mib = $process.WorkingSet64 / 1MB
                     private_memory_mib = $process.PrivateMemorySize64 / 1MB
                     cpu_percent = $cpuPercent
@@ -670,25 +806,42 @@ function Get-ScenarioResult {
             throw "$Configuration/$Scenario interaction failed with code $($child.ExitCode). $errorOutput"
         }
         $resources | Export-Csv -LiteralPath $resourcePath -NoTypeInformation -Encoding utf8
-        $logEvidenceDirectory = New-Item -ItemType Directory -Path (
-            Join-Path $scenarioDirectory "logs"
-        ) -Force
-        $logParts = @(
-            Get-ChildItem -LiteralPath (Join-Path $gradialDirectory "logs") -Filter "gradial*.log" |
-                Sort-Object LastWriteTime
-        )
-        foreach ($logPart in $logParts) {
-            Copy-Item -LiteralPath $logPart.FullName -Destination $logEvidenceDirectory
+        if ($Preset.soak) {
+            $logParts = @(
+                Get-ChildItem -LiteralPath $soakLogEvidenceDirectory -Filter "*.log" |
+                    Sort-Object Name
+            )
+        } else {
+            $logEvidenceDirectory = New-Item -ItemType Directory -Path (
+                Join-Path $scenarioDirectory "logs"
+            ) -Force
+            $logParts = @(
+                Get-ChildItem -LiteralPath (Join-Path $gradialDirectory "logs") -Filter "gradial*.log" |
+                    Sort-Object LastWriteTime
+            )
+            foreach ($logPart in $logParts) {
+                Copy-Item -LiteralPath $logPart.FullName -Destination $logEvidenceDirectory
+            }
         }
-        $log = ($logParts | ForEach-Object {
-            Get-Content -Raw -LiteralPath $_.FullName
-        }) -join [Environment]::NewLine
+        if ($logParts.Count -eq 0) {
+            throw "$Configuration/$Scenario retained no application log evidence."
+        }
+        $log = if ($Preset.soak) {
+            Read-UniqueLogEvidence $logParts
+        } else {
+            ($logParts | ForEach-Object {
+                Get-Content -Raw -LiteralPath $_.FullName
+            }) -join [Environment]::NewLine
+        }
         $succeeded = $true
     }
     finally {
         $env:LOCALAPPDATA = $originalLocalAppData
         if ($child -and -not $child.HasExited) {
             Stop-Process -Id $child.Id -Force
+        }
+        if (-not $succeeded) {
+            Remove-TemporaryScenarioRoot $temporaryRoot
         }
     }
 
@@ -703,6 +856,11 @@ function Get-ScenarioResult {
         $lifecycle = Get-PluginLifecycleSamples $log
         $timingSummaries = @(Get-PluginTimingSummaries $log)
         $allTiming = $timingSummaries | Where-Object stage -eq "all" | Select-Object -Last 1
+        $lifecycleIntegrity = if ($Preset.soak) {
+            Get-LifecycleIntegrity $lifecycle $Preset.invocation_count
+        } else {
+            $null
+        }
         $idle = @($resources | Where-Object phase -eq "idle")
         $idleCpu = [double[]]@(
             $idle | Select-Object -Skip 1 | Where-Object { $null -ne $_.cpu_percent } |
@@ -710,6 +868,31 @@ function Get-ScenarioResult {
         )
         $idleWorking = [double[]]@($idle | ForEach-Object { [double]$_.working_set_mib })
         $idlePrivate = [double[]]@($idle | ForEach-Object { [double]$_.private_memory_mib })
+        $postWarmup = @($resources | Where-Object {
+            $_.completed_invocations -ge 1000 -and $_.completed_invocations -lt 2000
+        })
+        $finalWindowStart = [Math]::Max(1000, $Preset.invocation_count - 1000)
+        $finalWindow = @($resources | Where-Object {
+            $_.completed_invocations -ge $finalWindowStart -and
+            $_.completed_invocations -le $Preset.invocation_count
+        })
+        $postWarmupWorking = Get-Statistics ([double[]]@(
+            $postWarmup | ForEach-Object { [double]$_.working_set_mib }
+        ))
+        $postWarmupPrivate = Get-Statistics ([double[]]@(
+            $postWarmup | ForEach-Object { [double]$_.private_memory_mib }
+        ))
+        $finalWorking = Get-Statistics ([double[]]@(
+            $finalWindow | ForEach-Object { [double]$_.working_set_mib }
+        ))
+        $finalPrivate = Get-Statistics ([double[]]@(
+            $finalWindow | ForEach-Object { [double]$_.private_memory_mib }
+        ))
+        $workingSetGrowth = if ($postWarmupWorking -and $finalWorking) {
+            $finalWorking.p95 - $postWarmupWorking.p95
+        } else {
+            $null
+        }
         $open = Get-MarkerDurations $markers "activation_dequeued" source_qpc "overlay_shown" marker_qpc
         $visualStart = if ($Scenario -in @("active", "slow")) {
             "continuous_value_requested"
@@ -763,7 +946,21 @@ function Get-ScenarioResult {
             $timingSummaries | Where-Object stage -eq "cancel" |
                 Select-Object -Last 1 -ExpandProperty callback_count
         )
-        $executionContract = if ($expectedCallbacks) {
+        $timingContract = (
+            $timingSummaries.Count -eq 5 -and
+            @($timingSummaries | Where-Object {
+                $_.histogram_bucket_count -ne 15 -or
+                $_.result_failure_count -ne 0 -or
+                $_.active_session_at_shutdown
+            }).Count -eq 0
+        )
+        $executionContract = if ($Preset.soak) {
+            $lifecycleIntegrity.result -eq "pass" -and
+            $beginCount -eq $lifecycleIntegrity.begin_count -and
+            $commitCount -eq $lifecycleIntegrity.commit_count -and
+            $cancelCount -eq $lifecycleIntegrity.cancel_count -and
+            $timingContract
+        } elseif ($expectedCallbacks) {
             $allTiming.callback_count -gt 0 -and
             $beginCount -ge $Preset.invocation_count -and
             $commitCount -ge $Preset.invocation_count
@@ -779,17 +976,90 @@ function Get-ScenarioResult {
         $health = [ordered]@{
             input_queue_overflows = ([regex]::Matches($log, "event_code=input_queue_overflow")).Count
             hook_heartbeat_misses = ([regex]::Matches($log, "event_code=hook_thread_unresponsive")).Count
-            focus_failures = ([regex]::Matches($log, "event_code=focus_checkpoint .*accepted=false")).Count
+            focus_failures = ([regex]::Matches($log, "event_code=focus_changed .*accepted=false")).Count
             renderer_failures = ([regex]::Matches(
                 $log,
                 "target=renderer .*result_code=failure"
             )).Count
+            continuous_failures = ([regex]::Matches(
+                $log,
+                "target=continuous .*result_code=failure"
+            )).Count
         }
         $healthContract = ($health.Values | Measure-Object -Sum).Sum -eq 0
-        $frameContract = (
+        $menuFrameIds = @(
+            [regex]::Matches(
+                $log,
+                "event_code=profile_menu_frame_ready .*invocation_id=(?<id>[0-9a-f-]+)"
+            ) | ForEach-Object { $_.Groups["id"].Value } | Sort-Object -Unique
+        )
+        $continuousCommitIds = @(
+            [regex]::Matches(
+                $log,
+                "event_code=continuous_meter_committed .*invocation_id=(?<id>[0-9a-f-]+)"
+            ) | ForEach-Object { $_.Groups["id"].Value } | Sort-Object -Unique
+        )
+        $discreteSelectionIds = @(
+            [regex]::Matches(
+                $log,
+                "event_code=slice_selected .*invocation_id=(?<id>[0-9a-f-]+)"
+            ) | ForEach-Object { $_.Groups["id"].Value } | Sort-Object -Unique
+        )
+        $invocationOutcomeIds = @(
+            @($continuousCommitIds) + @($discreteSelectionIds) | Sort-Object -Unique
+        )
+        $frameContract = if ($Preset.soak) {
+            $menuFrameIds.Count -gt 0 -and
+                $continuousCommitIds.Count -ge [Math]::Ceiling($Preset.invocation_count * 0.99) -and
+                $invocationOutcomeIds.Count -eq $Preset.invocation_count
+        } else {
             $open.Count -ge $Preset.invocation_count -and
             $visual.Count -ge $Preset.invocation_count
-        )
+        }
+        $interactionStop = [regex]::Matches(
+            $log,
+            "event_code=interaction_thread_stopped .*" +
+            "activation_down_events=(?<down>[0-9]+) .*" +
+            "activation_up_events=(?<up>[0-9]+) .*" +
+            "continuous_updates_dispatched=(?<dispatched>[0-9]+) " +
+            "continuous_updates_prioritized=(?<prioritized>[0-9]+) " +
+            "continuous_updates_coalesced=(?<coalesced>[0-9]+) cancel_events=(?<cancel>[0-9]+)"
+        ) | Select-Object -Last 1
+        $coalescingContract = if ($Preset.soak) {
+            $interactionStop -and
+            [int64]$interactionStop.Groups["down"].Value -eq $Preset.invocation_count -and
+            [int64]$interactionStop.Groups["up"].Value -eq $Preset.invocation_count -and
+            [int64]$interactionStop.Groups["dispatched"].Value -gt 0 -and
+            [int64]$interactionStop.Groups["prioritized"].Value -gt 0 -and
+            [int64]$interactionStop.Groups["coalesced"].Value -gt 0 -and
+            [int64]$interactionStop.Groups["cancel"].Value -eq 0
+        } else {
+            $true
+        }
+        $shutdownEvents = [ordered]@{}
+        foreach ($eventCode in @(
+            "action_executor_stopped",
+            "interaction_thread_stopped",
+            "hook_thread_stopped",
+            "plugin_worker_stopped"
+        )) {
+            $shutdownEvents[$eventCode] = ([regex]::Matches(
+                $log,
+                "event_code=$eventCode .*result_code=ok"
+            )).Count
+        }
+        $shutdownContract = @(
+            $shutdownEvents.Values | Where-Object { $_ -ne 1 }
+        ).Count -eq 0
+        $memoryContract = if ($Preset.qualifying_soak) {
+            $postWarmupWorking -and
+            $finalWorking -and
+            $postWarmupWorking.sample_count -ge 10 -and
+            $finalWorking.sample_count -ge 10 -and
+            $workingSetGrowth -le 10
+        } else {
+            $null
+        }
         $privacyContract = $log -notmatch (
             "disabled fixture source executed|faulted fixture source executed|" +
             "local function work"
@@ -818,6 +1088,11 @@ function Get-ScenarioResult {
                     commit = $commitCount
                     cancel = $cancelCount
                 }
+                lifecycle_integrity = $lifecycleIntegrity
+                timing_histogram_bucket_count = $allTiming.histogram_bucket_count
+                timing_result_ok_count = $allTiming.result_ok_count
+                timing_result_failure_count = $allTiming.result_failure_count
+                active_session_at_shutdown = $allTiming.active_session_at_shutdown
             }
             contracts = [ordered]@{
                 execution = if ($executionContract) { "pass" } else { "fail" }
@@ -825,11 +1100,35 @@ function Get-ScenarioResult {
                 frame_checkpoints = if ($frameContract) { "pass" } else { "fail" }
                 input_renderer_health = if ($healthContract) { "pass" } else { "fail" }
                 log_privacy = if ($privacyContract) { "pass" } else { "fail" }
+                bounded_timing_storage = if ($Preset.soak) {
+                    if ($timingContract) { "pass" } else { "fail" }
+                } else {
+                    "not_evaluated"
+                }
+                update_coalescing = if ($Preset.soak) {
+                    if ($coalescingContract) { "pass" } else { "fail" }
+                } else {
+                    "not_evaluated"
+                }
+                clean_shutdown = if ($Preset.soak) {
+                    if ($shutdownContract) { "pass" } else { "fail" }
+                } else {
+                    "not_evaluated"
+                }
+                post_warmup_memory_growth = if ($Preset.qualifying_soak) {
+                    if ($memoryContract) { "pass" } else { "fail" }
+                } else {
+                    "not_evaluated"
+                }
             }
             metrics = [ordered]@{
                 idle_cpu_percent = Get-Statistics $idleCpu
                 idle_working_set_mib = Get-Statistics $idleWorking
                 idle_private_memory_mib = Get-Statistics $idlePrivate
+                post_warmup_working_set_mib = $postWarmupWorking
+                final_working_set_mib = $finalWorking
+                post_warmup_private_memory_mib = $postWarmupPrivate
+                final_private_memory_mib = $finalPrivate
                 callback_duration_us = $allTiming.callback
                 callback_queue_wait_us = $allTiming.queue
                 application_open_checkpoint_ms = Get-Statistics $open
@@ -861,8 +1160,34 @@ function Get-ScenarioResult {
                 } else {
                     "unavailable"
                 }
+                unique_menu_frames = $menuFrameIds.Count
+                unique_continuous_commits = $continuousCommitIds.Count
+                unique_discrete_selections = $discreteSelectionIds.Count
+                unique_invocation_outcomes = $invocationOutcomeIds.Count
             }
             health = $health
+            soak = if ($Preset.soak) {
+                [ordered]@{
+                    qualifying_run = $Preset.qualifying_soak
+                    working_set_growth_p95_mib = $workingSetGrowth
+                    interaction = if ($interactionStop) {
+                        [ordered]@{
+                            activation_down = [int64]$interactionStop.Groups["down"].Value
+                            activation_up = [int64]$interactionStop.Groups["up"].Value
+                            updates_dispatched = [int64]$interactionStop.Groups["dispatched"].Value
+                            updates_prioritized = [int64]$interactionStop.Groups["prioritized"].Value
+                            updates_coalesced = [int64]$interactionStop.Groups["coalesced"].Value
+                            cancel_events = [int64]$interactionStop.Groups["cancel"].Value
+                        }
+                    } else {
+                        $null
+                    }
+                    shutdown_event_counts = $shutdownEvents
+                    archived_log_parts = $logParts.Count
+                }
+            } else {
+                $null
+            }
             evidence_directory = $scenarioDirectory.FullName
         }
         Write-Utf8File `
@@ -871,15 +1196,7 @@ function Get-ScenarioResult {
         return $result
     }
     finally {
-        $resolved = Resolve-Path -LiteralPath $temporaryRoot -ErrorAction SilentlyContinue
-        $systemTemporary = Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())
-        if (
-            $resolved -and
-            $resolved.Path.StartsWith($systemTemporary.Path, [StringComparison]::OrdinalIgnoreCase) -and
-            (Split-Path -Leaf $resolved.Path).StartsWith("gradial-plugin-performance-")
-        ) {
-            Remove-Item -LiteralPath $resolved.Path -Recurse -Force
-        }
+        Remove-TemporaryScenarioRoot $temporaryRoot
         if (-not $succeeded) {
             Write-Warning "$Configuration/$Scenario did not complete."
         }
@@ -917,14 +1234,43 @@ if ($SelfTest) {
         "event_code=plugin_callback_timing result_code=ok stage=all callback_count=7 " +
         "p50_callback_us=25 p95_callback_us=100 p99_callback_us=250 " +
         "maximum_callback_us=211 p50_queue_us=50 p95_queue_us=100 " +
-        "p99_queue_us=250 maximum_queue_us=201"
+        "p99_queue_us=250 maximum_queue_us=201 histogram_bucket_count=15 " +
+        "result_ok_count=7 result_failure_count=0 active_session_at_shutdown=false"
     )
     $summary = @(Get-PluginTimingSummaries $summaryLog)
     if (
         $summary.Count -ne 1 -or $summary[0].callback_count -ne 7 -or
-        $summary[0].callback.p95 -ne 100 -or $summary[0].queue.max -ne 201
+        $summary[0].callback.p95 -ne 100 -or $summary[0].queue.max -ne 201 -or
+        $summary[0].histogram_bucket_count -ne 15 -or
+        $summary[0].result_ok_count -ne 7 -or
+        $summary[0].active_session_at_shutdown
     ) {
         throw "Plugin timing aggregate analyzer self-test failed."
+    }
+    $integrityLog = @"
+event_code=plugin_lifecycle result_code=ok error_code=none plugin_id=org.gradial.performance session_id=00000000-0000-0000-0000-000000000001 stage=begin active_session=true queue_wait_us=1 callback_duration_us=2 total_duration_us=3
+event_code=plugin_lifecycle result_code=ok error_code=none plugin_id=org.gradial.performance session_id=00000000-0000-0000-0000-000000000001 stage=update active_session=true queue_wait_us=1 callback_duration_us=2 total_duration_us=3
+event_code=plugin_lifecycle result_code=ok error_code=none plugin_id=org.gradial.performance session_id=00000000-0000-0000-0000-000000000001 stage=commit active_session=false queue_wait_us=1 callback_duration_us=2 total_duration_us=3
+"@
+    $integrity = Get-LifecycleIntegrity @(Get-PluginLifecycleSamples $integrityLog) 1
+    if (
+        $integrity.result -ne "pass" -or
+        $integrity.observed_sessions -ne 1 -or
+        $integrity.updates_after_terminal -ne 0
+    ) {
+        throw "Plugin lifecycle integrity self-test failed."
+    }
+    $invalidIntegrityLog = $integrityLog + @"
+event_code=plugin_lifecycle result_code=ok error_code=none plugin_id=org.gradial.performance session_id=00000000-0000-0000-0000-000000000001 stage=update active_session=false queue_wait_us=1 callback_duration_us=2 total_duration_us=3
+"@
+    $invalidIntegrity = Get-LifecycleIntegrity `
+        @(Get-PluginLifecycleSamples $invalidIntegrityLog) `
+        1
+    if (
+        $invalidIntegrity.result -ne "fail" -or
+        $invalidIntegrity.updates_after_terminal -ne 1
+    ) {
+        throw "Plugin lifecycle integrity negative self-test failed."
     }
     $manifest = [Text.UTF8Encoding]::new($false).GetBytes("manifest")
     $source = [Text.UTF8Encoding]::new($false).GetBytes("source")
@@ -938,8 +1284,8 @@ if ($SelfTest) {
     return
 }
 
-if ($Mode -eq "Release" -and $Build -ne "release") {
-    throw "The release-duration protocol requires -Build release. Use Development mode to compare debug and release builds."
+if ($Mode -in @("Release", "Soak") -and $Build -ne "release") {
+    throw "Release and soak protocols require -Build release. Use Development mode to compare debug and release builds."
 }
 
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -968,8 +1314,23 @@ if (-not $PresentMonPath) {
 $presentMonAvailable = [bool](
     $PresentMonPath -and (Test-Path -LiteralPath $PresentMonPath)
 )
-$usePresentMon = $presentMonAvailable -and $isElevated -and -not $MarkersOnly
-$preset = if ($Mode -eq "Release") {
+$usePresentMon = (
+    $Mode -ne "Soak" -and $presentMonAvailable -and $isElevated -and -not $MarkersOnly
+)
+$preset = if ($Mode -eq "Soak") {
+    [ordered]@{
+        invocation_count = $SoakInvocationCount
+        warmup_seconds = 5
+        idle_seconds = 5
+        gesture_delay_ms = 0
+        inter_invocation_delay_ms = 2
+        sample_interval_ms = 250
+        pointer_burst_events = 4
+        pointer_burst_settle_ms = 35
+        soak = $true
+        qualifying_soak = $SoakInvocationCount -eq 10000
+    }
+} elseif ($Mode -eq "Release") {
     [ordered]@{
         invocation_count = 1000
         warmup_seconds = 300
@@ -977,6 +1338,8 @@ $preset = if ($Mode -eq "Release") {
         gesture_delay_ms = 50
         inter_invocation_delay_ms = 25
         sample_interval_ms = 1000
+        soak = $false
+        qualifying_soak = $false
     }
 } else {
     [ordered]@{
@@ -986,6 +1349,8 @@ $preset = if ($Mode -eq "Release") {
         gesture_delay_ms = 50
         inter_invocation_delay_ms = 25
         sample_interval_ms = 250
+        soak = $false
+        qualifying_soak = $false
     }
 }
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -993,7 +1358,11 @@ $reportDirectory = New-Item -ItemType Directory -Path (
     Join-Path $OutputDirectory "$timestamp-$($Mode.ToLowerInvariant())"
 ) -Force
 $results = @()
-$scenarios = @("disabled", "idle_enabled", "active", "slow", "faulted")
+$scenarios = if ($Mode -eq "Soak") {
+    @("active")
+} else {
+    @("disabled", "idle_enabled", "active", "slow", "faulted")
+}
 foreach ($configuration in $configurations) {
     foreach ($scenario in $scenarios) {
         Write-Host "Measuring $configuration/$scenario..."
@@ -1010,6 +1379,7 @@ foreach ($configuration in $configurations) {
 }
 
 $comparisons = @()
+if ($Mode -ne "Soak") {
 foreach ($configuration in $configurations) {
     $disabled = $results | Where-Object {
         $_.configuration -eq $configuration -and $_.scenario -eq "disabled"
@@ -1056,18 +1426,15 @@ foreach ($configuration in $configurations) {
         slow_fixture_timing = $slowDiagnostic
     }
 }
+}
 
 $contractFailures = @(
-    $results | Where-Object {
-        $_.contracts.execution -eq "fail" -or
-        $_.contracts.load_state -eq "fail" -or
-        $_.contracts.frame_checkpoints -eq "fail" -or
-        $_.contracts.input_renderer_health -eq "fail" -or
-        $_.contracts.log_privacy -eq "fail"
-    }
+    $results | Where-Object { $_.contracts.Values -contains "fail" }
 )
 $overall = if ($contractFailures.Count -gt 0) {
     "fail"
+} elseif ($Mode -eq "Soak" -and $preset.qualifying_soak) {
+    "pass"
 } elseif ($Mode -eq "Development") {
     "not_evaluated"
 } elseif ($comparisons.idle_enabled_working_set_gate -contains "fail") {
@@ -1076,7 +1443,7 @@ $overall = if ($contractFailures.Count -gt 0) {
     "not_evaluated"
 }
 $report = [ordered]@{
-    report_schema_version = 1
+    report_schema_version = 2
     captured_at = (Get-Date).ToUniversalTime().ToString("o")
     overall_gate_result = $overall
     protocol = [ordered]@{
@@ -1087,22 +1454,32 @@ $report = [ordered]@{
         warmup_seconds_per_scenario = $preset.warmup_seconds
         idle_seconds_per_scenario = $preset.idle_seconds
         release_duration_protocol = $Mode -eq "Release"
+        continuous_soak_protocol = $Mode -eq "Soak"
+        qualifying_continuous_soak = $preset.qualifying_soak
         complete_release_qualification = $false
     }
     capabilities = [ordered]@{
         elevated = $isElevated
-        presentmon = if ($usePresentMon) { "captured" } elseif ($presentMonAvailable) {
+        presentmon = if ($Mode -eq "Soak") {
+            "not_requested"
+        } elseif ($usePresentMon) { "captured" } elseif ($presentMonAvailable) {
             "installed_but_elevation_required"
         } else {
             "not_installed"
         }
-        timing_markers = "captured_per_scenario"
+        timing_markers = if ($Mode -eq "Soak") {
+            "not_requested"
+        } else {
+            "captured_per_scenario"
+        }
     }
     results = $results
     comparisons = $comparisons
     notes = @(
         "Development mode checks the harness and correctness contracts but does not qualify release resource or latency gates.",
         "Release mode evaluates the release-duration resource contract, but overall qualification remains not evaluated until displayed-frame and full input-to-callback latency gates are available.",
+        "Soak mode archives completed log rotations, de-duplicates exact lines, and validates every lifecycle session while production log retention remains bounded.",
+        "Only a release soak with exactly 10,000 sessions evaluates the post-warmup working-set gate and may pass overall.",
         "Disabled and faulted fixtures contain top-level failing Lua; zero callbacks and zero startup loads prove those sources stayed inert.",
         "Application checkpoints are diagnostic and do not substitute for PresentMon displayed-frame evidence.",
         "Callback queue wait starts when the continuous coordinator submits to the bounded plugin lane; it does not yet include the configured update-period wait."
@@ -1166,14 +1543,33 @@ foreach ($result in $results) {
         "$(Format-Number $result.metrics.hook_callback_us.p99) | $contracts |"
     )
 }
-$lines += @("", "## Comparisons", "")
-foreach ($comparison in $comparisons) {
-    $lines += (
-        "- $($comparison.configuration): idle-enabled working-set delta " +
-        "$(Format-Number $comparison.idle_enabled_working_set_delta_mib) MiB " +
-        "($($comparison.idle_enabled_working_set_gate)); slow timing " +
-        "$($comparison.slow_fixture_timing)."
+if ($Mode -eq "Soak") {
+    $soakResult = $results | Select-Object -First 1
+    $integrity = $soakResult.plugin.lifecycle_integrity
+    $lines += @(
+        "",
+        "## Continuous soak",
+        "",
+        "- Sessions: $($integrity.observed_sessions) observed; minimum $($integrity.minimum_expected_sessions).",
+        "- Lifecycle: Begin $($integrity.begin_count), Update $($integrity.update_count), Commit $($integrity.commit_count), Cancel $($integrity.cancel_count).",
+        "- Invalid sessions: $($integrity.invalid_session_count); updates after terminal: $($integrity.updates_after_terminal); failed callbacks: $($integrity.result_failure_count).",
+        "- Coalesced visual updates: $($soakResult.soak.interaction.updates_coalesced).",
+        "- Post-warmup working-set p95: $(Format-Number $soakResult.metrics.post_warmup_working_set_mib.p95) MiB.",
+        "- Final-window working-set p95: $(Format-Number $soakResult.metrics.final_working_set_mib.p95) MiB.",
+        "- Working-set p95 growth: $(Format-Number $soakResult.soak.working_set_growth_p95_mib) MiB (limit 10 MiB).",
+        "- Archived log parts: $($soakResult.soak.archived_log_parts)."
     )
+}
+if ($Mode -ne "Soak") {
+    $lines += @("", "## Comparisons", "")
+    foreach ($comparison in $comparisons) {
+        $lines += (
+            "- $($comparison.configuration): idle-enabled working-set delta " +
+            "$(Format-Number $comparison.idle_enabled_working_set_delta_mib) MiB " +
+            "($($comparison.idle_enabled_working_set_gate)); slow timing " +
+            "$($comparison.slow_fixture_timing)."
+        )
+    }
 }
 $lines += @("", "## Notes", "")
 foreach ($note in $report.notes) {
