@@ -82,3 +82,7 @@ notification, open a socket, launch a process, access files, or otherwise ask
 Windows to do anything. `input.shortcut`, `notification`, and
 `network.loopback` remain separate permission-checked capability brokers for
 later Milestone 3 slices.
+
+Subsequent status (2026-08-10): `input.shortcut` is now implemented as that
+separate broker. `notification` and `network.loopback` remain deferred. See
+`milestone-3-shortcut-capability-results.md` for the new boundary and evidence.

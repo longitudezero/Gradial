@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use gradial_core::{
     ContinuousBeginRequest, ContinuousCancelReason, ContinuousCancelRequest,
@@ -9,8 +14,10 @@ use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value};
 use uuid::Uuid;
 
 use crate::{
-    LUA_HOOK_INTERVAL, LoadedLuaPlugin, LuaSandboxError, LuaSandboxLimits, PluginSourceImage,
-    sandbox::{classify_mlua_error, execute_with_limits},
+    LUA_HOOK_INTERVAL, LoadedLuaPlugin, LuaCallbackPhase, LuaCapabilityHost, LuaSandboxError,
+    LuaSandboxLimits, PluginSourceImage,
+    host::deny_all_capability_host,
+    sandbox::{LuaCallbackScope, classify_mlua_error, execute_with_limits},
 };
 
 pub const LUA_BEGIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -140,7 +147,25 @@ impl LuaLifecycleAdapter {
         image: PluginSourceImage,
         sandbox_limits: LuaSandboxLimits,
     ) -> Result<Self, LuaSandboxError> {
-        Self::load_with_callback_limits(image, sandbox_limits, LuaCallbackLimits::default())
+        Self::load_with_capability_host(image, sandbox_limits, deny_all_capability_host())
+    }
+
+    /// Loads and validates callbacks with a nonblocking capability host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sandbox/load error or a stable missing/invalid callback code.
+    pub fn load_with_capability_host(
+        image: PluginSourceImage,
+        sandbox_limits: LuaSandboxLimits,
+        capability_host: Arc<dyn LuaCapabilityHost>,
+    ) -> Result<Self, LuaSandboxError> {
+        Self::load_with_callback_limits_and_capability_host(
+            image,
+            sandbox_limits,
+            LuaCallbackLimits::default(),
+            capability_host,
+        )
     }
 
     /// Loads and validates all four required callbacks with bounded custom
@@ -155,8 +180,23 @@ impl LuaLifecycleAdapter {
         sandbox_limits: LuaSandboxLimits,
         callback_limits: LuaCallbackLimits,
     ) -> Result<Self, LuaSandboxError> {
+        Self::load_with_callback_limits_and_capability_host(
+            image,
+            sandbox_limits,
+            callback_limits,
+            deny_all_capability_host(),
+        )
+    }
+
+    fn load_with_callback_limits_and_capability_host(
+        image: PluginSourceImage,
+        sandbox_limits: LuaSandboxLimits,
+        callback_limits: LuaCallbackLimits,
+        capability_host: Arc<dyn LuaCapabilityHost>,
+    ) -> Result<Self, LuaSandboxError> {
         callback_limits.validate()?;
-        let plugin = LoadedLuaPlugin::load(image, sandbox_limits)?;
+        let plugin =
+            LoadedLuaPlugin::load_with_capability_host(image, sandbox_limits, capability_host)?;
         let entry: Table = plugin.lua.registry_value(&plugin.entry).map_err(classify_mlua_error)?;
         let callbacks = CallbackSet {
             begin: required_callback(&plugin.lua, &entry, "begin")?,
@@ -197,6 +237,7 @@ impl LuaLifecycleAdapter {
             self.plugin.lua.registry_value(&self.callbacks.begin).map_err(classify_mlua_error);
         let function: Function = self.accept_plugin_result(function_result)?;
         let budget = self.limits.begin;
+        let scope = self.enter_callback_scope(session_id, LuaCallbackPhase::Begin)?;
         let result = execute_with_limits(
             &self.plugin.gate,
             &self.plugin.host_error,
@@ -204,6 +245,7 @@ impl LuaLifecycleAdapter {
             budget.instructions,
             || function.call::<MultiValue>((context, parameters, initial)),
         );
+        drop(scope);
         let returns = match result {
             Ok(returns) => returns,
             Err(error) => return self.fail(error),
@@ -234,7 +276,12 @@ impl LuaLifecycleAdapter {
         let session = self.active_session(request.session_id())?;
         let sample_result = sample_table(&self.plugin.lua, request.sample());
         let sample = self.accept_host_value(sample_result)?;
-        self.call_no_return(CallbackPhase::Update, session, Value::Table(sample))
+        self.call_no_return(
+            LuaCallbackPhase::Update,
+            request.session_id(),
+            session,
+            Value::Table(sample),
+        )
     }
 
     /// Removes the matching session before making its one terminal `commit`
@@ -248,7 +295,12 @@ impl LuaLifecycleAdapter {
         let session = self.take_session(request.session_id())?;
         let sample_result = sample_table(&self.plugin.lua, request.final_sample());
         let sample = self.accept_host_value(sample_result)?;
-        self.call_no_return(CallbackPhase::Commit, session, Value::Table(sample))
+        self.call_no_return(
+            LuaCallbackPhase::Commit,
+            request.session_id(),
+            session,
+            Value::Table(sample),
+        )
     }
 
     /// Removes the matching session before making its one best-effort
@@ -266,7 +318,12 @@ impl LuaLifecycleAdapter {
             .create_string(cancel_reason(request.reason()))
             .map_err(classify_mlua_error);
         let reason = self.accept_plugin_result(reason_result)?;
-        self.call_no_return(CallbackPhase::Cancel, session, Value::String(reason))
+        self.call_no_return(
+            LuaCallbackPhase::Cancel,
+            request.session_id(),
+            session,
+            Value::String(reason),
+        )
     }
 
     #[must_use]
@@ -307,17 +364,20 @@ impl LuaLifecycleAdapter {
 
     fn call_no_return(
         &mut self,
-        phase: CallbackPhase,
+        phase: LuaCallbackPhase,
+        session_id: Uuid,
         session: Table,
         argument: Value,
     ) -> Result<(), LuaSandboxError> {
         let (callback, budget) = match phase {
-            CallbackPhase::Update => (&self.callbacks.update, self.limits.update),
-            CallbackPhase::Commit => (&self.callbacks.commit, self.limits.commit),
-            CallbackPhase::Cancel => (&self.callbacks.cancel, self.limits.cancel),
+            LuaCallbackPhase::Update => (&self.callbacks.update, self.limits.update),
+            LuaCallbackPhase::Commit => (&self.callbacks.commit, self.limits.commit),
+            LuaCallbackPhase::Cancel => (&self.callbacks.cancel, self.limits.cancel),
+            LuaCallbackPhase::Begin => return self.fail(LuaSandboxError::Runtime),
         };
         let function_result = self.plugin.lua.registry_value(callback).map_err(classify_mlua_error);
         let function: Function = self.accept_plugin_result(function_result)?;
+        let scope = self.enter_callback_scope(session_id, phase)?;
         let result = execute_with_limits(
             &self.plugin.gate,
             &self.plugin.host_error,
@@ -325,6 +385,7 @@ impl LuaLifecycleAdapter {
             budget.instructions,
             || function.call::<MultiValue>((session, argument)),
         );
+        drop(scope);
         match result {
             Ok(returns) if returns.is_empty() => Ok(()),
             Ok(_) => self.fail(LuaSandboxError::CallbackReturnInvalid),
@@ -360,6 +421,21 @@ impl LuaLifecycleAdapter {
             Err(error) => self.fail(error),
         }
     }
+
+    fn enter_callback_scope(
+        &self,
+        session_id: Uuid,
+        phase: LuaCallbackPhase,
+    ) -> Result<CallbackScopeGuard, LuaSandboxError> {
+        let mut active =
+            self.plugin.callback_scope.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.is_some() {
+            return Err(LuaSandboxError::Runtime);
+        }
+        *active = Some(LuaCallbackScope { session_id, phase });
+        drop(active);
+        Ok(CallbackScopeGuard { scope: Arc::clone(&self.plugin.callback_scope) })
+    }
 }
 
 impl fmt::Debug for LuaLifecycleAdapter {
@@ -373,11 +449,14 @@ impl fmt::Debug for LuaLifecycleAdapter {
     }
 }
 
-#[derive(Clone, Copy)]
-enum CallbackPhase {
-    Update,
-    Commit,
-    Cancel,
+struct CallbackScopeGuard {
+    scope: Arc<Mutex<Option<LuaCallbackScope>>>,
+}
+
+impl Drop for CallbackScopeGuard {
+    fn drop(&mut self) {
+        *self.scope.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 fn required_callback(
@@ -554,12 +633,14 @@ const fn cancel_reason(reason: ContinuousCancelReason) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+    use std::{collections::BTreeMap, path::PathBuf, sync::Mutex, time::Duration};
 
     use gradial_core::{
         ContinuousActionSnapshot, ContinuousRequest, ContinuousSession,
-        PermittedApplicationContext, PluginActionId, PluginId,
+        PermittedApplicationContext, PluginActionId, PluginId, PluginShortcutChord,
     };
+
+    use crate::{LuaCapabilityRejection, LuaCapabilityStatus};
 
     use super::*;
 
@@ -661,6 +742,27 @@ mod tests {
 
     fn entry(adapter: &LuaLifecycleAdapter) -> Table {
         adapter.plugin.lua.registry_value(&adapter.plugin.entry).expect("entry table")
+    }
+
+    #[derive(Default)]
+    struct RecordingCapabilityHost {
+        calls: Mutex<Vec<(Uuid, LuaCallbackPhase, PluginShortcutChord)>>,
+        rejection: Mutex<Option<LuaCapabilityRejection>>,
+    }
+
+    impl LuaCapabilityHost for RecordingCapabilityHost {
+        fn request_shortcut(
+            &self,
+            session_id: Uuid,
+            phase: LuaCallbackPhase,
+            shortcut: PluginShortcutChord,
+        ) -> LuaCapabilityStatus {
+            self.calls.lock().expect("calls").push((session_id, phase, shortcut));
+            self.rejection
+                .lock()
+                .expect("rejection")
+                .map_or(LuaCapabilityStatus::Accepted, LuaCapabilityStatus::Rejected)
+        }
     }
 
     #[test]
@@ -771,6 +873,84 @@ mod tests {
         };
 
         adapter.begin(&request).expect("begin without context permissions");
+    }
+
+    #[test]
+    fn protected_shortcut_host_uses_the_exact_callback_scope() {
+        let source = r#"
+            local inactive, inactive_reason = gradial.input.shortcut("a")
+            assert(not inactive and inactive_reason == "inactive_session")
+            assert(not pcall(function() gradial.input.shortcut = function() end end))
+            return {
+                begin = function(context, parameters, initial)
+                    local accepted, reason = gradial.input.shortcut("left_control+right")
+                    assert(accepted and reason == nil)
+                    return {}
+                end,
+                update = function(session, sample)
+                    local accepted = gradial.input.shortcut("f14")
+                    assert(accepted)
+                end,
+                commit = function(session, sample)
+                    local accepted = gradial.input.shortcut("page_down")
+                    assert(accepted)
+                end,
+                cancel = function(session, reason) end,
+            }
+        "#;
+        let host = Arc::new(RecordingCapabilityHost::default());
+        let mut adapter = LuaLifecycleAdapter::load_with_capability_host(
+            image(source),
+            LuaSandboxLimits::default(),
+            host.clone(),
+        )
+        .expect("adapter");
+        let session_id = Uuid::from_u128(10);
+        let (mut session, begin) = begin_request(session_id);
+        adapter.begin(&begin).expect("begin");
+        adapter.update(&update_request(&mut session, 0.6)).expect("update");
+        adapter.commit(&commit_request(&mut session, 0.8)).expect("commit");
+
+        let calls = host.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|(found, _, _)| *found == session_id));
+        assert_eq!(calls[0].1, LuaCallbackPhase::Begin);
+        assert_eq!(calls[0].2.key().scan_code, 0x4D);
+        assert_eq!(calls[1].1, LuaCallbackPhase::Update);
+        assert_eq!(calls[1].2.key().scan_code, 0x65);
+        assert_eq!(calls[2].1, LuaCallbackPhase::Commit);
+        assert_eq!(calls[2].2.key().scan_code, 0x51);
+    }
+
+    #[test]
+    fn shortcut_host_returns_bounded_rejection_reasons_without_faulting_lua() {
+        let source = source(
+            r#"
+                local malformed, malformed_reason = gradial.input.shortcut("Control + A")
+                assert(not malformed and malformed_reason == "invalid_shortcut")
+                local wrong_type, wrong_type_reason = gradial.input.shortcut({})
+                assert(not wrong_type and wrong_type_reason == "invalid_shortcut")
+                local accepted, reason = gradial.input.shortcut("a")
+                assert(not accepted and reason == "permission_denied")
+                return {}
+            "#,
+            "",
+            "",
+            "",
+        );
+        let host = Arc::new(RecordingCapabilityHost::default());
+        *host.rejection.lock().expect("rejection") = Some(LuaCapabilityRejection::PermissionDenied);
+        let mut adapter = LuaLifecycleAdapter::load_with_capability_host(
+            image(&source),
+            LuaSandboxLimits::default(),
+            host.clone(),
+        )
+        .expect("adapter");
+        let (_session, begin) = begin_request(Uuid::from_u128(11));
+
+        adapter.begin(&begin).expect("handled rejection");
+        assert!(!adapter.is_faulted());
+        assert_eq!(host.calls.lock().expect("calls").len(), 1);
     }
 
     #[test]

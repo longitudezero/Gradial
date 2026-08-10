@@ -3,7 +3,7 @@
 ## Current milestone scope
 
 The foundation, Milestone 0 interaction spike, completed bounded Milestone 1
-and Milestone 2 slices, and the first three bounded Milestone 3 slices establish:
+and Milestone 2 slices, and the completed bounded Milestone 3 slices establish:
 
 - A Rust 2024 workspace pinned to the installed Rust 1.97.1 toolchain.
 - A reusable `gradial-core` crate.
@@ -141,6 +141,9 @@ and Milestone 2 slices, and the first three bounded Milestone 3 slices establish
   invocation-down, admits only enabled manifest actions, uses the manifest
   update cadence, revalidates the captured target, and dispatches bounded Lua
   Begin/Update/Commit/Cancel callbacks off the interaction thread.
+- Permission-filtered plugin application/title context and a bounded
+  `input.shortcut` broker that reuses full frozen-target validation and
+  synthesized-key cleanup outside Lua and interaction threads.
 - Manifest-backed continuous action authoring with typed, bounded parameter
   controls and a separate per-wedge continuous checkbox for Global and every
   application profile.
@@ -858,7 +861,10 @@ coroutines, global `require`, `load`, `loadfile`, `dofile`, `collectgarbage`,
 `print`, `warn`, `rawset`, and `string.dump`. Native modules and bytecode have
 already failed source-image construction, and every executed chunk is
 explicitly text-only. The `gradial` host table is a protected proxy and exposes
-only the private module loader in this slice—no context or OS capability.
+the private module loader. An enabled lifecycle adapter also attaches the
+protected `gradial.input.shortcut` function described below; it has no effect
+outside an active callback and delegates all Windows work to the capability
+broker.
 
 Lua authors load another file with:
 
@@ -1069,12 +1075,65 @@ Begin that times out while queued is explicitly aborted through the reserved
 terminal lane; the worker either rejects it before Lua or cancels it after Lua
 accepts, so it cannot leave an orphan session.
 
-This slice exposes no host capability. Context permissions reveal only the
-owned immutable values above and cannot request an operating-system effect.
 Settings can create actions for enabled manifest controls, edit their generic
 parameters without running plugin code, and assign them independently beyond
-any Global or application-profile wedge. All operating-system capability
-brokers remain later Milestone 3 work.
+any Global or application-profile wedge. The first operating-system capability
+is the separately permissioned shortcut broker described below.
+
+## `input.shortcut` capability broker
+
+An enabled plugin whose reviewed manifest declares `input.shortcut` receives a
+protected `gradial.input.shortcut(chord)` function. It accepts exactly one
+readable whole chord and returns either `true, nil` when the request enters the
+bounded broker, or `false, reason` when Gradial rejects it. Rejection reasons
+are stable, bounded strings: `inactive_session`, `permission_denied`,
+`rate_limited`, `busy`, `invalid_shortcut`, or `cancelled`. A rejection is not
+itself a Lua fault, so plugin code can handle it without an exception.
+
+The chord grammar is lowercase tokens separated by `+`, with every modifier
+before exactly one primary key. Modifiers are side-specific:
+`left_control`, `right_control`, `left_alt`, `right_alt`, `left_shift`,
+`right_shift`, `left_windows`, and `right_windows`. Primary names cover the
+same letters, digits, punctuation, F1-F24, navigation keys, arrows,
+`browser_back`, `international_backslash`, and `numpad_plus` that Gradial's
+shortcut editor supports. For example:
+
+```lua
+local accepted, reason = gradial.input.shortcut("left_control+right")
+```
+
+The string is limited to 128 bytes. There is no raw scan-code interface, mouse
+input, text injection, key-down/key-up split, held-key state, arbitrary event
+array, or shell interpretation. The host value and nested `input` object are
+read-only proxies.
+
+Each live continuous invocation opens one capability epoch containing the
+plugin identity, frozen invocation target, and current approved permission.
+Begin, Update, and Commit may enqueue requests; Cancel always rejects them.
+Gradial accepts at most 30 requests in any one-second window and uses a
+32-item nonblocking queue. Exceeding either bound fails that session closed.
+Permission reconciliation can revoke an open epoch and cancels pending work.
+The Lua callback never waits for Windows input.
+
+The broker calls the existing scan-code shortcut backend on its own worker.
+Immediately before injection that backend revalidates the frozen window handle,
+PID, process start time, foreground identity, and integrity level. Cancellation,
+shutdown, target loss, elevation, or injection failure stops the session. Any
+partly synthesized chord is released in reverse order, so a failed request
+cannot leave a Gradial-generated key held down.
+
+Commit stops new requests and drains accepted work within the coordinator's
+existing terminal deadline. A timeout cancels the epoch. Cancellation closes
+the epoch before Lua's Cancel callback runs, making Cancel side-effect-free.
+Operational failures reach the continuous coordinator as redacted stable codes;
+logs never contain the chord, target fields, Lua values, or host payload.
+
+The checked-in `examples/plugins/org.gradial.example.shortcut-bands` package is
+the positive authoring example. It divides the scalar into two to twelve bands
+and sends at most one whole request per 20 Hz callback. A large jump therefore
+catches up over later updates instead of producing an input burst. Its real
+manifest and Lua source cross the worker and fake bounded broker in the test
+suite.
 
 ## Configuration and profile resolution
 

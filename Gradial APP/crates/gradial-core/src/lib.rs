@@ -1,6 +1,7 @@
 //! Platform-independent building blocks for Gradial.
 
 pub mod actions;
+pub mod capabilities;
 pub mod configuration;
 pub mod continuous;
 pub mod geometry;
@@ -14,6 +15,9 @@ pub use actions::{
     ActionResult, ContinuousActionBinding, DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation,
     ExecutionPlan, ExecutionStep, MAX_ACTION_SEQUENCE_DEPTH, MAX_ACTION_SEQUENCE_DURATION_MS,
     MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
+};
+pub use capabilities::{
+    MAX_PLUGIN_SHORTCUT_CHORD_BYTES, PluginShortcutChord, PluginShortcutParseError,
 };
 pub use configuration::{
     ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,

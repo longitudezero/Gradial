@@ -3,6 +3,7 @@
 mod action_executor;
 mod action_target;
 mod application;
+mod capability_broker;
 mod configuration;
 mod continuous_executor;
 mod continuous_study;

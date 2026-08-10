@@ -20,6 +20,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    capability_broker::{
+        ShortcutCapabilityClient, ShortcutCapabilityFailure, ShortcutCapabilityRuntime,
+    },
     plugin_discovery::{
         DiscoveredPlugin, PluginDiscoveryReport, PluginPackageStatus, discover_plugins,
         log_discovery_report,
@@ -44,6 +47,7 @@ pub(crate) struct PluginActionAdmission {
     update_hz: u16,
     context_application: bool,
     context_window_title: bool,
+    input_shortcut: bool,
 }
 
 impl PluginActionAdmission {
@@ -52,6 +56,7 @@ impl PluginActionAdmission {
             update_hz,
             context_application: permissions.contains(&PluginPermission::ContextApplication),
             context_window_title: permissions.contains(&PluginPermission::ContextWindowTitle),
+            input_shortcut: permissions.contains(&PluginPermission::InputShortcut),
         }
     }
 
@@ -65,6 +70,10 @@ impl PluginActionAdmission {
 
     pub(crate) const fn permits_context_window_title(self) -> bool {
         self.context_window_title
+    }
+
+    pub(crate) const fn permits_input_shortcut(self) -> bool {
+        self.input_shortcut
     }
 
     #[cfg(test)]
@@ -392,6 +401,7 @@ pub(crate) struct PluginLifecycleClient {
     updates: Sender<PluginLifecycleCommand>,
     terminals: Sender<PluginLifecycleCommand>,
     action_catalog: SharedPluginActionCatalog,
+    shortcut_capabilities: ShortcutCapabilityClient,
     shutdown_requested: Arc<AtomicBool>,
 }
 
@@ -420,6 +430,7 @@ impl PluginLifecycleClient {
             updates,
             terminals,
             action_catalog: Arc::new(RwLock::new(Arc::new(action_catalog))),
+            shortcut_capabilities: ShortcutCapabilityClient::inert_for_test(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -471,6 +482,32 @@ impl PluginLifecycleClient {
             Err(TrySendError::Disconnected(_)) => Err(PluginLifecycleSubmitError::Unavailable),
         }
     }
+
+    pub(crate) fn open_shortcut_session(
+        &self,
+        session_id: Uuid,
+        plugin_id: &PluginId,
+        target: Arc<gradial_core::InvocationContext>,
+        permitted: bool,
+    ) -> Result<(), ShortcutCapabilityFailure> {
+        self.shortcut_capabilities.open_session(session_id, plugin_id.as_str(), target, permitted)
+    }
+
+    pub(crate) fn shortcut_failure(&self, session_id: Uuid) -> Option<ShortcutCapabilityFailure> {
+        self.shortcut_capabilities.failure(session_id)
+    }
+
+    pub(crate) fn cancel_shortcut_session(&self, session_id: Uuid) {
+        self.shortcut_capabilities.cancel_session(session_id);
+    }
+
+    pub(crate) fn finish_shortcut_commit(
+        &self,
+        session_id: Uuid,
+        deadline: std::time::Instant,
+    ) -> Result<(), ShortcutCapabilityFailure> {
+        self.shortcut_capabilities.finish_commit(session_id, deadline)
+    }
 }
 
 #[derive(Debug)]
@@ -480,10 +517,21 @@ pub(crate) struct PluginWorkerRuntime {
     shutdown_requested: Arc<AtomicBool>,
     stopped: Receiver<()>,
     join_handle: Option<JoinHandle<()>>,
+    shortcut_capabilities: ShortcutCapabilityRuntime,
 }
 
 impl PluginWorkerRuntime {
     pub(crate) fn start(paths: AppPaths) -> Result<Self> {
+        let shortcut_capabilities = ShortcutCapabilityRuntime::start()
+            .context("could not start the shortcut capability broker")?;
+        Self::start_with_shortcut_capabilities(paths, shortcut_capabilities)
+    }
+
+    fn start_with_shortcut_capabilities(
+        paths: AppPaths,
+        shortcut_capabilities: ShortcutCapabilityRuntime,
+    ) -> Result<Self> {
+        let shortcut_client = shortcut_capabilities.client();
         let (command_sender, commands) = bounded(COMMAND_CAPACITY);
         let (begin_sender, begins) = bounded(LIFECYCLE_BEGIN_CAPACITY);
         let (update_sender, updates) = bounded(LIFECYCLE_UPDATE_CAPACITY);
@@ -493,11 +541,16 @@ impl PluginWorkerRuntime {
         let action_catalog = Arc::new(RwLock::new(Arc::new(BTreeMap::new())));
         let worker_shutdown = Arc::clone(&shutdown_requested);
         let worker_action_catalog = Arc::clone(&action_catalog);
+        let worker_shortcut_client = shortcut_client.clone();
         let join_handle = thread::Builder::new()
             .name("gradial-plugin-worker".to_owned())
             .spawn(move || {
-                let mut worker =
-                    PluginWorker::bootstrap(paths, &worker_shutdown, worker_action_catalog);
+                let mut worker = PluginWorker::bootstrap(
+                    paths,
+                    &worker_shutdown,
+                    worker_action_catalog,
+                    worker_shortcut_client,
+                );
                 worker.run(&commands, &begins, &updates, &terminals, &worker_shutdown);
                 let _sent = stopped_sender.try_send(());
             })
@@ -515,6 +568,7 @@ impl PluginWorkerRuntime {
             updates: update_sender,
             terminals: terminal_sender,
             action_catalog,
+            shortcut_capabilities: shortcut_client,
             shutdown_requested: Arc::clone(&shutdown_requested),
         };
         Ok(Self {
@@ -523,6 +577,7 @@ impl PluginWorkerRuntime {
             shutdown_requested,
             stopped,
             join_handle: Some(join_handle),
+            shortcut_capabilities,
         })
     }
 
@@ -612,6 +667,7 @@ impl PluginWorkerRuntime {
                 SHUTDOWN_WAIT.as_millis()
             ),
         }
+        self.shortcut_capabilities.shutdown();
     }
 }
 
@@ -627,6 +683,7 @@ struct PluginWorker {
     state: PluginTrustState,
     adapters: BTreeMap<String, LoadedPlugin>,
     action_catalog: SharedPluginActionCatalog,
+    shortcut_capabilities: ShortcutCapabilityClient,
     aborted_begins: BTreeSet<Uuid>,
     active_session: Option<ActivePluginSession>,
     reconciliation_deferred: bool,
@@ -651,6 +708,7 @@ impl PluginWorker {
         paths: AppPaths,
         shutdown_requested: &AtomicBool,
         action_catalog: SharedPluginActionCatalog,
+        shortcut_capabilities: ShortcutCapabilityClient,
     ) -> Self {
         let store = PluginStateStore::new(paths.clone());
         let loaded = store.load_or_initialize();
@@ -680,6 +738,7 @@ impl PluginWorker {
             state: loaded.state,
             adapters: BTreeMap::new(),
             action_catalog,
+            shortcut_capabilities,
             aborted_begins: BTreeSet::new(),
             active_session: None,
             reconciliation_deferred: false,
@@ -724,7 +783,7 @@ impl PluginWorker {
                     continue;
                 }
                 let plugin_id = package.directory_name.clone();
-                match load_plugin(package) {
+                match load_plugin(package, &self.shortcut_capabilities) {
                     Ok(plugin) => {
                         self.adapters.insert(plugin_id.clone(), plugin);
                         log_operation(
@@ -1112,7 +1171,8 @@ impl PluginWorker {
             ));
         }
 
-        let candidate = load_plugin(&package).map_err(PluginWorkerError::Lua)?;
+        let candidate =
+            load_plugin(&package, &self.shortcut_capabilities).map_err(PluginWorkerError::Lua)?;
         let mut proposed = self.state.clone();
         proposed.record_successful_load(&package).map_err(PluginWorkerError::StateTransition)?;
         self.persist(&proposed)?;
@@ -1149,7 +1209,7 @@ impl PluginWorker {
         }
 
         self.adapters.remove(plugin_id);
-        let candidate = match load_plugin(&package) {
+        let candidate = match load_plugin(&package, &self.shortcut_capabilities) {
             Ok(candidate) => candidate,
             Err(error) => {
                 self.persist_adapter_fault(plugin_id);
@@ -1308,6 +1368,14 @@ impl PluginWorker {
                 })
             })
             .collect();
+        let shortcut_permissions = self
+            .adapters
+            .iter()
+            .map(|(plugin_id, plugin)| {
+                (plugin_id.clone(), plugin.permissions.contains(&PluginPermission::InputShortcut))
+            })
+            .collect();
+        self.shortcut_capabilities.reconcile_permissions(&shortcut_permissions);
         let mut published =
             self.action_catalog.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         *published = Arc::new(catalog);
@@ -1421,11 +1489,18 @@ fn ensure_compatible(package: &DiscoveredPlugin) -> Result<(), PluginWorkerError
     }
 }
 
-fn load_plugin(package: &DiscoveredPlugin) -> Result<LoadedPlugin, LuaSandboxError> {
+fn load_plugin(
+    package: &DiscoveredPlugin,
+    shortcut_capabilities: &ShortcutCapabilityClient,
+) -> Result<LoadedPlugin, LuaSandboxError> {
     let PluginPackageStatus::Compatible { manifest, sources, .. } = &package.status else {
         return Err(LuaSandboxError::Initialization);
     };
-    let adapter = LuaLifecycleAdapter::load(sources.clone(), LuaSandboxLimits::default())?;
+    let adapter = LuaLifecycleAdapter::load_with_capability_host(
+        sources.clone(),
+        LuaSandboxLimits::default(),
+        Arc::new(shortcut_capabilities.clone()),
+    )?;
     let actions =
         manifest.actions.iter().cloned().map(|action| (action.id.clone(), action)).collect();
     Ok(LoadedPlugin { adapter, actions, permissions: manifest.permissions.clone() })
@@ -1470,7 +1545,7 @@ mod tests {
 
     use gradial_core::{
         ContinuousActionSnapshot, ContinuousCancelReason, ContinuousSession, PermittedContext,
-        PluginActionId,
+        PluginActionId, PluginValue,
     };
 
     use super::*;
@@ -1483,6 +1558,11 @@ mod tests {
         include_str!("../../../examples/plugins/org.gradial.example.meter/plugin.toml");
     const METER_SOURCE: &str =
         include_str!("../../../examples/plugins/org.gradial.example.meter/main.lua");
+    const SHORTCUT_BANDS_PLUGIN: &str = "org.gradial.example.shortcut-bands";
+    const SHORTCUT_BANDS_MANIFEST: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.shortcut-bands/plugin.toml");
+    const SHORTCUT_BANDS_SOURCE: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.shortcut-bands/main.lua");
     const VALID_SOURCE: &str = r"
         return {
             begin = function(context, parameters, sample) return {} end,
@@ -1524,6 +1604,13 @@ mod tests {
         fs::write(package.join("main.lua"), METER_SOURCE).expect("example source");
     }
 
+    fn write_shortcut_bands_example(root: &Path) {
+        let package = root.join(SHORTCUT_BANDS_PLUGIN);
+        fs::create_dir_all(&package).expect("example package");
+        fs::write(package.join("plugin.toml"), SHORTCUT_BANDS_MANIFEST).expect("example manifest");
+        fs::write(package.join("main.lua"), SHORTCUT_BANDS_SOURCE).expect("example source");
+    }
+
     fn write_required_parameter_package(root: &Path, plugin_id: &str) {
         let package = root.join(plugin_id);
         fs::create_dir_all(&package).expect("plugin package");
@@ -1554,16 +1641,38 @@ mod tests {
         ContinuousSession::begin(session_id, action, 0.25).expect("begin session")
     }
 
+    fn begin_shortcut_bands_session(session_id: Uuid) -> (ContinuousSession, ContinuousRequest) {
+        let parameters = BTreeMap::from([
+            ("bands".to_owned(), PluginValue::Integer(6)),
+            ("increase_shortcut".to_owned(), PluginValue::Choice("right".to_owned())),
+            ("decrease_shortcut".to_owned(), PluginValue::Choice("left".to_owned())),
+        ]);
+        let action = ContinuousActionSnapshot::new(
+            PluginId::new(SHORTCUT_BANDS_PLUGIN).expect("plugin ID"),
+            PluginActionId::new("step-between-bands").expect("action ID"),
+            PermittedContext::new(None, None),
+            parameters,
+            20,
+        )
+        .expect("continuous action");
+        ContinuousSession::begin(session_id, action, 0.25).expect("begin session")
+    }
+
     fn accept_begin(session: &mut ContinuousSession) {
         assert!(session.accept_begin(Duration::ZERO).expect("accept begin").is_none());
     }
 
     fn update_request(session: &mut ContinuousSession, value: f64) -> ContinuousRequest {
-        session.observe(value, Duration::from_millis(40)).expect("observe");
-        session
-            .take_due_update(Duration::from_millis(40))
-            .expect("take update")
-            .expect("due update")
+        update_request_at(session, value, Duration::from_millis(40))
+    }
+
+    fn update_request_at(
+        session: &mut ContinuousSession,
+        value: f64,
+        elapsed: Duration,
+    ) -> ContinuousRequest {
+        session.observe(value, elapsed).expect("observe");
+        session.take_due_update(elapsed).expect("take update").expect("due update")
     }
 
     fn cancel_request(
@@ -1628,7 +1737,7 @@ mod tests {
         write_package(
             &paths.plugins,
             FIRST_PLUGIN,
-            &["context.application", "context.window_title"],
+            &["context.application", "context.window_title", "input.shortcut"],
             VALID_SOURCE,
         );
         write_package(&paths.plugins, SECOND_PLUGIN, &[], "this is invalid Lua");
@@ -1650,6 +1759,7 @@ mod tests {
         assert_eq!(admission.update_hz(), 30);
         assert!(admission.permits_context_application());
         assert!(admission.permits_context_window_title());
+        assert!(admission.permits_input_shortcut());
         assert_eq!(
             client.action_admission(
                 &PluginId::new(SECOND_PLUGIN).expect("plugin ID"),
@@ -1676,6 +1786,137 @@ mod tests {
 
         assert_eq!(dispatch(&client, update), Err(PluginLifecycleError::SessionNotActive));
         assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![METER_PLUGIN]);
+    }
+
+    #[test]
+    fn admitted_shortcut_request_crosses_lua_worker_and_bounded_broker() {
+        let (_temporary, paths) = setup();
+        let source = VALID_SOURCE.replace(
+            "begin = function(context, parameters, sample) return {} end",
+            r#"begin = function(context, parameters, sample)
+                local accepted, reason = gradial.input.shortcut("left_control+right")
+                assert(accepted and reason == nil)
+                return {}
+            end"#,
+        );
+        write_package(&paths.plugins, FIRST_PLUGIN, &["input.shortcut"], &source);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let (shortcut_capabilities, calls) = ShortcutCapabilityRuntime::successful_for_test();
+        let runtime =
+            PluginWorkerRuntime::start_with_shortcut_capabilities(paths, shortcut_capabilities)
+                .expect("plugin worker");
+        assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(FIRST_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("measure").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        let session_id = Uuid::from_u128(101);
+        client
+            .open_shortcut_session(
+                session_id,
+                &plugin_id,
+                Arc::new(gradial_core::InvocationContext::default()),
+                admission.permits_input_shortcut(),
+            )
+            .expect("capability session");
+        let (mut session, begin) = begin_session(FIRST_PLUGIN, session_id);
+
+        dispatch(&client, begin).expect("begin");
+        client
+            .finish_shortcut_commit(session_id, Instant::now() + Duration::from_secs(1))
+            .expect("shortcut completion");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        accept_begin(&mut session);
+        dispatch(&client, cancel_request(&mut session, ContinuousCancelReason::ReturnedToDiscrete))
+            .expect("cancel");
+    }
+
+    #[test]
+    fn checked_in_shortcut_example_crosses_worker_and_broker() {
+        let (_temporary, paths) = setup();
+        write_shortcut_bands_example(&paths.plugins);
+        prepare_state(&paths, &[(SHORTCUT_BANDS_PLUGIN, true)]);
+        let (shortcut_capabilities, calls) = ShortcutCapabilityRuntime::successful_for_test();
+        let runtime =
+            PluginWorkerRuntime::start_with_shortcut_capabilities(paths, shortcut_capabilities)
+                .expect("plugin worker");
+        assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![SHORTCUT_BANDS_PLUGIN]);
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(SHORTCUT_BANDS_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("step-between-bands").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        assert!(admission.permits_input_shortcut());
+        let session_id = Uuid::from_u128(103);
+        client
+            .open_shortcut_session(
+                session_id,
+                &plugin_id,
+                Arc::new(gradial_core::InvocationContext::default()),
+                admission.permits_input_shortcut(),
+            )
+            .expect("capability session");
+        let (mut session, begin) = begin_shortcut_bands_session(session_id);
+
+        dispatch(&client, begin).expect("begin");
+        accept_begin(&mut session);
+        dispatch(&client, update_request_at(&mut session, 0.55, Duration::from_millis(60)))
+            .expect("update");
+        let commit = session
+            .commit(0.75, Duration::from_millis(80))
+            .expect("commit")
+            .expect("commit request");
+        dispatch(&client, commit).expect("commit");
+        client
+            .finish_shortcut_commit(session_id, Instant::now() + Duration::from_secs(1))
+            .expect("shortcut completion");
+
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn undeclared_shortcut_permission_fails_session_without_broker_work() {
+        let (_temporary, paths) = setup();
+        let source = VALID_SOURCE.replace(
+            "begin = function(context, parameters, sample) return {} end",
+            r#"begin = function(context, parameters, sample)
+                local accepted, reason = gradial.input.shortcut("a")
+                assert(not accepted and reason == "permission_denied")
+                return {}
+            end"#,
+        );
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], &source);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let (shortcut_capabilities, calls) = ShortcutCapabilityRuntime::successful_for_test();
+        let runtime =
+            PluginWorkerRuntime::start_with_shortcut_capabilities(paths, shortcut_capabilities)
+                .expect("plugin worker");
+        assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(FIRST_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("measure").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        assert!(!admission.permits_input_shortcut());
+        let session_id = Uuid::from_u128(102);
+        client
+            .open_shortcut_session(
+                session_id,
+                &plugin_id,
+                Arc::new(gradial_core::InvocationContext::default()),
+                admission.permits_input_shortcut(),
+            )
+            .expect("capability session");
+        let (mut session, begin) = begin_session(FIRST_PLUGIN, session_id);
+
+        dispatch(&client, begin).expect("begin with handled denial");
+        assert_eq!(
+            client.shortcut_failure(session_id),
+            Some(ShortcutCapabilityFailure::PermissionDenied)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        client.cancel_shortcut_session(session_id);
+        accept_begin(&mut session);
+        dispatch(&client, cancel_request(&mut session, ContinuousCancelReason::PluginFaulted))
+            .expect("cancel");
     }
 
     #[test]

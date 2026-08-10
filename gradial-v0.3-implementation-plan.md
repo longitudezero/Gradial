@@ -1144,9 +1144,10 @@ and manual authoring steps pass without executing code from a disabled plugin.
 
 ### Milestone 3 — Capabilities and action editing
 
-Implementation note (2026-08-10): the editor and permission-filtered context
-slices are complete. Settings receives compatible manifest action schemas,
-offers actions from enabled plugins for portable continuous-action creation,
+Implementation note (2026-08-10): the editor, permission-filtered context, and
+`input.shortcut` slices are complete. Settings receives compatible manifest
+action schemas, offers actions from enabled plugins for portable continuous
+action creation,
 renders all five bounded parameter kinds without executing Lua, and validates
 known schemas before save. Global and application-profile wedges expose a
 separate continuous checkbox and selector without replacing their discrete
@@ -1156,7 +1157,12 @@ approved `context.application`/`context.window_title` flags; Gradial filters
 the frozen target into an immutable context containing no handles, PIDs,
 coordinates, or configuration data. Absent and unavailable values reach Lua
 as `nil`, and permission revocation removes action and context admission
-together. All host capability brokers remain later Milestone 3 slices.
+together. The shortcut capability accepts only a complete readable chord,
+runs through a bounded off-Lua broker, revalidates the frozen target, limits
+each session to 30 accepted requests per second, drains accepted work before
+Commit completes, and closes before Cancel. The checked-in banded-shortcut
+example exercises that real worker boundary. `notification` and
+`network.loopback` remain later Milestone 3 slices.
 
 Deliver:
 

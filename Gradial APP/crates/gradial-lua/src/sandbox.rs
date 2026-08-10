@@ -10,7 +10,10 @@ use mlua::{
 };
 use thiserror::Error;
 
-use crate::{PluginSourceImage, PluginSourceImageError};
+use crate::{
+    LuaCallbackPhase, LuaCapabilityHost, LuaCapabilityRejection, LuaCapabilityStatus,
+    PluginSourceImage, PluginSourceImageError, host::deny_all_capability_host,
+};
 
 pub const LUA_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_LUA_LOAD_TIMEOUT: Duration = Duration::from_millis(100);
@@ -72,6 +75,13 @@ pub struct LoadedLuaPlugin {
     pub(crate) entry: RegistryKey,
     pub(crate) gate: Arc<ExecutionGate>,
     pub(crate) host_error: Arc<Mutex<Option<LuaSandboxError>>>,
+    pub(crate) callback_scope: Arc<Mutex<Option<LuaCallbackScope>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LuaCallbackScope {
+    pub(crate) session_id: uuid::Uuid,
+    pub(crate) phase: LuaCallbackPhase,
 }
 
 impl LoadedLuaPlugin {
@@ -88,13 +98,28 @@ impl LoadedLuaPlugin {
         image: PluginSourceImage,
         limits: LuaSandboxLimits,
     ) -> Result<Self, LuaSandboxError> {
+        Self::load_with_capability_host(image, limits, deny_all_capability_host())
+    }
+
+    /// Loads a plugin with a nonblocking host capability boundary. Capability
+    /// authorization remains the host application's responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded, redacted errors as [`Self::load`].
+    pub fn load_with_capability_host(
+        image: PluginSourceImage,
+        limits: LuaSandboxLimits,
+        capability_host: Arc<dyn LuaCapabilityHost>,
+    ) -> Result<Self, LuaSandboxError> {
         validate_limits(limits)?;
         let lua = create_lua(limits.memory_bytes)?;
         let gate = Arc::new(ExecutionGate::default());
         let host_error = Arc::new(Mutex::new(None));
+        let callback_scope = Arc::new(Mutex::new(None));
         install_execution_hook(&lua, Arc::clone(&gate))?;
         let image = Arc::new(image);
-        install_environment(&lua, &image, &host_error)?;
+        install_environment(&lua, &image, &host_error, &callback_scope, capability_host)?;
 
         let entry_path = image.entry_path().to_owned();
         let entry_value = execute_with_limits(
@@ -113,7 +138,7 @@ impl LoadedLuaPlugin {
             return Err(LuaSandboxError::EntryNotTable);
         };
         let entry = lua.create_registry_value(entry_table).map_err(classify_mlua_error)?;
-        Ok(Self { lua, entry, gate, host_error })
+        Ok(Self { lua, entry, gate, host_error, callback_scope })
     }
 
     /// Checks a raw entry-table field without invoking Lua metamethods or
@@ -179,6 +204,8 @@ fn install_environment(
     lua: &Lua,
     image: &Arc<PluginSourceImage>,
     host_error: &Arc<Mutex<Option<LuaSandboxError>>>,
+    callback_scope: &Arc<Mutex<Option<LuaCallbackScope>>>,
+    capability_host: Arc<dyn LuaCapabilityHost>,
 ) -> Result<(), LuaSandboxError> {
     let globals = lua.globals();
     for excluded in [
@@ -251,10 +278,57 @@ fn install_environment(
 
     let host_exports = lua.create_table().map_err(classify_setup_error)?;
     host_exports.raw_set("require", require).map_err(classify_setup_error)?;
-    let host_proxy = lua.create_table().map_err(classify_setup_error)?;
-    let host_metatable = lua.create_table().map_err(classify_setup_error)?;
-    host_metatable.raw_set("__index", host_exports).map_err(classify_setup_error)?;
-    host_metatable
+    let input = input_host_proxy(lua, callback_scope, capability_host)?;
+    host_exports.raw_set("input", input).map_err(classify_setup_error)?;
+    let host_proxy = read_only_proxy(lua, host_exports)?;
+    globals.raw_set("gradial", host_proxy).map_err(classify_setup_error)?;
+    Ok(())
+}
+
+fn input_host_proxy(
+    lua: &Lua,
+    callback_scope: &Arc<Mutex<Option<LuaCallbackScope>>>,
+    capability_host: Arc<dyn LuaCapabilityHost>,
+) -> Result<Table, LuaSandboxError> {
+    let shortcut_scope = Arc::clone(callback_scope);
+    let shortcut = lua
+        .create_function(move |_, chord: Value| {
+            let parsed = match chord {
+                Value::String(chord) => chord.to_str().ok().and_then(|value| value.parse().ok()),
+                _ => None,
+            };
+            let status = parsed.map_or(
+                LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InvalidRequest),
+                |shortcut| {
+                    let scope = *lock_unpoisoned(&shortcut_scope);
+                    scope.map_or(
+                        LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InactiveSession),
+                        |scope| {
+                            capability_host.request_shortcut(
+                                scope.session_id,
+                                scope.phase,
+                                shortcut,
+                            )
+                        },
+                    )
+                },
+            );
+            Ok(match status {
+                LuaCapabilityStatus::Accepted => (true, None),
+                LuaCapabilityStatus::Rejected(reason) => (false, Some(reason.as_str())),
+            })
+        })
+        .map_err(classify_setup_error)?;
+    let input_exports = lua.create_table().map_err(classify_setup_error)?;
+    input_exports.raw_set("shortcut", shortcut).map_err(classify_setup_error)?;
+    read_only_proxy(lua, input_exports)
+}
+
+fn read_only_proxy(lua: &Lua, exports: Table) -> Result<Table, LuaSandboxError> {
+    let proxy = lua.create_table().map_err(classify_setup_error)?;
+    let metatable = lua.create_table().map_err(classify_setup_error)?;
+    metatable.raw_set("__index", exports).map_err(classify_setup_error)?;
+    metatable
         .raw_set(
             "__newindex",
             lua.create_function(|_, (_table, _key, _value): (Table, Value, Value)| {
@@ -263,10 +337,9 @@ fn install_environment(
             .map_err(classify_setup_error)?,
         )
         .map_err(classify_setup_error)?;
-    host_metatable.raw_set("__metatable", false).map_err(classify_setup_error)?;
-    host_proxy.set_metatable(Some(host_metatable)).map_err(classify_setup_error)?;
-    globals.raw_set("gradial", host_proxy).map_err(classify_setup_error)?;
-    Ok(())
+    metatable.raw_set("__metatable", false).map_err(classify_setup_error)?;
+    proxy.set_metatable(Some(metatable)).map_err(classify_setup_error)?;
+    Ok(proxy)
 }
 
 pub(crate) fn execute_with_limits<T>(

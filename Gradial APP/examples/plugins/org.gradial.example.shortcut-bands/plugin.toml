@@ -1,0 +1,39 @@
+manifest_version = 1
+id = "org.gradial.example.shortcut-bands"
+name = "Banded shortcut example"
+version = "0.1.0"
+api_version = 1
+entry = "main.lua"
+permissions = ["input.shortcut"]
+
+[[actions]]
+id = "step-between-bands"
+name = "Step between bands"
+kind = "continuous"
+description = "Sends one complete shortcut whenever the measured value crosses a band."
+update_hz = 20
+
+[[actions.parameters]]
+key = "bands"
+label = "Number of bands"
+type = "integer"
+required = true
+default = 6
+minimum = 2
+maximum = 12
+
+[[actions.parameters]]
+key = "increase_shortcut"
+label = "Increase shortcut"
+type = "choice"
+required = true
+default = "right"
+choices = ["right", "up", "page_up", "numpad_plus"]
+
+[[actions.parameters]]
+key = "decrease_shortcut"
+label = "Decrease shortcut"
+type = "choice"
+required = true
+default = "left"
+choices = ["left", "down", "page_down", "minus"]

@@ -21,6 +21,7 @@ use crate::{
         ActionDispatch, ActionExecutorHandle, ContinuousActionLease, CoordinatorStopToken,
     },
     action_target,
+    capability_broker::ShortcutCapabilityFailure,
     plugin_worker::{PluginLifecycleClient, PluginLifecycleError, PluginLifecycleSubmitError},
     tray,
 };
@@ -210,6 +211,10 @@ impl PluginContinuousBackend {
         if !matches!(request, ContinuousRequest::Begin(_)) {
             return;
         }
+        self.abort_plugin_session(request, reason);
+    }
+
+    fn abort_plugin_session(&self, request: &ContinuousRequest, reason: ContinuousCancelReason) {
         if let Err(error) = self.client.abort_begin(request.session_id(), reason) {
             log::error!(
                 target: "continuous",
@@ -222,6 +227,66 @@ impl PluginContinuousBackend {
             );
         }
     }
+
+    fn capability_failure(
+        &self,
+        request: &ContinuousRequest,
+    ) -> Result<(), ContinuousBackendError> {
+        let Some(failure) = self.client.shortcut_failure(request.session_id()) else {
+            return Ok(());
+        };
+        log::warn!(
+            target: "continuous",
+            "component=capabilities event_code=shortcut_session_failed result_code=failure \
+             error_code={} config_revision={} invocation_id={} session_id={} stage={:?}",
+            failure.code(),
+            self.target.config_revision,
+            self.invocation_id,
+            request.session_id(),
+            stage_for(request)
+        );
+        Err(map_shortcut_capability_failure(failure))
+    }
+
+    fn abandon_commit(&self, request: &ContinuousRequest, reason: ContinuousCancelReason) {
+        if matches!(request, ContinuousRequest::Commit(_)) {
+            self.abort_plugin_session(request, reason);
+            self.client.cancel_shortcut_session(request.session_id());
+        }
+    }
+
+    fn prepare_dispatch(
+        &self,
+        request: &ContinuousRequest,
+        context: ContinuousBackendContext<'_>,
+    ) -> Result<(), ContinuousBackendError> {
+        if matches!(request, ContinuousRequest::Cancel(_)) {
+            self.client.cancel_shortcut_session(request.session_id());
+        }
+        if !matches!(request, ContinuousRequest::Cancel(_)) && context.should_stop() {
+            let reason = if context.shutdown_requested() {
+                ContinuousCancelReason::Shutdown
+            } else {
+                ContinuousCancelReason::UserRequested
+            };
+            self.abandon_commit(request, reason);
+            return Err(ContinuousBackendError::Interrupted);
+        }
+        if Instant::now() >= context.deadline() {
+            self.abandon_commit(request, ContinuousCancelReason::PluginFaulted);
+            return Err(ContinuousBackendError::TimedOut);
+        }
+        if let Err(error) = validate_plugin_target(self.invocation_id, &self.target, request) {
+            let reason = if error == ContinuousBackendError::TargetStale {
+                ContinuousCancelReason::TargetStale
+            } else {
+                ContinuousCancelReason::PluginFaulted
+            };
+            self.abandon_commit(request, reason);
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 impl ContinuousBackend for PluginContinuousBackend {
@@ -230,21 +295,45 @@ impl ContinuousBackend for PluginContinuousBackend {
         request: &ContinuousRequest,
         context: ContinuousBackendContext<'_>,
     ) -> Result<(), ContinuousBackendError> {
-        if !matches!(request, ContinuousRequest::Cancel(_)) && context.should_stop() {
-            return Err(ContinuousBackendError::Interrupted);
-        }
-        if Instant::now() >= context.deadline() {
-            return Err(ContinuousBackendError::TimedOut);
-        }
-        validate_plugin_target(self.invocation_id, &self.target, request)?;
+        self.prepare_dispatch(request, context)?;
 
-        let ticket = self
-            .client
-            .request(request.clone())
-            .map_err(|error| map_plugin_submit_error(error, request, context))?;
-        loop {
+        match request {
+            ContinuousRequest::Begin(begin) => {
+                let admission = self
+                    .client
+                    .action_admission(begin.plugin_id(), begin.action_id())
+                    .ok_or(ContinuousBackendError::Rejected)?;
+                self.client
+                    .open_shortcut_session(
+                        begin.session_id(),
+                        begin.plugin_id(),
+                        Arc::clone(&self.target),
+                        admission.permits_input_shortcut(),
+                    )
+                    .map_err(map_shortcut_capability_failure)?;
+            }
+            ContinuousRequest::Update(_) => self.capability_failure(request)?,
+            ContinuousRequest::Commit(_) => {
+                if let Err(error) = self.capability_failure(request) {
+                    self.abort_plugin_session(request, ContinuousCancelReason::PluginFaulted);
+                    self.client.cancel_shortcut_session(request.session_id());
+                    return Err(error);
+                }
+            }
+            ContinuousRequest::Cancel(_) => {}
+        }
+
+        let ticket = match self.client.request(request.clone()) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.abandon_commit(request, ContinuousCancelReason::PluginFaulted);
+                self.client.cancel_shortcut_session(request.session_id());
+                return Err(map_plugin_submit_error(error, request, context));
+            }
+        };
+        let lifecycle_result = loop {
             if let Some(result) = ticket.try_result() {
-                return result.map_err(|error| map_plugin_lifecycle_error(error, request));
+                break result.map_err(|error| map_plugin_lifecycle_error(error, request));
             }
             if !matches!(request, ContinuousRequest::Cancel(_)) && context.should_stop() {
                 let reason = if context.shutdown_requested() {
@@ -253,17 +342,56 @@ impl ContinuousBackend for PluginContinuousBackend {
                     ContinuousCancelReason::UserRequested
                 };
                 self.abort_pending_begin(request, reason);
-                return Err(ContinuousBackendError::Interrupted);
+                break Err(ContinuousBackendError::Interrupted);
             }
             let now = Instant::now();
             if now >= context.deadline() {
                 self.abort_pending_begin(request, ContinuousCancelReason::PluginFaulted);
-                return Err(ContinuousBackendError::TimedOut);
+                break Err(ContinuousBackendError::TimedOut);
             }
             thread::park_timeout(
                 WORKER_POLL_INTERVAL.min(context.deadline().saturating_duration_since(now)),
             );
+        };
+        if let Err(error) = lifecycle_result {
+            self.client.cancel_shortcut_session(request.session_id());
+            return Err(error);
         }
+
+        match request {
+            ContinuousRequest::Begin(_) | ContinuousRequest::Update(_) => {
+                if let Err(error) = self.capability_failure(request) {
+                    if matches!(request, ContinuousRequest::Begin(_)) {
+                        self.abort_pending_begin(request, ContinuousCancelReason::PluginFaulted);
+                    }
+                    self.client.cancel_shortcut_session(request.session_id());
+                    return Err(error);
+                }
+            }
+            ContinuousRequest::Commit(_) => {
+                return self
+                    .client
+                    .finish_shortcut_commit(request.session_id(), context.deadline())
+                    .map_err(map_shortcut_capability_failure);
+            }
+            ContinuousRequest::Cancel(_) => {}
+        }
+        Ok(())
+    }
+}
+
+const fn map_shortcut_capability_failure(
+    failure: ShortcutCapabilityFailure,
+) -> ContinuousBackendError {
+    match failure {
+        ShortcutCapabilityFailure::TargetStale => ContinuousBackendError::TargetStale,
+        ShortcutCapabilityFailure::Interrupted => ContinuousBackendError::Interrupted,
+        ShortcutCapabilityFailure::DeadlineExceeded => ContinuousBackendError::TimedOut,
+        ShortcutCapabilityFailure::PermissionDenied
+        | ShortcutCapabilityFailure::RateLimited
+        | ShortcutCapabilityFailure::Busy
+        | ShortcutCapabilityFailure::TargetElevated
+        | ShortcutCapabilityFailure::InjectionFailed => ContinuousBackendError::Faulted,
     }
 }
 

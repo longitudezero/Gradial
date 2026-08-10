@@ -10,8 +10,7 @@ To inspect and enable the package during development, copy this complete
 `%LOCALAPPDATA%\Gradial\plugins`, open Gradial's **Plugins** page, choose
 **Rescan plugins**, then review and enable it.
 
-The current application does not route live radial interactions into plugin
-callbacks yet, so enabling this example only validates and holds its adapter.
-Its complete lifecycle is exercised by the worker test suite. The next live
-bridge slice will make it usable through Gradial's built-in continuous meter
-without adding an external capability.
+After enabling it, create its continuous action in Settings and assign that
+action to a continuous-enabled wedge. It then receives the live radial value
+without requesting an external capability. Its complete lifecycle is also
+exercised by the worker test suite.

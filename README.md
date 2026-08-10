@@ -378,28 +378,43 @@ The separate `gradial-lua` foundation embeds vendored Lua 5.4. A fresh state
 exposes only reviewed basic functions,
 `math`, `string`, `table`, `utf8`, and the rooted/cached
 `gradial.require("lib.mapping")` source loader. It has no filesystem-backed
-loader or OS capability and enforces memory, instruction, and wall-time limits.
+loader; its only current operating-system surface is the explicit protected
+shortcut capability. Memory, instruction, and wall-time limits remain enforced.
 Its strict lifecycle adapter validates and bounds `begin`, `update`, `commit`,
 and `cancel` with private session state and immutable host values. At startup,
 the bounded worker constructs one adapter only for a freshly rediscovered
 package whose effective trust status is exactly enabled. Newly discovered,
 disabled, changed, incompatible, invalid, unavailable, and faulted packages
 execute zero Lua. Enable and reload validate Lua first, atomically record the
-exact successful package second, and admit the adapter last. There is still no
-capability broker, continuous-action catalog connection, or live continuous
-assignment. The worker now accepts bounded Begin, Update, Commit, and Cancel
+exact successful package second, and admit the adapter last. The worker accepts
+bounded Begin, Update, Commit, and Cancel
 requests through separate one-slot lanes; Commit and Cancel share a reserved
 terminal lane and are selected before ordinary updates. It owns one active
 plugin session, faults and unloads an adapter after a callback failure, and
 defers package-change teardown observed during a session until its terminal
-callback. The application does not route radial interactions into this bridge
-yet. Rescan is code-free; unapproved source is rejected before Lua evaluation
-even if enablement is requested outside the Settings UI.
+callback. The production continuous route freezes an enabled manifest action,
+its validated parameters, update cadence, permission-filtered context, and
+target identity at invocation-down. Rescan is code-free; unapproved source is
+rejected before Lua evaluation even if enablement is requested outside the
+Settings UI.
+
+Plugins approved for `input.shortcut` can request one readable, complete key
+chord through the protected `gradial.input.shortcut(...)` API during Begin,
+Update, or Commit. A bounded broker handles Windows input outside Lua and the
+interaction runtime, permits at most 30 accepted requests per active session
+per second, rechecks the frozen target and permission, and always uses the
+existing stuck-key cleanup path. Cancellation closes the request epoch before
+Lua's Cancel callback, and Commit waits within its existing deadline for
+accepted work to finish. Shortcut contents, target details, and plugin values
+remain absent from logs.
 
 A permission-free no-side-effect package is included at
 [`Gradial APP/examples/plugins/org.gradial.example.meter`](Gradial%20APP/examples/plugins/org.gradial.example.meter).
 It records only private session-local scalar state and is used by the worker
-lifecycle tests.
+lifecycle tests. The permission-checked
+[`Gradial APP/examples/plugins/org.gradial.example.shortcut-bands`](Gradial%20APP/examples/plugins/org.gradial.example.shortcut-bands)
+example demonstrates bounded radial bands with at most one whole shortcut
+request per callback.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
