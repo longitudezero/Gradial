@@ -386,9 +386,20 @@ package whose effective trust status is exactly enabled. Newly discovered,
 disabled, changed, incompatible, invalid, unavailable, and faulted packages
 execute zero Lua. Enable and reload validate Lua first, atomically record the
 exact successful package second, and admit the adapter last. There is still no
-capability broker, callback routing, continuous-action catalog connection, or
-live continuous assignment. Rescan is code-free; unapproved source is rejected
-before Lua evaluation even if enablement is requested outside the Settings UI.
+capability broker, continuous-action catalog connection, or live continuous
+assignment. The worker now accepts bounded Begin, Update, Commit, and Cancel
+requests through separate one-slot lanes; Commit and Cancel share a reserved
+terminal lane and are selected before ordinary updates. It owns one active
+plugin session, faults and unloads an adapter after a callback failure, and
+defers package-change teardown observed during a session until its terminal
+callback. The application does not route radial interactions into this bridge
+yet. Rescan is code-free; unapproved source is rejected before Lua evaluation
+even if enablement is requested outside the Settings UI.
+
+A permission-free no-side-effect package is included at
+[`Gradial APP/examples/plugins/org.gradial.example.meter`](Gradial%20APP/examples/plugins/org.gradial.example.meter).
+It records only private session-local scalar state and is used by the worker
+lifecycle tests.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
@@ -493,8 +504,9 @@ recorded in
 [`Documentation/milestone-2-lua-lifecycle-results.md`](Documentation/milestone-2-lua-lifecycle-results.md),
 [`Documentation/milestone-2-plugin-trust-state-results.md`](Documentation/milestone-2-plugin-trust-state-results.md),
 [`Documentation/milestone-2-plugin-worker-results.md`](Documentation/milestone-2-plugin-worker-results.md),
+[`Documentation/milestone-2-plugin-settings-results.md`](Documentation/milestone-2-plugin-settings-results.md),
 and
-[`Documentation/milestone-2-plugin-settings-results.md`](Documentation/milestone-2-plugin-settings-results.md).
+[`Documentation/milestone-2-plugin-lifecycle-bridge-results.md`](Documentation/milestone-2-plugin-lifecycle-bridge-results.md).
 Configuration, snapshot, persistence, and resolver results are recorded in
 [`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).
 Profile-driven gesture and renderer results are recorded in

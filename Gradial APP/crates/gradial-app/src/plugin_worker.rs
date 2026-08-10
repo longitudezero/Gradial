@@ -9,10 +9,14 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
-use gradial_core::{AppPaths, PluginId, PluginPermission};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, select_biased};
+use gradial_core::{
+    AppPaths, ContinuousBeginRequest, ContinuousCancelRequest, ContinuousCommitRequest,
+    ContinuousRequest, ContinuousUpdateRequest, PluginId, PluginPermission,
+};
 use gradial_lua::{LuaLifecycleAdapter, LuaSandboxError, LuaSandboxLimits};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{
     plugin_discovery::{
@@ -26,6 +30,9 @@ use crate::{
 };
 
 const COMMAND_CAPACITY: usize = 8;
+const LIFECYCLE_BEGIN_CAPACITY: usize = 1;
+const LIFECYCLE_UPDATE_CAPACITY: usize = 1;
+const LIFECYCLE_TERMINAL_CAPACITY: usize = 1;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +124,58 @@ pub(crate) enum PluginWorkerSubmitError {
     ShuttingDown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginLifecycleStage {
+    Begin,
+    Update,
+    Commit,
+    Cancel,
+}
+
+impl PluginLifecycleStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Update => "update",
+            Self::Commit => "commit",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum PluginLifecycleSubmitError {
+    #[error("plugin_lifecycle_queue_full")]
+    QueueFull(PluginLifecycleStage),
+    #[error("plugin_worker_unavailable")]
+    Unavailable,
+    #[error("plugin_worker_shutting_down")]
+    ShuttingDown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum PluginLifecycleError {
+    #[error("plugin_lifecycle_plugin_unavailable")]
+    PluginUnavailable,
+    #[error("plugin_lifecycle_session_active")]
+    SessionActive,
+    #[error("plugin_lifecycle_session_not_active")]
+    SessionNotActive,
+    #[error("{0}")]
+    Lua(LuaSandboxError),
+}
+
+impl PluginLifecycleError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::PluginUnavailable => "plugin_unavailable",
+            Self::SessionActive => "session_active",
+            Self::SessionNotActive => "session_not_active",
+            Self::Lua(error) => lua_error_code(error),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum PluginWorkerError {
     #[error("plugin_worker_discovery_unavailable")]
@@ -131,6 +190,8 @@ pub(crate) enum PluginWorkerError {
     Faulted,
     #[error("plugin_worker_unavailable")]
     Unavailable,
+    #[error("plugin_worker_session_active")]
+    SessionActive,
     #[error("{0}")]
     StateTransition(PluginStateTransitionError),
     #[error("{0}")]
@@ -148,6 +209,7 @@ impl PluginWorkerError {
             Self::ReloadRequired => "reload_required",
             Self::Faulted => "faulted",
             Self::Unavailable => "unavailable",
+            Self::SessionActive => "session_active",
             Self::StateTransition(error) => transition_error_code(error),
             Self::StatePersistence(error) => error.code(),
             Self::Lua(error) => lua_error_code(error),
@@ -232,6 +294,35 @@ impl PluginWorkerSnapshotTicket {
 }
 
 #[derive(Debug)]
+pub(crate) struct PluginLifecycleTicket {
+    reply: Receiver<Result<(), PluginLifecycleError>>,
+}
+
+impl PluginLifecycleTicket {
+    #[allow(dead_code, reason = "the live continuous backend will wait within its deadline")]
+    pub(crate) fn try_result(&self) -> Option<Result<(), PluginLifecycleError>> {
+        match self.reply.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(PluginLifecycleError::PluginUnavailable)),
+        }
+    }
+
+    #[cfg(test)]
+    fn receive(self) -> Result<(), PluginLifecycleError> {
+        self.reply
+            .recv_timeout(SHUTDOWN_WAIT)
+            .unwrap_or(Err(PluginLifecycleError::PluginUnavailable))
+    }
+}
+
+#[derive(Debug)]
+struct PluginLifecycleCommand {
+    request: ContinuousRequest,
+    reply: Sender<Result<(), PluginLifecycleError>>,
+}
+
+#[derive(Debug)]
 enum PluginWorkerCommand {
     Operate {
         operation: PluginWorkerOperation,
@@ -247,9 +338,43 @@ enum PluginWorkerCommand {
     Shutdown,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PluginLifecycleClient {
+    begins: Sender<PluginLifecycleCommand>,
+    updates: Sender<PluginLifecycleCommand>,
+    terminals: Sender<PluginLifecycleCommand>,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+impl PluginLifecycleClient {
+    #[allow(dead_code, reason = "the next live bridge slice will dispatch production requests")]
+    pub(crate) fn request(
+        &self,
+        request: ContinuousRequest,
+    ) -> Result<PluginLifecycleTicket, PluginLifecycleSubmitError> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(PluginLifecycleSubmitError::ShuttingDown);
+        }
+        let stage = lifecycle_stage(&request);
+        let sender = match stage {
+            PluginLifecycleStage::Begin => &self.begins,
+            PluginLifecycleStage::Update => &self.updates,
+            PluginLifecycleStage::Commit | PluginLifecycleStage::Cancel => &self.terminals,
+        };
+        let (reply, replies) = bounded(1);
+        let command = PluginLifecycleCommand { request, reply };
+        match sender.try_send(command) {
+            Ok(()) => Ok(PluginLifecycleTicket { reply: replies }),
+            Err(TrySendError::Full(_)) => Err(PluginLifecycleSubmitError::QueueFull(stage)),
+            Err(TrySendError::Disconnected(_)) => Err(PluginLifecycleSubmitError::Unavailable),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PluginWorkerRuntime {
     commands: Sender<PluginWorkerCommand>,
+    lifecycle: PluginLifecycleClient,
     shutdown_requested: Arc<AtomicBool>,
     stopped: Receiver<()>,
     join_handle: Option<JoinHandle<()>>,
@@ -258,6 +383,9 @@ pub(crate) struct PluginWorkerRuntime {
 impl PluginWorkerRuntime {
     pub(crate) fn start(paths: AppPaths) -> Result<Self> {
         let (command_sender, commands) = bounded(COMMAND_CAPACITY);
+        let (begin_sender, begins) = bounded(LIFECYCLE_BEGIN_CAPACITY);
+        let (update_sender, updates) = bounded(LIFECYCLE_UPDATE_CAPACITY);
+        let (terminal_sender, terminals) = bounded(LIFECYCLE_TERMINAL_CAPACITY);
         let (stopped_sender, stopped) = bounded(1);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown_requested);
@@ -265,22 +393,36 @@ impl PluginWorkerRuntime {
             .name("gradial-plugin-worker".to_owned())
             .spawn(move || {
                 let mut worker = PluginWorker::bootstrap(paths, &worker_shutdown);
-                worker.run(&commands, &worker_shutdown);
+                worker.run(&commands, &begins, &updates, &terminals, &worker_shutdown);
                 let _sent = stopped_sender.try_send(());
             })
             .context("could not spawn the plugin worker")?;
         log::info!(
             target: "plugins",
             "component=plugins event_code=plugin_worker_started result_code=ok \
-             command_capacity={COMMAND_CAPACITY} shutdown_wait_ms={}",
+             command_capacity={COMMAND_CAPACITY} lifecycle_begin_capacity={LIFECYCLE_BEGIN_CAPACITY} \
+             lifecycle_update_capacity={LIFECYCLE_UPDATE_CAPACITY} \
+             lifecycle_terminal_capacity={LIFECYCLE_TERMINAL_CAPACITY} shutdown_wait_ms={}",
             SHUTDOWN_WAIT.as_millis()
         );
+        let lifecycle = PluginLifecycleClient {
+            begins: begin_sender,
+            updates: update_sender,
+            terminals: terminal_sender,
+            shutdown_requested: Arc::clone(&shutdown_requested),
+        };
         Ok(Self {
             commands: command_sender,
+            lifecycle,
             shutdown_requested,
             stopped,
             join_handle: Some(join_handle),
         })
+    }
+
+    #[allow(dead_code, reason = "the next live bridge slice will retain this client")]
+    pub(crate) fn lifecycle_client(&self) -> PluginLifecycleClient {
+        self.lifecycle.clone()
     }
 
     #[allow(dead_code, reason = "the Plugins page and coordinator will submit these operations")]
@@ -379,8 +521,16 @@ struct PluginWorker {
     store: PluginStateStore,
     state: PluginTrustState,
     adapters: BTreeMap<String, LuaLifecycleAdapter>,
+    active_session: Option<ActivePluginSession>,
+    reconciliation_deferred: bool,
     inventory: Vec<PluginInventoryEntry>,
     scan_error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivePluginSession {
+    session_id: Uuid,
+    plugin_id: String,
 }
 
 impl PluginWorker {
@@ -412,6 +562,8 @@ impl PluginWorker {
             store,
             state: loaded.state,
             adapters: BTreeMap::new(),
+            active_session: None,
+            reconciliation_deferred: false,
             inventory: Vec::new(),
             scan_error_code: None,
         };
@@ -465,7 +617,7 @@ impl PluginWorker {
                         );
                     }
                     Err(error) => {
-                        self.persist_fault_after_load_failure(&plugin_id);
+                        self.persist_adapter_fault(&plugin_id);
                         log_operation(
                             PluginWorkerOperation::Enable,
                             &plugin_id,
@@ -488,45 +640,245 @@ impl PluginWorker {
         );
     }
 
-    fn run(&mut self, commands: &Receiver<PluginWorkerCommand>, shutdown_requested: &AtomicBool) {
+    fn run(
+        &mut self,
+        commands: &Receiver<PluginWorkerCommand>,
+        begins: &Receiver<PluginLifecycleCommand>,
+        updates: &Receiver<PluginLifecycleCommand>,
+        terminals: &Receiver<PluginLifecycleCommand>,
+        shutdown_requested: &AtomicBool,
+    ) {
         while !shutdown_requested.load(Ordering::Acquire) {
-            let Ok(command) = commands.recv() else {
-                break;
-            };
-            match command {
-                PluginWorkerCommand::Operate { operation, plugin_id, reply } => {
-                    let result = self.operate(operation, &plugin_id);
-                    self.refresh_inventory_view();
-                    log_operation(
-                        operation,
-                        &plugin_id,
-                        result.as_ref().map(|_| ()).map_err(|error| *error),
-                        self.state.revision(),
-                        self.adapters.contains_key(&plugin_id),
-                        "request",
-                    );
-                    let _sent = reply.try_send(result);
+            select_biased! {
+                recv(terminals) -> command => {
+                    let Ok(command) = command else { break };
+                    self.handle_lifecycle_command(command);
                 }
-                PluginWorkerCommand::Snapshot { reply } => {
-                    let _sent = reply.try_send(self.snapshot());
+                recv(begins) -> command => {
+                    let Ok(command) = command else { break };
+                    self.handle_lifecycle_command(command);
                 }
-                PluginWorkerCommand::Rescan { reply } => {
-                    let result = self.fresh_report();
-                    log::info!(
-                        target: "plugins",
-                        "component=plugins event_code=plugin_rescan result_code={} \
-                         state_revision={} plugin_count={} error_code={}",
-                        if result.is_ok() { "ok" } else { "failure" },
-                        self.state.revision(),
-                        self.inventory.len(),
-                        result.err().map_or("none", PluginWorkerError::code)
-                    );
-                    let _sent = reply.try_send(self.snapshot());
+                recv(updates) -> command => {
+                    let Ok(command) = command else { break };
+                    self.handle_lifecycle_command(command);
                 }
-                PluginWorkerCommand::Shutdown => break,
+                recv(commands) -> command => {
+                    let Ok(command) = command else { break };
+                    if !self.handle_worker_command(command) {
+                        break;
+                    }
+                }
             }
         }
+        self.active_session = None;
         self.adapters.clear();
+    }
+
+    fn handle_worker_command(&mut self, command: PluginWorkerCommand) -> bool {
+        match command {
+            PluginWorkerCommand::Operate { operation, plugin_id, reply } => {
+                let result = self.operate(operation, &plugin_id);
+                if matches!(&result, Err(PluginWorkerError::SessionActive)) {
+                    let _deferred = self.rescan();
+                } else {
+                    self.refresh_inventory_view();
+                }
+                log_operation(
+                    operation,
+                    &plugin_id,
+                    result.as_ref().map(|_| ()).map_err(|error| *error),
+                    self.state.revision(),
+                    self.adapters.contains_key(&plugin_id),
+                    "request",
+                );
+                let _sent = reply.try_send(result);
+            }
+            PluginWorkerCommand::Snapshot { reply } => {
+                let _sent = reply.try_send(self.snapshot());
+            }
+            PluginWorkerCommand::Rescan { reply } => {
+                let result = self.rescan();
+                log::info!(
+                    target: "plugins",
+                    "component=plugins event_code=plugin_rescan result_code={} \
+                     state_revision={} plugin_count={} active_session={} error_code={}",
+                    if result.is_ok() { "ok" } else { "failure" },
+                    self.state.revision(),
+                    self.inventory.len(),
+                    self.active_session.is_some(),
+                    result.err().map_or("none", PluginWorkerError::code)
+                );
+                let _sent = reply.try_send(self.snapshot());
+            }
+            PluginWorkerCommand::Shutdown => return false,
+        }
+        true
+    }
+
+    fn handle_lifecycle_command(&mut self, command: PluginLifecycleCommand) {
+        let PluginLifecycleCommand { request, reply } = command;
+        let stage = lifecycle_stage(&request);
+        let session_id = request.session_id();
+        let plugin_id = match &request {
+            ContinuousRequest::Begin(request) => request.plugin_id().as_str().to_owned(),
+            ContinuousRequest::Update(_)
+            | ContinuousRequest::Commit(_)
+            | ContinuousRequest::Cancel(_) => self
+                .active_session
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |active| active.plugin_id.clone()),
+        };
+        let result = self.dispatch_lifecycle(&request);
+        log::info!(
+            target: "plugins",
+            "component=plugins event_code=plugin_lifecycle result_code={} error_code={} \
+             plugin_id={} session_id={} stage={} active_session={}",
+            if result.is_ok() { "ok" } else { "failure" },
+            result.as_ref().err().map_or("none", |error| error.code()),
+            plugin_id,
+            session_id,
+            stage.as_str(),
+            self.active_session.is_some()
+        );
+        let _sent = reply.try_send(result);
+    }
+
+    fn dispatch_lifecycle(
+        &mut self,
+        request: &ContinuousRequest,
+    ) -> Result<(), PluginLifecycleError> {
+        match request {
+            ContinuousRequest::Begin(request) => self.begin_lifecycle(request),
+            ContinuousRequest::Update(request) => self.update_lifecycle(*request),
+            ContinuousRequest::Commit(request) => self.commit_lifecycle(*request),
+            ContinuousRequest::Cancel(request) => self.cancel_lifecycle(*request),
+        }
+    }
+
+    fn begin_lifecycle(
+        &mut self,
+        request: &ContinuousBeginRequest,
+    ) -> Result<(), PluginLifecycleError> {
+        if self.active_session.is_some() {
+            return Err(PluginLifecycleError::SessionActive);
+        }
+        let plugin_id = request.plugin_id().as_str().to_owned();
+        let result = self
+            .adapters
+            .get_mut(&plugin_id)
+            .ok_or(PluginLifecycleError::PluginUnavailable)?
+            .begin(request);
+        self.map_lua_result(&plugin_id, result)?;
+        self.active_session =
+            Some(ActivePluginSession { session_id: request.session_id(), plugin_id });
+        Ok(())
+    }
+
+    fn update_lifecycle(
+        &mut self,
+        request: ContinuousUpdateRequest,
+    ) -> Result<(), PluginLifecycleError> {
+        let plugin_id = self.plugin_for_session(request.session_id())?;
+        let Some(adapter) = self.adapters.get_mut(&plugin_id) else {
+            self.active_session = None;
+            self.finish_deferred_reconciliation();
+            return Err(PluginLifecycleError::PluginUnavailable);
+        };
+        let result = adapter.update(&request);
+        self.map_lua_result(&plugin_id, result)
+    }
+
+    fn commit_lifecycle(
+        &mut self,
+        request: ContinuousCommitRequest,
+    ) -> Result<(), PluginLifecycleError> {
+        let plugin_id = self.plugin_for_session(request.session_id())?;
+        self.active_session = None;
+        let result = self
+            .adapters
+            .get_mut(&plugin_id)
+            .map_or(Err(PluginLifecycleError::PluginUnavailable), |adapter| {
+                adapter.commit(&request).map_err(PluginLifecycleError::Lua)
+            });
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(PluginLifecycleError::Lua(error)) => self.map_lua_result(&plugin_id, Err(error)),
+            Err(error) => Err(error),
+        };
+        self.finish_deferred_reconciliation();
+        result
+    }
+
+    fn cancel_lifecycle(
+        &mut self,
+        request: ContinuousCancelRequest,
+    ) -> Result<(), PluginLifecycleError> {
+        let plugin_id = self.plugin_for_session(request.session_id())?;
+        self.active_session = None;
+        let result = self
+            .adapters
+            .get_mut(&plugin_id)
+            .map_or(Err(PluginLifecycleError::PluginUnavailable), |adapter| {
+                adapter.cancel(&request).map_err(PluginLifecycleError::Lua)
+            });
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(PluginLifecycleError::Lua(error)) => self.map_lua_result(&plugin_id, Err(error)),
+            Err(error) => Err(error),
+        };
+        self.finish_deferred_reconciliation();
+        result
+    }
+
+    fn plugin_for_session(&self, session_id: Uuid) -> Result<String, PluginLifecycleError> {
+        self.active_session
+            .as_ref()
+            .filter(|active| active.session_id == session_id)
+            .map(|active| active.plugin_id.clone())
+            .ok_or(PluginLifecycleError::SessionNotActive)
+    }
+
+    fn map_lua_result(
+        &mut self,
+        plugin_id: &str,
+        result: Result<(), LuaSandboxError>,
+    ) -> Result<(), PluginLifecycleError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let faulted =
+                    self.adapters.get(plugin_id).is_some_and(LuaLifecycleAdapter::is_faulted);
+                if faulted {
+                    self.active_session = None;
+                    self.persist_adapter_fault(plugin_id);
+                    self.refresh_inventory_view();
+                    self.finish_deferred_reconciliation();
+                }
+                Err(PluginLifecycleError::Lua(error))
+            }
+        }
+    }
+
+    fn finish_deferred_reconciliation(&mut self) {
+        if !std::mem::take(&mut self.reconciliation_deferred) {
+            return;
+        }
+        if let Err(error) = self.fresh_report() {
+            log::error!(
+                target: "plugins",
+                "component=plugins event_code=plugin_deferred_reconciliation \
+                 result_code=failure error_code={} state_revision={}",
+                error.code(),
+                self.state.revision()
+            );
+        } else {
+            log::info!(
+                target: "plugins",
+                "component=plugins event_code=plugin_deferred_reconciliation \
+                 result_code=ok state_revision={}",
+                self.state.revision()
+            );
+        }
     }
 
     fn operate(
@@ -534,6 +886,9 @@ impl PluginWorker {
         operation: PluginWorkerOperation,
         plugin_id: &str,
     ) -> Result<PluginWorkerReceipt, PluginWorkerError> {
+        if self.active_session.is_some() {
+            return Err(PluginWorkerError::SessionActive);
+        }
         match operation {
             PluginWorkerOperation::ApprovePermissions => self.approve_permissions(plugin_id)?,
             PluginWorkerOperation::Enable => self.enable(plugin_id)?,
@@ -630,7 +985,7 @@ impl PluginWorker {
         let candidate = match load_adapter(&package) {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.persist_fault_after_load_failure(plugin_id);
+                self.persist_adapter_fault(plugin_id);
                 return Err(PluginWorkerError::Lua(error));
             }
         };
@@ -655,11 +1010,30 @@ impl PluginWorker {
         self.persist(&proposed)
     }
 
+    fn rescan(&mut self) -> Result<(), PluginWorkerError> {
+        if self.active_session.is_none() {
+            self.fresh_report()?;
+            return Ok(());
+        }
+
+        self.reconciliation_deferred = true;
+        let report = discover_plugins(&self.paths.plugins);
+        log_discovery_report(&report);
+        if let Some(error) = report.root_error {
+            self.scan_error_code = Some(error.to_string());
+            return Err(PluginWorkerError::DiscoveryUnavailable);
+        }
+        self.update_inventory(&report);
+        self.scan_error_code = None;
+        Ok(())
+    }
+
     fn fresh_report(&mut self) -> Result<PluginDiscoveryReport, PluginWorkerError> {
         let report = discover_plugins(&self.paths.plugins);
         log_discovery_report(&report);
         if let Some(error) = report.root_error {
             self.scan_error_code = Some(error.to_string());
+            self.adapters.clear();
             return Err(PluginWorkerError::DiscoveryUnavailable);
         }
         let (_reconciliation, persistence_error) = self.reconcile_report(&report);
@@ -727,7 +1101,7 @@ impl PluginWorker {
         Ok(())
     }
 
-    fn persist_fault_after_load_failure(&mut self, plugin_id: &str) {
+    fn persist_adapter_fault(&mut self, plugin_id: &str) {
         self.adapters.remove(plugin_id);
         let mut proposed = self.state.clone();
         if proposed.mark_faulted(plugin_id).is_err() {
@@ -817,6 +1191,15 @@ impl PluginWorker {
     }
 }
 
+const fn lifecycle_stage(request: &ContinuousRequest) -> PluginLifecycleStage {
+    match request {
+        ContinuousRequest::Begin(_) => PluginLifecycleStage::Begin,
+        ContinuousRequest::Update(_) => PluginLifecycleStage::Update,
+        ContinuousRequest::Commit(_) => PluginLifecycleStage::Commit,
+        ContinuousRequest::Cancel(_) => PluginLifecycleStage::Cancel,
+    }
+}
+
 fn find_package<'a>(
     report: &'a PluginDiscoveryReport,
     plugin_id: &str,
@@ -882,13 +1265,23 @@ fn log_operation(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Instant};
+    use std::{collections::BTreeMap, fs, path::Path, thread, time::Instant};
+
+    use gradial_core::{
+        ContinuousActionSnapshot, ContinuousCancelReason, ContinuousSession, PermittedContext,
+        PluginActionId,
+    };
 
     use super::*;
     use crate::plugin_discovery::discover_plugins;
 
     const FIRST_PLUGIN: &str = "example.first";
     const SECOND_PLUGIN: &str = "example.second";
+    const METER_PLUGIN: &str = "org.gradial.example.meter";
+    const METER_MANIFEST: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.meter/plugin.toml");
+    const METER_SOURCE: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.meter/main.lua");
     const VALID_SOURCE: &str = r"
         return {
             begin = function(context, parameters, sample) return {} end,
@@ -920,6 +1313,55 @@ mod tests {
         );
         fs::write(package.join("plugin.toml"), manifest).expect("plugin manifest");
         fs::write(package.join("main.lua"), source).expect("plugin source");
+    }
+
+    fn write_meter_example(root: &Path) {
+        let package = root.join(METER_PLUGIN);
+        fs::create_dir_all(&package).expect("example package");
+        fs::write(package.join("plugin.toml"), METER_MANIFEST).expect("example manifest");
+        fs::write(package.join("main.lua"), METER_SOURCE).expect("example source");
+    }
+
+    fn begin_session(plugin_id: &str, session_id: Uuid) -> (ContinuousSession, ContinuousRequest) {
+        let action = ContinuousActionSnapshot::new(
+            PluginId::new(plugin_id).expect("plugin ID"),
+            PluginActionId::new("measure").expect("action ID"),
+            PermittedContext::new(None, None),
+            BTreeMap::new(),
+            30,
+        )
+        .expect("continuous action");
+        ContinuousSession::begin(session_id, action, 0.25).expect("begin session")
+    }
+
+    fn accept_begin(session: &mut ContinuousSession) {
+        assert!(session.accept_begin(Duration::ZERO).expect("accept begin").is_none());
+    }
+
+    fn update_request(session: &mut ContinuousSession, value: f64) -> ContinuousRequest {
+        session.observe(value, Duration::from_millis(40)).expect("observe");
+        session
+            .take_due_update(Duration::from_millis(40))
+            .expect("take update")
+            .expect("due update")
+    }
+
+    fn cancel_request(
+        session: &mut ContinuousSession,
+        reason: ContinuousCancelReason,
+    ) -> ContinuousRequest {
+        session.cancel(reason).expect("cancel").expect("cancel request")
+    }
+
+    fn commit_request(session: &mut ContinuousSession, value: f64) -> ContinuousRequest {
+        session.commit(value, Duration::from_millis(60)).expect("commit").expect("commit request")
+    }
+
+    fn dispatch(
+        client: &PluginLifecycleClient,
+        request: ContinuousRequest,
+    ) -> Result<(), PluginLifecycleError> {
+        client.request(request).expect("accepted lifecycle request").receive()
     }
 
     fn prepare_state(paths: &AppPaths, approvals: &[(&str, bool)]) {
@@ -971,6 +1413,114 @@ mod tests {
         let snapshot = snapshot(&runtime);
 
         assert_eq!(snapshot.loaded_plugin_ids, vec![FIRST_PLUGIN]);
+    }
+
+    #[test]
+    fn no_side_effect_example_completes_the_worker_lifecycle() {
+        let (_temporary, paths) = setup();
+        write_meter_example(&paths.plugins);
+        prepare_state(&paths, &[(METER_PLUGIN, true)]);
+        let runtime = PluginWorkerRuntime::start(paths).expect("plugin worker");
+        let client = runtime.lifecycle_client();
+        let (mut session, begin) = begin_session(METER_PLUGIN, Uuid::from_u128(1));
+
+        dispatch(&client, begin).expect("begin");
+        accept_begin(&mut session);
+        let update = update_request(&mut session, 0.55);
+        dispatch(&client, update.clone()).expect("update");
+        dispatch(&client, commit_request(&mut session, 0.75)).expect("commit");
+
+        assert_eq!(dispatch(&client, update), Err(PluginLifecycleError::SessionNotActive));
+        assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![METER_PLUGIN]);
+    }
+
+    #[test]
+    fn worker_owns_one_session_and_defers_changed_package_teardown_until_terminal() {
+        let (_temporary, paths) = setup();
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], VALID_SOURCE);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let runtime = PluginWorkerRuntime::start(paths.clone()).expect("plugin worker");
+        let client = runtime.lifecycle_client();
+        let (mut first, begin) = begin_session(FIRST_PLUGIN, Uuid::from_u128(11));
+        dispatch(&client, begin).expect("first begin");
+        accept_begin(&mut first);
+
+        let (_second, second_begin) = begin_session(FIRST_PLUGIN, Uuid::from_u128(12));
+        assert_eq!(dispatch(&client, second_begin), Err(PluginLifecycleError::SessionActive));
+        assert_eq!(
+            operate(&runtime, PluginWorkerOperation::Disable, FIRST_PLUGIN),
+            Err(PluginWorkerError::SessionActive)
+        );
+
+        let changed_source = VALID_SOURCE.replace("return {}", "return { changed = true }");
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], &changed_source);
+        let during_session = rescan(&runtime);
+        assert_eq!(during_session.loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        assert_eq!(during_session.plugins[0].status, PluginInventoryStatus::ReloadRequired);
+
+        dispatch(&client, cancel_request(&mut first, ContinuousCancelReason::ReturnedToDiscrete))
+            .expect("cancel");
+        let after_terminal = snapshot(&runtime);
+        assert!(after_terminal.loaded_plugin_ids.is_empty());
+        assert_eq!(after_terminal.plugins[0].status, PluginInventoryStatus::ReloadRequired);
+    }
+
+    #[test]
+    fn callback_failure_faults_and_unloads_the_owned_plugin() {
+        let (_temporary, paths) = setup();
+        let source = VALID_SOURCE.replace(
+            "update = function(session, sample) end",
+            "update = function(session, sample) error('private failure') end",
+        );
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], &source);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let runtime = PluginWorkerRuntime::start(paths.clone()).expect("plugin worker");
+        let client = runtime.lifecycle_client();
+        let (mut session, begin) = begin_session(FIRST_PLUGIN, Uuid::from_u128(21));
+        dispatch(&client, begin).expect("begin");
+        accept_begin(&mut session);
+
+        assert_eq!(
+            dispatch(&client, update_request(&mut session, 0.5)),
+            Err(PluginLifecycleError::Lua(LuaSandboxError::Runtime))
+        );
+        assert!(snapshot(&runtime).loaded_plugin_ids.is_empty());
+        assert_eq!(persisted_status(&paths, FIRST_PLUGIN), PluginTrustStatus::Faulted);
+    }
+
+    #[test]
+    fn terminal_lane_remains_available_when_the_update_lane_is_full() {
+        let (_temporary, paths) = setup();
+        let slow_begin = VALID_SOURCE.replace(
+            "begin = function(context, parameters, sample) return {} end",
+            "begin = function(context, parameters, sample) while true do end end",
+        );
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], &slow_begin);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let runtime = PluginWorkerRuntime::start(paths).expect("plugin worker");
+        let client = runtime.lifecycle_client();
+        let (mut session, begin) = begin_session(FIRST_PLUGIN, Uuid::from_u128(31));
+        accept_begin(&mut session);
+        let update = update_request(&mut session, 0.5);
+        let terminal = cancel_request(&mut session, ContinuousCancelReason::UserRequested);
+
+        let begin_ticket = client.request(begin).expect("begin accepted");
+        thread::sleep(Duration::from_millis(10));
+        let update_ticket = client.request(update.clone()).expect("first update accepted");
+        assert!(matches!(
+            client.request(update),
+            Err(PluginLifecycleSubmitError::QueueFull(PluginLifecycleStage::Update))
+        ));
+        let terminal_ticket = client.request(terminal).expect("reserved terminal accepted");
+
+        assert!(matches!(
+            begin_ticket.receive(),
+            Err(PluginLifecycleError::Lua(
+                LuaSandboxError::InstructionLimit | LuaSandboxError::DeadlineExceeded
+            ))
+        ));
+        assert_eq!(terminal_ticket.receive(), Err(PluginLifecycleError::SessionNotActive));
+        assert_eq!(update_ticket.receive(), Err(PluginLifecycleError::SessionNotActive));
     }
 
     #[test]

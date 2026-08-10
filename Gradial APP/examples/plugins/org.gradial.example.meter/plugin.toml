@@ -1,0 +1,14 @@
+manifest_version = 1
+id = "org.gradial.example.meter"
+name = "No-side-effect meter"
+version = "0.1.0"
+api_version = 1
+entry = "main.lua"
+permissions = []
+
+[[actions]]
+id = "measure"
+name = "Measure continuously"
+kind = "continuous"
+description = "Tracks the current scalar only in private session memory."
+update_hz = 30

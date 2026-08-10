@@ -4802,6 +4802,9 @@ fn plugin_worker_error_message(error: PluginWorkerError) -> String {
         "reload_required" => "This plugin changed and must be reloaded.".to_owned(),
         "faulted" => "This plugin is faulted. Reload or disable it first.".to_owned(),
         "not_enabled" => "This plugin is not enabled.".to_owned(),
+        "session_active" => {
+            "This plugin is in use. Finish the current continuous control and try again.".to_owned()
+        }
         "write_failed" | "replace_failed" | "stale" | "revision_exhausted" => {
             "Gradial could not save the local plugin state. The plugin remains stopped.".to_owned()
         }
@@ -5531,6 +5534,10 @@ mod tests {
         assert_eq!(
             plugin_issue_message("plugin_reparse_point_rejected"),
             "Links, junctions, and other redirected plugin paths are not allowed."
+        );
+        assert_eq!(
+            plugin_worker_error_message(PluginWorkerError::SessionActive),
+            "This plugin is in use. Finish the current continuous control and try again."
         );
     }
 

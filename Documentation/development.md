@@ -969,10 +969,44 @@ of Save, Discard, import, export, and any unsaved Settings draft. Closing
 Settings dismisses a pending trust confirmation but does not cancel an already
 accepted worker operation.
 
-The worker still does not route Begin/Update/Commit/Cancel, expose any host
-capability, or connect plugin actions to the live coordinator. The current
-adapters therefore hold no active sessions, and reload/disable teardown has no
-external effect to cancel.
+## Worker lifecycle bridge
+
+The runtime exposes a cloneable internal lifecycle client with three independent
+bounded lanes: one pending Begin, one pending Update, and one pending Commit or
+Cancel. The terminal lane is therefore available even when the ordinary update
+lane is full, and the worker's biased selection checks terminal work first.
+The runtime-neutral continuous core remains responsible for coalescing samples
+before this boundary; the worker never accumulates mouse-rate update history.
+
+The worker owns one global active-session record containing only its opaque
+session UUID and plugin ID. Begin selects an already admitted adapter and
+establishes ownership only after Lua accepts the session. Update and terminal
+requests must match that owner. Commit and Cancel clear worker ownership before
+calling Lua; the lifecycle adapter independently removes its private Lua table
+before invoking the terminal callback. Unknown, duplicate, and post-terminal
+requests fail without reaching Lua.
+
+Any callback execution, resource-limit, or return-shape failure that faults the
+adapter immediately clears worker ownership, unloads the adapter, and attempts
+to persist the plugin's faulted state. The reply and release log contain only a
+stable error code. A persistence failure cannot make the adapter reachable
+again in the current process.
+
+Manual rescan remains code-free during an active session. It may show that a
+package now needs reload or permission review, but replacement and trust-state
+reconciliation are deferred until Commit or Cancel has completed. Settings
+enable, disable, reload, approval, and explicit fault operations return
+`session_active` rather than tearing down private Lua state without its terminal
+callback. The later live coordinator connection will translate such requests
+into Cancel followed by retry, as required by the full plan.
+
+The checked-in `examples/plugins/org.gradial.example.meter` package requests no
+permissions and stores its latest scalar only in private session state. Worker
+tests load its real manifest and source and complete Begin, Update, and Commit.
+
+The application still does not connect plugin actions to the live coordinator
+or expose any host capability. Production-enabled adapters therefore remain
+idle after validation until the next live bridge slice.
 
 ## Configuration and profile resolution
 

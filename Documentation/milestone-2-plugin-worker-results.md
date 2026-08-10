@@ -88,15 +88,17 @@ automatic unloading when changed source invalidates an admitted package.
 
 The complete repository check passed PowerShell analyzer self-tests,
 formatting, warning-denied linting, all-feature tests, documentation tests, and
-the debug workspace build. After the Plugins page slice, the debug suites pass
-245 application, 81 core, and 22 Lua tests. The independent optimized suites
-pass 241 application, 81 core, and 22 Lua tests.
+the debug workspace build. After the lifecycle bridge slice, the debug suites
+pass 249 application, 81 core, and 22 Lua tests. The independent optimized
+suites pass 245 application, 81 core, and 22 Lua tests.
 
 ## Superseded deferred boundary
 
 The Plugins Settings page now provides the production permission-review,
 enable, disable, reload, rescan, and managed-folder controls described in
-`milestone-2-plugin-settings-results.md`. There is still no live lifecycle
-routing, continuous action catalog connection, or capability broker. Loaded
+`milestone-2-plugin-settings-results.md`. The isolated Begin/Update/Commit/Cancel
+command boundary is implemented in
+`milestone-2-plugin-lifecycle-bridge-results.md`. There is still no live radial
+caller, continuous action catalog connection, or capability broker. Production
 adapters remain deliberately idle after validation; those boundaries remain
 separate future slices.
