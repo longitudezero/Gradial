@@ -19,6 +19,7 @@ mod overlay;
 mod platform;
 mod plugin_discovery;
 mod plugin_state;
+mod plugin_worker;
 mod process_launch;
 mod settings;
 mod shell_open;
@@ -34,69 +35,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use gradial_core::AppPaths;
 
-fn log_startup_begin(paths: &AppPaths) {
+fn log_startup_begin() {
     log::info!(
         target: "startup",
         "component=app event_code=startup_begin result_code=ok config_revision=0"
-    );
-    let report = plugin_discovery::discover_plugins(&paths.plugins);
-    plugin_discovery::log_discovery_report(&report);
-    let store = plugin_state::PluginStateStore::new(paths.clone());
-    let loaded = store.load_or_initialize();
-    log::info!(
-        target: "plugins",
-        "component=plugins event_code=plugin_state_loaded result_code=ok state_revision={} \
-         source={} tracked_plugins={}",
-        loaded.state.revision(),
-        loaded.source.as_str(),
-        loaded.state.plugin_count()
-    );
-    if let Some(warning) = loaded.warning {
-        log::error!(
-            target: "plugins",
-            "component=plugins event_code=plugin_state_recovery result_code=failure \
-             primary_error={} backup_error={}",
-            warning.primary_error.as_str(),
-            warning.backup_error.map_or("none", plugin_state::PluginStateFileErrorCode::as_str)
-        );
-    }
-
-    let mut reconciled = loaded.state.clone();
-    let reconciliation = reconciled.reconcile(&report);
-    let active = if reconciliation.changed {
-        match store.save(&loaded.state, &reconciled) {
-            Ok(saved) => saved,
-            Err(error) => {
-                log::error!(
-                    target: "plugins",
-                    "component=plugins event_code=plugin_state_reconciled result_code=failure \
-                     error_code={} permission_changes={} unavailable_disabled={}",
-                    error.code(),
-                    reconciliation.permission_changes,
-                    reconciliation.unavailable_disabled
-                );
-                reconciled
-            }
-        }
-    } else {
-        loaded.state
-    };
-    let counts = reconciliation.status_counts();
-    log::info!(
-        target: "plugins",
-        "component=plugins event_code=plugin_state_status result_code=ok state_revision={} \
-         scan_available={} enabled={} disabled={} reload_required={} faulted={} \
-         permission_review_required={} incompatible={} unavailable={} invalid={}",
-        active.revision(),
-        reconciliation.scan_available,
-        counts.get("enabled").copied().unwrap_or(0),
-        counts.get("disabled").copied().unwrap_or(0),
-        counts.get("reload_required").copied().unwrap_or(0),
-        counts.get("faulted").copied().unwrap_or(0),
-        counts.get("permission_review_required").copied().unwrap_or(0),
-        counts.get("incompatible").copied().unwrap_or(0),
-        counts.get("unavailable").copied().unwrap_or(0),
-        counts.get("invalid").copied().unwrap_or(0)
     );
 }
 
@@ -114,7 +56,9 @@ fn main() -> Result<()> {
 
     let logger =
         diagnostics::initialize(&paths.logs).context("could not initialize local logging")?;
-    log_startup_begin(&paths);
+    log_startup_begin();
+    let plugin_worker = plugin_worker::PluginWorkerRuntime::start(paths.clone())
+        .context("could not start Gradial's plugin worker")?;
     let loaded_configuration = configuration::ConfigStore::new(paths.clone())
         .load_or_initialize()
         .context("could not load Gradial configuration")?;
@@ -151,6 +95,7 @@ fn main() -> Result<()> {
     let app_services = application::ApplicationServices::new(
         configuration::ConfigStore::new(paths.clone()),
         diagnostic_bundle::DiagnosticBundleService::new(paths.clone(), logger.clone()),
+        plugin_worker,
     );
     let onboarding_store = onboarding::OnboardingStore::new(&paths);
     let onboarding_bypassed = startup_options.bypasses_onboarding();

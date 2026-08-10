@@ -107,9 +107,10 @@ and the same 13 Lua-host tests.
 
 ## Superseded deferred boundary
 
-The callback-validation and isolated execution portion originally deferred by
-this report is now implemented by `LuaLifecycleAdapter`; see
-`milestone-2-lua-lifecycle-results.md`. The atomic trust-state model is also
-now present, but coordinator integration, plugin workers, enablement/approval
-UI, and external capabilities remain deferred. The application still has no
-normal Lua-loading call site.
+The callback-validation portion originally deferred by this report is now
+implemented by `LuaLifecycleAdapter`; see
+`milestone-2-lua-lifecycle-results.md`. Atomic trust state and the dedicated
+Lua-owning worker are also present; see
+`milestone-2-plugin-trust-state-results.md` and
+`milestone-2-plugin-worker-results.md`. Coordinator integration,
+enablement/approval UI, and external capabilities remain deferred.

@@ -809,6 +809,15 @@ action belongs to a plugin.
 
 - All channels are bounded.
 - Lua states are created, used, and destroyed only by the plugin worker.
+- The plugin worker alone owns the mutable local trust snapshot while the app
+  is running; Settings and coordinators submit bounded commands rather than
+  loading Lua or writing plugin state themselves.
+- Startup and every enable/reload request repeat complete discovery. Admission
+  requires the current package's effective reconciled status, never the stored
+  enabled bit alone.
+- Enable/reload constructs and validates the frozen candidate first, atomically
+  records its exact fingerprint second, and admits it last. A failed state save
+  destroys the candidate.
 - One plugin callback runs at a time in v0.3.
 - Capability operations carry the continuous session ID and are rejected after
   its request epoch closes.

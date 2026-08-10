@@ -95,10 +95,9 @@ The debug suite passed 217 application tests, 81 core tests, and 22 Lua-host
 tests. The independent all-feature release suite passed 213 application tests,
 81 core tests, and the same 22 Lua-host tests.
 
-## Deferred boundary
+## Superseded deferred boundary
 
-No production application path constructs `LuaLifecycleAdapter`. This slice
-does not add plugin enablement, permission approval, Settings UI, a plugin
-worker, coordinator routing, capabilities, or OS effects. Those remain later
-boundaries so callback semantics are proven before code execution becomes a
-user-visible feature.
+The dedicated plugin worker now owns production `LuaLifecycleAdapter`
+construction and validated enable/reload admission; see
+`milestone-2-plugin-worker-results.md`. Settings UI, coordinator callback
+routing, capabilities, and OS effects remain later boundaries.

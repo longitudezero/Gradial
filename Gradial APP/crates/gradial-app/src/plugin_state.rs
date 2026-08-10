@@ -165,7 +165,6 @@ impl PluginTrustState {
         self.plugins.len()
     }
 
-    #[allow(dead_code, reason = "consumed by the upcoming Plugins settings page")]
     pub(crate) fn status(
         &self,
         package: &DiscoveredPlugin,
@@ -174,7 +173,6 @@ impl PluginTrustState {
         Ok(self.observation_status(&observation))
     }
 
-    #[allow(dead_code, reason = "consumed by the upcoming Plugins settings page")]
     pub(crate) fn approve_permissions(
         &mut self,
         package: &DiscoveredPlugin,
@@ -192,7 +190,6 @@ impl PluginTrustState {
 
     /// Records a completed load only after the caller has repeated discovery,
     /// compatibility checks, sandbox loading, and callback validation.
-    #[allow(dead_code, reason = "consumed by the upcoming plugin worker")]
     pub(crate) fn record_successful_load(
         &mut self,
         package: &DiscoveredPlugin,
@@ -214,7 +211,6 @@ impl PluginTrustState {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "consumed by the upcoming Plugins settings page")]
     pub(crate) fn disable(&mut self, plugin_id: &str) -> Result<(), PluginStateTransitionError> {
         let record =
             self.plugins.get_mut(plugin_id).ok_or(PluginStateTransitionError::UnknownPlugin)?;
@@ -223,7 +219,6 @@ impl PluginTrustState {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "consumed by the upcoming plugin worker")]
     pub(crate) fn mark_faulted(
         &mut self,
         plugin_id: &str,

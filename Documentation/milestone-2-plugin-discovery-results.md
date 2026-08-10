@@ -88,10 +88,10 @@ unavailable roots, and Windows directory-reparse rejection.
 
 ## Superseded deferred boundary
 
-The frozen source loader, Lua sandbox/lifecycle adapter, and atomic
-`plugins-state.json` trust model originally deferred by this report are now
-implemented in later isolated slices. Capability brokers, the Settings plugin
-page, a plugin worker, rescan/reload controls, and live continuous catalog
-connection remain deferred. Newly discovered source still has no production
-execution path, and enable/reload must repeat complete discovery before a Lua
-state can be admitted.
+The frozen source loader, Lua sandbox/lifecycle adapter, atomic
+`plugins-state.json` trust model, and dedicated plugin worker originally
+deferred by this report are now implemented in later isolated slices.
+Capability brokers, the Settings plugin page, its rescan/reload controls, and
+live continuous catalog connection remain deferred. Newly discovered source
+still starts disabled, and worker enable/reload repeats complete discovery
+before a Lua state can be admitted.

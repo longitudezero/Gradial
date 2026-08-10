@@ -349,7 +349,7 @@ discrete action. Settings retains these portable definitions, shows their
 identity read-only in the action catalog, and excludes them from discrete
 assignment and sequences.
 
-Startup now performs read-only discovery below
+The dedicated plugin worker performs read-only discovery below
 `%LOCALAPPDATA%\Gradial\plugins`. A strict `plugin.toml` declares identity,
 version, API, entry source, permissions, continuous actions, and bounded
 parameters. Each immediate package directory is independently classified as
@@ -365,20 +365,23 @@ of the last successfully loaded package. Permission changes disable an enabled
 record until reviewed; ordinary manifest or Lua edits retain approval but are
 marked as requiring manual reload. Atomic `.tmp`/`.bak` recovery fails closed
 to an empty disabled state and never stores source, paths, parameters, or
-credentials. No UI or runtime currently calls the approval or successful-load
-transitions.
+credentials. No UI calls the approval or successful-load transitions yet; the
+plugin worker owns them and the Lua states they authorize.
 
-The separate `gradial-lua` foundation embeds vendored Lua 5.4 for an explicit
-future enablement path. A fresh state exposes only reviewed basic functions,
+The separate `gradial-lua` foundation embeds vendored Lua 5.4. A fresh state
+exposes only reviewed basic functions,
 `math`, `string`, `table`, `utf8`, and the rooted/cached
 `gradial.require("lib.mapping")` source loader. It has no filesystem-backed
 loader or OS capability and enforces memory, instruction, and wall-time limits.
 Its strict lifecycle adapter validates and bounds `begin`, `update`, `commit`,
-and `cancel` with private session state and immutable host values. Gradial does
-not call either Lua path during normal operation, so discovered packages still
-execute zero code. There is intentionally no enable switch, permission-review
-UI, Settings plugin page, plugin worker, capability broker, or live continuous
-assignment yet.
+and `cancel` with private session state and immutable host values. At startup,
+the bounded worker constructs one adapter only for a freshly rediscovered
+package whose effective trust status is exactly enabled. Newly discovered,
+disabled, changed, incompatible, invalid, unavailable, and faulted packages
+execute zero Lua. Enable and reload validate Lua first, atomically record the
+exact successful package second, and admit the adapter last. There is still no
+enable switch, permission-review UI, Settings plugin page, capability broker,
+callback routing, or live continuous assignment.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
@@ -478,6 +481,12 @@ Read-only plugin manifest and package-discovery evidence is recorded in
 [`Documentation/milestone-2-plugin-discovery-results.md`](Documentation/milestone-2-plugin-discovery-results.md).
 Frozen-source and restricted Lua-host evidence is recorded in
 [`Documentation/milestone-2-lua-sandbox-results.md`](Documentation/milestone-2-lua-sandbox-results.md).
+Strict lifecycle-adapter, atomic trust-state, and isolated worker evidence is
+recorded in
+[`Documentation/milestone-2-lua-lifecycle-results.md`](Documentation/milestone-2-lua-lifecycle-results.md),
+[`Documentation/milestone-2-plugin-trust-state-results.md`](Documentation/milestone-2-plugin-trust-state-results.md),
+and
+[`Documentation/milestone-2-plugin-worker-results.md`](Documentation/milestone-2-plugin-worker-results.md).
 Configuration, snapshot, persistence, and resolver results are recorded in
 [`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).
 Profile-driven gesture and renderer results are recorded in

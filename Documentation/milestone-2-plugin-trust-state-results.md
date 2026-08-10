@@ -88,9 +88,9 @@ PowerShell analyzer self-tests, documentation tests, and the debug workspace
 build. The debug suites passed 229 application, 81 core, and 22 Lua tests. The
 optimized suites passed 225 application, 81 core, and 22 Lua tests.
 
-## Deferred boundary
+## Superseded deferred boundary
 
-Only read-only discovery, state loading, reconciliation, and fail-closed
-disablement run at startup. Approval, enable, reload, disable, and fault
-transitions are tested host APIs awaiting the Plugins page and plugin worker.
-No transition in this slice loads Lua or performs an OS effect.
+This slice originally stopped at read-only startup reconciliation. The
+dedicated owner and production admission caller are now implemented in
+`milestone-2-plugin-worker-results.md`. The Plugins page, capability effects,
+and live continuous coordinator connection remain deferred.

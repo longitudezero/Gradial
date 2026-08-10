@@ -771,7 +771,7 @@ in total. Discovery also bounds the managed root to 1,024 entries, one package
 to 4,096 filesystem entries, and package nesting to 32 directories. Files are
 opened through bounded reads so a concurrent size change cannot turn metadata
 validation into an unbounded allocation. Non-source documentation/assets are
-inspected as inert files and are never candidates for the future module loader.
+inspected as inert files and are never candidates for the Lua module loader.
 
 Discovery returns a deterministic package-name-sorted report. Status is
 isolated per directory (`Compatible`, `IncompatibleApi`, or `Invalid`) with a
@@ -779,16 +779,17 @@ stable non-content error code; a bad package cannot abort or hide later
 packages. Routine logs include only sanitized package/plugin identity, version,
 status, source counts, byte counts, and error codes—never TOML or Lua source.
 Compatible discovery captures accepted Lua bytes in an immutable source image.
-Changing a package file afterward cannot change that image or make the future
+Changing a package file afterward cannot change that image or make the Lua
 module loader reopen it. An enable/reload operation must still repeat complete
 validation and create a new image before creating a Lua state, rather than
 treating an earlier startup report as authorization.
 
 ## Atomic local plugin trust state
 
-Startup loads and reconciles a bounded schema-one `plugins-state.json` after
-read-only discovery. This file is machine-local and separate from portable
-`config.json`. It stores only a revision, per-plugin enabled/faulted flags, the
+Startup loads a bounded schema-one `plugins-state.json` and reconciles it
+against fresh read-only discovery. This file is machine-local and separate
+from portable `config.json`. It stores only a revision, per-plugin
+enabled/faulted flags, the
 canonical approved permission names, and the last successfully loaded manifest
 identity plus a package SHA-256 fingerprint. It contains no Lua or TOML source,
 plugin path, action parameter, credential, window context, or capability
@@ -807,15 +808,18 @@ Runtime admission must use the reconciled effective status for the current
 discovered package. The persisted `enabled` flag is historical state, not
 standalone authorization: `reload_required`, `permission_review_required`,
 faulted, unavailable, and incompatible records must never construct or retain
-a Lua state.
+a Lua state after the worker observes them through startup discovery or a
+requested operation's fresh scan. Gradial does not watch package files between
+operations; editing a currently loaded local script takes effect only after
+manual reload.
 
 Permission approval and successful enablement are separate transitions.
 Approval alone always leaves the record disabled. The successful-load
 transition is callable only after repeated package and API validation, bounded
-Lua entry evaluation, and lifecycle callback validation. There is no such
-production caller in this slice, so startup can initialize, recover,
-reconcile, and disable state but cannot enable or execute a plugin. Fault state
-is persisted; disable or a later validated successful reload clears it.
+Lua entry evaluation, and lifecycle callback validation. The dedicated plugin
+worker is now that production caller and the only owner allowed to write trust
+transitions while Gradial is running. Fault state is persisted; disable or a
+later validated successful reload clears it.
 
 The state file is capped at 512 KiB and 1,024 plugin records, rejects unknown
 JSON fields, future schemas, malformed IDs, unordered/duplicate permissions,
@@ -827,12 +831,12 @@ without overwriting either file. If neither copy is usable, Gradial retains the
 evidence and continues with an empty in-memory state, which disables all
 plugins. Stale writers and interrupted saves cannot replace newer state.
 
-## Inert Lua sandbox foundation
+## Lua sandbox foundation
 
 `gradial-lua` embeds vendored Lua 5.4 through `mlua`. Loading is an explicit
 host call that creates one fresh, sendable state from one frozen source image.
-Startup discovery never makes that call, so placing a package in the plugin
-directory still executes zero Lua code.
+Discovery itself never makes that call. Placing a package in the plugin
+directory starts it disabled and therefore executes zero Lua code.
 
 The state loads only Lua's basic value/iteration functions plus `math`,
 `string`, `table`, and `utf8`. It removes `os`, `io`, `package`, `debug`,
@@ -896,10 +900,47 @@ failure faults the adapter and drops every retained session; duplicate or
 unknown session requests are rejected as host protocol errors without blaming
 the plugin.
 
-This remains an inert testable host API. Application startup has no lifecycle
-adapter call site, and the enable/reload transitions have no production
-caller. Settings controls, capability functions, plugin workers, and
-continuous-coordinator integration remain absent.
+## Dedicated plugin worker
+
+`gradial-plugin-worker` owns the mutable trust snapshot and every
+`LuaLifecycleAdapter`. No Lua state crosses its thread boundary. Its command
+channel is bounded to eight pending operations; submissions are nonblocking
+and return a one-result ticket intended for later Settings polling. Invalid
+plugin IDs, a full queue, shutdown, and worker loss are rejected before work.
+The shared shutdown flag bypasses queue pressure, destroys every adapter, and
+waits no longer than two seconds.
+
+Startup loads the atomic local state, performs a fresh complete discovery,
+persists any permission/unavailability disablement, and constructs adapters
+only for packages whose reconciled status is exactly `enabled`. A package that
+fails sandbox or callback validation is unloaded and atomically marked faulted.
+If that fault write itself fails, the adapter remains absent for the current
+process and the fixed persistence failure is logged. A broken plugin cannot
+prevent the worker from reaching its command loop or the rest of Gradial from
+starting.
+
+Enable and reload are serialized admission transactions:
+
+1. repeat complete discovery and trust reconciliation;
+2. select the compatible frozen package by validated ID;
+3. require current approval and the operation-appropriate effective status;
+4. construct and validate a candidate adapter under normal Lua limits;
+5. atomically record the exact package identity/fingerprint; and
+6. admit the candidate only after the state save succeeds.
+
+A validation or persistence failure leaves no candidate adapter reachable.
+Reload removes an observed stale/faulted adapter before loading replacement
+code. Permission changes unload and disable before reapproval. Disable and
+fault requests tear down the adapter before attempting their durable state
+transition, which keeps the current process fail-closed even if storage is
+unavailable. File scans, Lua work, and state writes never run on the input,
+interaction, renderer, or action-executor threads.
+
+This worker does not yet route Begin/Update/Commit/Cancel, expose any host
+capability, or connect plugin actions to the live coordinator. The current
+adapters therefore hold no active sessions, and reload/disable teardown has no
+external effect to cancel. The Plugins Settings page remains the next
+user-facing caller of the already asynchronous operation API.
 
 ## Configuration and profile resolution
 

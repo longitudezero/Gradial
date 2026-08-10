@@ -25,6 +25,7 @@ use crate::{
     options::{ContinuousMeterMode, StartupOptions},
     overlay::{AnimationMode, OverlayPool},
     platform,
+    plugin_worker::PluginWorkerRuntime,
     settings::{SettingsEditor, SettingsEvent, settings_viewport_id},
     start_at_login::{StartAtLoginAction, StartAtLoginService},
     tray::{TrayCommand, TrayHealth, TrayIcon},
@@ -59,6 +60,7 @@ fn overlay_size_dip(mode: ContinuousMeterMode, continuous_full_scale_radius_dip:
 pub(crate) struct ApplicationServices {
     config_store: ConfigStore,
     diagnostic_bundles: DiagnosticBundleService,
+    plugin_worker: PluginWorkerRuntime,
     start_at_login: StartAtLoginService,
     continuous_study_directory: PathBuf,
 }
@@ -67,20 +69,26 @@ impl ApplicationServices {
     pub(crate) fn new(
         config_store: ConfigStore,
         diagnostic_bundles: DiagnosticBundleService,
+        plugin_worker: PluginWorkerRuntime,
     ) -> Self {
         let continuous_study_directory = config_store.continuous_study_directory();
         Self {
             config_store,
             diagnostic_bundles,
+            plugin_worker,
             start_at_login: StartAtLoginService::for_current_executable(),
             continuous_study_directory,
         }
     }
 
-    fn into_parts(self) -> (ConfigStore, DiagnosticBundleService, StartAtLoginService, PathBuf) {
+    fn into_parts(
+        self,
+    ) -> (ConfigStore, DiagnosticBundleService, PluginWorkerRuntime, StartAtLoginService, PathBuf)
+    {
         (
             self.config_store,
             self.diagnostic_bundles,
+            self.plugin_worker,
             self.start_at_login,
             self.continuous_study_directory,
         )
@@ -157,6 +165,8 @@ pub(crate) struct GradialApp {
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
     action_executor: ActionExecutor,
+    #[allow(dead_code, reason = "keeps the isolated plugin worker alive until application exit")]
+    plugin_worker: PluginWorkerRuntime,
     native_style_passes: u8,
     pool_generation: u64,
     rebuild_in_progress: bool,
@@ -191,8 +201,13 @@ impl GradialApp {
         configuration: Configuration,
         recovery_warning: bool,
     ) -> Result<Self> {
-        let (config_store, diagnostic_bundles, start_at_login, continuous_study_directory) =
-            services.into_parts();
+        let (
+            config_store,
+            diagnostic_bundles,
+            plugin_worker,
+            start_at_login,
+            continuous_study_directory,
+        ) = services.into_parts();
         let config_revision = configuration.config_revision;
         let icons = Arc::new(IconManager::new(config_store.icon_directory()));
         let icon_protection = config_store.icon_protection_snapshot(&configuration, None);
@@ -283,6 +298,7 @@ impl GradialApp {
             overlay_pool,
             interaction: None,
             action_executor,
+            plugin_worker,
             native_style_passes: 0,
             pool_generation: 0,
             rebuild_in_progress: false,
