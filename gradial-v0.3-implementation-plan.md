@@ -743,12 +743,17 @@ protocol.
   `127.0.0.1` or `[::1]`.
 - Performs no DNS lookup, proxy discovery, redirect following, Windows
   credential use, or non-loopback fallback.
-- Allows only manifest-declared HTTP methods and ports.
+- Allows only manifest-declared `GET` and `POST` methods and explicit nonzero
+  ports. Cleartext HTTP is the only v0.3 transport.
+- Accepts a bounded ASCII origin-form path and a closed content-type set; it
+  exposes no arbitrary request headers.
 - Bounds request and response bodies to 64 KiB.
 - Uses a maximum 250 ms operation deadline and a bounded broker queue.
 - Allows at most 30 accepted requests per second per active session.
 - Enqueues requests without blocking the Lua callback. Lua receives only
   accepted/rejected status; response content is not delivered in v0.3.
+- Gives the coordinator a 350 ms Commit budget: the existing 100 ms Lua Commit
+  ceiling followed by at most the 250 ms capability deadline.
 - Never logs headers, bodies, query values, or responses.
 - Supports no stored secret in v0.3.
 
@@ -1150,7 +1155,8 @@ and manual authoring steps pass without executing code from a disabled plugin.
 ### Milestone 3 — Capabilities and action editing
 
 Implementation note (2026-08-10): the editor, permission-filtered context,
-`input.shortcut`, and `notification` slices are complete. Settings receives
+`input.shortcut`, `notification`, and `network.loopback` slices are complete.
+Settings receives
 compatible manifest action schemas, offers actions from enabled plugins for
 portable continuous action creation, renders all five bounded parameter kinds
 without executing Lua, and validates
@@ -1172,7 +1178,13 @@ five messages per plugin per rolling minute, and hands accepted work to a
 bounded cancellation-aware native queue. It identifies the plugin, requests
 no focus or sound, and exposes no link or action surface. The checked-in commit
 notification example exercises its real worker boundary. `network.loopback`
-remains the later Milestone 3 capability slice.
+uses only reviewed literal `127.0.0.1`/`[::1]` origins, explicit ports, and
+GET/POST grants. Grant changes require fresh review. A dedicated bounded broker
+uses direct socket addresses with no DNS, proxy, redirect, credentials, retry,
+or non-loopback fallback; requests and responses are capped at 64 KiB and the
+complete operation at 250 ms. Lua receives only enqueue status. The checked-in
+Commit example and local TCP harness exercise the worker and production HTTP
+boundaries. Milestone 3 is complete.
 
 Deliver:
 
@@ -1187,8 +1199,8 @@ Deliver:
 - Loopback integration harness.
 - Import/export dependency summary.
 
-Exit only when every capability has positive, denied, revoked, stale-target,
-rate-limit, timeout, cancellation, and privacy evidence.
+Exit only when every capability has positive, denied, revoked, stale-target
+where applicable, rate-limit, timeout, cancellation, and privacy evidence.
 
 ### Milestone 4 — Hardening and documentation
 

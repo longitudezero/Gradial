@@ -1,13 +1,280 @@
 //! Runtime-neutral payloads accepted by Gradial capability brokers.
 
-use std::{fmt, net::IpAddr, str::FromStr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    str::FromStr,
+};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 use crate::{ShortcutKey, ShortcutModifier};
 
 pub const MAX_PLUGIN_SHORTCUT_CHORD_BYTES: usize = 128;
 pub const MAX_PLUGIN_NOTIFICATION_TEXT_BYTES: usize = 128;
+pub const MAX_PLUGIN_LOOPBACK_PATH_BYTES: usize = 2_048;
+pub const MAX_PLUGIN_LOOPBACK_BODY_BYTES: usize = 64 * 1_024;
+
+/// One exact, canonical, cleartext HTTP loopback origin. It always includes an
+/// explicit nonzero port and can be converted directly to a socket address
+/// without DNS or proxy discovery.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PluginLoopbackOrigin {
+    text: String,
+    socket_addr: SocketAddr,
+}
+
+impl PluginLoopbackOrigin {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    #[must_use]
+    pub const fn socket_addr(&self) -> SocketAddr {
+        self.socket_addr
+    }
+}
+
+impl fmt::Debug for PluginLoopbackOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("PluginLoopbackOrigin").field(&self.text).finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PluginLoopbackOriginParseError {
+    #[error("plugin_loopback_origin_invalid")]
+    Invalid,
+}
+
+impl FromStr for PluginLoopbackOrigin {
+    type Err = PluginLoopbackOriginParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let authority =
+            value.strip_prefix("http://").ok_or(PluginLoopbackOriginParseError::Invalid)?;
+        let socket_addr = if let Some(port) = authority.strip_prefix("[::1]:") {
+            let port = parse_canonical_port(port)?;
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
+        } else if let Some(port) = authority.strip_prefix("127.0.0.1:") {
+            let port = parse_canonical_port(port)?;
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        } else {
+            return Err(PluginLoopbackOriginParseError::Invalid);
+        };
+        let canonical = match socket_addr {
+            SocketAddr::V4(address) => format!("http://127.0.0.1:{}", address.port()),
+            SocketAddr::V6(address) => format!("http://[::1]:{}", address.port()),
+        };
+        if value != canonical {
+            return Err(PluginLoopbackOriginParseError::Invalid);
+        }
+        Ok(Self { text: canonical, socket_addr })
+    }
+}
+
+fn parse_canonical_port(value: &str) -> Result<u16, PluginLoopbackOriginParseError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(PluginLoopbackOriginParseError::Invalid);
+    }
+    let port = value.parse::<u16>().map_err(|_| PluginLoopbackOriginParseError::Invalid)?;
+    if port == 0 || value != port.to_string() {
+        return Err(PluginLoopbackOriginParseError::Invalid);
+    }
+    Ok(port)
+}
+
+impl Serialize for PluginLoopbackOrigin {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginLoopbackOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?.parse().map_err(de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum PluginLoopbackMethod {
+    #[serde(rename = "GET")]
+    Get,
+    #[serde(rename = "POST")]
+    Post,
+}
+
+impl PluginLoopbackMethod {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+        }
+    }
+}
+
+impl FromStr for PluginLoopbackMethod {
+    type Err = PluginLoopbackRequestParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "GET" => Ok(Self::Get),
+            "POST" => Ok(Self::Post),
+            _ => Err(PluginLoopbackRequestParseError::Method),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginLoopbackGrant {
+    pub origin: PluginLoopbackOrigin,
+    pub methods: Vec<PluginLoopbackMethod>,
+}
+
+impl PluginLoopbackGrant {
+    #[must_use]
+    pub fn permits(&self, request: &PluginLoopbackRequest) -> bool {
+        self.origin == request.origin && self.methods.contains(&request.method)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginLoopbackContentType {
+    Binary,
+    Json,
+    Form,
+    Text,
+}
+
+impl PluginLoopbackContentType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "application/octet-stream",
+            Self::Json => "application/json",
+            Self::Form => "application/x-www-form-urlencoded",
+            Self::Text => "text/plain; charset=utf-8",
+        }
+    }
+}
+
+impl FromStr for PluginLoopbackContentType {
+    type Err = PluginLoopbackRequestParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "application/octet-stream" => Ok(Self::Binary),
+            "application/json" => Ok(Self::Json),
+            "application/x-www-form-urlencoded" => Ok(Self::Form),
+            "text/plain; charset=utf-8" => Ok(Self::Text),
+            _ => Err(PluginLoopbackRequestParseError::ContentType),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct PluginLoopbackRequest {
+    method: PluginLoopbackMethod,
+    origin: PluginLoopbackOrigin,
+    path: String,
+    body: Vec<u8>,
+    content_type: PluginLoopbackContentType,
+}
+
+impl PluginLoopbackRequest {
+    /// Validates a complete request before it reaches a capability broker.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded parse error for an unsafe request target, an
+    /// oversized body, or a GET request carrying a body.
+    pub fn new(
+        method: PluginLoopbackMethod,
+        origin: PluginLoopbackOrigin,
+        path: impl Into<String>,
+        body: Vec<u8>,
+        content_type: PluginLoopbackContentType,
+    ) -> Result<Self, PluginLoopbackRequestParseError> {
+        let path = path.into();
+        if path.is_empty()
+            || path.len() > MAX_PLUGIN_LOOPBACK_PATH_BYTES
+            || !path.is_ascii()
+            || !path.starts_with('/')
+            || path.starts_with("//")
+            || path.bytes().any(|byte| byte.is_ascii_control() || byte == b' ' || byte == b'\\')
+            || path.contains('#')
+        {
+            return Err(PluginLoopbackRequestParseError::Path);
+        }
+        if body.len() > MAX_PLUGIN_LOOPBACK_BODY_BYTES {
+            return Err(PluginLoopbackRequestParseError::BodyTooLarge);
+        }
+        if method == PluginLoopbackMethod::Get && !body.is_empty() {
+            return Err(PluginLoopbackRequestParseError::GetBody);
+        }
+        Ok(Self { method, origin, path, body, content_type })
+    }
+
+    #[must_use]
+    pub const fn method(&self) -> PluginLoopbackMethod {
+        self.method
+    }
+
+    #[must_use]
+    pub const fn origin(&self) -> &PluginLoopbackOrigin {
+        &self.origin
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn content_type(&self) -> PluginLoopbackContentType {
+        self.content_type
+    }
+}
+
+impl fmt::Debug for PluginLoopbackRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PluginLoopbackRequest")
+            .field("method", &self.method)
+            .field("origin", &self.origin)
+            .field("body_bytes", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PluginLoopbackRequestParseError {
+    #[error("plugin_loopback_method_invalid")]
+    Method,
+    #[error("plugin_loopback_path_invalid")]
+    Path,
+    #[error("plugin_loopback_body_too_large")]
+    BodyTooLarge,
+    #[error("plugin_loopback_get_body_invalid")]
+    GetBody,
+    #[error("plugin_loopback_content_type_invalid")]
+    ContentType,
+}
 
 /// One complete keyboard chord. It can never represent a held key or an
 /// arbitrary input event sequence.
@@ -397,5 +664,85 @@ mod tests {
                 Err(PluginNotificationParseError::UrlDisallowed)
             );
         }
+    }
+
+    #[test]
+    fn loopback_origins_are_canonical_literal_socket_addresses() {
+        let ipv4: PluginLoopbackOrigin = "http://127.0.0.1:8080".parse().expect("IPv4");
+        assert_eq!(ipv4.as_str(), "http://127.0.0.1:8080");
+        assert_eq!(ipv4.socket_addr(), "127.0.0.1:8080".parse().expect("socket"));
+        let ipv6: PluginLoopbackOrigin = "http://[::1]:65535".parse().expect("IPv6");
+        assert_eq!(ipv6.socket_addr(), "[::1]:65535".parse().expect("socket"));
+
+        for rejected in [
+            "https://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://127.0.0.2:8080",
+            "http://0.0.0.0:8080",
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:08080",
+            "http://127.0.0.1:8080/path",
+            "http://user@127.0.0.1:8080",
+        ] {
+            assert!(rejected.parse::<PluginLoopbackOrigin>().is_err(), "accepted {rejected}");
+        }
+    }
+
+    #[test]
+    fn loopback_request_is_bounded_and_debug_redacts_path_and_body() {
+        let origin = "http://127.0.0.1:8080".parse().expect("origin");
+        let request = PluginLoopbackRequest::new(
+            PluginLoopbackMethod::Post,
+            origin,
+            "/private?token=secret",
+            b"private-body".to_vec(),
+            PluginLoopbackContentType::Json,
+        )
+        .expect("request");
+        assert_eq!(request.method(), PluginLoopbackMethod::Post);
+        assert_eq!(request.path(), "/private?token=secret");
+        assert_eq!(request.body(), b"private-body");
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("token"));
+        assert!(!debug.contains("private-body"));
+    }
+
+    #[test]
+    fn loopback_request_rejects_unsafe_targets_and_payloads() {
+        let origin = || "http://127.0.0.1:8080".parse().expect("origin");
+        for path in ["", "relative", "//other/path", "/space here", "/line\nbreak", "/a\\b", "/a#b"]
+        {
+            assert_eq!(
+                PluginLoopbackRequest::new(
+                    PluginLoopbackMethod::Get,
+                    origin(),
+                    path,
+                    Vec::new(),
+                    PluginLoopbackContentType::Binary,
+                ),
+                Err(PluginLoopbackRequestParseError::Path)
+            );
+        }
+        assert_eq!(
+            PluginLoopbackRequest::new(
+                PluginLoopbackMethod::Get,
+                origin(),
+                "/",
+                vec![1],
+                PluginLoopbackContentType::Binary,
+            ),
+            Err(PluginLoopbackRequestParseError::GetBody)
+        );
+        assert_eq!(
+            PluginLoopbackRequest::new(
+                PluginLoopbackMethod::Post,
+                origin(),
+                "/",
+                vec![0; MAX_PLUGIN_LOOPBACK_BODY_BYTES + 1],
+                PluginLoopbackContentType::Binary,
+            ),
+            Err(PluginLoopbackRequestParseError::BodyTooLarge)
+        );
     }
 }

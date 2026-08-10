@@ -15,10 +15,10 @@ use gradial_core::{
     ActivationBindingId, Appearance, ApplicationProfile, Configuration, ConfigurationError,
     ExecutionOperation, IconReference, LabelTheme, MAX_ACTION_SEQUENCE_DEPTH,
     MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu,
-    MenuSlice, PhysicalModifiers, PluginManifestAction, PluginParameterDefinition,
-    PluginPermission, PluginValue, Profile, ProfileResolver, ProfileRule, ProfileTarget,
-    ResolutionDecision, ResolvedMenu, ShortcutKey, SizePreset, SliceCount, WindowCommand,
-    slice_for_delta,
+    MenuSlice, PhysicalModifiers, PluginLoopbackGrant, PluginManifestAction,
+    PluginParameterDefinition, PluginPermission, PluginValue, Profile, ProfileResolver,
+    ProfileRule, ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey, SizePreset,
+    SliceCount, WindowCommand, slice_for_delta,
 };
 #[cfg(debug_assertions)]
 use gradial_core::{AppPaths, ShortcutModifier};
@@ -2277,7 +2277,7 @@ impl SettingsState {
                         );
                         ui.add_space(10.0);
                         ui.strong("Requested permissions");
-                        render_plugin_permissions(ui, &plugin.permissions);
+                        render_plugin_permissions(ui, &plugin.permissions, &plugin.loopback);
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
                             if ui.button("Approve and enable").clicked() {
@@ -5048,7 +5048,7 @@ fn render_plugin_entry(
     }
     ui.add_space(6.0);
     ui.strong("Requested permissions");
-    render_plugin_permissions(ui, &plugin.permissions);
+    render_plugin_permissions(ui, &plugin.permissions, &plugin.loopback);
     if !plugin.actions.is_empty() {
         ui.add_space(6.0);
         ui.strong("Continuous controls");
@@ -5128,13 +5128,30 @@ const fn plugin_requires_trust_confirmation(plugin: &PluginInventoryEntry) -> bo
         || matches!(plugin.status, PluginInventoryStatus::Disabled) && !plugin.permissions_approved
 }
 
-fn render_plugin_permissions(ui: &mut egui::Ui, permissions: &[PluginPermission]) {
+fn render_plugin_permissions(
+    ui: &mut egui::Ui,
+    permissions: &[PluginPermission],
+    loopback: &[PluginLoopbackGrant],
+) {
     if permissions.is_empty() {
         ui.weak("No optional Gradial permissions requested.");
         return;
     }
     for permission in permissions {
         ui.label(format!("• {}", plugin_permission_description(*permission)));
+        if *permission == PluginPermission::NetworkLoopback {
+            ui.indent("plugin_loopback_origins", |ui| {
+                for grant in loopback {
+                    let methods = grant
+                        .methods
+                        .iter()
+                        .map(|method| method.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ui.monospace(format!("{} ({methods})", grant.origin.as_str()));
+                }
+            });
+        }
     }
 }
 
@@ -5659,6 +5676,7 @@ maximum = 2.0
                 version: Some(manifest.version),
                 api_version: Some(manifest.api_version),
                 permissions: manifest.permissions,
+                loopback: manifest.loopback,
                 actions: manifest.actions,
                 permissions_approved: true,
                 status: if loaded {
@@ -6053,6 +6071,7 @@ maximum = 2.0
                 version: Some("1.0.0".to_owned()),
                 api_version: Some(1),
                 permissions: vec![PluginPermission::Notification],
+                loopback: Vec::new(),
                 actions: Vec::new(),
                 permissions_approved: false,
                 status: PluginInventoryStatus::Disabled,
@@ -6093,6 +6112,7 @@ maximum = 2.0
             version: Some("1.0.0".to_owned()),
             api_version: Some(1),
             permissions: vec![PluginPermission::InputShortcut],
+            loopback: Vec::new(),
             actions: Vec::new(),
             permissions_approved: false,
             status: PluginInventoryStatus::Disabled,

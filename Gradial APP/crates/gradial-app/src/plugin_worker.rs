@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, s
 use gradial_core::{
     AppPaths, ContinuousBeginRequest, ContinuousCancelReason, ContinuousCancelRequest,
     ContinuousCommitRequest, ContinuousRequest, ContinuousUpdateRequest, PluginActionId, PluginId,
-    PluginManifestAction, PluginPermission,
+    PluginLoopbackGrant, PluginManifestAction, PluginPermission,
 };
 use gradial_lua::{LuaLifecycleAdapter, LuaSandboxError, LuaSandboxLimits};
 use thiserror::Error;
@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     capability_broker::{
+        LoopbackCapabilityClient, LoopbackCapabilityFailure, LoopbackCapabilityRuntime,
         LuaCapabilityBrokerClient, NotificationCapabilityClient, NotificationCapabilityFailure,
         NotificationCapabilityRuntime, ShortcutCapabilityClient, ShortcutCapabilityFailure,
         ShortcutCapabilityRuntime,
@@ -54,6 +55,7 @@ const CONTEXT_APPLICATION_PERMISSION: u8 = 1 << 0;
 const CONTEXT_WINDOW_TITLE_PERMISSION: u8 = 1 << 1;
 const INPUT_SHORTCUT_PERMISSION: u8 = 1 << 2;
 const NOTIFICATION_PERMISSION: u8 = 1 << 3;
+const NETWORK_LOOPBACK_PERMISSION: u8 = 1 << 4;
 
 impl PluginActionAdmission {
     fn new(update_hz: u16, permissions: &[PluginPermission]) -> Self {
@@ -63,7 +65,7 @@ impl PluginActionAdmission {
                 PluginPermission::ContextWindowTitle => CONTEXT_WINDOW_TITLE_PERMISSION,
                 PluginPermission::InputShortcut => INPUT_SHORTCUT_PERMISSION,
                 PluginPermission::Notification => NOTIFICATION_PERMISSION,
-                PluginPermission::NetworkLoopback => 0,
+                PluginPermission::NetworkLoopback => NETWORK_LOOPBACK_PERMISSION,
             }
         });
         Self { update_hz, permissions }
@@ -87,6 +89,10 @@ impl PluginActionAdmission {
 
     pub(crate) const fn permits_notification(self) -> bool {
         self.permissions & NOTIFICATION_PERMISSION != 0
+    }
+
+    pub(crate) const fn permits_network_loopback(self) -> bool {
+        self.permissions & NETWORK_LOOPBACK_PERMISSION != 0
     }
 
     #[cfg(test)]
@@ -159,6 +165,7 @@ pub(crate) struct PluginInventoryEntry {
     pub(crate) version: Option<String>,
     pub(crate) api_version: Option<u16>,
     pub(crate) permissions: Vec<PluginPermission>,
+    pub(crate) loopback: Vec<PluginLoopbackGrant>,
     pub(crate) actions: Vec<PluginManifestAction>,
     pub(crate) permissions_approved: bool,
     pub(crate) status: PluginInventoryStatus,
@@ -416,6 +423,7 @@ pub(crate) struct PluginLifecycleClient {
     action_catalog: SharedPluginActionCatalog,
     shortcut_capabilities: ShortcutCapabilityClient,
     notification_capabilities: NotificationCapabilityClient,
+    loopback_capabilities: LoopbackCapabilityClient,
     shutdown_requested: Arc<AtomicBool>,
 }
 
@@ -446,6 +454,7 @@ impl PluginLifecycleClient {
             action_catalog: Arc::new(RwLock::new(Arc::new(action_catalog))),
             shortcut_capabilities: ShortcutCapabilityClient::inert_for_test(),
             notification_capabilities: NotificationCapabilityClient::inert_for_test(),
+            loopback_capabilities: LoopbackCapabilityClient::inert_for_test(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -550,6 +559,31 @@ impl PluginLifecycleClient {
     ) -> Result<(), NotificationCapabilityFailure> {
         self.notification_capabilities.finish_commit(session_id)
     }
+
+    pub(crate) fn open_loopback_session(
+        &self,
+        session_id: Uuid,
+        plugin_id: &PluginId,
+        permitted: bool,
+    ) -> Result<(), LoopbackCapabilityFailure> {
+        self.loopback_capabilities.open_session(session_id, plugin_id.as_str(), permitted)
+    }
+
+    pub(crate) fn loopback_failure(&self, session_id: Uuid) -> Option<LoopbackCapabilityFailure> {
+        self.loopback_capabilities.failure(session_id)
+    }
+
+    pub(crate) fn cancel_loopback_session(&self, session_id: Uuid) {
+        self.loopback_capabilities.cancel_session(session_id);
+    }
+
+    pub(crate) fn finish_loopback_commit(
+        &self,
+        session_id: Uuid,
+        deadline: std::time::Instant,
+    ) -> Result<(), LoopbackCapabilityFailure> {
+        self.loopback_capabilities.finish_commit(session_id, deadline)
+    }
 }
 
 #[derive(Debug)]
@@ -561,6 +595,7 @@ pub(crate) struct PluginWorkerRuntime {
     join_handle: Option<JoinHandle<()>>,
     shortcut_capabilities: ShortcutCapabilityRuntime,
     notification_capabilities: NotificationCapabilityRuntime,
+    loopback_capabilities: LoopbackCapabilityRuntime,
 }
 
 impl PluginWorkerRuntime {
@@ -568,7 +603,14 @@ impl PluginWorkerRuntime {
         let shortcut_capabilities = ShortcutCapabilityRuntime::start()
             .context("could not start the shortcut capability broker")?;
         let notification_capabilities = NotificationCapabilityRuntime::start();
-        Self::start_with_capabilities(paths, shortcut_capabilities, notification_capabilities)
+        let loopback_capabilities = LoopbackCapabilityRuntime::start()
+            .context("could not start the loopback capability broker")?;
+        Self::start_with_all_capabilities(
+            paths,
+            shortcut_capabilities,
+            notification_capabilities,
+            loopback_capabilities,
+        )
     }
 
     #[cfg(test)]
@@ -583,13 +625,31 @@ impl PluginWorkerRuntime {
         )
     }
 
+    #[cfg(test)]
     fn start_with_capabilities(
         paths: AppPaths,
         shortcut_capabilities: ShortcutCapabilityRuntime,
         notification_capabilities: NotificationCapabilityRuntime,
     ) -> Result<Self> {
+        let loopback_capabilities = LoopbackCapabilityRuntime::start()
+            .context("could not start the test loopback capability broker")?;
+        Self::start_with_all_capabilities(
+            paths,
+            shortcut_capabilities,
+            notification_capabilities,
+            loopback_capabilities,
+        )
+    }
+
+    fn start_with_all_capabilities(
+        paths: AppPaths,
+        shortcut_capabilities: ShortcutCapabilityRuntime,
+        notification_capabilities: NotificationCapabilityRuntime,
+        loopback_capabilities: LoopbackCapabilityRuntime,
+    ) -> Result<Self> {
         let shortcut_client = shortcut_capabilities.client();
         let notification_client = notification_capabilities.client();
+        let loopback_client = loopback_capabilities.client();
         let (command_sender, commands) = bounded(COMMAND_CAPACITY);
         let (begin_sender, begins) = bounded(LIFECYCLE_BEGIN_CAPACITY);
         let (update_sender, updates) = bounded(LIFECYCLE_UPDATE_CAPACITY);
@@ -601,6 +661,7 @@ impl PluginWorkerRuntime {
         let worker_action_catalog = Arc::clone(&action_catalog);
         let worker_shortcut_client = shortcut_client.clone();
         let worker_notification_client = notification_client.clone();
+        let worker_loopback_client = loopback_client.clone();
         let join_handle = thread::Builder::new()
             .name("gradial-plugin-worker".to_owned())
             .spawn(move || {
@@ -610,6 +671,7 @@ impl PluginWorkerRuntime {
                     worker_action_catalog,
                     worker_shortcut_client,
                     worker_notification_client,
+                    worker_loopback_client,
                 );
                 worker.run(&commands, &begins, &updates, &terminals, &worker_shutdown);
                 let _sent = stopped_sender.try_send(());
@@ -630,6 +692,7 @@ impl PluginWorkerRuntime {
             action_catalog,
             shortcut_capabilities: shortcut_client,
             notification_capabilities: notification_client,
+            loopback_capabilities: loopback_client,
             shutdown_requested: Arc::clone(&shutdown_requested),
         };
         Ok(Self {
@@ -640,6 +703,7 @@ impl PluginWorkerRuntime {
             join_handle: Some(join_handle),
             shortcut_capabilities,
             notification_capabilities,
+            loopback_capabilities,
         })
     }
 
@@ -729,6 +793,7 @@ impl PluginWorkerRuntime {
                 SHUTDOWN_WAIT.as_millis()
             ),
         }
+        self.loopback_capabilities.shutdown();
         self.notification_capabilities.shutdown();
         self.shortcut_capabilities.shutdown();
     }
@@ -748,6 +813,7 @@ struct PluginWorker {
     action_catalog: SharedPluginActionCatalog,
     shortcut_capabilities: ShortcutCapabilityClient,
     notification_capabilities: NotificationCapabilityClient,
+    loopback_capabilities: LoopbackCapabilityClient,
     aborted_begins: BTreeSet<Uuid>,
     active_session: Option<ActivePluginSession>,
     reconciliation_deferred: bool,
@@ -765,6 +831,7 @@ struct LoadedPlugin {
     adapter: LuaLifecycleAdapter,
     actions: BTreeMap<String, PluginManifestAction>,
     permissions: Vec<PluginPermission>,
+    loopback: Vec<PluginLoopbackGrant>,
 }
 
 impl PluginWorker {
@@ -774,6 +841,7 @@ impl PluginWorker {
         action_catalog: SharedPluginActionCatalog,
         shortcut_capabilities: ShortcutCapabilityClient,
         notification_capabilities: NotificationCapabilityClient,
+        loopback_capabilities: LoopbackCapabilityClient,
     ) -> Self {
         let store = PluginStateStore::new(paths.clone());
         let loaded = store.load_or_initialize();
@@ -805,6 +873,7 @@ impl PluginWorker {
             action_catalog,
             shortcut_capabilities,
             notification_capabilities,
+            loopback_capabilities,
             aborted_begins: BTreeSet::new(),
             active_session: None,
             reconciliation_deferred: false,
@@ -853,6 +922,7 @@ impl PluginWorker {
                     package,
                     &self.shortcut_capabilities,
                     &self.notification_capabilities,
+                    &self.loopback_capabilities,
                 ) {
                     Ok(plugin) => {
                         self.adapters.insert(plugin_id.clone(), plugin);
@@ -1241,9 +1311,13 @@ impl PluginWorker {
             ));
         }
 
-        let candidate =
-            load_plugin(&package, &self.shortcut_capabilities, &self.notification_capabilities)
-                .map_err(PluginWorkerError::Lua)?;
+        let candidate = load_plugin(
+            &package,
+            &self.shortcut_capabilities,
+            &self.notification_capabilities,
+            &self.loopback_capabilities,
+        )
+        .map_err(PluginWorkerError::Lua)?;
         let mut proposed = self.state.clone();
         proposed.record_successful_load(&package).map_err(PluginWorkerError::StateTransition)?;
         self.persist(&proposed)?;
@@ -1284,6 +1358,7 @@ impl PluginWorker {
             &package,
             &self.shortcut_capabilities,
             &self.notification_capabilities,
+            &self.loopback_capabilities,
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -1459,6 +1534,15 @@ impl PluginWorker {
             })
             .collect();
         self.notification_capabilities.reconcile_permissions(&notification_permissions);
+        let loopback_grants = self
+            .adapters
+            .iter()
+            .filter(|(_plugin_id, plugin)| {
+                plugin.permissions.contains(&PluginPermission::NetworkLoopback)
+            })
+            .map(|(plugin_id, plugin)| (plugin_id.clone(), plugin.loopback.clone()))
+            .collect();
+        self.loopback_capabilities.reconcile_grants(&loopback_grants);
         let mut published =
             self.action_catalog.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         *published = Arc::new(catalog);
@@ -1483,6 +1567,7 @@ impl PluginWorker {
                             version: Some(manifest.version.clone()),
                             api_version: Some(manifest.api_version),
                             permissions: manifest.permissions.clone(),
+                            loopback: manifest.loopback.clone(),
                             actions: manifest.actions.clone(),
                             permissions_approved,
                             status: status.into(),
@@ -1496,6 +1581,7 @@ impl PluginWorker {
                             version: Some(manifest.version.clone()),
                             api_version: Some(manifest.api_version),
                             permissions: manifest.permissions.clone(),
+                            loopback: manifest.loopback.clone(),
                             actions: Vec::new(),
                             permissions_approved: false,
                             status: status.into(),
@@ -1508,6 +1594,7 @@ impl PluginWorker {
                         version: None,
                         api_version: None,
                         permissions: Vec::new(),
+                        loopback: Vec::new(),
                         actions: Vec::new(),
                         permissions_approved: false,
                         status: PluginInventoryStatus::Invalid,
@@ -1519,6 +1606,7 @@ impl PluginWorker {
                         version: None,
                         api_version: None,
                         permissions: Vec::new(),
+                        loopback: Vec::new(),
                         actions: Vec::new(),
                         permissions_approved: false,
                         status: PluginInventoryStatus::Unavailable,
@@ -1576,6 +1664,7 @@ fn load_plugin(
     package: &DiscoveredPlugin,
     shortcut_capabilities: &ShortcutCapabilityClient,
     notification_capabilities: &NotificationCapabilityClient,
+    loopback_capabilities: &LoopbackCapabilityClient,
 ) -> Result<LoadedPlugin, LuaSandboxError> {
     let PluginPackageStatus::Compatible { manifest, sources, .. } = &package.status else {
         return Err(LuaSandboxError::Initialization);
@@ -1586,11 +1675,17 @@ fn load_plugin(
         Arc::new(LuaCapabilityBrokerClient::new(
             shortcut_capabilities.clone(),
             notification_capabilities.clone(),
+            loopback_capabilities.clone(),
         )),
     )?;
     let actions =
         manifest.actions.iter().cloned().map(|action| (action.id.clone(), action)).collect();
-    Ok(LoadedPlugin { adapter, actions, permissions: manifest.permissions.clone() })
+    Ok(LoadedPlugin {
+        adapter,
+        actions,
+        permissions: manifest.permissions.clone(),
+        loopback: manifest.loopback.clone(),
+    })
 }
 
 fn log_operation(
@@ -1655,6 +1750,11 @@ mod tests {
         include_str!("../../../examples/plugins/org.gradial.example.notification/plugin.toml");
     const NOTIFICATION_SOURCE: &str =
         include_str!("../../../examples/plugins/org.gradial.example.notification/main.lua");
+    const LOOPBACK_PLUGIN: &str = "org.gradial.example.loopback";
+    const LOOPBACK_MANIFEST: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.loopback/plugin.toml");
+    const LOOPBACK_SOURCE: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.loopback/main.lua");
     const VALID_SOURCE: &str = r"
         return {
             begin = function(context, parameters, sample) return {} end,
@@ -1710,6 +1810,13 @@ mod tests {
         fs::write(package.join("main.lua"), NOTIFICATION_SOURCE).expect("example source");
     }
 
+    fn write_loopback_example(root: &Path) {
+        let package = root.join(LOOPBACK_PLUGIN);
+        fs::create_dir_all(&package).expect("example package");
+        fs::write(package.join("plugin.toml"), LOOPBACK_MANIFEST).expect("example manifest");
+        fs::write(package.join("main.lua"), LOOPBACK_SOURCE).expect("example source");
+    }
+
     fn write_required_parameter_package(root: &Path, plugin_id: &str) {
         let package = root.join(plugin_id);
         fs::create_dir_all(&package).expect("plugin package");
@@ -1761,6 +1868,18 @@ mod tests {
         let action = ContinuousActionSnapshot::new(
             PluginId::new(NOTIFICATION_PLUGIN).expect("plugin ID"),
             PluginActionId::new("notify-on-commit").expect("action ID"),
+            PermittedContext::new(None, None),
+            BTreeMap::new(),
+            10,
+        )
+        .expect("continuous action");
+        ContinuousSession::begin(session_id, action, 0.25).expect("begin session")
+    }
+
+    fn begin_loopback_session(session_id: Uuid) -> (ContinuousSession, ContinuousRequest) {
+        let action = ContinuousActionSnapshot::new(
+            PluginId::new(LOOPBACK_PLUGIN).expect("plugin ID"),
+            PluginActionId::new("post-on-commit").expect("action ID"),
             PermittedContext::new(None, None),
             BTreeMap::new(),
             10,
@@ -2066,6 +2185,108 @@ mod tests {
             Err(NotificationCapabilityFailure::PermissionDenied)
         );
         assert!(notifications.lock().expect("notifications").is_empty());
+    }
+
+    #[test]
+    fn checked_in_loopback_example_crosses_worker_and_broker() {
+        let (_temporary, paths) = setup();
+        write_loopback_example(&paths.plugins);
+        prepare_state(&paths, &[(LOOPBACK_PLUGIN, true)]);
+        let (shortcut_capabilities, _shortcut_calls) =
+            ShortcutCapabilityRuntime::successful_for_test();
+        let (notification_capabilities, _notifications) =
+            NotificationCapabilityRuntime::successful_for_test();
+        let (loopback_capabilities, requests) = LoopbackCapabilityRuntime::successful_for_test();
+        let runtime = PluginWorkerRuntime::start_with_all_capabilities(
+            paths,
+            shortcut_capabilities,
+            notification_capabilities,
+            loopback_capabilities,
+        )
+        .expect("plugin worker");
+        let snapshot = snapshot(&runtime);
+        assert_eq!(snapshot.loaded_plugin_ids, vec![LOOPBACK_PLUGIN]);
+        assert_eq!(snapshot.plugins[0].loopback.len(), 1);
+        assert_eq!(snapshot.plugins[0].loopback[0].origin.as_str(), "http://127.0.0.1:32123");
+        assert_eq!(
+            snapshot.plugins[0].loopback[0].methods,
+            vec![gradial_core::PluginLoopbackMethod::Post]
+        );
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(LOOPBACK_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("post-on-commit").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        assert!(admission.permits_network_loopback());
+        let session_id = Uuid::from_u128(106);
+        client
+            .open_loopback_session(session_id, &plugin_id, admission.permits_network_loopback())
+            .expect("capability session");
+        let (mut session, begin) = begin_loopback_session(session_id);
+
+        dispatch(&client, begin).expect("begin");
+        accept_begin(&mut session);
+        dispatch(&client, commit_request(&mut session, 0.75)).expect("commit");
+        client
+            .finish_loopback_commit(session_id, Instant::now() + Duration::from_secs(1))
+            .expect("loopback completion");
+
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "POST");
+        assert_eq!(requests[0].1, "http://127.0.0.1:32123");
+        assert_eq!(requests[0].2, "/gradial/example");
+        assert_eq!(requests[0].3, br#"{"value":0.750000}"#);
+    }
+
+    #[test]
+    fn undeclared_loopback_permission_fails_without_broker_delivery() {
+        let (_temporary, paths) = setup();
+        let source = VALID_SOURCE.replace(
+            "commit = function(session, sample) end",
+            r#"commit = function(session, sample)
+                local accepted, reason = gradial.network.loopback({
+                    method = "POST",
+                    origin = "http://127.0.0.1:32123",
+                    path = "/must-not-run",
+                    body = "private",
+                })
+                assert(not accepted and reason == "permission_denied")
+            end"#,
+        );
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], &source);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let (shortcut_capabilities, _shortcut_calls) =
+            ShortcutCapabilityRuntime::successful_for_test();
+        let (notification_capabilities, _notifications) =
+            NotificationCapabilityRuntime::successful_for_test();
+        let (loopback_capabilities, requests) = LoopbackCapabilityRuntime::successful_for_test();
+        let runtime = PluginWorkerRuntime::start_with_all_capabilities(
+            paths,
+            shortcut_capabilities,
+            notification_capabilities,
+            loopback_capabilities,
+        )
+        .expect("plugin worker");
+        assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(FIRST_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("measure").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        assert!(!admission.permits_network_loopback());
+        let session_id = Uuid::from_u128(107);
+        client
+            .open_loopback_session(session_id, &plugin_id, admission.permits_network_loopback())
+            .expect("capability session");
+        let (mut session, begin) = begin_session(FIRST_PLUGIN, session_id);
+
+        dispatch(&client, begin).expect("begin");
+        accept_begin(&mut session);
+        dispatch(&client, commit_request(&mut session, 0.75)).expect("handled denial");
+        assert_eq!(
+            client.finish_loopback_commit(session_id, Instant::now() + Duration::from_secs(1)),
+            Err(LoopbackCapabilityFailure::PermissionDenied)
+        );
+        assert!(requests.lock().expect("requests").is_empty());
     }
 
     #[test]

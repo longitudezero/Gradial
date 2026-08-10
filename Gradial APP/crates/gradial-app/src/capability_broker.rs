@@ -11,19 +11,22 @@ use std::{
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
-    ActionErrorCode, ActionResult, InvocationContext, PluginNotificationText, PluginShortcutChord,
+    ActionErrorCode, ActionResult, InvocationContext, PluginLoopbackGrant, PluginLoopbackRequest,
+    PluginNotificationText, PluginShortcutChord,
 };
 use gradial_lua::{
     LuaCallbackPhase, LuaCapabilityHost, LuaCapabilityRejection, LuaCapabilityStatus,
 };
 use uuid::Uuid;
 
-use crate::{shortcut, tray};
+use crate::{loopback, shortcut, tray};
 
 const SHORTCUT_QUEUE_CAPACITY: usize = 32;
 const SHORTCUT_REQUESTS_PER_SECOND: usize = 30;
 const NOTIFICATIONS_PER_PLUGIN_PER_MINUTE: usize = 5;
 const NOTIFICATION_RATE_WINDOW: Duration = Duration::from_mins(1);
+const LOOPBACK_QUEUE_CAPACITY: usize = 32;
+const LOOPBACK_REQUESTS_PER_SECOND: usize = 30;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,14 +539,16 @@ fn prune_notification_history(state: &mut NotificationState, now: Instant) {
 pub(crate) struct LuaCapabilityBrokerClient {
     shortcuts: ShortcutCapabilityClient,
     notifications: NotificationCapabilityClient,
+    loopback: LoopbackCapabilityClient,
 }
 
 impl LuaCapabilityBrokerClient {
     pub(crate) fn new(
         shortcuts: ShortcutCapabilityClient,
         notifications: NotificationCapabilityClient,
+        loopback: LoopbackCapabilityClient,
     ) -> Self {
-        Self { shortcuts, notifications }
+        Self { shortcuts, notifications, loopback }
     }
 }
 
@@ -564,6 +569,15 @@ impl LuaCapabilityHost for LuaCapabilityBrokerClient {
         text: PluginNotificationText,
     ) -> LuaCapabilityStatus {
         self.notifications.submit(session_id, phase, text)
+    }
+
+    fn request_loopback(
+        &self,
+        session_id: Uuid,
+        phase: LuaCallbackPhase,
+        request: PluginLoopbackRequest,
+    ) -> LuaCapabilityStatus {
+        self.loopback.submit(session_id, phase, request)
     }
 }
 
@@ -659,6 +673,454 @@ impl Drop for NotificationCapabilityRuntime {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoopbackCapabilityFailure {
+    PermissionDenied,
+    GrantDenied,
+    RateLimited,
+    Busy,
+    RequestFailed,
+    Interrupted,
+    DeadlineExceeded,
+}
+
+impl LoopbackCapabilityFailure {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "plugin_permission_denied",
+            Self::GrantDenied => "plugin_loopback_grant_denied",
+            Self::RateLimited => "plugin_rate_limited",
+            Self::Busy => "plugin_capability_busy",
+            Self::RequestFailed => "plugin_capability_failed",
+            Self::Interrupted => "plugin_capability_cancelled",
+            Self::DeadlineExceeded => "plugin_capability_timeout",
+        }
+    }
+}
+
+struct LoopbackSession {
+    plugin_id: String,
+    permitted: bool,
+    grants: Vec<PluginLoopbackGrant>,
+    accepting: bool,
+    accepted_at: VecDeque<Instant>,
+    pending: usize,
+    cancellation: Arc<AtomicBool>,
+    failure: Option<LoopbackCapabilityFailure>,
+}
+
+#[derive(Default)]
+struct LoopbackState {
+    sessions: BTreeMap<Uuid, LoopbackSession>,
+    grants_by_plugin: BTreeMap<String, Vec<PluginLoopbackGrant>>,
+}
+
+struct SharedLoopbackState {
+    state: Mutex<LoopbackState>,
+    changed: Condvar,
+    shutdown: Arc<AtomicBool>,
+}
+
+struct LoopbackWork {
+    session_id: Uuid,
+    accepted_at: Instant,
+    request: PluginLoopbackRequest,
+    cancellation: Arc<AtomicBool>,
+}
+
+trait LoopbackRunner: Send + 'static {
+    fn run(
+        &mut self,
+        request: &PluginLoopbackRequest,
+        accepted_at: Instant,
+        cancellation: &AtomicBool,
+        shutdown: &AtomicBool,
+    ) -> Result<(), loopback::LoopbackTransportFailure>;
+}
+
+struct DirectLoopbackRunner;
+
+impl LoopbackRunner for DirectLoopbackRunner {
+    fn run(
+        &mut self,
+        request: &PluginLoopbackRequest,
+        accepted_at: Instant,
+        cancellation: &AtomicBool,
+        shutdown: &AtomicBool,
+    ) -> Result<(), loopback::LoopbackTransportFailure> {
+        loopback::execute(request, accepted_at, cancellation, shutdown)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LoopbackCapabilityClient {
+    work: Sender<LoopbackWork>,
+    shared: Arc<SharedLoopbackState>,
+}
+
+impl std::fmt::Debug for LoopbackCapabilityClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("LoopbackCapabilityClient").finish_non_exhaustive()
+    }
+}
+
+impl LoopbackCapabilityClient {
+    pub(crate) fn open_session(
+        &self,
+        session_id: Uuid,
+        plugin_id: &str,
+        permitted: bool,
+    ) -> Result<(), LoopbackCapabilityFailure> {
+        if self.shared.shutdown.load(Ordering::Acquire) {
+            return Err(LoopbackCapabilityFailure::Interrupted);
+        }
+        let mut state = lock_loopback_state(&self.shared);
+        if state.sessions.contains_key(&session_id) || !state.sessions.is_empty() {
+            return Err(LoopbackCapabilityFailure::Busy);
+        }
+        let grants = state.grants_by_plugin.get(plugin_id).cloned().unwrap_or_default();
+        state.sessions.insert(
+            session_id,
+            LoopbackSession {
+                plugin_id: plugin_id.to_owned(),
+                permitted: permitted && !grants.is_empty(),
+                grants,
+                accepting: true,
+                accepted_at: VecDeque::with_capacity(LOOPBACK_REQUESTS_PER_SECOND),
+                pending: 0,
+                cancellation: Arc::new(AtomicBool::new(false)),
+                failure: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn failure(&self, session_id: Uuid) -> Option<LoopbackCapabilityFailure> {
+        lock_loopback_state(&self.shared)
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.failure)
+    }
+
+    pub(crate) fn cancel_session(&self, session_id: Uuid) {
+        let session = lock_loopback_state(&self.shared).sessions.remove(&session_id);
+        if let Some(session) = session {
+            session.cancellation.store(true, Ordering::Release);
+        }
+        self.shared.changed.notify_all();
+    }
+
+    pub(crate) fn finish_commit(
+        &self,
+        session_id: Uuid,
+        deadline: Instant,
+    ) -> Result<(), LoopbackCapabilityFailure> {
+        let mut state = lock_loopback_state(&self.shared);
+        let Some(session) = state.sessions.get_mut(&session_id) else {
+            return Err(LoopbackCapabilityFailure::Interrupted);
+        };
+        session.accepting = false;
+        loop {
+            let Some(session) = state.sessions.get(&session_id) else {
+                return Err(LoopbackCapabilityFailure::Interrupted);
+            };
+            if session.pending == 0 {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some(session) = state.sessions.remove(&session_id) {
+                    session.cancellation.store(true, Ordering::Release);
+                }
+                return Err(LoopbackCapabilityFailure::DeadlineExceeded);
+            }
+            let wait = deadline.saturating_duration_since(now);
+            let (next, _timeout) = self
+                .shared
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+        let session = state.sessions.remove(&session_id).expect("session remains while locked");
+        session.cancellation.store(true, Ordering::Release);
+        session.failure.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn reconcile_grants(
+        &self,
+        grants_by_plugin: &BTreeMap<String, Vec<PluginLoopbackGrant>>,
+    ) {
+        let mut state = lock_loopback_state(&self.shared);
+        state.grants_by_plugin.clone_from(grants_by_plugin);
+        for session in state.sessions.values_mut() {
+            let grants = grants_by_plugin.get(&session.plugin_id).cloned().unwrap_or_default();
+            if !session.permitted || grants != session.grants {
+                fail_loopback_session(session, LoopbackCapabilityFailure::PermissionDenied);
+            }
+        }
+        drop(state);
+        self.shared.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inert_for_test() -> Self {
+        let (work, _works) = bounded(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        Self {
+            work,
+            shared: Arc::new(SharedLoopbackState {
+                state: Mutex::new(LoopbackState::default()),
+                changed: Condvar::new(),
+                shutdown,
+            }),
+        }
+    }
+
+    fn submit(
+        &self,
+        session_id: Uuid,
+        phase: LuaCallbackPhase,
+        request: PluginLoopbackRequest,
+    ) -> LuaCapabilityStatus {
+        if phase == LuaCallbackPhase::Cancel || self.shared.shutdown.load(Ordering::Acquire) {
+            return LuaCapabilityStatus::Rejected(LuaCapabilityRejection::Cancelled);
+        }
+        let mut state = lock_loopback_state(&self.shared);
+        let Some(session) = state.sessions.get_mut(&session_id) else {
+            return LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InactiveSession);
+        };
+        if !session.accepting || session.cancellation.load(Ordering::Acquire) {
+            return LuaCapabilityStatus::Rejected(LuaCapabilityRejection::Cancelled);
+        }
+        if !session.permitted {
+            fail_loopback_session(session, LoopbackCapabilityFailure::PermissionDenied);
+            return LuaCapabilityStatus::Rejected(LuaCapabilityRejection::PermissionDenied);
+        }
+        if !session.grants.iter().any(|grant| grant.permits(&request)) {
+            fail_loopback_session(session, LoopbackCapabilityFailure::GrantDenied);
+            return LuaCapabilityStatus::Rejected(LuaCapabilityRejection::AllowlistDenied);
+        }
+
+        let now = Instant::now();
+        while session.accepted_at.front().is_some_and(|accepted| {
+            now.saturating_duration_since(*accepted) >= Duration::from_secs(1)
+        }) {
+            session.accepted_at.pop_front();
+        }
+        if session.accepted_at.len() >= LOOPBACK_REQUESTS_PER_SECOND {
+            fail_loopback_session(session, LoopbackCapabilityFailure::RateLimited);
+            return LuaCapabilityStatus::Rejected(LuaCapabilityRejection::RateLimited);
+        }
+
+        let work = LoopbackWork {
+            session_id,
+            accepted_at: now,
+            request,
+            cancellation: Arc::clone(&session.cancellation),
+        };
+        session.pending = session.pending.saturating_add(1);
+        match self.work.try_send(work) {
+            Ok(()) => {
+                session.accepted_at.push_back(now);
+                LuaCapabilityStatus::Accepted
+            }
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                session.pending = session.pending.saturating_sub(1);
+                fail_loopback_session(session, LoopbackCapabilityFailure::Busy);
+                LuaCapabilityStatus::Rejected(LuaCapabilityRejection::Busy)
+            }
+        }
+    }
+}
+
+fn fail_loopback_session(session: &mut LoopbackSession, failure: LoopbackCapabilityFailure) {
+    session.failure.get_or_insert(failure);
+    session.accepting = false;
+    session.cancellation.store(true, Ordering::Release);
+}
+
+#[derive(Debug)]
+pub(crate) struct LoopbackCapabilityRuntime {
+    client: LoopbackCapabilityClient,
+    stopped: Receiver<()>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+pub(crate) type RecordedLoopbackRequests = Arc<Mutex<Vec<(String, String, String, Vec<u8>)>>>;
+
+#[cfg(test)]
+struct CapturingLoopbackRunner(RecordedLoopbackRequests);
+
+#[cfg(test)]
+impl LoopbackRunner for CapturingLoopbackRunner {
+    fn run(
+        &mut self,
+        request: &PluginLoopbackRequest,
+        _accepted_at: Instant,
+        cancellation: &AtomicBool,
+        shutdown: &AtomicBool,
+    ) -> Result<(), loopback::LoopbackTransportFailure> {
+        if cancellation.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
+            return Err(loopback::LoopbackTransportFailure::Interrupted);
+        }
+        self.0.lock().expect("loopback requests").push((
+            request.method().as_str().to_owned(),
+            request.origin().as_str().to_owned(),
+            request.path().to_owned(),
+            request.body().to_vec(),
+        ));
+        Ok(())
+    }
+}
+
+impl LoopbackCapabilityRuntime {
+    pub(crate) fn start() -> Result<Self> {
+        Self::start_with_runner(Box::new(DirectLoopbackRunner))
+    }
+
+    fn start_with_runner(mut runner: Box<dyn LoopbackRunner>) -> Result<Self> {
+        let (work, works) = bounded(LOOPBACK_QUEUE_CAPACITY);
+        let (stopped_sender, stopped) = bounded(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(SharedLoopbackState {
+            state: Mutex::new(LoopbackState::default()),
+            changed: Condvar::new(),
+            shutdown,
+        });
+        let worker_shared = Arc::clone(&shared);
+        let join_handle = thread::Builder::new()
+            .name("gradial-loopback-broker".to_owned())
+            .spawn(move || {
+                run_loopback_broker(&works, &worker_shared, runner.as_mut());
+                let _sent = stopped_sender.try_send(());
+            })
+            .context("could not spawn the loopback capability broker")?;
+        log::info!(
+            target: "plugins",
+            "component=capabilities event_code=loopback_broker_started result_code=ok \
+             queue_capacity={LOOPBACK_QUEUE_CAPACITY} \
+             session_rate_per_second={LOOPBACK_REQUESTS_PER_SECOND} timeout_ms={}",
+            loopback::LOOPBACK_OPERATION_TIMEOUT.as_millis()
+        );
+        Ok(Self {
+            client: LoopbackCapabilityClient { work, shared },
+            stopped,
+            join_handle: Some(join_handle),
+        })
+    }
+
+    pub(crate) fn client(&self) -> LoopbackCapabilityClient {
+        self.client.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn successful_for_test() -> (Self, RecordedLoopbackRequests) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runtime =
+            Self::start_with_runner(Box::new(CapturingLoopbackRunner(Arc::clone(&calls))))
+                .expect("test loopback broker");
+        (runtime, calls)
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        let Some(join_handle) = self.join_handle.take() else {
+            return;
+        };
+        self.client.shared.shutdown.store(true, Ordering::Release);
+        {
+            let mut state = lock_loopback_state(&self.client.shared);
+            for session in state.sessions.values_mut() {
+                fail_loopback_session(session, LoopbackCapabilityFailure::Interrupted);
+            }
+        }
+        self.client.shared.changed.notify_all();
+        match self.stopped.recv_timeout(SHUTDOWN_WAIT) {
+            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                if join_handle.join().is_err() {
+                    log::error!(
+                        target: "plugins",
+                        "component=capabilities event_code=loopback_broker_panicked \
+                         result_code=failure"
+                    );
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => log::error!(
+                target: "plugins",
+                "component=capabilities event_code=loopback_broker_shutdown_timeout \
+                 result_code=failure wait_ms={}",
+                SHUTDOWN_WAIT.as_millis()
+            ),
+        }
+    }
+}
+
+impl Drop for LoopbackCapabilityRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_loopback_broker(
+    works: &Receiver<LoopbackWork>,
+    shared: &SharedLoopbackState,
+    runner: &mut dyn LoopbackRunner,
+) {
+    while !shared.shutdown.load(Ordering::Acquire) {
+        let Ok(work) = works.recv_timeout(Duration::from_millis(25)) else {
+            continue;
+        };
+        let result =
+            runner.run(&work.request, work.accepted_at, &work.cancellation, &shared.shutdown);
+        complete_loopback_work(shared, work.session_id, result);
+    }
+}
+
+fn complete_loopback_work(
+    shared: &SharedLoopbackState,
+    session_id: Uuid,
+    result: Result<(), loopback::LoopbackTransportFailure>,
+) {
+    let mut state = lock_loopback_state(shared);
+    let Some(session) = state.sessions.get_mut(&session_id) else {
+        return;
+    };
+    session.pending = session.pending.saturating_sub(1);
+    if !session.cancellation.load(Ordering::Acquire)
+        && let Err(transport_failure) = result
+    {
+        let failure = match transport_failure {
+            loopback::LoopbackTransportFailure::Interrupted => {
+                LoopbackCapabilityFailure::Interrupted
+            }
+            loopback::LoopbackTransportFailure::TimedOut => {
+                LoopbackCapabilityFailure::DeadlineExceeded
+            }
+            loopback::LoopbackTransportFailure::Connection
+            | loopback::LoopbackTransportFailure::Protocol
+            | loopback::LoopbackTransportFailure::ResponseTooLarge
+            | loopback::LoopbackTransportFailure::HttpStatus => {
+                LoopbackCapabilityFailure::RequestFailed
+            }
+        };
+        fail_loopback_session(session, failure);
+        log::warn!(
+            target: "plugins",
+            "component=capabilities event_code=loopback_request_completed result_code=failure \
+             error_code={} plugin_id={} session_id={session_id}",
+            failure.code(),
+            session.plugin_id
+        );
+    }
+    drop(state);
+    shared.changed.notify_all();
+}
+
+fn lock_loopback_state(shared: &SharedLoopbackState) -> std::sync::MutexGuard<'_, LoopbackState> {
+    shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Debug)]
@@ -1210,6 +1672,258 @@ mod tests {
         );
         assert!(calls.lock().expect("notifications").is_empty());
         client.cancel_session(session_id);
+        runtime.shutdown();
+    }
+
+    type RecordedLoopbackCalls = Arc<Mutex<Vec<(String, String, usize)>>>;
+
+    struct RecordingLoopbackRunner {
+        calls: RecordedLoopbackCalls,
+        result: Result<(), loopback::LoopbackTransportFailure>,
+    }
+
+    impl LoopbackRunner for RecordingLoopbackRunner {
+        fn run(
+            &mut self,
+            request: &PluginLoopbackRequest,
+            _accepted_at: Instant,
+            cancellation: &AtomicBool,
+            shutdown: &AtomicBool,
+        ) -> Result<(), loopback::LoopbackTransportFailure> {
+            if cancellation.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
+                return Err(loopback::LoopbackTransportFailure::Interrupted);
+            }
+            self.calls.lock().expect("loopback calls").push((
+                request.method().as_str().to_owned(),
+                request.origin().as_str().to_owned(),
+                request.body().len(),
+            ));
+            self.result
+        }
+    }
+
+    fn loopback_runtime(
+        result: Result<(), loopback::LoopbackTransportFailure>,
+    ) -> (LoopbackCapabilityRuntime, RecordedLoopbackCalls) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = RecordingLoopbackRunner { calls: Arc::clone(&calls), result };
+        (LoopbackCapabilityRuntime::start_with_runner(Box::new(runner)).expect("runtime"), calls)
+    }
+
+    fn loopback_grant(port: u16) -> PluginLoopbackGrant {
+        PluginLoopbackGrant {
+            origin: format!("http://127.0.0.1:{port}").parse().expect("origin"),
+            methods: vec![
+                gradial_core::PluginLoopbackMethod::Get,
+                gradial_core::PluginLoopbackMethod::Post,
+            ],
+        }
+    }
+
+    fn loopback_request(
+        port: u16,
+        method: gradial_core::PluginLoopbackMethod,
+    ) -> PluginLoopbackRequest {
+        PluginLoopbackRequest::new(
+            method,
+            format!("http://127.0.0.1:{port}").parse().expect("origin"),
+            "/private?value=42",
+            if method == gradial_core::PluginLoopbackMethod::Post {
+                b"private body".to_vec()
+            } else {
+                Vec::new()
+            },
+            gradial_core::PluginLoopbackContentType::Text,
+        )
+        .expect("request")
+    }
+
+    fn approve_loopback(client: &LoopbackCapabilityClient, plugin_id: &str, port: u16) {
+        client.reconcile_grants(&BTreeMap::from([(
+            plugin_id.to_owned(),
+            vec![loopback_grant(port)],
+        )]));
+    }
+
+    #[test]
+    fn permitted_loopback_request_runs_off_lua_and_commit_waits() {
+        let (mut runtime, calls) = loopback_runtime(Ok(()));
+        let client = runtime.client();
+        approve_loopback(&client, "org.gradial.test", 18080);
+        let session_id = Uuid::from_u128(301);
+        client.open_session(session_id, "org.gradial.test", true).expect("open");
+
+        assert_eq!(
+            client.submit(
+                session_id,
+                LuaCallbackPhase::Commit,
+                loopback_request(18080, gradial_core::PluginLoopbackMethod::Post),
+            ),
+            LuaCapabilityStatus::Accepted
+        );
+        client.finish_commit(session_id, Instant::now() + Duration::from_secs(1)).expect("commit");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![("POST".to_owned(), "http://127.0.0.1:18080".to_owned(), 12)]
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn loopback_permission_and_allowlist_denials_never_reach_transport() {
+        let (mut runtime, calls) = loopback_runtime(Ok(()));
+        let client = runtime.client();
+        approve_loopback(&client, "org.gradial.test", 18080);
+
+        let denied = Uuid::from_u128(302);
+        client.open_session(denied, "org.gradial.test", false).expect("open");
+        assert_eq!(
+            client.submit(
+                denied,
+                LuaCallbackPhase::Update,
+                loopback_request(18080, gradial_core::PluginLoopbackMethod::Get),
+            ),
+            LuaCapabilityStatus::Rejected(LuaCapabilityRejection::PermissionDenied)
+        );
+        client.cancel_session(denied);
+
+        let wrong_origin = Uuid::from_u128(303);
+        client.open_session(wrong_origin, "org.gradial.test", true).expect("open");
+        assert_eq!(
+            client.submit(
+                wrong_origin,
+                LuaCallbackPhase::Update,
+                loopback_request(18081, gradial_core::PluginLoopbackMethod::Get),
+            ),
+            LuaCapabilityStatus::Rejected(LuaCapabilityRejection::AllowlistDenied)
+        );
+        assert_eq!(client.failure(wrong_origin), Some(LoopbackCapabilityFailure::GrantDenied));
+        assert!(calls.lock().expect("calls").is_empty());
+        client.cancel_session(wrong_origin);
+
+        client.reconcile_grants(&BTreeMap::from([(
+            "org.gradial.test".to_owned(),
+            vec![PluginLoopbackGrant {
+                origin: "http://127.0.0.1:18080".parse().expect("origin"),
+                methods: vec![gradial_core::PluginLoopbackMethod::Get],
+            }],
+        )]));
+        let wrong_method = Uuid::from_u128(309);
+        client.open_session(wrong_method, "org.gradial.test", true).expect("open");
+        assert_eq!(
+            client.submit(
+                wrong_method,
+                LuaCallbackPhase::Update,
+                loopback_request(18080, gradial_core::PluginLoopbackMethod::Post),
+            ),
+            LuaCapabilityStatus::Rejected(LuaCapabilityRejection::AllowlistDenied)
+        );
+        assert!(calls.lock().expect("calls").is_empty());
+        client.cancel_session(wrong_method);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn loopback_rate_revocation_cancel_and_shutdown_fail_closed() {
+        let (mut runtime, _calls) = loopback_runtime(Ok(()));
+        let client = runtime.client();
+        approve_loopback(&client, "org.gradial.test", 18080);
+        let session_id = Uuid::from_u128(304);
+        client.open_session(session_id, "org.gradial.test", true).expect("open");
+        for _ in 0..LOOPBACK_REQUESTS_PER_SECOND {
+            assert_eq!(
+                client.submit(
+                    session_id,
+                    LuaCallbackPhase::Update,
+                    loopback_request(18080, gradial_core::PluginLoopbackMethod::Get),
+                ),
+                LuaCapabilityStatus::Accepted
+            );
+        }
+        assert_eq!(
+            client.submit(
+                session_id,
+                LuaCallbackPhase::Update,
+                loopback_request(18080, gradial_core::PluginLoopbackMethod::Get),
+            ),
+            LuaCapabilityStatus::Rejected(LuaCapabilityRejection::RateLimited)
+        );
+        client.cancel_session(session_id);
+
+        let revoked = Uuid::from_u128(305);
+        client.open_session(revoked, "org.gradial.test", true).expect("open");
+        client.reconcile_grants(&BTreeMap::new());
+        assert_eq!(client.failure(revoked), Some(LoopbackCapabilityFailure::PermissionDenied));
+        client.cancel_session(revoked);
+
+        approve_loopback(&client, "org.gradial.test", 18080);
+        let shutdown = Uuid::from_u128(306);
+        client.open_session(shutdown, "org.gradial.test", true).expect("open");
+        runtime.shutdown();
+        assert_eq!(client.failure(shutdown), Some(LoopbackCapabilityFailure::Interrupted));
+    }
+
+    #[test]
+    fn loopback_transport_timeout_busy_and_cancel_phase_have_stable_results() {
+        for (transport, expected) in [
+            (
+                loopback::LoopbackTransportFailure::Connection,
+                LoopbackCapabilityFailure::RequestFailed,
+            ),
+            (
+                loopback::LoopbackTransportFailure::TimedOut,
+                LoopbackCapabilityFailure::DeadlineExceeded,
+            ),
+        ] {
+            let (mut runtime, _calls) = loopback_runtime(Err(transport));
+            let client = runtime.client();
+            approve_loopback(&client, "org.gradial.test", 18080);
+            let session_id = Uuid::new_v4();
+            client.open_session(session_id, "org.gradial.test", true).expect("open");
+            assert_eq!(
+                client.submit(
+                    session_id,
+                    LuaCallbackPhase::Commit,
+                    loopback_request(18080, gradial_core::PluginLoopbackMethod::Get),
+                ),
+                LuaCapabilityStatus::Accepted
+            );
+            assert_eq!(
+                client.finish_commit(session_id, Instant::now() + Duration::from_secs(1)),
+                Err(expected)
+            );
+            runtime.shutdown();
+        }
+
+        let client = LoopbackCapabilityClient::inert_for_test();
+        approve_loopback(&client, "org.gradial.test", 18080);
+        let busy = Uuid::from_u128(307);
+        client.open_session(busy, "org.gradial.test", true).expect("open");
+        assert_eq!(
+            client.submit(
+                busy,
+                LuaCallbackPhase::Update,
+                loopback_request(18080, gradial_core::PluginLoopbackMethod::Get),
+            ),
+            LuaCapabilityStatus::Rejected(LuaCapabilityRejection::Busy)
+        );
+        client.cancel_session(busy);
+
+        let (mut runtime, calls) = loopback_runtime(Ok(()));
+        let client = runtime.client();
+        approve_loopback(&client, "org.gradial.test", 18080);
+        let cancelled = Uuid::from_u128(308);
+        client.open_session(cancelled, "org.gradial.test", true).expect("open");
+        assert_eq!(
+            client.submit(
+                cancelled,
+                LuaCallbackPhase::Cancel,
+                loopback_request(18080, gradial_core::PluginLoopbackMethod::Get),
+            ),
+            LuaCapabilityStatus::Rejected(LuaCapabilityRejection::Cancelled)
+        );
+        assert!(calls.lock().expect("calls").is_empty());
+        client.cancel_session(cancelled);
         runtime.shutdown();
     }
 }

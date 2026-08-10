@@ -143,8 +143,9 @@ and Milestone 2 slices, and the completed bounded Milestone 3 slices establish:
   Begin/Update/Commit/Cancel callbacks off the interaction thread.
 - Permission-filtered plugin application/title context, a bounded
   `input.shortcut` broker that reuses full frozen-target validation and
-  synthesized-key cleanup, and a bounded non-focus-stealing `notification`
-  broker. Native effects stay outside Lua and interaction threads.
+  synthesized-key cleanup, a bounded non-focus-stealing `notification` broker,
+  and an exact-origin `network.loopback` HTTP broker. Native effects stay
+  outside Lua and interaction threads.
 - Manifest-backed continuous action authoring with typed, bounded parameter
   controls and a separate per-wedge continuous checkbox for Global and every
   application profile.
@@ -779,6 +780,10 @@ required; a different plugin API version remains structurally valid and is
 reported as incompatible. Semantic plugin versions, unique IDs and
 permissions, 10–60 Hz continuous update rates, and boolean/integer/number/
 string/choice parameter constraints are validated without source execution.
+An optional `loopback` array is valid only with `network.loopback`. It contains
+at most sixteen unique exact `http://127.0.0.1:PORT` or
+`http://[::1]:PORT` origins, each with a nonempty unique subset of `GET` and
+`POST`. Ports are explicit, nonzero, and canonical.
 
 Filesystem inspection canonicalizes the owned plugin root and each immediate
 package. Absolute/traversing entry paths, alternate-stream syntax, paths that
@@ -808,16 +813,18 @@ Startup loads a bounded schema-one `plugins-state.json` and reconciles it
 against fresh read-only discovery. This file is machine-local and separate
 from portable `config.json`. It stores only a revision, per-plugin
 enabled/faulted flags, the
-canonical approved permission names, and the last successfully loaded manifest
-identity plus a package SHA-256 fingerprint. It contains no Lua or TOML source,
+canonical approved permission names and loopback origin/method grants, and the
+last successfully loaded manifest identity plus a package SHA-256 fingerprint.
+It contains no Lua or TOML source,
 plugin path, action parameter, credential, window context, or capability
 payload.
 
 The package fingerprint covers the exact bounded manifest and every accepted
 Lua path and byte in deterministic order. It is used only for change
-detection. A changed permission set is a trust change: reconciliation disables
-an enabled record immediately and reports `permission_review_required` until
-the new canonical set is explicitly approved. Other manifest or source edits
+detection. A changed permission set or loopback origin/method allowlist is a
+trust change: reconciliation disables an enabled record immediately and reports
+`permission_review_required` until the new canonical set is explicitly
+approved. Other manifest or source edits
 preserve approval but report `reload_required`; a rescan never loads them.
 Missing, invalid, or incompatible packages are unavailable and an enabled
 persisted record is disabled fail-closed.
@@ -841,7 +848,8 @@ later validated successful reload clears it.
 
 The state file is capped at 512 KiB and 1,024 plugin records, rejects unknown
 JSON fields, future schemas, malformed IDs, unordered/duplicate permissions,
-invalid fingerprints, and impossible enabled-without-loaded states. Saves
+noncanonical/duplicate loopback grants, invalid fingerprints, and impossible
+enabled-without-loaded states. Saves
 advance a checked revision, flush a temporary file, and use Windows
 write-through replacement while retaining the previous valid primary as
 `plugins-state.json.bak`. A broken primary recovers from the valid backup
@@ -863,9 +871,9 @@ coroutines, global `require`, `load`, `loadfile`, `dofile`, `collectgarbage`,
 already failed source-image construction, and every executed chunk is
 explicitly text-only. The `gradial` host table is a protected proxy and exposes
 the private module loader. An enabled lifecycle adapter also attaches the
-protected `gradial.input.shortcut` and `gradial.notification` functions
-described below; they have no effect outside an active callback and delegate
-all native work to capability brokers.
+protected `gradial.input.shortcut`, `gradial.notification`, and
+`gradial.network.loopback` functions described below; they have no effect
+outside an active callback and delegate all native work to capability brokers.
 
 Lua authors load another file with:
 
@@ -1079,8 +1087,8 @@ accepts, so it cannot leave an orphan session.
 Settings can create actions for enabled manifest controls, edit their generic
 parameters without running plugin code, and assign them independently beyond
 any Global or application-profile wedge. The currently implemented
-operating-system capabilities are the separately permissioned shortcut and
-notification brokers described below.
+operating-system capabilities are the separately permissioned shortcut,
+notification, and loopback brokers described below.
 
 ## `input.shortcut` capability broker
 
@@ -1177,6 +1185,69 @@ notification. The checked-in
 `examples/plugins/org.gradial.example.notification` package demonstrates one
 fixed plain-text request from Commit, and its real manifest/source cross the
 plugin worker and fake broker in the automated suite.
+
+## `network.loopback` capability broker
+
+An enabled plugin whose reviewed manifest declares `network.loopback` and at
+least one exact grant receives the protected
+`gradial.network.loopback(request)` function. The closed request table requires
+`method` and `origin`; `path` defaults to `/`, `body` defaults empty, and
+`content_type` defaults to `application/octet-stream`:
+
+```lua
+local accepted, reason = gradial.network.loopback({
+    method = "POST",
+    origin = "http://127.0.0.1:32123",
+    path = "/control?mode=preview",
+    body = '{"value":0.75}',
+    content_type = "application/json",
+})
+```
+
+Only `GET` and `POST` exist. GET requires an empty body. The other accepted
+content types are `application/x-www-form-urlencoded`,
+`text/plain; charset=utf-8`, and `application/octet-stream`; plugins cannot add
+arbitrary headers. A path is an ASCII HTTP origin-form target beginning with
+exactly one `/`, at most 2,048 bytes, with no space, control character,
+backslash, or fragment. Unknown table fields, malformed values, unsafe paths,
+and request bodies above 64 KiB return `false, "invalid_loopback"` without
+reaching the broker.
+
+Each grant is an exact cleartext HTTP origin using literal `127.0.0.1` or
+`[::1]`, one explicit nonzero port, and a nonempty method list. The request must
+match both the reviewed origin and method. There is no hostname parser, DNS
+lookup, proxy discovery, redirect following, ambient Windows credential,
+alternate address, HTTPS fallback, or stored secret. The Plugins review dialog
+shows every exact origin and method. Any grant change is part of the canonical
+trust identity and disables the plugin until explicitly reviewed again.
+
+The Lua call performs validation and a nonblocking `try_send` only. It returns
+`true, nil` when the 32-item broker queue accepts the work—not when HTTP
+finishes—or one of `inactive_session`, `permission_denied`, `allowlist_denied`,
+`rate_limited`, `busy`, `invalid_loopback`, and `cancelled`. Each session can
+accept at most thirty requests in a rolling second. Permission and exact grants
+are checked on every call; denial, revocation, queue exhaustion, transport
+failure, cancellation, or shutdown fails that request epoch closed.
+
+The dedicated broker thread converts the validated origin directly to a
+`SocketAddr`, connects with no resolver, writes one HTTP/1.1 request with
+`Connection: close`, and never retries. Its complete queue-plus-connect-plus-I/O
+deadline is 250 ms. It accepts only a bounded HTTP/1.0 or HTTP/1.1 2xx response;
+redirects and other statuses fail. Response headers are capped at 16 KiB and
+the body at 64 KiB. Identity responses may be content-length or close delimited;
+other transfer encodings fail closed. Lua receives no status, headers, or body.
+
+Commit stops admission and waits only within the coordinator deadline for
+accepted work to complete. The coordinator's Commit budget is 350 ms: the
+existing 100 ms Lua Commit ceiling plus at most 250 ms for capability work.
+Cancellation closes the epoch before Lua's Cancel callback and marks queued or
+active work cancelled. Logging contains stable
+codes, plugin ID, and session ID only—never request paths, query values,
+headers, bodies, response content, or native network errors. The checked-in
+`examples/plugins/org.gradial.example.loopback` package posts one bounded JSON
+scalar from Commit. Automated coverage crosses its real manifest and source
+through the plugin worker and fake broker, while a direct local TCP harness
+verifies the production HTTP transport and no-redirect behavior.
 
 ## Configuration and profile resolution
 

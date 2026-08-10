@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gradial_core::{PluginNotificationText, PluginShortcutChord};
+use gradial_core::{PluginLoopbackRequest, PluginNotificationText, PluginShortcutChord};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,10 +15,12 @@ pub enum LuaCallbackPhase {
 pub enum LuaCapabilityRejection {
     InactiveSession,
     PermissionDenied,
+    AllowlistDenied,
     RateLimited,
     Busy,
     InvalidRequest,
     InvalidNotification,
+    InvalidLoopback,
     Cancelled,
 }
 
@@ -27,10 +29,12 @@ impl LuaCapabilityRejection {
         match self {
             Self::InactiveSession => "inactive_session",
             Self::PermissionDenied => "permission_denied",
+            Self::AllowlistDenied => "allowlist_denied",
             Self::RateLimited => "rate_limited",
             Self::Busy => "busy",
             Self::InvalidRequest => "invalid_shortcut",
             Self::InvalidNotification => "invalid_notification",
+            Self::InvalidLoopback => "invalid_loopback",
             Self::Cancelled => "cancelled",
         }
     }
@@ -56,6 +60,15 @@ pub trait LuaCapabilityHost: Send + Sync {
         _session_id: Uuid,
         _phase: LuaCallbackPhase,
         _text: PluginNotificationText,
+    ) -> LuaCapabilityStatus {
+        LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InactiveSession)
+    }
+
+    fn request_loopback(
+        &self,
+        _session_id: Uuid,
+        _phase: LuaCallbackPhase,
+        _request: PluginLoopbackRequest,
     ) -> LuaCapabilityStatus {
         LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InactiveSession)
     }

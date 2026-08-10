@@ -17,7 +17,10 @@ pub use actions::{
     MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
 };
 pub use capabilities::{
-    MAX_PLUGIN_NOTIFICATION_TEXT_BYTES, MAX_PLUGIN_SHORTCUT_CHORD_BYTES,
+    MAX_PLUGIN_LOOPBACK_BODY_BYTES, MAX_PLUGIN_LOOPBACK_PATH_BYTES,
+    MAX_PLUGIN_NOTIFICATION_TEXT_BYTES, MAX_PLUGIN_SHORTCUT_CHORD_BYTES, PluginLoopbackContentType,
+    PluginLoopbackGrant, PluginLoopbackMethod, PluginLoopbackOrigin,
+    PluginLoopbackOriginParseError, PluginLoopbackRequest, PluginLoopbackRequestParseError,
     PluginNotificationParseError, PluginNotificationText, PluginShortcutChord,
     PluginShortcutParseError,
 };
@@ -52,10 +55,11 @@ pub use interaction::{
 };
 pub use paths::{AppPaths, AppPathsError};
 pub use plugins::{
-    MAX_PLUGIN_ACTIONS, MAX_PLUGIN_MANIFEST_BYTES, MAX_PLUGIN_PARAMETERS_PER_ACTION,
-    PLUGIN_API_VERSION, PLUGIN_MANIFEST_VERSION, PluginActionKind, PluginManifest,
-    PluginManifestAction, PluginManifestError, PluginParameterDefinition,
-    PluginParameterValidationError, PluginPermission, parse_plugin_manifest,
+    MAX_PLUGIN_ACTIONS, MAX_PLUGIN_LOOPBACK_ORIGINS, MAX_PLUGIN_MANIFEST_BYTES,
+    MAX_PLUGIN_PARAMETERS_PER_ACTION, PLUGIN_API_VERSION, PLUGIN_MANIFEST_VERSION,
+    PluginActionKind, PluginManifest, PluginManifestAction, PluginManifestError,
+    PluginParameterDefinition, PluginParameterValidationError, PluginPermission,
+    parse_plugin_manifest,
 };
 pub use profiles::{
     ProfileMatch, ProfileResolution, ProfileResolver, ProfileTarget, ResolutionDecision,

@@ -9,8 +9,8 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
-    ActionErrorCode, ActionResult, ContinuousActionSnapshot, ContinuousCancelReason,
-    ContinuousRequest, ContinuousSession, ExecutionPlan, InvocationContext,
+    ActionErrorCode, ActionResult, ContinuousActionSnapshot, ContinuousBeginRequest,
+    ContinuousCancelReason, ContinuousRequest, ContinuousSession, ExecutionPlan, InvocationContext,
 };
 use gradial_lua::LuaSandboxError;
 use thiserror::Error;
@@ -21,7 +21,9 @@ use crate::{
         ActionDispatch, ActionExecutorHandle, ContinuousActionLease, CoordinatorStopToken,
     },
     action_target,
-    capability_broker::{NotificationCapabilityFailure, ShortcutCapabilityFailure},
+    capability_broker::{
+        LoopbackCapabilityFailure, NotificationCapabilityFailure, ShortcutCapabilityFailure,
+    },
     plugin_worker::{PluginLifecycleClient, PluginLifecycleError, PluginLifecycleSubmitError},
     tray,
 };
@@ -31,7 +33,9 @@ const COMPLETION_CAPACITY: usize = 1;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const BEGIN_TIMEOUT: Duration = Duration::from_millis(100);
 const UPDATE_TIMEOUT: Duration = Duration::from_millis(16);
-const COMMIT_TIMEOUT: Duration = Duration::from_millis(100);
+// A Commit may use its complete 100 ms Lua budget and then enqueue one final
+// loopback operation with a 250 ms capability deadline.
+const COMMIT_TIMEOUT: Duration = Duration::from_millis(350);
 const CANCEL_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,12 +263,26 @@ impl PluginContinuousBackend {
             );
             return Err(map_notification_capability_failure(failure));
         }
+        if let Some(failure) = self.client.loopback_failure(request.session_id()) {
+            log::warn!(
+                target: "continuous",
+                "component=capabilities event_code=loopback_session_failed result_code=failure \
+                 error_code={} config_revision={} invocation_id={} session_id={} stage={:?}",
+                failure.code(),
+                self.target.config_revision,
+                self.invocation_id,
+                request.session_id(),
+                stage_for(request)
+            );
+            return Err(map_loopback_capability_failure(failure));
+        }
         Ok(())
     }
 
     fn cancel_capability_session(&self, session_id: Uuid) {
         self.client.cancel_shortcut_session(session_id);
         self.client.cancel_notification_session(session_id);
+        self.client.cancel_loopback_session(session_id);
     }
 
     fn abandon_commit(&self, request: &ContinuousRequest, reason: ContinuousCancelReason) {
@@ -306,6 +324,61 @@ impl PluginContinuousBackend {
         }
         Ok(())
     }
+
+    fn open_capability_sessions(
+        &self,
+        begin: &ContinuousBeginRequest,
+    ) -> Result<(), ContinuousBackendError> {
+        let admission = self
+            .client
+            .action_admission(begin.plugin_id(), begin.action_id())
+            .ok_or(ContinuousBackendError::Rejected)?;
+        self.client
+            .open_shortcut_session(
+                begin.session_id(),
+                begin.plugin_id(),
+                Arc::clone(&self.target),
+                admission.permits_input_shortcut(),
+            )
+            .map_err(map_shortcut_capability_failure)?;
+        if let Err(failure) = self.client.open_notification_session(
+            begin.session_id(),
+            begin.plugin_id(),
+            admission.permits_notification(),
+        ) {
+            self.client.cancel_shortcut_session(begin.session_id());
+            return Err(map_notification_capability_failure(failure));
+        }
+        if let Err(failure) = self.client.open_loopback_session(
+            begin.session_id(),
+            begin.plugin_id(),
+            admission.permits_network_loopback(),
+        ) {
+            self.client.cancel_notification_session(begin.session_id());
+            self.client.cancel_shortcut_session(begin.session_id());
+            return Err(map_loopback_capability_failure(failure));
+        }
+        Ok(())
+    }
+
+    fn finish_capability_commit(
+        &self,
+        session_id: Uuid,
+        deadline: Instant,
+    ) -> Result<(), ContinuousBackendError> {
+        if let Err(failure) = self.client.finish_shortcut_commit(session_id, deadline) {
+            self.client.cancel_notification_session(session_id);
+            self.client.cancel_loopback_session(session_id);
+            return Err(map_shortcut_capability_failure(failure));
+        }
+        if let Err(failure) = self.client.finish_loopback_commit(session_id, deadline) {
+            self.client.cancel_notification_session(session_id);
+            return Err(map_loopback_capability_failure(failure));
+        }
+        self.client
+            .finish_notification_commit(session_id)
+            .map_err(map_notification_capability_failure)
+    }
 }
 
 impl ContinuousBackend for PluginContinuousBackend {
@@ -317,28 +390,7 @@ impl ContinuousBackend for PluginContinuousBackend {
         self.prepare_dispatch(request, context)?;
 
         match request {
-            ContinuousRequest::Begin(begin) => {
-                let admission = self
-                    .client
-                    .action_admission(begin.plugin_id(), begin.action_id())
-                    .ok_or(ContinuousBackendError::Rejected)?;
-                self.client
-                    .open_shortcut_session(
-                        begin.session_id(),
-                        begin.plugin_id(),
-                        Arc::clone(&self.target),
-                        admission.permits_input_shortcut(),
-                    )
-                    .map_err(map_shortcut_capability_failure)?;
-                if let Err(failure) = self.client.open_notification_session(
-                    begin.session_id(),
-                    begin.plugin_id(),
-                    admission.permits_notification(),
-                ) {
-                    self.client.cancel_shortcut_session(begin.session_id());
-                    return Err(map_notification_capability_failure(failure));
-                }
-            }
+            ContinuousRequest::Begin(begin) => self.open_capability_sessions(begin)?,
             ContinuousRequest::Update(_) => self.capability_failure(request)?,
             ContinuousRequest::Commit(_) => {
                 if let Err(error) = self.capability_failure(request) {
@@ -396,20 +448,25 @@ impl ContinuousBackend for PluginContinuousBackend {
                 }
             }
             ContinuousRequest::Commit(_) => {
-                if let Err(failure) =
-                    self.client.finish_shortcut_commit(request.session_id(), context.deadline())
-                {
-                    self.client.cancel_notification_session(request.session_id());
-                    return Err(map_shortcut_capability_failure(failure));
-                }
-                return self
-                    .client
-                    .finish_notification_commit(request.session_id())
-                    .map_err(map_notification_capability_failure);
+                return self.finish_capability_commit(request.session_id(), context.deadline());
             }
             ContinuousRequest::Cancel(_) => {}
         }
         Ok(())
+    }
+}
+
+const fn map_loopback_capability_failure(
+    failure: LoopbackCapabilityFailure,
+) -> ContinuousBackendError {
+    match failure {
+        LoopbackCapabilityFailure::Interrupted => ContinuousBackendError::Interrupted,
+        LoopbackCapabilityFailure::DeadlineExceeded => ContinuousBackendError::TimedOut,
+        LoopbackCapabilityFailure::PermissionDenied
+        | LoopbackCapabilityFailure::GrantDenied
+        | LoopbackCapabilityFailure::RateLimited
+        | LoopbackCapabilityFailure::Busy
+        | LoopbackCapabilityFailure::RequestFailed => ContinuousBackendError::Faulted,
     }
 }
 
@@ -1416,10 +1473,11 @@ mod tests {
         ContinuousBackend, ContinuousBackendContext, ContinuousBackendError,
         ContinuousBackendFailure, ContinuousBackendStage, ContinuousCompletion,
         ContinuousCompletionOutcome, ContinuousInvocation, ValidatingInertBackend,
-        map_notification_capability_failure, map_plugin_lifecycle_error, map_plugin_submit_error,
+        map_loopback_capability_failure, map_notification_capability_failure,
+        map_plugin_lifecycle_error, map_plugin_submit_error,
     };
     use crate::action_executor::{ActionDispatch, ActionExecutor};
-    use crate::capability_broker::NotificationCapabilityFailure;
+    use crate::capability_broker::{LoopbackCapabilityFailure, NotificationCapabilityFailure};
     use crate::plugin_worker::{
         PluginLifecycleError, PluginLifecycleStage, PluginLifecycleSubmitError,
     };
@@ -1548,6 +1606,18 @@ mod tests {
         );
         assert_eq!(
             map_notification_capability_failure(NotificationCapabilityFailure::Interrupted),
+            ContinuousBackendError::Interrupted
+        );
+        assert_eq!(
+            map_loopback_capability_failure(LoopbackCapabilityFailure::RequestFailed),
+            ContinuousBackendError::Faulted
+        );
+        assert_eq!(
+            map_loopback_capability_failure(LoopbackCapabilityFailure::DeadlineExceeded),
+            ContinuousBackendError::TimedOut
+        );
+        assert_eq!(
+            map_loopback_capability_failure(LoopbackCapabilityFailure::Interrupted),
             ContinuousBackendError::Interrupted
         );
         drop(lease);

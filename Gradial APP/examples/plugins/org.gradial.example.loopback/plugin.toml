@@ -1,0 +1,15 @@
+manifest_version = 1
+id = "org.gradial.example.loopback"
+name = "Loopback commit example"
+version = "0.1.0"
+api_version = 1
+entry = "main.lua"
+permissions = ["network.loopback"]
+loopback = [{ origin = "http://127.0.0.1:32123", methods = ["POST"] }]
+
+[[actions]]
+id = "post-on-commit"
+name = "Post on commit"
+kind = "continuous"
+description = "Posts one bounded JSON value to an approved local HTTP service when the gesture commits."
+update_hz = 10

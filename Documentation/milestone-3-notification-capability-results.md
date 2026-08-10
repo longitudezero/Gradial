@@ -80,3 +80,7 @@ application, 92 core, and 26 Lua tests.
 `network.loopback` remains a separate capability slice. Notifications cannot
 synthesize input, access target details, open files or URLs, start processes,
 send network traffic, persist messages, add actions, or receive user responses.
+
+Subsequent status (2026-08-10): `network.loopback` is now implemented as its
+own exact-origin bounded broker, completing the Milestone 3 capability set. See
+`milestone-3-loopback-capability-results.md` for its boundary and evidence.

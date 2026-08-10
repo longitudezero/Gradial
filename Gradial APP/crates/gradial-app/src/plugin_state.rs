@@ -6,7 +6,10 @@ use std::{
     path::Path,
 };
 
-use gradial_core::{AppPaths, PLUGIN_MANIFEST_VERSION, PluginId, PluginManifest, PluginPermission};
+use gradial_core::{
+    AppPaths, MAX_PLUGIN_LOOPBACK_ORIGINS, PLUGIN_MANIFEST_VERSION, PluginId, PluginLoopbackGrant,
+    PluginManifest, PluginPermission,
+};
 use gradial_lua::MAX_PLUGIN_ROOT_ENTRIES;
 use serde::{Deserialize, Serialize};
 use windows::{
@@ -43,6 +46,8 @@ impl Default for PluginTrustState {
 struct PluginTrustRecord {
     enabled: bool,
     approved_permissions: Vec<PluginPermission>,
+    #[serde(default)]
+    approved_loopback: Vec<PluginLoopbackGrant>,
     last_loaded_manifest: Option<LoadedPluginManifest>,
     faulted: bool,
 }
@@ -110,6 +115,7 @@ struct PluginObservation {
     plugin_version: String,
     api_version: u16,
     permissions: Vec<PluginPermission>,
+    loopback: Vec<PluginLoopbackGrant>,
     package_fingerprint: PluginPackageFingerprint,
     compatible: bool,
 }
@@ -134,12 +140,18 @@ impl PluginObservation {
     ) -> Self {
         let mut permissions = manifest.permissions.clone();
         permissions.sort_unstable();
+        let mut loopback = manifest.loopback.clone();
+        for grant in &mut loopback {
+            grant.methods.sort_unstable();
+        }
+        loopback.sort_unstable();
         Self {
             plugin_id: manifest.id.clone(),
             manifest_version: manifest.manifest_version,
             plugin_version: manifest.version.clone(),
             api_version: manifest.api_version,
             permissions,
+            loopback,
             package_fingerprint,
             compatible,
         }
@@ -181,10 +193,10 @@ impl PluginTrustState {
         if !observation.compatible {
             return Err(PluginStateTransitionError::Incompatible);
         }
-        Ok(self
-            .plugins
-            .get(&observation.plugin_id)
-            .is_some_and(|record| record.approved_permissions == observation.permissions))
+        Ok(self.plugins.get(&observation.plugin_id).is_some_and(|record| {
+            record.approved_permissions == observation.permissions
+                && record.approved_loopback == observation.loopback
+        }))
     }
 
     pub(crate) fn approve_permissions(
@@ -198,6 +210,7 @@ impl PluginTrustState {
         let record = self.plugins.entry(observation.plugin_id).or_default();
         record.enabled = false;
         record.approved_permissions = observation.permissions;
+        record.approved_loopback = observation.loopback;
         record.faulted = false;
         Ok(())
     }
@@ -216,7 +229,9 @@ impl PluginTrustState {
             .plugins
             .get_mut(&observation.plugin_id)
             .ok_or(PluginStateTransitionError::ApprovalRequired)?;
-        if record.approved_permissions != observation.permissions {
+        if record.approved_permissions != observation.permissions
+            || record.approved_loopback != observation.loopback
+        {
             return Err(PluginStateTransitionError::ApprovalRequired);
         }
         record.enabled = true;
@@ -286,7 +301,10 @@ impl PluginTrustState {
                 }
                 continue;
             }
-            if record.approved_permissions != observation.permissions && record.enabled {
+            if (record.approved_permissions != observation.permissions
+                || record.approved_loopback != observation.loopback)
+                && record.enabled
+            {
                 record.enabled = false;
                 record.faulted = false;
                 result.changed = true;
@@ -316,7 +334,9 @@ impl PluginTrustState {
         let Some(record) = self.plugins.get(&observation.plugin_id) else {
             return PluginTrustStatus::Disabled;
         };
-        if record.approved_permissions != observation.permissions {
+        if record.approved_permissions != observation.permissions
+            || record.approved_loopback != observation.loopback
+        {
             return PluginTrustStatus::PermissionReviewRequired;
         }
         if !record.enabled {
@@ -344,6 +364,17 @@ impl PluginTrustState {
         for (plugin_id, record) in &self.plugins {
             PluginId::new(plugin_id).map_err(|_| PluginStateValidationError::InvalidPluginId)?;
             if !record.approved_permissions.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Err(PluginStateValidationError::InvalidPermissions);
+            }
+            if record.approved_loopback.len() > MAX_PLUGIN_LOOPBACK_ORIGINS
+                || !record.approved_loopback.windows(2).all(|pair| pair[0] < pair[1])
+                || record.approved_loopback.iter().any(|grant| {
+                    grant.methods.is_empty()
+                        || !grant.methods.windows(2).all(|pair| pair[0] < pair[1])
+                })
+                || record.approved_loopback.is_empty()
+                    == record.approved_permissions.contains(&PluginPermission::NetworkLoopback)
+            {
                 return Err(PluginStateValidationError::InvalidPermissions);
             }
             if record.faulted && !record.enabled
@@ -1076,7 +1107,7 @@ mod tests {
             1,
             &["network.loopback"],
             "return { secret = 'private-source-sentinel' }",
-            "",
+            "loopback = [{ origin = \"http://127.0.0.1:8080\", methods = [\"POST\"] }]",
         );
         let report = discovered(&paths);
         let initial = store.load_or_initialize().state;
@@ -1088,6 +1119,7 @@ mod tests {
         let private_plugin_path = paths.plugins.to_string_lossy().into_owned();
 
         assert!(text.contains("network.loopback"));
+        assert!(text.contains("http://127.0.0.1:8080"));
         assert!(text.contains(PLUGIN_ID));
         for private in [
             SOURCE_SENTINEL,
@@ -1099,6 +1131,37 @@ mod tests {
         ] {
             assert!(!text.contains(private), "state leaked {private}");
         }
+    }
+
+    #[test]
+    fn loopback_allowlist_changes_require_fresh_review() {
+        let (_temporary, paths, _store) = setup();
+        write_package(
+            &paths.plugins,
+            1,
+            &["network.loopback"],
+            SOURCE_SENTINEL,
+            "loopback = [{ origin = \"http://127.0.0.1:8080\", methods = [\"GET\"] }]",
+        );
+        let first_report = discovered(&paths);
+        let mut state = PluginTrustState::default();
+        state.approve_permissions(only_package(&first_report)).expect("approval");
+        state.record_successful_load(only_package(&first_report)).expect("enable");
+
+        write_package(
+            &paths.plugins,
+            1,
+            &["network.loopback"],
+            SOURCE_SENTINEL,
+            "loopback = [{ origin = \"http://127.0.0.1:9090\", methods = [\"GET\", \"POST\"] }]",
+        );
+        let changed_report = discovered(&paths);
+        let changed = only_package(&changed_report);
+        assert_eq!(state.status(changed), Ok(PluginTrustStatus::PermissionReviewRequired));
+        assert_eq!(state.permissions_approved(changed), Ok(false));
+        let reconciliation = state.reconcile(&changed_report);
+        assert_eq!(reconciliation.permission_changes, 1);
+        assert_eq!(reconciliation.statuses[PLUGIN_ID], PluginTrustStatus::PermissionReviewRequired);
     }
 
     #[test]

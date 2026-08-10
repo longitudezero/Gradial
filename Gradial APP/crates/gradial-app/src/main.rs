@@ -13,6 +13,7 @@ mod focus;
 mod icons;
 mod input;
 mod interaction;
+mod loopback;
 mod native_file_dialog;
 mod onboarding;
 mod options;

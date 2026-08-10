@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::{
     MAX_CONTINUOUS_IDENTIFIER_BYTES, MAX_CONTINUOUS_UPDATE_HZ, MIN_CONTINUOUS_UPDATE_HZ,
+    PluginLoopbackGrant,
     continuous::{PluginParameters, PluginValue, plugin_parameters_fit_serialized_limit},
 };
 
@@ -18,6 +19,7 @@ pub const PLUGIN_API_VERSION: u16 = 1;
 pub const MAX_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MAX_PLUGIN_ACTIONS: usize = 64;
 pub const MAX_PLUGIN_PARAMETERS_PER_ACTION: usize = 32;
+pub const MAX_PLUGIN_LOOPBACK_ORIGINS: usize = 16;
 const MAX_DISPLAY_NAME_BYTES: usize = 128;
 const MAX_DESCRIPTION_BYTES: usize = 1_024;
 const MAX_PARAMETER_STRING_BYTES: usize = 4_096;
@@ -34,6 +36,8 @@ pub struct PluginManifest {
     pub entry: String,
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    #[serde(default)]
+    pub loopback: Vec<PluginLoopbackGrant>,
     #[serde(default)]
     pub actions: Vec<PluginManifestAction>,
 }
@@ -283,6 +287,7 @@ impl PluginManifest {
         if self.permissions.iter().any(|permission| !permissions.insert(*permission)) {
             return Err(PluginManifestError::DuplicatePermission);
         }
+        self.validate_loopback()?;
 
         let mut action_ids = HashSet::with_capacity(self.actions.len());
         for action in &self.actions {
@@ -290,6 +295,30 @@ impl PluginManifest {
                 return Err(PluginManifestError::DuplicateActionId);
             }
             action.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_loopback(&self) -> Result<(), PluginManifestError> {
+        let requested = self.permissions.contains(&PluginPermission::NetworkLoopback);
+        if requested == self.loopback.is_empty() {
+            return Err(PluginManifestError::LoopbackPermissionMismatch);
+        }
+        if self.loopback.len() > MAX_PLUGIN_LOOPBACK_ORIGINS {
+            return Err(PluginManifestError::TooManyLoopbackOrigins);
+        }
+        let mut origins = HashSet::with_capacity(self.loopback.len());
+        for grant in &self.loopback {
+            if !origins.insert(grant.origin.clone())
+                || grant.methods.is_empty()
+                || grant.methods.len() > 2
+            {
+                return Err(PluginManifestError::InvalidLoopbackGrant);
+            }
+            let mut methods = HashSet::with_capacity(grant.methods.len());
+            if grant.methods.iter().any(|method| !methods.insert(*method)) {
+                return Err(PluginManifestError::InvalidLoopbackGrant);
+            }
         }
         Ok(())
     }
@@ -473,6 +502,12 @@ pub enum PluginManifestError {
     InvalidEntry,
     #[error("plugin_permission_duplicate")]
     DuplicatePermission,
+    #[error("plugin_loopback_permission_mismatch")]
+    LoopbackPermissionMismatch,
+    #[error("plugin_loopback_origins_too_many")]
+    TooManyLoopbackOrigins,
+    #[error("plugin_loopback_grant_invalid")]
+    InvalidLoopbackGrant,
     #[error("plugin_actions_too_many")]
     TooManyActions,
     #[error("plugin_action_id_duplicate")]
@@ -570,6 +605,45 @@ maximum = 120
         assert_eq!(
             parse_plugin_manifest(unknown_permission.as_bytes()),
             Err(PluginManifestError::Toml)
+        );
+    }
+
+    #[test]
+    fn loopback_grants_require_exact_origins_methods_and_permission() {
+        let source = VALID.replace(
+            "permissions = [\"context.application\", \"input.shortcut\"]",
+            "permissions = [\"context.application\", \"input.shortcut\", \"network.loopback\"]\n\
+             loopback = [{ origin = \"http://127.0.0.1:8080\", methods = [\"GET\", \"POST\"] }, \
+             { origin = \"http://[::1]:9090\", methods = [\"POST\"] }]",
+        );
+        let manifest = parse_plugin_manifest(source.as_bytes()).expect("loopback manifest");
+        assert_eq!(manifest.loopback.len(), 2);
+        assert_eq!(manifest.loopback[0].origin.as_str(), "http://127.0.0.1:8080");
+
+        let absent_permission = source.replace(", \"network.loopback\"", "");
+        assert_eq!(
+            parse_plugin_manifest(absent_permission.as_bytes()),
+            Err(PluginManifestError::LoopbackPermissionMismatch)
+        );
+        let absent_grant = source
+            .lines()
+            .filter(|line| !line.starts_with("loopback = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse_plugin_manifest(absent_grant.as_bytes()),
+            Err(PluginManifestError::LoopbackPermissionMismatch)
+        );
+        for replacement in
+            ["http://localhost:8080", "https://127.0.0.1:8080", "http://127.0.0.1:8080/path"]
+        {
+            let invalid = source.replace("http://127.0.0.1:8080", replacement);
+            assert_eq!(parse_plugin_manifest(invalid.as_bytes()), Err(PluginManifestError::Toml));
+        }
+        let duplicate_method = source.replace("[\"GET\", \"POST\"]", "[\"GET\", \"GET\"]");
+        assert_eq!(
+            parse_plugin_manifest(duplicate_method.as_bytes()),
+            Err(PluginManifestError::InvalidLoopbackGrant)
         );
     }
 

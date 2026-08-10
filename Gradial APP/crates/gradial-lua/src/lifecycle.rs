@@ -637,8 +637,8 @@ mod tests {
 
     use gradial_core::{
         ContinuousActionSnapshot, ContinuousRequest, ContinuousSession,
-        PermittedApplicationContext, PluginActionId, PluginId, PluginNotificationText,
-        PluginShortcutChord,
+        PermittedApplicationContext, PluginActionId, PluginId, PluginLoopbackRequest,
+        PluginNotificationText, PluginShortcutChord,
     };
 
     use crate::{LuaCapabilityRejection, LuaCapabilityStatus};
@@ -749,6 +749,7 @@ mod tests {
     struct RecordingCapabilityHost {
         calls: Mutex<Vec<(Uuid, LuaCallbackPhase, PluginShortcutChord)>>,
         notifications: Mutex<Vec<(Uuid, LuaCallbackPhase, PluginNotificationText)>>,
+        loopback: Mutex<Vec<(Uuid, LuaCallbackPhase, PluginLoopbackRequest)>>,
         rejection: Mutex<Option<LuaCapabilityRejection>>,
     }
 
@@ -773,6 +774,19 @@ mod tests {
             text: PluginNotificationText,
         ) -> LuaCapabilityStatus {
             self.notifications.lock().expect("notifications").push((session_id, phase, text));
+            self.rejection
+                .lock()
+                .expect("rejection")
+                .map_or(LuaCapabilityStatus::Accepted, LuaCapabilityStatus::Rejected)
+        }
+
+        fn request_loopback(
+            &self,
+            session_id: Uuid,
+            phase: LuaCallbackPhase,
+            request: PluginLoopbackRequest,
+        ) -> LuaCapabilityStatus {
+            self.loopback.lock().expect("loopback").push((session_id, phase, request));
             self.rejection
                 .lock()
                 .expect("rejection")
@@ -1016,6 +1030,70 @@ mod tests {
         assert_eq!(notifications[1].1, LuaCallbackPhase::Update);
         assert_eq!(notifications[2].1, LuaCallbackPhase::Commit);
         assert_eq!(notifications[2].2.as_str(), "Gesture committed");
+    }
+
+    #[test]
+    fn protected_loopback_host_validates_request_shape_and_callback_scope() {
+        let source = r#"
+            local inactive, inactive_reason = gradial.network.loopback({
+                method = "GET", origin = "http://127.0.0.1:8080"
+            })
+            assert(not inactive and inactive_reason == "inactive_session")
+            assert(not pcall(function() gradial.network.loopback = function() end end))
+            return {
+                begin = function(context, parameters, initial)
+                    local accepted, reason = gradial.network.loopback({
+                        method = "GET",
+                        origin = "http://127.0.0.1:8080",
+                        path = "/status?private=value",
+                    })
+                    assert(accepted and reason == nil)
+                    return {}
+                end,
+                update = function(session, sample)
+                    local accepted = gradial.network.loopback({
+                        method = "POST",
+                        origin = "http://127.0.0.1:8080",
+                        path = "/control",
+                        body = '{"value":0.5}',
+                        content_type = "application/json",
+                    })
+                    assert(accepted)
+                    for _, malformed in ipairs({
+                        {},
+                        { method = "DELETE", origin = "http://127.0.0.1:8080" },
+                        { method = "GET", origin = "http://localhost:8080" },
+                        { method = "GET", origin = "http://127.0.0.1:8080", path = "//escape" },
+                        { method = "GET", origin = "http://127.0.0.1:8080", extra = true },
+                    }) do
+                        local ok, reason = gradial.network.loopback(malformed)
+                        assert(not ok and reason == "invalid_loopback")
+                    end
+                end,
+                commit = function(session, sample) end,
+                cancel = function(session, reason) end,
+            }
+        "#;
+        let host = Arc::new(RecordingCapabilityHost::default());
+        let mut adapter = LuaLifecycleAdapter::load_with_capability_host(
+            image(source),
+            LuaSandboxLimits::default(),
+            host.clone(),
+        )
+        .expect("adapter");
+        let session_id = Uuid::from_u128(13);
+        let (mut session, begin) = begin_request(session_id);
+
+        adapter.begin(&begin).expect("begin");
+        adapter.update(&update_request(&mut session, 0.5)).expect("update");
+
+        let requests = host.loopback.lock().expect("loopback");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(found, _, _)| *found == session_id));
+        assert_eq!(requests[0].1, LuaCallbackPhase::Begin);
+        assert_eq!(requests[1].1, LuaCallbackPhase::Update);
+        assert_eq!(requests[1].2.body(), br#"{"value":0.5}"#);
+        assert!(!format!("{:?}", requests[1].2).contains("private"));
     }
 
     #[test]

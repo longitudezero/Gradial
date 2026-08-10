@@ -368,8 +368,9 @@ to an empty disabled state and never stores source, paths, parameters, or
 credentials. The plugin worker owns these transitions and the Lua states they
 authorize; the UI only submits bounded commands and reads immutable snapshots.
 The **Plugins** Settings page is now the user-facing caller: it presents the
-discovered inventory and requested permissions, asks for explicit trust before first
-enablement or after permission changes, and submits rescan, enable, disable,
+discovered inventory and requested permissions, including exact loopback
+destinations, asks for explicit trust before first enablement or after permission
+or destination changes, and submits rescan, enable, disable,
 and reload work asynchronously. Those machine-local changes apply immediately
 and never modify or save the open menu-settings draft. **Open plugins folder**
 opens the managed package root.
@@ -379,8 +380,8 @@ exposes only reviewed basic functions,
 `math`, `string`, `table`, `utf8`, and the rooted/cached
 `gradial.require("lib.mapping")` source loader. It has no filesystem-backed
 loader; its only current operating-system surface is the explicit protected
-shortcut and notification capability set. Memory, instruction, and wall-time
-limits remain enforced.
+shortcut, notification, and exact-origin loopback capability set. Memory,
+instruction, and wall-time limits remain enforced.
 Its strict lifecycle adapter validates and bounds `begin`, `update`, `commit`,
 and `cancel` with private session state and immutable host values. At startup,
 the bounded worker constructs one adapter only for a freshly rediscovered
@@ -417,6 +418,16 @@ may accept one message; each plugin may accept five in a rolling minute.
 Pending delivery is cancelled with the gesture or permission epoch, and the
 native request remains outside Lua and interaction threads.
 
+Plugins approved for `network.loopback` can enqueue bounded GET or POST requests
+through `gradial.network.loopback({...})`. Every cleartext HTTP origin must be
+an exact manifest entry using `127.0.0.1` or `[::1]` and an explicit port. The
+review dialog shows those origins and methods; changing any of them disables
+the plugin until another review. Gradial connects directly without DNS,
+proxies, redirects, credentials, or non-loopback fallback. Paths are bounded
+ASCII origin-form targets, bodies and responses are limited to 64 KiB, every
+operation has a 250 ms deadline, and Lua receives no response content. Queries,
+bodies, and responses never enter logs.
+
 A permission-free no-side-effect package is included at
 [`Gradial APP/examples/plugins/org.gradial.example.meter`](Gradial%20APP/examples/plugins/org.gradial.example.meter).
 It records only private session-local scalar state and is used by the worker
@@ -425,7 +436,10 @@ lifecycle tests. The permission-checked
 example demonstrates bounded radial bands with at most one whole shortcut
 request per callback. The
 [`Gradial APP/examples/plugins/org.gradial.example.notification`](Gradial%20APP/examples/plugins/org.gradial.example.notification)
-example requests one plain notification only when its gesture commits.
+example requests one plain notification only when its gesture commits. The
+[`Gradial APP/examples/plugins/org.gradial.example.loopback`](Gradial%20APP/examples/plugins/org.gradial.example.loopback)
+example posts one JSON scalar on Commit to an explicitly reviewed local test
+service.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the

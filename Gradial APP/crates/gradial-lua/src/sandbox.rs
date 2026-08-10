@@ -4,6 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use gradial_core::{
+    PluginLoopbackContentType, PluginLoopbackMethod, PluginLoopbackOrigin, PluginLoopbackRequest,
+};
 use mlua::{
     Error as MluaError, Function, HookTriggers, Lua, LuaOptions, LuaString, RegistryKey, StdLib,
     Table, Value, VmState, chunk::ChunkMode,
@@ -280,8 +283,11 @@ fn install_environment(
     host_exports.raw_set("require", require).map_err(classify_setup_error)?;
     let input = input_host_proxy(lua, callback_scope, Arc::clone(&capability_host))?;
     host_exports.raw_set("input", input).map_err(classify_setup_error)?;
-    let notification = notification_host_function(lua, callback_scope, capability_host)?;
+    let notification =
+        notification_host_function(lua, callback_scope, Arc::clone(&capability_host))?;
     host_exports.raw_set("notification", notification).map_err(classify_setup_error)?;
+    let network = network_host_proxy(lua, callback_scope, capability_host)?;
+    host_exports.raw_set("network", network).map_err(classify_setup_error)?;
     let host_proxy = read_only_proxy(lua, host_exports)?;
     globals.raw_set("gradial", host_proxy).map_err(classify_setup_error)?;
     Ok(())
@@ -355,6 +361,80 @@ fn notification_host_function(
         })
     })
     .map_err(classify_setup_error)
+}
+
+fn network_host_proxy(
+    lua: &Lua,
+    callback_scope: &Arc<Mutex<Option<LuaCallbackScope>>>,
+    capability_host: Arc<dyn LuaCapabilityHost>,
+) -> Result<Table, LuaSandboxError> {
+    let loopback_scope = Arc::clone(callback_scope);
+    let loopback = lua
+        .create_function(move |_, value: Value| {
+            let parsed = parse_loopback_request(value);
+            let status = parsed.map_or(
+                LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InvalidLoopback),
+                |request| {
+                    let scope = *lock_unpoisoned(&loopback_scope);
+                    scope.map_or(
+                        LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InactiveSession),
+                        |scope| {
+                            capability_host.request_loopback(scope.session_id, scope.phase, request)
+                        },
+                    )
+                },
+            );
+            Ok(match status {
+                LuaCapabilityStatus::Accepted => (true, None),
+                LuaCapabilityStatus::Rejected(reason) => (false, Some(reason.as_str())),
+            })
+        })
+        .map_err(classify_setup_error)?;
+    let network_exports = lua.create_table().map_err(classify_setup_error)?;
+    network_exports.raw_set("loopback", loopback).map_err(classify_setup_error)?;
+    read_only_proxy(lua, network_exports)
+}
+
+fn parse_loopback_request(value: Value) -> Option<PluginLoopbackRequest> {
+    let Value::Table(table) = value else {
+        return None;
+    };
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _value) = pair.ok()?;
+        let Value::String(key) = key else {
+            return None;
+        };
+        let key = key.to_str().ok()?;
+        if !matches!(key.as_ref(), "method" | "origin" | "path" | "body" | "content_type") {
+            return None;
+        }
+    }
+
+    let method = lua_utf8_field(&table, "method")?.parse::<PluginLoopbackMethod>().ok()?;
+    let origin = lua_utf8_field(&table, "origin")?.parse::<PluginLoopbackOrigin>().ok()?;
+    let path = match table.raw_get::<Value>("path").ok()? {
+        Value::Nil => "/".to_owned(),
+        Value::String(path) => path.to_str().ok()?.to_owned(),
+        _ => return None,
+    };
+    let body = match table.raw_get::<Value>("body").ok()? {
+        Value::Nil => Vec::new(),
+        Value::String(body) => body.as_bytes().as_ref().to_vec(),
+        _ => return None,
+    };
+    let content_type = match table.raw_get::<Value>("content_type").ok()? {
+        Value::Nil => PluginLoopbackContentType::Binary,
+        Value::String(content_type) => content_type.to_str().ok()?.parse().ok()?,
+        _ => return None,
+    };
+    PluginLoopbackRequest::new(method, origin, path, body, content_type).ok()
+}
+
+fn lua_utf8_field(table: &Table, key: &str) -> Option<String> {
+    match table.raw_get::<Value>(key).ok()? {
+        Value::String(value) => Some(value.to_str().ok()?.to_owned()),
+        _ => None,
+    }
 }
 
 fn read_only_proxy(lua: &Lua, exports: Table) -> Result<Table, LuaSandboxError> {
