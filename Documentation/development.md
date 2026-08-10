@@ -936,11 +936,43 @@ transition, which keeps the current process fail-closed even if storage is
 unavailable. File scans, Lua work, and state writes never run on the input,
 interaction, renderer, or action-executor threads.
 
-This worker does not yet route Begin/Update/Commit/Cancel, expose any host
+The worker exposes an immutable inventory snapshot containing display metadata,
+requested permissions, effective status, whether the current permissions were
+approved, and safe issue codes. A manual rescan repeats discovery and trust
+reconciliation without constructing a Lua state. If package changes revoke an
+adapter's effective enabled status, rescan unloads it immediately. Enable also
+checks current permission approval before constructing the candidate, so an
+unapproved package cannot execute source even when a caller bypasses the UI.
+
+## Plugins Settings page
+
+The **Plugins** page polls worker tickets without blocking the renderer. It
+shows each discovered or remembered package's name, ID, version, plugin API,
+requested permissions, effective status, and a stable user-safe problem
+message. **Rescan plugins**, **Enable**, **Disable**, and **Reload** are disabled
+while one worker request is pending. **Open plugins folder** uses the managed
+`%LOCALAPPDATA%\Gradial\plugins` directory and does not expose arbitrary paths
+to the shell.
+
+An unapproved disabled plugin and every permission-change review open a modal
+that identifies the plugin, lists its permissions in plain language, and warns
+that local Lua scripts should be enabled only when trusted. **Approve and
+enable** is deliberately two serialized worker operations: persist the exact
+permission set first, then perform fresh discovery and candidate validation.
+A failure at either boundary leaves the adapter absent. Once permissions are
+unchanged, later enablement does not repeat the confirmation; source changes
+still require an explicit reload.
+
+Plugin management is machine-local operational state, not portable menu
+configuration. Its controls therefore apply immediately and remain independent
+of Save, Discard, import, export, and any unsaved Settings draft. Closing
+Settings dismisses a pending trust confirmation but does not cancel an already
+accepted worker operation.
+
+The worker still does not route Begin/Update/Commit/Cancel, expose any host
 capability, or connect plugin actions to the live coordinator. The current
 adapters therefore hold no active sessions, and reload/disable teardown has no
-external effect to cancel. The Plugins Settings page remains the next
-user-facing caller of the already asynchronous operation API.
+external effect to cancel.
 
 ## Configuration and profile resolution
 

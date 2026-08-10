@@ -365,8 +365,14 @@ of the last successfully loaded package. Permission changes disable an enabled
 record until reviewed; ordinary manifest or Lua edits retain approval but are
 marked as requiring manual reload. Atomic `.tmp`/`.bak` recovery fails closed
 to an empty disabled state and never stores source, paths, parameters, or
-credentials. No UI calls the approval or successful-load transitions yet; the
-plugin worker owns them and the Lua states they authorize.
+credentials. The plugin worker owns these transitions and the Lua states they
+authorize; the UI only submits bounded commands and reads immutable snapshots.
+The **Plugins** Settings page is now the user-facing caller: it presents the
+discovered inventory and requested permissions, asks for explicit trust before first
+enablement or after permission changes, and submits rescan, enable, disable,
+and reload work asynchronously. Those machine-local changes apply immediately
+and never modify or save the open menu-settings draft. **Open plugins folder**
+opens the managed package root.
 
 The separate `gradial-lua` foundation embeds vendored Lua 5.4. A fresh state
 exposes only reviewed basic functions,
@@ -380,8 +386,9 @@ package whose effective trust status is exactly enabled. Newly discovered,
 disabled, changed, incompatible, invalid, unavailable, and faulted packages
 execute zero Lua. Enable and reload validate Lua first, atomically record the
 exact successful package second, and admit the adapter last. There is still no
-enable switch, permission-review UI, Settings plugin page, capability broker,
-callback routing, or live continuous assignment.
+capability broker, callback routing, continuous-action catalog connection, or
+live continuous assignment. Rescan is code-free; unapproved source is rejected
+before Lua evaluation even if enablement is requested outside the Settings UI.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
@@ -485,8 +492,9 @@ Strict lifecycle-adapter, atomic trust-state, and isolated worker evidence is
 recorded in
 [`Documentation/milestone-2-lua-lifecycle-results.md`](Documentation/milestone-2-lua-lifecycle-results.md),
 [`Documentation/milestone-2-plugin-trust-state-results.md`](Documentation/milestone-2-plugin-trust-state-results.md),
+[`Documentation/milestone-2-plugin-worker-results.md`](Documentation/milestone-2-plugin-worker-results.md),
 and
-[`Documentation/milestone-2-plugin-worker-results.md`](Documentation/milestone-2-plugin-worker-results.md).
+[`Documentation/milestone-2-plugin-settings-results.md`](Documentation/milestone-2-plugin-settings-results.md).
 Configuration, snapshot, persistence, and resolver results are recorded in
 [`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).
 Profile-driven gesture and renderer results are recorded in

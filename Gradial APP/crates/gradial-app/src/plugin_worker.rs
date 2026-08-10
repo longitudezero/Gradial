@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
-use gradial_core::{AppPaths, PluginId};
+use gradial_core::{AppPaths, PluginId, PluginPermission};
 use gradial_lua::{LuaLifecycleAdapter, LuaSandboxError, LuaSandboxLimits};
 use thiserror::Error;
 
@@ -58,10 +58,51 @@ pub(crate) struct PluginWorkerReceipt {
     pub(crate) loaded: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginInventoryStatus {
+    Disabled,
+    PermissionReviewRequired,
+    Enabled,
+    ReloadRequired,
+    Faulted,
+    Incompatible,
+    Unavailable,
+    Invalid,
+}
+
+impl From<PluginTrustStatus> for PluginInventoryStatus {
+    fn from(status: PluginTrustStatus) -> Self {
+        match status {
+            PluginTrustStatus::Disabled => Self::Disabled,
+            PluginTrustStatus::PermissionReviewRequired => Self::PermissionReviewRequired,
+            PluginTrustStatus::Enabled => Self::Enabled,
+            PluginTrustStatus::ReloadRequired => Self::ReloadRequired,
+            PluginTrustStatus::Faulted => Self::Faulted,
+            PluginTrustStatus::Incompatible => Self::Incompatible,
+            PluginTrustStatus::Unavailable => Self::Unavailable,
+            PluginTrustStatus::Invalid => Self::Invalid,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PluginInventoryEntry {
+    pub(crate) plugin_id: String,
+    pub(crate) display_name: String,
+    pub(crate) version: Option<String>,
+    pub(crate) api_version: Option<u16>,
+    pub(crate) permissions: Vec<PluginPermission>,
+    pub(crate) permissions_approved: bool,
+    pub(crate) status: PluginInventoryStatus,
+    pub(crate) issue_code: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginWorkerSnapshot {
     pub(crate) state_revision: u64,
     pub(crate) loaded_plugin_ids: Vec<String>,
+    pub(crate) plugins: Vec<PluginInventoryEntry>,
+    pub(crate) scan_error_code: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -200,6 +241,9 @@ enum PluginWorkerCommand {
     Snapshot {
         reply: Sender<PluginWorkerSnapshot>,
     },
+    Rescan {
+        reply: Sender<PluginWorkerSnapshot>,
+    },
     Shutdown,
 }
 
@@ -274,6 +318,20 @@ impl PluginWorkerRuntime {
         }
     }
 
+    pub(crate) fn request_rescan(
+        &self,
+    ) -> Result<PluginWorkerSnapshotTicket, PluginWorkerSubmitError> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(PluginWorkerSubmitError::ShuttingDown);
+        }
+        let (reply, replies) = bounded(1);
+        match self.commands.try_send(PluginWorkerCommand::Rescan { reply }) {
+            Ok(()) => Ok(PluginWorkerSnapshotTicket { reply: replies }),
+            Err(TrySendError::Full(_)) => Err(PluginWorkerSubmitError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(PluginWorkerSubmitError::Unavailable),
+        }
+    }
+
     pub(crate) fn shutdown(&mut self) {
         let Some(join_handle) = self.join_handle.take() else {
             return;
@@ -321,6 +379,8 @@ struct PluginWorker {
     store: PluginStateStore,
     state: PluginTrustState,
     adapters: BTreeMap<String, LuaLifecycleAdapter>,
+    inventory: Vec<PluginInventoryEntry>,
+    scan_error_code: Option<String>,
 }
 
 impl PluginWorker {
@@ -347,7 +407,14 @@ impl PluginWorker {
             );
         }
 
-        let mut worker = Self { paths, store, state: loaded.state, adapters: BTreeMap::new() };
+        let mut worker = Self {
+            paths,
+            store,
+            state: loaded.state,
+            adapters: BTreeMap::new(),
+            inventory: Vec::new(),
+            scan_error_code: None,
+        };
         worker.bootstrap_packages(shutdown_requested);
         worker
     }
@@ -355,6 +422,9 @@ impl PluginWorker {
     fn bootstrap_packages(&mut self, shutdown_requested: &AtomicBool) {
         let report = discover_plugins(&self.paths.plugins);
         log_discovery_report(&report);
+        if let Some(error) = report.root_error {
+            self.scan_error_code = Some(error.to_string());
+        }
         let (reconciliation, _persistence_error) = self.reconcile_report(&report);
         let counts = reconciliation.status_counts();
         log::info!(
@@ -407,6 +477,7 @@ impl PluginWorker {
                     }
                 }
             }
+            self.update_inventory(&report);
         }
         log::info!(
             target: "plugins",
@@ -425,6 +496,7 @@ impl PluginWorker {
             match command {
                 PluginWorkerCommand::Operate { operation, plugin_id, reply } => {
                     let result = self.operate(operation, &plugin_id);
+                    self.refresh_inventory_view();
                     log_operation(
                         operation,
                         &plugin_id,
@@ -436,6 +508,19 @@ impl PluginWorker {
                     let _sent = reply.try_send(result);
                 }
                 PluginWorkerCommand::Snapshot { reply } => {
+                    let _sent = reply.try_send(self.snapshot());
+                }
+                PluginWorkerCommand::Rescan { reply } => {
+                    let result = self.fresh_report();
+                    log::info!(
+                        target: "plugins",
+                        "component=plugins event_code=plugin_rescan result_code={} \
+                         state_revision={} plugin_count={} error_code={}",
+                        if result.is_ok() { "ok" } else { "failure" },
+                        self.state.revision(),
+                        self.inventory.len(),
+                        result.err().map_or("none", PluginWorkerError::code)
+                    );
                     let _sent = reply.try_send(self.snapshot());
                 }
                 PluginWorkerCommand::Shutdown => break,
@@ -497,6 +582,12 @@ impl PluginWorker {
             PluginTrustStatus::Unavailable | PluginTrustStatus::Invalid => {
                 return Err(PluginWorkerError::Unavailable);
             }
+        }
+
+        if !self.state.permissions_approved(&package).map_err(PluginWorkerError::StateTransition)? {
+            return Err(PluginWorkerError::StateTransition(
+                PluginStateTransitionError::ApprovalRequired,
+            ));
         }
 
         let candidate = load_adapter(&package).map_err(PluginWorkerError::Lua)?;
@@ -567,16 +658,19 @@ impl PluginWorker {
     fn fresh_report(&mut self) -> Result<PluginDiscoveryReport, PluginWorkerError> {
         let report = discover_plugins(&self.paths.plugins);
         log_discovery_report(&report);
-        if report.root_error.is_some() {
+        if let Some(error) = report.root_error {
+            self.scan_error_code = Some(error.to_string());
             return Err(PluginWorkerError::DiscoveryUnavailable);
         }
         let (_reconciliation, persistence_error) = self.reconcile_report(&report);
         self.prune_unauthorized(&report);
+        self.update_inventory(&report);
         if let Some(error) = persistence_error {
             // A failed save leaves `self.state` unchanged. Effective status
             // still prunes changed packages, but no admission may proceed.
             return Err(PluginWorkerError::StatePersistence(error));
         }
+        self.scan_error_code = None;
         Ok(report)
     }
 
@@ -655,6 +749,70 @@ impl PluginWorker {
         PluginWorkerSnapshot {
             state_revision: self.state.revision(),
             loaded_plugin_ids: self.adapters.keys().cloned().collect(),
+            plugins: self.inventory.clone(),
+            scan_error_code: self.scan_error_code.clone(),
+        }
+    }
+
+    fn update_inventory(&mut self, report: &PluginDiscoveryReport) {
+        let mut observed = self.state.clone();
+        let statuses = observed.reconcile(report).statuses;
+        self.inventory = statuses
+            .into_iter()
+            .map(|(plugin_id, status)| {
+                let package =
+                    report.packages.iter().find(|package| package.directory_name == plugin_id);
+                match package.map(|package| &package.status) {
+                    Some(
+                        PluginPackageStatus::Compatible { manifest, .. }
+                        | PluginPackageStatus::IncompatibleApi { manifest, .. },
+                    ) => {
+                        let permissions_approved = package.is_some_and(|package| {
+                            self.state.permissions_approved(package).unwrap_or(false)
+                        });
+                        PluginInventoryEntry {
+                            plugin_id,
+                            display_name: manifest.name.clone(),
+                            version: Some(manifest.version.clone()),
+                            api_version: Some(manifest.api_version),
+                            permissions: manifest.permissions.clone(),
+                            permissions_approved,
+                            status: status.into(),
+                            issue_code: None,
+                        }
+                    }
+                    Some(PluginPackageStatus::Invalid(error)) => PluginInventoryEntry {
+                        display_name: plugin_id.clone(),
+                        plugin_id,
+                        version: None,
+                        api_version: None,
+                        permissions: Vec::new(),
+                        permissions_approved: false,
+                        status: PluginInventoryStatus::Invalid,
+                        issue_code: Some(error.to_string()),
+                    },
+                    None => PluginInventoryEntry {
+                        display_name: plugin_id.clone(),
+                        plugin_id,
+                        version: None,
+                        api_version: None,
+                        permissions: Vec::new(),
+                        permissions_approved: false,
+                        status: PluginInventoryStatus::Unavailable,
+                        issue_code: Some("package_missing".to_owned()),
+                    },
+                }
+            })
+            .collect();
+    }
+
+    fn refresh_inventory_view(&mut self) {
+        let report = discover_plugins(&self.paths.plugins);
+        if let Some(error) = report.root_error {
+            self.scan_error_code = Some(error.to_string());
+        } else {
+            self.update_inventory(&report);
+            self.scan_error_code = None;
         }
     }
 }
@@ -791,6 +949,10 @@ mod tests {
         runtime.request_snapshot().expect("accepted snapshot").receive()
     }
 
+    fn rescan(runtime: &PluginWorkerRuntime) -> PluginWorkerSnapshot {
+        runtime.request_rescan().expect("accepted rescan").receive()
+    }
+
     fn persisted_status(paths: &AppPaths, plugin_id: &str) -> PluginTrustStatus {
         let store = PluginStateStore::new(paths.clone());
         let state = store.load_or_initialize().state;
@@ -842,6 +1004,28 @@ mod tests {
             .expect("validated enable");
         assert!(enabled.loaded);
         assert_eq!(persisted_status(&paths, FIRST_PLUGIN), PluginTrustStatus::Enabled);
+    }
+
+    #[test]
+    fn unapproved_source_is_never_evaluated_by_enable() {
+        let (_temporary, paths) = setup();
+        write_package(
+            &paths.plugins,
+            FIRST_PLUGIN,
+            &["notification"],
+            "error('this source must stay inert')",
+        );
+        let runtime = PluginWorkerRuntime::start(paths).expect("plugin worker");
+
+        assert_eq!(
+            operate(&runtime, PluginWorkerOperation::Enable, FIRST_PLUGIN),
+            Err(PluginWorkerError::StateTransition(PluginStateTransitionError::ApprovalRequired))
+        );
+        let snapshot = snapshot(&runtime);
+        assert!(snapshot.loaded_plugin_ids.is_empty());
+        assert_eq!(snapshot.plugins.len(), 1);
+        assert!(!snapshot.plugins[0].permissions_approved);
+        assert_eq!(snapshot.plugins[0].status, PluginInventoryStatus::Disabled);
     }
 
     #[test]
@@ -936,6 +1120,20 @@ mod tests {
 
         assert!(reloaded.loaded);
         assert_eq!(persisted_status(&paths, FIRST_PLUGIN), PluginTrustStatus::Enabled);
+    }
+
+    #[test]
+    fn explicit_rescan_is_code_free_and_unloads_a_changed_package() {
+        let (_temporary, paths) = setup();
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], VALID_SOURCE);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let runtime = PluginWorkerRuntime::start(paths.clone()).expect("plugin worker");
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], "error('rescan must not execute this')");
+
+        let snapshot = rescan(&runtime);
+
+        assert!(snapshot.loaded_plugin_ids.is_empty());
+        assert_eq!(snapshot.plugins[0].status, PluginInventoryStatus::ReloadRequired);
     }
 
     #[test]

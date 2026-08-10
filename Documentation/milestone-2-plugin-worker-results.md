@@ -10,9 +10,9 @@ load a previously enabled plugin, but only after fresh complete discovery and
 an exact effective-status check. Merely copying a package into the managed
 directory still executes no code.
 
-The worker is connected to application lifetime but not to the continuous
-coordinator or Settings. It exposes no OS capability and cannot currently run
-a lifecycle callback after load-time validation.
+The worker is connected to application lifetime and the Plugins Settings page,
+but not to the continuous coordinator. It exposes no OS capability and cannot
+currently run a lifecycle callback after load-time validation.
 
 ## Admission transaction
 
@@ -69,6 +69,8 @@ threads.
 Focused fixtures cover:
 
 - startup admission of only effectively enabled packages;
+- rejection before source evaluation when enable is requested without current
+  permission approval;
 - startup faulting when a persisted enabled package cannot validate;
 - separate approval and successful enable transactions;
 - fresh-source callback validation before enablement is recorded;
@@ -81,16 +83,20 @@ Focused fixtures cover:
 - shutdown under queued work and a bounded nonterminating Lua load; and
 - plugin-root failure admitting no persisted enabled package.
 
+The later Plugins Settings slice also covers code-free explicit rescan and
+automatic unloading when changed source invalidates an admitted package.
+
 The complete repository check passed PowerShell analyzer self-tests,
 formatting, warning-denied linting, all-feature tests, documentation tests, and
-the debug workspace build. The debug suites passed 240 application, 81 core,
-and 22 Lua tests. The independent optimized suites passed 236 application, 81
-core, and 22 Lua tests.
+the debug workspace build. After the Plugins page slice, the debug suites pass
+245 application, 81 core, and 22 Lua tests. The independent optimized suites
+pass 241 application, 81 core, and 22 Lua tests.
 
-## Deferred boundary
+## Superseded deferred boundary
 
-There is no Plugins Settings page yet, so production has no user gesture that
-approves or enables a new package. There is also no live lifecycle routing,
-continuous action catalog connection, or capability broker. The loaded
-adapters are deliberately idle after validation; those boundaries remain
+The Plugins Settings page now provides the production permission-review,
+enable, disable, reload, rescan, and managed-folder controls described in
+`milestone-2-plugin-settings-results.md`. There is still no live lifecycle
+routing, continuous action catalog connection, or capability broker. Loaded
+adapters remain deliberately idle after validation; those boundaries remain
 separate future slices.

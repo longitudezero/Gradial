@@ -15,9 +15,9 @@ use gradial_core::{
     ActivationBindingId, Appearance, ApplicationProfile, Configuration, ConfigurationError,
     ExecutionOperation, IconReference, LabelTheme, MAX_ACTION_SEQUENCE_DEPTH,
     MAX_ACTION_SEQUENCE_DURATION_MS, MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, Menu,
-    MenuSlice, PhysicalModifiers, Profile, ProfileResolver, ProfileRule, ProfileTarget,
-    ResolutionDecision, ResolvedMenu, ShortcutKey, SizePreset, SliceCount, WindowCommand,
-    slice_for_delta,
+    MenuSlice, PhysicalModifiers, PluginPermission, Profile, ProfileResolver, ProfileRule,
+    ProfileTarget, ResolutionDecision, ResolvedMenu, ShortcutKey, SizePreset, SliceCount,
+    WindowCommand, slice_for_delta,
 };
 #[cfg(debug_assertions)]
 use gradial_core::{AppPaths, ShortcutModifier};
@@ -34,6 +34,10 @@ use crate::{
     native_file_dialog::{PathDialogKind, PathDialogOutcome, choose_path},
     overlay::{FoundationOverlayRenderer, OverlayRenderFrame, OverlayRenderer},
     platform::{self, ProfileTestTarget},
+    plugin_worker::{
+        PluginInventoryEntry, PluginInventoryStatus, PluginWorkerError, PluginWorkerOperation,
+        PluginWorkerReceipt, PluginWorkerSnapshot, PluginWorkerSubmitError,
+    },
     shortcut_recorder::{CaptureOutcome, ShortcutRecorder, shortcut_display},
     start_at_login::{StartAtLoginAction, StartAtLoginError, StartAtLoginStatus},
 };
@@ -150,13 +154,22 @@ enum SettingsSection {
     Appearance,
     Profiles,
     Actions,
+    Plugins,
     Diagnostics,
 }
 
 impl SettingsSection {
     const fn edits_configuration(self) -> bool {
-        !matches!(self, Self::General | Self::Diagnostics)
+        !matches!(self, Self::General | Self::Plugins | Self::Diagnostics)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginSettingsAction {
+    Enable,
+    ApproveAndEnable,
+    Reload,
+    Disable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,6 +265,12 @@ enum DiagnosticFeedback {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StartAtLoginFeedback {
+    Info(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PluginFeedback {
     Info(String),
     Error(String),
 }
@@ -524,6 +543,9 @@ pub(crate) enum SettingsEvent {
     ExportDiagnostics { path: PrivatePath, request: DiagnosticBundleRequest },
     RefreshStartAtLogin,
     ChangeStartAtLogin(StartAtLoginAction),
+    RefreshPlugins,
+    PluginAction { action: PluginSettingsAction, plugin_id: String },
+    OpenPluginsFolder,
     Closed,
 }
 
@@ -549,6 +571,13 @@ impl std::fmt::Debug for SettingsEvent {
             Self::ChangeStartAtLogin(action) => {
                 formatter.debug_tuple("ChangeStartAtLogin").field(action).finish()
             }
+            Self::RefreshPlugins => formatter.write_str("RefreshPlugins"),
+            Self::PluginAction { action, plugin_id } => formatter
+                .debug_struct("PluginAction")
+                .field("action", action)
+                .field("plugin_id", plugin_id)
+                .finish(),
+            Self::OpenPluginsFolder => formatter.write_str("OpenPluginsFolder"),
             Self::Closed => formatter.write_str("Closed"),
         }
     }
@@ -698,6 +727,74 @@ impl SettingsEditor {
         self.state().start_at_login_failed(action, error);
     }
 
+    pub(crate) fn plugin_snapshot_started(&self, rescan: bool) {
+        let mut state = self.state();
+        state.plugin_pending = Some(if rescan {
+            "Rescanning plugin packages…".to_owned()
+        } else {
+            "Loading plugin list…".to_owned()
+        });
+        if rescan {
+            state.plugin_feedback = None;
+        }
+    }
+
+    pub(crate) fn accept_plugin_snapshot(&self, snapshot: PluginWorkerSnapshot, rescan: bool) {
+        let mut state = self.state();
+        let rescan_feedback = rescan.then(|| {
+            snapshot.scan_error_code.as_ref().map_or_else(
+                || PluginFeedback::Info("Plugin list refreshed.".to_owned()),
+                |code| PluginFeedback::Error(plugin_issue_message(code)),
+            )
+        });
+        state.plugin_snapshot = Some(snapshot);
+        state.plugin_pending = None;
+        if let Some(feedback) = rescan_feedback {
+            state.plugin_feedback = Some(feedback);
+        }
+    }
+
+    pub(crate) fn plugin_operation_started(
+        &self,
+        operation: PluginWorkerOperation,
+        plugin_id: &str,
+    ) {
+        let mut state = self.state();
+        state.plugin_pending =
+            Some(format!("{} {}\u{2026}", plugin_operation_progress(operation), plugin_id));
+        state.plugin_feedback = None;
+    }
+
+    pub(crate) fn plugin_operation_succeeded(&self, receipt: &PluginWorkerReceipt) {
+        let mut state = self.state();
+        state.plugin_pending = None;
+        state.plugin_feedback = Some(PluginFeedback::Info(format!(
+            "{} {}.",
+            plugin_operation_success(receipt.operation),
+            receipt.plugin_id
+        )));
+    }
+
+    pub(crate) fn plugin_operation_failed(&self, error: PluginWorkerError) {
+        let mut state = self.state();
+        state.plugin_pending = None;
+        state.plugin_feedback = Some(PluginFeedback::Error(plugin_worker_error_message(error)));
+    }
+
+    pub(crate) fn plugin_submission_failed(&self, error: PluginWorkerSubmitError) {
+        let mut state = self.state();
+        state.plugin_pending = None;
+        state.plugin_feedback = Some(PluginFeedback::Error(plugin_submit_error_message(error)));
+    }
+
+    pub(crate) fn plugins_folder_result(&self, opened: bool) {
+        self.state().plugin_feedback = Some(if opened {
+            PluginFeedback::Info("Plugins folder opened.".to_owned())
+        } else {
+            PluginFeedback::Error("Gradial could not open the plugins folder.".to_owned())
+        });
+    }
+
     fn state(&self) -> MutexGuard<'_, SettingsState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -727,6 +824,10 @@ struct SettingsState {
     diagnostic_feedback: Option<DiagnosticFeedback>,
     start_at_login_status: Option<Result<StartAtLoginStatus, StartAtLoginError>>,
     start_at_login_feedback: Option<StartAtLoginFeedback>,
+    plugin_snapshot: Option<PluginWorkerSnapshot>,
+    plugin_pending: Option<String>,
+    plugin_feedback: Option<PluginFeedback>,
+    plugin_trust_confirmation: Option<String>,
     recovery_warning: bool,
     preview_renderer: FoundationOverlayRenderer,
     pending_event: Option<SettingsEvent>,
@@ -757,6 +858,10 @@ impl SettingsState {
             diagnostic_feedback: None,
             start_at_login_status: None,
             start_at_login_feedback: None,
+            plugin_snapshot: None,
+            plugin_pending: None,
+            plugin_feedback: None,
+            plugin_trust_confirmation: None,
             recovery_warning,
             preview_renderer: FoundationOverlayRenderer::new(icons),
             pending_event: None,
@@ -790,6 +895,10 @@ impl SettingsState {
             self.diagnostic_include_process_paths = false;
             self.diagnostic_feedback = None;
             self.start_at_login_feedback = None;
+            self.plugin_snapshot = None;
+            self.plugin_pending = Some("Loading plugin list…".to_owned());
+            self.plugin_feedback = None;
+            self.plugin_trust_confirmation = None;
             log::info!(
                 target: "settings",
                 "component=settings event_code=settings_opened result_code=ok \
@@ -1697,6 +1806,7 @@ impl SettingsState {
                 ui.selectable_value(&mut self.section, SettingsSection::Menu, "Menu");
                 ui.selectable_value(&mut self.section, SettingsSection::Profiles, "Profiles");
                 ui.selectable_value(&mut self.section, SettingsSection::Actions, "Actions");
+                ui.selectable_value(&mut self.section, SettingsSection::Plugins, "Plugins");
                 ui.selectable_value(
                     &mut self.section,
                     SettingsSection::Diagnostics,
@@ -1844,6 +1954,12 @@ impl SettingsState {
             SettingsSection::Menu => self.render_menu_section(ui, &mut draft),
             SettingsSection::Profiles => self.render_profiles_section(ui, &mut draft),
             SettingsSection::Actions => self.render_actions_section(ui, &mut draft),
+            SettingsSection::Plugins => {
+                let plugin_event = self.render_plugins_section(ui);
+                if event.is_none() {
+                    event = plugin_event;
+                }
+            }
             SettingsSection::Diagnostics => {
                 let diagnostic_event = self.render_diagnostics_section(ui);
                 if event.is_none() {
@@ -2039,6 +2155,128 @@ impl SettingsState {
                 );
             });
         });
+        event
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_plugins_section(&mut self, ui: &mut egui::Ui) -> Option<SettingsEvent> {
+        let mut event = None;
+        let snapshot = self.plugin_snapshot.clone();
+        let pending = self.plugin_pending.is_some();
+        let mut trust_request = None;
+        egui::CentralPanel::default().show(ui, |ui| {
+            ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Plugins");
+                ui.label(
+                    "Local Lua plugins can provide continuous controls. Plugin changes apply \
+                     immediately on this computer and are separate from unsaved menu edits.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!pending, egui::Button::new("Rescan plugins")).clicked() {
+                        event = Some(SettingsEvent::RefreshPlugins);
+                    }
+                    if ui.button("Open plugins folder").clicked() {
+                        event = Some(SettingsEvent::OpenPluginsFolder);
+                    }
+                    if let Some(message) = &self.plugin_pending {
+                        ui.spinner();
+                        ui.weak(message);
+                    }
+                });
+                render_plugin_feedback(ui, self.plugin_feedback.as_ref());
+                ui.add_space(8.0);
+                ui.weak(
+                    "Rescan reads and validates package files but never runs plugin code. Source \
+                     edits require Reload before they become active.",
+                );
+                ui.weak(
+                    "Plugin actions are not connected to menus yet; enabled plugins remain idle \
+                     after validation in this milestone.",
+                );
+
+                let Some(snapshot) = snapshot.as_ref() else {
+                    ui.add_space(16.0);
+                    ui.label("Waiting for the plugin worker…");
+                    return;
+                };
+                if let Some(error_code) = &snapshot.scan_error_code {
+                    ui.add_space(12.0);
+                    ui.colored_label(
+                        Color32::from_rgb(239, 113, 113),
+                        plugin_issue_message(error_code),
+                    );
+                }
+                ui.add_space(12.0);
+                if snapshot.plugins.is_empty() {
+                    ui.group(|ui| {
+                        ui.label("No plugin packages were found.");
+                        ui.weak("Open the plugins folder, add one package directory, then rescan.");
+                    });
+                }
+                for plugin in &snapshot.plugins {
+                    ui.group(|ui| {
+                        render_plugin_entry(ui, plugin, pending, &mut trust_request, &mut event);
+                    });
+                    ui.add_space(8.0);
+                }
+                ui.weak(format!("Local plugin-state revision {}", snapshot.state_revision));
+            });
+        });
+        if let Some(plugin_id) = trust_request {
+            self.plugin_trust_confirmation = Some(plugin_id);
+        }
+
+        if let Some(plugin_id) = self.plugin_trust_confirmation.clone() {
+            let plugin = snapshot.as_ref().and_then(|snapshot| {
+                snapshot.plugins.iter().find(|entry| entry.plugin_id == plugin_id)
+            });
+            if let Some(plugin) = plugin {
+                let mut approve = false;
+                let mut cancel = false;
+                let frame = egui::Frame::popup(ui.style()).fill(Color32::from_rgb(28, 28, 28));
+                Modal::new(Id::new("plugin_trust_confirmation"))
+                    .frame(frame)
+                    .backdrop_color(Color32::from_black_alpha(150))
+                    .show(ui.ctx(), |ui| {
+                        ui.set_min_width(420.0);
+                        ui.heading("Trust and enable this plugin?");
+                        ui.label(format!("{} ({})", plugin.display_name, plugin.plugin_id));
+                        ui.add_space(8.0);
+                        ui.colored_label(
+                            Color32::from_rgb(245, 188, 78),
+                            "Lua plugins are local scripts. Enable only plugins you wrote or trust.",
+                        );
+                        ui.label(
+                            "Gradial limits their access and resource use, but this version does \
+                             not promise safe execution of hostile downloaded code.",
+                        );
+                        ui.add_space(10.0);
+                        ui.strong("Requested permissions");
+                        render_plugin_permissions(ui, &plugin.permissions);
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Approve and enable").clicked() {
+                                approve = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if approve {
+                    self.plugin_trust_confirmation = None;
+                    event = Some(SettingsEvent::PluginAction {
+                        action: PluginSettingsAction::ApproveAndEnable,
+                        plugin_id,
+                    });
+                } else if cancel {
+                    self.plugin_trust_confirmation = None;
+                }
+            } else {
+                self.plugin_trust_confirmation = None;
+            }
+        }
         event
     }
 
@@ -3335,6 +3573,7 @@ impl SettingsState {
 
     fn request_close(&mut self) -> CloseOutcome {
         self.cancel_binding_test();
+        self.plugin_trust_confirmation = None;
         if matches!(self.profile_test, ProfileTestState::CountingDown { .. }) {
             self.profile_test = ProfileTestState::Idle;
         }
@@ -4395,6 +4634,246 @@ fn render_diagnostic_feedback(ui: &mut egui::Ui, feedback: Option<&DiagnosticFee
     }
 }
 
+fn render_plugin_entry(
+    ui: &mut egui::Ui,
+    plugin: &PluginInventoryEntry,
+    pending: bool,
+    trust_request: &mut Option<String>,
+    event: &mut Option<SettingsEvent>,
+) {
+    ui.horizontal(|ui| {
+        ui.heading(&plugin.display_name);
+        let (status, color) = plugin_status_display(plugin.status);
+        ui.colored_label(color, status);
+    });
+    ui.monospace(&plugin.plugin_id);
+    if let (Some(version), Some(api_version)) = (&plugin.version, plugin.api_version) {
+        ui.weak(format!("Version {version} · Plugin API {api_version}"));
+    }
+    ui.add_space(6.0);
+    ui.strong("Requested permissions");
+    render_plugin_permissions(ui, &plugin.permissions);
+    if let Some(issue_code) = &plugin.issue_code {
+        ui.colored_label(Color32::from_rgb(239, 113, 113), plugin_issue_message(issue_code));
+    }
+    if plugin.status == PluginInventoryStatus::PermissionReviewRequired {
+        ui.colored_label(
+            Color32::from_rgb(245, 188, 78),
+            "The requested permissions changed. This plugin is disabled until you review them.",
+        );
+    } else if plugin.status == PluginInventoryStatus::ReloadRequired {
+        ui.colored_label(
+            Color32::from_rgb(245, 188, 78),
+            "The package changed. Reload it to validate and use the new files.",
+        );
+    } else if plugin.status == PluginInventoryStatus::Faulted {
+        ui.colored_label(
+            Color32::from_rgb(239, 113, 113),
+            "The plugin faulted and remains stopped until you reload or disable it.",
+        );
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| match plugin.status {
+        PluginInventoryStatus::Disabled => {
+            let label = if plugin.permissions_approved { "Enable" } else { "Review and enable" };
+            if ui.add_enabled(!pending, egui::Button::new(label)).clicked() {
+                if plugin_requires_trust_confirmation(plugin) {
+                    *trust_request = Some(plugin.plugin_id.clone());
+                } else {
+                    *event = Some(SettingsEvent::PluginAction {
+                        action: PluginSettingsAction::Enable,
+                        plugin_id: plugin.plugin_id.clone(),
+                    });
+                }
+            }
+        }
+        PluginInventoryStatus::PermissionReviewRequired => {
+            if ui.add_enabled(!pending, egui::Button::new("Review and enable")).clicked() {
+                *trust_request = Some(plugin.plugin_id.clone());
+            }
+        }
+        PluginInventoryStatus::Enabled
+        | PluginInventoryStatus::ReloadRequired
+        | PluginInventoryStatus::Faulted => {
+            if ui.add_enabled(!pending, egui::Button::new("Reload")).clicked() {
+                *event = Some(SettingsEvent::PluginAction {
+                    action: PluginSettingsAction::Reload,
+                    plugin_id: plugin.plugin_id.clone(),
+                });
+            }
+            if ui.add_enabled(!pending, egui::Button::new("Disable")).clicked() {
+                *event = Some(SettingsEvent::PluginAction {
+                    action: PluginSettingsAction::Disable,
+                    plugin_id: plugin.plugin_id.clone(),
+                });
+            }
+        }
+        PluginInventoryStatus::Incompatible => {
+            ui.weak("This plugin targets a different Gradial plugin API version.");
+        }
+        PluginInventoryStatus::Unavailable => {
+            ui.weak("Restore this plugin's package directory before it can be managed.");
+        }
+        PluginInventoryStatus::Invalid => {
+            ui.weak("Fix the package files, then rescan.");
+        }
+    });
+}
+
+const fn plugin_requires_trust_confirmation(plugin: &PluginInventoryEntry) -> bool {
+    matches!(plugin.status, PluginInventoryStatus::PermissionReviewRequired)
+        || matches!(plugin.status, PluginInventoryStatus::Disabled) && !plugin.permissions_approved
+}
+
+fn render_plugin_permissions(ui: &mut egui::Ui, permissions: &[PluginPermission]) {
+    if permissions.is_empty() {
+        ui.weak("No optional Gradial permissions requested.");
+        return;
+    }
+    for permission in permissions {
+        ui.label(format!("• {}", plugin_permission_description(*permission)));
+    }
+}
+
+const fn plugin_permission_description(permission: PluginPermission) -> &'static str {
+    match permission {
+        PluginPermission::ContextApplication => {
+            "Read the frozen application path and window class for an invocation"
+        }
+        PluginPermission::ContextWindowTitle => "Read the frozen window title for an invocation",
+        PluginPermission::InputShortcut => {
+            "Request bounded keyboard shortcuts for the frozen target window"
+        }
+        PluginPermission::Notification => "Request a non-focus-stealing Gradial notification",
+        PluginPermission::NetworkLoopback => {
+            "Request bounded HTTP access to manifest-approved services on this computer"
+        }
+    }
+}
+
+const fn plugin_status_display(status: PluginInventoryStatus) -> (&'static str, Color32) {
+    match status {
+        PluginInventoryStatus::Disabled => ("Disabled", Color32::from_rgb(170, 170, 170)),
+        PluginInventoryStatus::PermissionReviewRequired => {
+            ("Permission review required", Color32::from_rgb(245, 188, 78))
+        }
+        PluginInventoryStatus::Enabled => ("Enabled", Color32::from_rgb(112, 205, 151)),
+        PluginInventoryStatus::ReloadRequired => {
+            ("Reload required", Color32::from_rgb(245, 188, 78))
+        }
+        PluginInventoryStatus::Faulted => ("Faulted", Color32::from_rgb(239, 113, 113)),
+        PluginInventoryStatus::Incompatible => ("Incompatible", Color32::from_rgb(239, 113, 113)),
+        PluginInventoryStatus::Unavailable => ("Unavailable", Color32::from_rgb(239, 113, 113)),
+        PluginInventoryStatus::Invalid => ("Invalid", Color32::from_rgb(239, 113, 113)),
+    }
+}
+
+const fn plugin_operation_progress(operation: PluginWorkerOperation) -> &'static str {
+    match operation {
+        PluginWorkerOperation::ApprovePermissions => "Reviewing permissions for",
+        PluginWorkerOperation::Enable => "Enabling",
+        PluginWorkerOperation::Reload => "Reloading",
+        PluginWorkerOperation::Disable => "Disabling",
+        PluginWorkerOperation::MarkFaulted => "Stopping",
+    }
+}
+
+const fn plugin_operation_success(operation: PluginWorkerOperation) -> &'static str {
+    match operation {
+        PluginWorkerOperation::ApprovePermissions => "Permissions approved for",
+        PluginWorkerOperation::Enable => "Enabled",
+        PluginWorkerOperation::Reload => "Reloaded",
+        PluginWorkerOperation::Disable => "Disabled",
+        PluginWorkerOperation::MarkFaulted => "Stopped",
+    }
+}
+
+fn plugin_worker_error_message(error: PluginWorkerError) -> String {
+    match error.code() {
+        "approval_required" => {
+            "Review this plugin's requested permissions before enabling it.".to_owned()
+        }
+        "incompatible" => "This plugin targets an unsupported Gradial plugin API.".to_owned(),
+        "package_missing" | "unavailable" => {
+            "The plugin package is no longer available. Rescan after restoring it.".to_owned()
+        }
+        "package_invalid" => "The plugin package is invalid. Fix it and rescan.".to_owned(),
+        "already_enabled" => "This plugin is already enabled.".to_owned(),
+        "reload_required" => "This plugin changed and must be reloaded.".to_owned(),
+        "faulted" => "This plugin is faulted. Reload or disable it first.".to_owned(),
+        "not_enabled" => "This plugin is not enabled.".to_owned(),
+        "write_failed" | "replace_failed" | "stale" | "revision_exhausted" => {
+            "Gradial could not save the local plugin state. The plugin remains stopped.".to_owned()
+        }
+        code if code.starts_with("lua_")
+            || code.starts_with("callback_")
+            || matches!(
+                code,
+                "entry_not_table" | "module_name_invalid" | "module_not_found" | "module_cycle"
+            ) =>
+        {
+            format!("Gradial could not safely load this plugin ({code}).")
+        }
+        code => format!("The plugin operation failed ({code})."),
+    }
+}
+
+fn plugin_submit_error_message(error: PluginWorkerSubmitError) -> String {
+    match error {
+        PluginWorkerSubmitError::InvalidPluginId => {
+            "This package does not have a valid plugin ID.".to_owned()
+        }
+        PluginWorkerSubmitError::QueueFull => {
+            "The plugin worker is busy. Wait a moment and try again.".to_owned()
+        }
+        PluginWorkerSubmitError::Unavailable => {
+            "The plugin worker is unavailable. Restart Gradial and try again.".to_owned()
+        }
+        PluginWorkerSubmitError::ShuttingDown => {
+            "Gradial is shutting down, so the plugin request was not started.".to_owned()
+        }
+    }
+}
+
+fn plugin_issue_message(code: &str) -> String {
+    match code {
+        "plugin_io_error" | "plugin_manifest_missing" => {
+            "Gradial could not read this plugin's required files.".to_owned()
+        }
+        "plugin_root_not_directory" => "The managed plugins location is not a folder.".to_owned(),
+        "plugin_path_unsafe" | "plugin_outside_root" | "plugin_outside_package" => {
+            "This package contains a path Gradial cannot safely use.".to_owned()
+        }
+        "plugin_reparse_point_rejected" => {
+            "Links, junctions, and other redirected plugin paths are not allowed.".to_owned()
+        }
+        "plugin_directory_id_mismatch" => {
+            "The package folder name must exactly match its manifest plugin ID.".to_owned()
+        }
+        "plugin_native_or_bytecode_rejected" | "plugin_file_type_unsupported" => {
+            "Native modules, Lua bytecode, and unsupported package files are not allowed."
+                .to_owned()
+        }
+        "plugin_source_not_utf8" => "Every Lua source file must use UTF-8 text.".to_owned(),
+        "package_missing" => "The plugin package directory is missing.".to_owned(),
+        code => format!("Gradial rejected this plugin package ({code})."),
+    }
+}
+
+fn render_plugin_feedback(ui: &mut egui::Ui, feedback: Option<&PluginFeedback>) {
+    let Some(feedback) = feedback else {
+        return;
+    };
+    match feedback {
+        PluginFeedback::Info(message) => {
+            ui.colored_label(Color32::from_rgb(112, 205, 151), message);
+        }
+        PluginFeedback::Error(message) => {
+            ui.colored_label(Color32::from_rgb(239, 113, 113), message);
+        }
+    }
+}
+
 fn render_start_at_login_feedback(ui: &mut egui::Ui, feedback: Option<&StartAtLoginFeedback>) {
     let Some(feedback) = feedback else {
         return;
@@ -4689,22 +5168,24 @@ mod tests {
     use gradial_core::{
         AccentColor, ActionDefinition, ActionKind, ActivationBinding, ActivationBindingId,
         Appearance, Configuration, IconFormat, IconReference, LabelTheme, MAX_TYPED_TEXT_BYTES,
-        MenuSlice, PhysicalModifiers, ResolutionDecision, ScreenPoint, ShortcutKey,
-        ShortcutModifier, SizePreset, SliceCount, WindowCommand,
+        MenuSlice, PhysicalModifiers, PluginPermission, ResolutionDecision, ScreenPoint,
+        ShortcutKey, ShortcutModifier, SizePreset, SliceCount, WindowCommand,
     };
     use uuid::Uuid;
 
     use super::{
         ActionReferenceSummary, CloseOutcome, DraftValidationError, EditorLifecycle,
-        NewActionTemplate, PayloadEditOutcome, PortableIconSummary, PrivatePath, ProfileTestState,
-        SequenceEditorContext, SequenceMetrics, SequenceMove, SettingsDraft, SettingsEvent,
-        SettingsSection, SettingsState, StartAtLoginFeedback, TransferFeedback, action_options,
-        action_references, activation_binding_display, add_executable_argument, add_sequence_step,
-        apply_dialog_outcome, binding_test_selection, countdown_seconds_remaining, create_action,
-        create_application_profile, delete_action, delete_application_profile, duplicate_action,
-        duplicate_application_profile, map_selected_slice, move_sequence_step,
-        normalize_preview_offset, preview_slice_at, remove_executable_argument,
-        remove_sequence_step, resize_menu, resolution_decision_text, resolved_menu, validate_draft,
+        NewActionTemplate, PayloadEditOutcome, PluginFeedback, PortableIconSummary, PrivatePath,
+        ProfileTestState, SequenceEditorContext, SequenceMetrics, SequenceMove, SettingsDraft,
+        SettingsEvent, SettingsSection, SettingsState, StartAtLoginFeedback, TransferFeedback,
+        action_options, action_references, activation_binding_display, add_executable_argument,
+        add_sequence_step, apply_dialog_outcome, binding_test_selection,
+        countdown_seconds_remaining, create_action, create_application_profile, delete_action,
+        delete_application_profile, duplicate_action, duplicate_application_profile,
+        map_selected_slice, move_sequence_step, normalize_preview_offset, plugin_issue_message,
+        plugin_requires_trust_confirmation, plugin_worker_error_message, preview_slice_at,
+        remove_executable_argument, remove_sequence_step, resize_menu, resolution_decision_text,
+        resolved_menu, validate_draft,
     };
 
     #[test]
@@ -4738,6 +5219,9 @@ mod tests {
         input::ActivationBindingTestResult,
         native_file_dialog::PathDialogOutcome,
         platform::ProfileTestTarget,
+        plugin_worker::{
+            PluginInventoryEntry, PluginInventoryStatus, PluginWorkerError, PluginWorkerSnapshot,
+        },
         start_at_login::{StartAtLoginAction, StartAtLoginError, StartAtLoginStatus},
     };
 
@@ -5006,6 +5490,68 @@ mod tests {
         assert_eq!(editor.start_at_login_status, Some(Err(StartAtLoginError::RegistryDelete(5))));
         assert!(matches!(editor.start_at_login_feedback, Some(StartAtLoginFeedback::Error(_))));
         assert!(!editor.draft.as_ref().expect("open draft").is_dirty());
+    }
+
+    #[test]
+    fn plugin_inventory_and_feedback_stay_outside_the_configuration_draft() {
+        let configuration = Configuration::default();
+        let mut editor = SettingsState::new(false, Arc::new(IconManager::new(PathBuf::new())));
+        editor.open(&configuration);
+        editor.section = SettingsSection::Plugins;
+        editor.plugin_snapshot = Some(PluginWorkerSnapshot {
+            state_revision: 4,
+            loaded_plugin_ids: Vec::new(),
+            plugins: vec![PluginInventoryEntry {
+                plugin_id: "org.gradial.volume".to_owned(),
+                display_name: "Volume".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                api_version: Some(1),
+                permissions: vec![PluginPermission::Notification],
+                permissions_approved: false,
+                status: PluginInventoryStatus::Disabled,
+                issue_code: None,
+            }],
+            scan_error_code: None,
+        });
+        editor.plugin_feedback = Some(PluginFeedback::Info("Plugin list refreshed.".to_owned()));
+
+        assert!(!SettingsSection::Plugins.edits_configuration());
+        assert!(!editor.draft.as_ref().expect("open draft").is_dirty());
+        assert_eq!(editor.draft.as_ref().expect("open draft").proposed, configuration);
+    }
+
+    #[test]
+    fn plugin_errors_are_presented_without_runtime_details() {
+        assert_eq!(
+            plugin_worker_error_message(PluginWorkerError::Lua(
+                gradial_lua::LuaSandboxError::Runtime,
+            )),
+            "Gradial could not safely load this plugin (lua_runtime_error)."
+        );
+        assert_eq!(
+            plugin_issue_message("plugin_reparse_point_rejected"),
+            "Links, junctions, and other redirected plugin paths are not allowed."
+        );
+    }
+
+    #[test]
+    fn first_enable_and_permission_changes_require_explicit_trust() {
+        let mut plugin = PluginInventoryEntry {
+            plugin_id: "org.gradial.volume".to_owned(),
+            display_name: "Volume".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            api_version: Some(1),
+            permissions: vec![PluginPermission::InputShortcut],
+            permissions_approved: false,
+            status: PluginInventoryStatus::Disabled,
+            issue_code: None,
+        };
+
+        assert!(plugin_requires_trust_confirmation(&plugin));
+        plugin.permissions_approved = true;
+        assert!(!plugin_requires_trust_confirmation(&plugin));
+        plugin.status = PluginInventoryStatus::PermissionReviewRequired;
+        assert!(plugin_requires_trust_confirmation(&plugin));
     }
 
     #[test]

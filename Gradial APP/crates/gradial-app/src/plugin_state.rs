@@ -173,6 +173,20 @@ impl PluginTrustState {
         Ok(self.observation_status(&observation))
     }
 
+    pub(crate) fn permissions_approved(
+        &self,
+        package: &DiscoveredPlugin,
+    ) -> Result<bool, PluginStateTransitionError> {
+        let observation = PluginObservation::from_package(package)?;
+        if !observation.compatible {
+            return Err(PluginStateTransitionError::Incompatible);
+        }
+        Ok(self
+            .plugins
+            .get(&observation.plugin_id)
+            .is_some_and(|record| record.approved_permissions == observation.permissions))
+    }
+
     pub(crate) fn approve_permissions(
         &mut self,
         package: &DiscoveredPlugin,

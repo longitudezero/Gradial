@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -25,8 +26,10 @@ use crate::{
     options::{ContinuousMeterMode, StartupOptions},
     overlay::{AnimationMode, OverlayPool},
     platform,
-    plugin_worker::PluginWorkerRuntime,
-    settings::{SettingsEditor, SettingsEvent, settings_viewport_id},
+    plugin_worker::{
+        PluginWorkerOperation, PluginWorkerRuntime, PluginWorkerSnapshotTicket, PluginWorkerTicket,
+    },
+    settings::{PluginSettingsAction, SettingsEditor, SettingsEvent, settings_viewport_id},
     start_at_login::{StartAtLoginAction, StartAtLoginService},
     tray::{TrayCommand, TrayHealth, TrayIcon},
 };
@@ -131,6 +134,20 @@ struct LearningTools {
     continuous_study: ContinuousStudy,
 }
 
+#[derive(Debug)]
+enum PendingPluginRequest {
+    Snapshot {
+        ticket: PluginWorkerSnapshotTicket,
+        rescan: bool,
+    },
+    Operation {
+        ticket: PluginWorkerTicket,
+        operation: PluginWorkerOperation,
+        plugin_id: String,
+        enable_after_approval: bool,
+    },
+}
+
 impl LearningTools {
     fn new(
         onboarding_required: bool,
@@ -165,8 +182,8 @@ pub(crate) struct GradialApp {
     overlay_pool: OverlayPool,
     interaction: Option<InteractionRuntime>,
     action_executor: ActionExecutor,
-    #[allow(dead_code, reason = "keeps the isolated plugin worker alive until application exit")]
     plugin_worker: PluginWorkerRuntime,
+    pending_plugin_request: Option<PendingPluginRequest>,
     native_style_passes: u8,
     pool_generation: u64,
     rebuild_in_progress: bool,
@@ -288,7 +305,7 @@ impl GradialApp {
             settings.open(&configuration);
         }
 
-        Ok(Self {
+        let mut app = Self {
             geometry_mode: startup_options.geometry_mode,
             debug_menu_override,
             debug_continuous_meter: startup_options.debug_continuous_meter,
@@ -299,6 +316,7 @@ impl GradialApp {
             interaction: None,
             action_executor,
             plugin_worker,
+            pending_plugin_request: None,
             native_style_passes: 0,
             pool_generation: 0,
             rebuild_in_progress: false,
@@ -318,7 +336,11 @@ impl GradialApp {
             continuous_study: learning_tools.continuous_study,
             config_revision,
             tray_icon,
-        })
+        };
+        if startup_options.debug_open_settings {
+            app.begin_plugin_snapshot(&creation_context.egui_ctx, false);
+        }
+        Ok(app)
     }
 
     fn fail(
@@ -497,12 +519,139 @@ impl GradialApp {
         }
         let newly_opened = self.settings.open(&self.configuration);
         self.refresh_start_at_login_status(context);
+        self.begin_plugin_snapshot(context, false);
         if newly_opened {
             context.request_repaint();
         } else {
             context
                 .send_viewport_cmd_to(settings_viewport_id(), eframe::egui::ViewportCommand::Focus);
         }
+    }
+
+    fn begin_plugin_snapshot(&mut self, context: &eframe::egui::Context, rescan: bool) {
+        if self.pending_plugin_request.is_some() {
+            return;
+        }
+        self.settings.plugin_snapshot_started(rescan);
+        let request = if rescan {
+            self.plugin_worker.request_rescan()
+        } else {
+            self.plugin_worker.request_snapshot()
+        };
+        match request {
+            Ok(ticket) => {
+                self.pending_plugin_request =
+                    Some(PendingPluginRequest::Snapshot { ticket, rescan });
+                context.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(error) => self.settings.plugin_submission_failed(error),
+        }
+    }
+
+    fn begin_plugin_operation(
+        &mut self,
+        context: &eframe::egui::Context,
+        operation: PluginWorkerOperation,
+        plugin_id: String,
+        enable_after_approval: bool,
+    ) {
+        if self.pending_plugin_request.is_some() {
+            return;
+        }
+        self.settings.plugin_operation_started(operation, &plugin_id);
+        match self.plugin_worker.request(operation, plugin_id.clone()) {
+            Ok(ticket) => {
+                self.pending_plugin_request = Some(PendingPluginRequest::Operation {
+                    ticket,
+                    operation,
+                    plugin_id,
+                    enable_after_approval,
+                });
+                context.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(error) => self.settings.plugin_submission_failed(error),
+        }
+    }
+
+    fn poll_plugin_worker(&mut self, context: &eframe::egui::Context) {
+        let Some(pending) = self.pending_plugin_request.take() else {
+            return;
+        };
+        match pending {
+            PendingPluginRequest::Snapshot { ticket, rescan } => match ticket.try_result() {
+                None => {
+                    self.pending_plugin_request =
+                        Some(PendingPluginRequest::Snapshot { ticket, rescan });
+                    context.request_repaint_after(Duration::from_millis(50));
+                }
+                Some(Ok(snapshot)) => {
+                    self.settings.accept_plugin_snapshot(snapshot, rescan);
+                    context.request_repaint_of(settings_viewport_id());
+                }
+                Some(Err(error)) => {
+                    self.settings.plugin_operation_failed(error);
+                    context.request_repaint_of(settings_viewport_id());
+                }
+            },
+            PendingPluginRequest::Operation {
+                ticket,
+                operation,
+                plugin_id,
+                enable_after_approval,
+            } => match ticket.try_result() {
+                None => {
+                    self.pending_plugin_request = Some(PendingPluginRequest::Operation {
+                        ticket,
+                        operation,
+                        plugin_id,
+                        enable_after_approval,
+                    });
+                    context.request_repaint_after(Duration::from_millis(50));
+                }
+                Some(Ok(receipt)) if enable_after_approval => {
+                    self.begin_plugin_operation(
+                        context,
+                        PluginWorkerOperation::Enable,
+                        plugin_id,
+                        false,
+                    );
+                    log::info!(
+                        target: "plugins",
+                        "component=plugins event_code=plugin_settings_approval_chained \
+                         result_code=ok state_revision={}",
+                        receipt.state_revision
+                    );
+                }
+                Some(Ok(receipt)) => {
+                    self.settings.plugin_operation_succeeded(&receipt);
+                    self.begin_plugin_snapshot(context, false);
+                    context.request_repaint_of(settings_viewport_id());
+                }
+                Some(Err(error)) => {
+                    self.settings.plugin_operation_failed(error);
+                    self.begin_plugin_snapshot(context, false);
+                    context.request_repaint_of(settings_viewport_id());
+                }
+            },
+        }
+    }
+
+    fn open_plugins_folder(&self, context: &eframe::egui::Context) {
+        let opened = platform::open_folder(&self.config_store.plugin_directory()).is_ok();
+        self.settings.plugins_folder_result(opened);
+        if opened {
+            log::info!(
+                target: "plugins",
+                "component=plugins event_code=plugins_folder_opened result_code=ok"
+            );
+        } else {
+            log::warn!(
+                target: "plugins",
+                "component=plugins event_code=plugins_folder_opened result_code=failure \
+                 error_code=shell_open_failed"
+            );
+        }
+        context.request_repaint_of(settings_viewport_id());
     }
 
     fn persist_configuration(
@@ -767,8 +916,30 @@ impl GradialApp {
             SettingsEvent::ChangeStartAtLogin(action) => {
                 self.change_start_at_login(context, action);
             }
+            SettingsEvent::RefreshPlugins => self.begin_plugin_snapshot(context, true),
+            SettingsEvent::PluginAction { action, plugin_id } => {
+                self.handle_plugin_settings_action(context, action, plugin_id);
+            }
+            SettingsEvent::OpenPluginsFolder => self.open_plugins_folder(context),
             SettingsEvent::Closed => self.reconcile_icon_storage(None),
         }
+    }
+
+    fn handle_plugin_settings_action(
+        &mut self,
+        context: &eframe::egui::Context,
+        action: PluginSettingsAction,
+        plugin_id: String,
+    ) {
+        let (operation, enable_after_approval) = match action {
+            PluginSettingsAction::Enable => (PluginWorkerOperation::Enable, false),
+            PluginSettingsAction::ApproveAndEnable => {
+                (PluginWorkerOperation::ApprovePermissions, true)
+            }
+            PluginSettingsAction::Reload => (PluginWorkerOperation::Reload, false),
+            PluginSettingsAction::Disable => (PluginWorkerOperation::Disable, false),
+        };
+        self.begin_plugin_operation(context, operation, plugin_id, enable_after_approval);
     }
 
     fn refresh_start_at_login_status(&self, context: &eframe::egui::Context) {
@@ -1159,6 +1330,7 @@ impl eframe::App for GradialApp {
         if let Some(event) = self.settings.try_event() {
             self.handle_settings_event(context, event);
         }
+        self.poll_plugin_worker(context);
 
         self.onboarding.poll_practice_events(context);
         if let Some(event) = self.onboarding.try_event() {

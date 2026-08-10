@@ -2,8 +2,8 @@ use std::{
     ffi::OsString,
     fmt,
     mem::size_of,
-    os::windows::ffi::OsStringExt,
-    path::PathBuf,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -37,22 +37,25 @@ use windows::Win32::{
     },
     UI::{
         HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
-        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+        Shell::{
+            DefSubclassProc, RemoveWindowSubclass, SEE_MASK_FLAG_NO_UI, SEE_MASK_UNICODE,
+            SHELLEXECUTEINFOW, SetWindowSubclass, ShellExecuteExW,
+        },
         WindowsAndMessaging::{
             FindWindowW, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW,
             GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
             HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, PBT_APMRESUMEAUTOMATIC,
             PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY, PBT_APMRESUMESUSPEND, PostMessageW,
             RegisterWindowMessageW, SET_WINDOW_POS_FLAGS, SPI_SETWORKAREA, SW_HIDE,
-            SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-            SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_DISPLAYCHANGE,
-            WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST,
-            WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WTS_SESSION_UNLOCK,
+            SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP,
+            WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST,
+            WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WTS_SESSION_UNLOCK,
         },
     },
 };
-use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR, w};
 
 const OVERLAY_SUBCLASS_ID: usize = 0x4752_444C;
 const WM_GRADIAL_SHOW_OVERLAY: u32 = WM_APP + 0x244;
@@ -117,6 +120,25 @@ pub(crate) fn foreground_window_identity() -> ForegroundWindowIdentity {
         GetWindowThreadProcessId(window, Some(&raw mut process_id));
     }
     ForegroundWindowIdentity { window: window.0.addr(), process_id }
+}
+
+pub(crate) fn open_folder(path: &Path) -> Result<()> {
+    if !path.is_absolute() || !path.is_dir() {
+        bail!("folder is unavailable");
+    }
+    let path = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: u32::try_from(size_of::<SHELLEXECUTEINFOW>()).expect("structure size fits u32"),
+        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_UNICODE,
+        lpVerb: w!("open"),
+        lpFile: PCWSTR::from_raw(path.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    // SAFETY: the structure size is correct and its path buffer remains live
+    // for the duration of this non-retaining shell invocation.
+    unsafe { ShellExecuteExW(&raw mut execute) }.context("Windows rejected the folder request")?;
+    Ok(())
 }
 
 pub(crate) fn capture_profile_test_target() -> ProfileTestTarget {

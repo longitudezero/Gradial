@@ -832,9 +832,18 @@ action belongs to a plugin.
 
 ### 9.1 Plugins page
 
+Implementation note (2026-08-10): the bounded Plugins page is implemented.
+It uses immutable asynchronous worker snapshots, applies machine-local plugin
+state independently of unsaved configuration drafts, and requires explicit
+trust before first approval or changed permissions. The page displays the
+managed package ID rather than an absolute local path; **Open plugins folder**
+opens the single validated managed root. Live action catalog and callback
+routing remain deferred to their later milestones.
+
 The settings window gains a **Plugins** page that shows:
 
-- Plugin name, ID, version, API version, and local path.
+- Plugin name, ID, version, API version, and managed package identity. The page
+  does not disclose an absolute local path; it can open the single managed root.
 - Disabled, enabled, incompatible, unavailable, or faulted status.
 - Requested permissions in plain language.
 - Last load error using a safe stable message.
