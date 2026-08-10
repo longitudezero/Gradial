@@ -99,3 +99,11 @@ was completed by the later
 `input.shortcut`, notification, and `network.loopback` brokers, capability
 revocation/rate/timeout evidence, dependency summaries, and external-effect
 examples remain later Milestone 3 work.
+
+Subsequent status (2026-08-10): permission-filtered context, `input.shortcut`,
+and `notification` are now complete as separate bounded slices.
+`network.loopback` remains deferred. See
+[permission-filtered context](milestone-3-permission-filtered-context-results.md),
+[shortcut capability](milestone-3-shortcut-capability-results.md), and
+[notification capability](milestone-3-notification-capability-results.md) for
+their current boundaries and evidence.

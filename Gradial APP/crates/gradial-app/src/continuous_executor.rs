@@ -21,7 +21,7 @@ use crate::{
         ActionDispatch, ActionExecutorHandle, ContinuousActionLease, CoordinatorStopToken,
     },
     action_target,
-    capability_broker::ShortcutCapabilityFailure,
+    capability_broker::{NotificationCapabilityFailure, ShortcutCapabilityFailure},
     plugin_worker::{PluginLifecycleClient, PluginLifecycleError, PluginLifecycleSubmitError},
     tray,
 };
@@ -232,26 +232,45 @@ impl PluginContinuousBackend {
         &self,
         request: &ContinuousRequest,
     ) -> Result<(), ContinuousBackendError> {
-        let Some(failure) = self.client.shortcut_failure(request.session_id()) else {
-            return Ok(());
-        };
-        log::warn!(
-            target: "continuous",
-            "component=capabilities event_code=shortcut_session_failed result_code=failure \
-             error_code={} config_revision={} invocation_id={} session_id={} stage={:?}",
-            failure.code(),
-            self.target.config_revision,
-            self.invocation_id,
-            request.session_id(),
-            stage_for(request)
-        );
-        Err(map_shortcut_capability_failure(failure))
+        if let Some(failure) = self.client.shortcut_failure(request.session_id()) {
+            log::warn!(
+                target: "continuous",
+                "component=capabilities event_code=shortcut_session_failed result_code=failure \
+                 error_code={} config_revision={} invocation_id={} session_id={} stage={:?}",
+                failure.code(),
+                self.target.config_revision,
+                self.invocation_id,
+                request.session_id(),
+                stage_for(request)
+            );
+            return Err(map_shortcut_capability_failure(failure));
+        }
+        if let Some(failure) = self.client.notification_failure(request.session_id()) {
+            log::warn!(
+                target: "continuous",
+                "component=capabilities event_code=notification_session_failed \
+                 result_code=failure error_code={} config_revision={} invocation_id={} \
+                 session_id={} stage={:?}",
+                failure.code(),
+                self.target.config_revision,
+                self.invocation_id,
+                request.session_id(),
+                stage_for(request)
+            );
+            return Err(map_notification_capability_failure(failure));
+        }
+        Ok(())
+    }
+
+    fn cancel_capability_session(&self, session_id: Uuid) {
+        self.client.cancel_shortcut_session(session_id);
+        self.client.cancel_notification_session(session_id);
     }
 
     fn abandon_commit(&self, request: &ContinuousRequest, reason: ContinuousCancelReason) {
         if matches!(request, ContinuousRequest::Commit(_)) {
             self.abort_plugin_session(request, reason);
-            self.client.cancel_shortcut_session(request.session_id());
+            self.cancel_capability_session(request.session_id());
         }
     }
 
@@ -261,7 +280,7 @@ impl PluginContinuousBackend {
         context: ContinuousBackendContext<'_>,
     ) -> Result<(), ContinuousBackendError> {
         if matches!(request, ContinuousRequest::Cancel(_)) {
-            self.client.cancel_shortcut_session(request.session_id());
+            self.cancel_capability_session(request.session_id());
         }
         if !matches!(request, ContinuousRequest::Cancel(_)) && context.should_stop() {
             let reason = if context.shutdown_requested() {
@@ -311,12 +330,20 @@ impl ContinuousBackend for PluginContinuousBackend {
                         admission.permits_input_shortcut(),
                     )
                     .map_err(map_shortcut_capability_failure)?;
+                if let Err(failure) = self.client.open_notification_session(
+                    begin.session_id(),
+                    begin.plugin_id(),
+                    admission.permits_notification(),
+                ) {
+                    self.client.cancel_shortcut_session(begin.session_id());
+                    return Err(map_notification_capability_failure(failure));
+                }
             }
             ContinuousRequest::Update(_) => self.capability_failure(request)?,
             ContinuousRequest::Commit(_) => {
                 if let Err(error) = self.capability_failure(request) {
                     self.abort_plugin_session(request, ContinuousCancelReason::PluginFaulted);
-                    self.client.cancel_shortcut_session(request.session_id());
+                    self.cancel_capability_session(request.session_id());
                     return Err(error);
                 }
             }
@@ -327,7 +354,7 @@ impl ContinuousBackend for PluginContinuousBackend {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.abandon_commit(request, ContinuousCancelReason::PluginFaulted);
-                self.client.cancel_shortcut_session(request.session_id());
+                self.cancel_capability_session(request.session_id());
                 return Err(map_plugin_submit_error(error, request, context));
             }
         };
@@ -354,7 +381,7 @@ impl ContinuousBackend for PluginContinuousBackend {
             );
         };
         if let Err(error) = lifecycle_result {
-            self.client.cancel_shortcut_session(request.session_id());
+            self.cancel_capability_session(request.session_id());
             return Err(error);
         }
 
@@ -364,19 +391,36 @@ impl ContinuousBackend for PluginContinuousBackend {
                     if matches!(request, ContinuousRequest::Begin(_)) {
                         self.abort_pending_begin(request, ContinuousCancelReason::PluginFaulted);
                     }
-                    self.client.cancel_shortcut_session(request.session_id());
+                    self.cancel_capability_session(request.session_id());
                     return Err(error);
                 }
             }
             ContinuousRequest::Commit(_) => {
+                if let Err(failure) =
+                    self.client.finish_shortcut_commit(request.session_id(), context.deadline())
+                {
+                    self.client.cancel_notification_session(request.session_id());
+                    return Err(map_shortcut_capability_failure(failure));
+                }
                 return self
                     .client
-                    .finish_shortcut_commit(request.session_id(), context.deadline())
-                    .map_err(map_shortcut_capability_failure);
+                    .finish_notification_commit(request.session_id())
+                    .map_err(map_notification_capability_failure);
             }
             ContinuousRequest::Cancel(_) => {}
         }
         Ok(())
+    }
+}
+
+const fn map_notification_capability_failure(
+    failure: NotificationCapabilityFailure,
+) -> ContinuousBackendError {
+    match failure {
+        NotificationCapabilityFailure::Interrupted => ContinuousBackendError::Interrupted,
+        NotificationCapabilityFailure::PermissionDenied
+        | NotificationCapabilityFailure::RateLimited
+        | NotificationCapabilityFailure::Busy => ContinuousBackendError::Faulted,
     }
 }
 
@@ -1372,9 +1416,10 @@ mod tests {
         ContinuousBackend, ContinuousBackendContext, ContinuousBackendError,
         ContinuousBackendFailure, ContinuousBackendStage, ContinuousCompletion,
         ContinuousCompletionOutcome, ContinuousInvocation, ValidatingInertBackend,
-        map_plugin_lifecycle_error, map_plugin_submit_error,
+        map_notification_capability_failure, map_plugin_lifecycle_error, map_plugin_submit_error,
     };
     use crate::action_executor::{ActionDispatch, ActionExecutor};
+    use crate::capability_broker::NotificationCapabilityFailure;
     use crate::plugin_worker::{
         PluginLifecycleError, PluginLifecycleStage, PluginLifecycleSubmitError,
     };
@@ -1496,6 +1541,14 @@ mod tests {
                 context,
             ),
             ContinuousBackendError::Rejected
+        );
+        assert_eq!(
+            map_notification_capability_failure(NotificationCapabilityFailure::PermissionDenied),
+            ContinuousBackendError::Faulted
+        );
+        assert_eq!(
+            map_notification_capability_failure(NotificationCapabilityFailure::Interrupted),
+            ContinuousBackendError::Interrupted
         );
         drop(lease);
         executor.shutdown();

@@ -17,7 +17,9 @@ pub use actions::{
     MAX_ACTION_SEQUENCE_STEPS, MAX_TYPED_TEXT_BYTES, ShortcutKey, ShortcutModifier, WindowCommand,
 };
 pub use capabilities::{
-    MAX_PLUGIN_SHORTCUT_CHORD_BYTES, PluginShortcutChord, PluginShortcutParseError,
+    MAX_PLUGIN_NOTIFICATION_TEXT_BYTES, MAX_PLUGIN_SHORTCUT_CHORD_BYTES,
+    PluginNotificationParseError, PluginNotificationText, PluginShortcutChord,
+    PluginShortcutParseError,
 };
 pub use configuration::{
     ACTION_CONFIG_SCHEMA_VERSION, ACTIVATION_CONFIG_SCHEMA_VERSION,

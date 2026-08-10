@@ -5,8 +5,8 @@ use std::{
 };
 
 use mlua::{
-    Error as MluaError, HookTriggers, Lua, LuaOptions, LuaString, RegistryKey, StdLib, Table,
-    Value, VmState, chunk::ChunkMode,
+    Error as MluaError, Function, HookTriggers, Lua, LuaOptions, LuaString, RegistryKey, StdLib,
+    Table, Value, VmState, chunk::ChunkMode,
 };
 use thiserror::Error;
 
@@ -278,8 +278,10 @@ fn install_environment(
 
     let host_exports = lua.create_table().map_err(classify_setup_error)?;
     host_exports.raw_set("require", require).map_err(classify_setup_error)?;
-    let input = input_host_proxy(lua, callback_scope, capability_host)?;
+    let input = input_host_proxy(lua, callback_scope, Arc::clone(&capability_host))?;
     host_exports.raw_set("input", input).map_err(classify_setup_error)?;
+    let notification = notification_host_function(lua, callback_scope, capability_host)?;
+    host_exports.raw_set("notification", notification).map_err(classify_setup_error)?;
     let host_proxy = read_only_proxy(lua, host_exports)?;
     globals.raw_set("gradial", host_proxy).map_err(classify_setup_error)?;
     Ok(())
@@ -322,6 +324,37 @@ fn input_host_proxy(
     let input_exports = lua.create_table().map_err(classify_setup_error)?;
     input_exports.raw_set("shortcut", shortcut).map_err(classify_setup_error)?;
     read_only_proxy(lua, input_exports)
+}
+
+fn notification_host_function(
+    lua: &Lua,
+    callback_scope: &Arc<Mutex<Option<LuaCallbackScope>>>,
+    capability_host: Arc<dyn LuaCapabilityHost>,
+) -> Result<Function, LuaSandboxError> {
+    let notification_scope = Arc::clone(callback_scope);
+    lua.create_function(move |_, text: Value| {
+        let parsed = match text {
+            Value::String(text) => text.to_str().ok().and_then(|value| value.parse().ok()),
+            _ => None,
+        };
+        let status = parsed.map_or(
+            LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InvalidNotification),
+            |text| {
+                let scope = *lock_unpoisoned(&notification_scope);
+                scope.map_or(
+                    LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InactiveSession),
+                    |scope| {
+                        capability_host.request_notification(scope.session_id, scope.phase, text)
+                    },
+                )
+            },
+        );
+        Ok(match status {
+            LuaCapabilityStatus::Accepted => (true, None),
+            LuaCapabilityStatus::Rejected(reason) => (false, Some(reason.as_str())),
+        })
+    })
+    .map_err(classify_setup_error)
 }
 
 fn read_only_proxy(lua: &Lua, exports: Table) -> Result<Table, LuaSandboxError> {

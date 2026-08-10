@@ -637,7 +637,8 @@ mod tests {
 
     use gradial_core::{
         ContinuousActionSnapshot, ContinuousRequest, ContinuousSession,
-        PermittedApplicationContext, PluginActionId, PluginId, PluginShortcutChord,
+        PermittedApplicationContext, PluginActionId, PluginId, PluginNotificationText,
+        PluginShortcutChord,
     };
 
     use crate::{LuaCapabilityRejection, LuaCapabilityStatus};
@@ -747,6 +748,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCapabilityHost {
         calls: Mutex<Vec<(Uuid, LuaCallbackPhase, PluginShortcutChord)>>,
+        notifications: Mutex<Vec<(Uuid, LuaCallbackPhase, PluginNotificationText)>>,
         rejection: Mutex<Option<LuaCapabilityRejection>>,
     }
 
@@ -758,6 +760,19 @@ mod tests {
             shortcut: PluginShortcutChord,
         ) -> LuaCapabilityStatus {
             self.calls.lock().expect("calls").push((session_id, phase, shortcut));
+            self.rejection
+                .lock()
+                .expect("rejection")
+                .map_or(LuaCapabilityStatus::Accepted, LuaCapabilityStatus::Rejected)
+        }
+
+        fn request_notification(
+            &self,
+            session_id: Uuid,
+            phase: LuaCallbackPhase,
+            text: PluginNotificationText,
+        ) -> LuaCapabilityStatus {
+            self.notifications.lock().expect("notifications").push((session_id, phase, text));
             self.rejection
                 .lock()
                 .expect("rejection")
@@ -951,6 +966,56 @@ mod tests {
         adapter.begin(&begin).expect("handled rejection");
         assert!(!adapter.is_faulted());
         assert_eq!(host.calls.lock().expect("calls").len(), 1);
+    }
+
+    #[test]
+    fn protected_notification_host_validates_text_and_callback_scope() {
+        let source = r#"
+            local inactive, inactive_reason = gradial.notification("Not active")
+            assert(not inactive and inactive_reason == "inactive_session")
+            assert(not pcall(function() gradial.notification = function() end end))
+            return {
+                begin = function(context, parameters, initial)
+                    local accepted, reason = gradial.notification("Gesture started")
+                    assert(accepted and reason == nil)
+                    return {}
+                end,
+                update = function(session, sample)
+                    local malformed, malformed_reason = gradial.notification({})
+                    assert(not malformed and malformed_reason == "invalid_notification")
+                    local linked, linked_reason = gradial.notification("https://example.test")
+                    assert(not linked and linked_reason == "invalid_notification")
+                    local accepted = gradial.notification("Gesture updated")
+                    assert(accepted)
+                end,
+                commit = function(session, sample)
+                    local accepted = gradial.notification("Gesture committed")
+                    assert(accepted)
+                end,
+                cancel = function(session, reason) end,
+            }
+        "#;
+        let host = Arc::new(RecordingCapabilityHost::default());
+        let mut adapter = LuaLifecycleAdapter::load_with_capability_host(
+            image(source),
+            LuaSandboxLimits::default(),
+            host.clone(),
+        )
+        .expect("adapter");
+        let session_id = Uuid::from_u128(12);
+        let (mut session, begin) = begin_request(session_id);
+
+        adapter.begin(&begin).expect("begin");
+        adapter.update(&update_request(&mut session, 0.6)).expect("update");
+        adapter.commit(&commit_request(&mut session, 0.8)).expect("commit");
+
+        let notifications = host.notifications.lock().expect("notifications");
+        assert_eq!(notifications.len(), 3);
+        assert!(notifications.iter().all(|(found, _, _)| *found == session_id));
+        assert_eq!(notifications[0].1, LuaCallbackPhase::Begin);
+        assert_eq!(notifications[1].1, LuaCallbackPhase::Update);
+        assert_eq!(notifications[2].1, LuaCallbackPhase::Commit);
+        assert_eq!(notifications[2].2.as_str(), "Gesture committed");
     }
 
     #[test]

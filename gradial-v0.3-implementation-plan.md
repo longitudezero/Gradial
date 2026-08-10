@@ -626,9 +626,10 @@ return plugin
 - Callback arguments are read-only host values.
 - `update`, `commit`, and `cancel` must return no values.
 - A callback may use only approved functions in the `gradial` host module.
-- `begin` initializes session state and cannot request an external effect.
+- `begin` initializes session state and may use an approved nonblocking host
+  capability after Gradial opens that session's broker epoch.
 - Effect-producing host functions reject calls made during module loading,
-  `begin`, or outside the currently active update/commit/cancel callback.
+  `cancel`, or outside the currently active begin/update/commit callback.
 - Lua errors become stable plugin failures; they never unwind into Gradial.
 - Callback return values are bounded and validated before use.
 
@@ -728,9 +729,13 @@ protocol.
 #### `notification`
 
 - Requests a non-focus-stealing Gradial notification.
-- Accepts bounded plain text with no markup, URLs, or action buttons.
+- Accepts one nonempty line of at most 128 UTF-8 bytes. Control characters and
+  URL-shaped content are rejected; text is never interpreted as markup.
+- Has no sound, URL target, callback destination, or action button.
 - Allows at most one notification per session and five per plugin per minute.
-- The UI identifies the requesting plugin.
+- Uses a bounded 20-item application handoff and cancellation tokens for work
+  that has not entered native submission.
+- The UI identifies the requesting plugin by validated plugin ID.
 
 #### `network.loopback`
 
@@ -1144,11 +1149,11 @@ and manual authoring steps pass without executing code from a disabled plugin.
 
 ### Milestone 3 — Capabilities and action editing
 
-Implementation note (2026-08-10): the editor, permission-filtered context, and
-`input.shortcut` slices are complete. Settings receives compatible manifest
-action schemas, offers actions from enabled plugins for portable continuous
-action creation,
-renders all five bounded parameter kinds without executing Lua, and validates
+Implementation note (2026-08-10): the editor, permission-filtered context,
+`input.shortcut`, and `notification` slices are complete. Settings receives
+compatible manifest action schemas, offers actions from enabled plugins for
+portable continuous action creation, renders all five bounded parameter kinds
+without executing Lua, and validates
 known schemas before save. Global and application-profile wedges expose a
 separate continuous checkbox and selector without replacing their discrete
 action. The plugin worker repeats manifest parameter validation before Begin.
@@ -1161,8 +1166,13 @@ together. The shortcut capability accepts only a complete readable chord,
 runs through a bounded off-Lua broker, revalidates the frozen target, limits
 each session to 30 accepted requests per second, drains accepted work before
 Commit completes, and closes before Cancel. The checked-in banded-shortcut
-example exercises that real worker boundary. `notification` and
-`network.loopback` remain later Milestone 3 slices.
+example exercises that real worker boundary. The notification capability
+accepts one 128-byte plain-text line per session,
+five messages per plugin per rolling minute, and hands accepted work to a
+bounded cancellation-aware native queue. It identifies the plugin, requests
+no focus or sound, and exposes no link or action surface. The checked-in commit
+notification example exercises its real worker boundary. `network.loopback`
+remains the later Milestone 3 capability slice.
 
 Deliver:
 

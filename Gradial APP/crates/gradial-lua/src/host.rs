@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gradial_core::PluginShortcutChord;
+use gradial_core::{PluginNotificationText, PluginShortcutChord};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +18,7 @@ pub enum LuaCapabilityRejection {
     RateLimited,
     Busy,
     InvalidRequest,
+    InvalidNotification,
     Cancelled,
 }
 
@@ -29,6 +30,7 @@ impl LuaCapabilityRejection {
             Self::RateLimited => "rate_limited",
             Self::Busy => "busy",
             Self::InvalidRequest => "invalid_shortcut",
+            Self::InvalidNotification => "invalid_notification",
             Self::Cancelled => "cancelled",
         }
     }
@@ -48,6 +50,15 @@ pub trait LuaCapabilityHost: Send + Sync {
         phase: LuaCallbackPhase,
         shortcut: PluginShortcutChord,
     ) -> LuaCapabilityStatus;
+
+    fn request_notification(
+        &self,
+        _session_id: Uuid,
+        _phase: LuaCallbackPhase,
+        _text: PluginNotificationText,
+    ) -> LuaCapabilityStatus {
+        LuaCapabilityStatus::Rejected(LuaCapabilityRejection::InactiveSession)
+    }
 }
 
 pub(crate) fn deny_all_capability_host() -> Arc<dyn LuaCapabilityHost> {

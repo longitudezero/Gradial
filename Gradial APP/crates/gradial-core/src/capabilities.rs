@@ -1,12 +1,13 @@
 //! Runtime-neutral payloads accepted by Gradial capability brokers.
 
-use std::{fmt, str::FromStr};
+use std::{fmt, net::IpAddr, str::FromStr};
 
 use thiserror::Error;
 
 use crate::{ShortcutKey, ShortcutModifier};
 
 pub const MAX_PLUGIN_SHORTCUT_CHORD_BYTES: usize = 128;
+pub const MAX_PLUGIN_NOTIFICATION_TEXT_BYTES: usize = 128;
 
 /// One complete keyboard chord. It can never represent a held key or an
 /// arbitrary input event sequence.
@@ -90,6 +91,107 @@ impl FromStr for PluginShortcutChord {
         let key = key.ok_or(PluginShortcutParseError::MissingPrimaryKey)?;
         Ok(Self { modifiers, key })
     }
+}
+
+/// One bounded single-line notification body. Gradial treats it only as
+/// literal text and rejects URL-shaped content before it reaches a broker.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PluginNotificationText(String);
+
+impl PluginNotificationText {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PluginNotificationText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("PluginNotificationText").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PluginNotificationParseError {
+    #[error("plugin_notification_empty")]
+    Empty,
+    #[error("plugin_notification_too_long")]
+    TooLong,
+    #[error("plugin_notification_control_character")]
+    ControlCharacter,
+    #[error("plugin_notification_url_disallowed")]
+    UrlDisallowed,
+}
+
+impl FromStr for PluginNotificationText {
+    type Err = PluginNotificationParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.trim().is_empty() {
+            return Err(PluginNotificationParseError::Empty);
+        }
+        if value.len() > MAX_PLUGIN_NOTIFICATION_TEXT_BYTES {
+            return Err(PluginNotificationParseError::TooLong);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(PluginNotificationParseError::ControlCharacter);
+        }
+        if notification_contains_url(value) {
+            return Err(PluginNotificationParseError::UrlDisallowed);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+fn notification_contains_url(value: &str) -> bool {
+    let lowercase = value.to_ascii_lowercase();
+    if ["http:", "https:", "ftp:", "file:", "mailto:", "www.", "://", ":\\", "\\\\"]
+        .iter()
+        .any(|marker| lowercase.contains(marker))
+        || lowercase.contains('@')
+        || lowercase.contains("::")
+    {
+        return true;
+    }
+    lowercase.split_whitespace().any(|token| {
+        let candidate = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                ',' | ';' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\''
+            )
+        });
+        let host =
+            candidate.split(['/', '?', '#']).next().unwrap_or_default().trim_end_matches('.');
+        if host.eq_ignore_ascii_case("localhost") || host.starts_with("localhost:") {
+            return true;
+        }
+        let host = host
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .map_or(host, |(host, _)| host);
+        if host.parse::<IpAddr>().is_ok() {
+            return true;
+        }
+        let mut labels = host.split('.');
+        let Some(first) = labels.next() else {
+            return false;
+        };
+        let remaining = labels.collect::<Vec<_>>();
+        let Some(last) = remaining.last() else {
+            return false;
+        };
+        domain_label_is_valid(first)
+            && remaining.iter().all(|label| domain_label_is_valid(label))
+            && last.len() >= 2
+            && last.bytes().all(|byte| byte.is_ascii_alphabetic())
+    })
+}
+
+fn domain_label_is_valid(label: &str) -> bool {
+    !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 const fn modifier_for_name(value: &str) -> Option<ShortcutModifier> {
@@ -251,5 +353,49 @@ mod tests {
             "a".repeat(MAX_PLUGIN_SHORTCUT_CHORD_BYTES + 1).parse::<PluginShortcutChord>(),
             Err(PluginShortcutParseError::TooLong)
         );
+    }
+
+    #[test]
+    fn notification_text_is_bounded_literal_and_redacted() {
+        let text: PluginNotificationText = "Export complete: 50% processed.".parse().expect("text");
+        assert_eq!(text.as_str(), "Export complete: 50% processed.");
+        assert!(!format!("{text:?}").contains("Export"));
+        assert!("✓ Complete".parse::<PluginNotificationText>().is_ok());
+    }
+
+    #[test]
+    fn notification_text_rejects_empty_control_and_oversized_values() {
+        assert_eq!(
+            "   ".parse::<PluginNotificationText>(),
+            Err(PluginNotificationParseError::Empty)
+        );
+        assert_eq!(
+            "line one\nline two".parse::<PluginNotificationText>(),
+            Err(PluginNotificationParseError::ControlCharacter)
+        );
+        assert_eq!(
+            "x".repeat(MAX_PLUGIN_NOTIFICATION_TEXT_BYTES + 1).parse::<PluginNotificationText>(),
+            Err(PluginNotificationParseError::TooLong)
+        );
+    }
+
+    #[test]
+    fn notification_text_rejects_url_shaped_content_case_insensitively() {
+        for value in [
+            "Open HTTPS://example.test",
+            "Visit www.example.test",
+            "Send MAILTO:user@example.test",
+            "custom://destination",
+            "Visit example.test/path",
+            "Contact user@example.test",
+            "Connect to 127.0.0.1",
+            "Connect to localhost:8080",
+            r"Open C:\private\file.txt",
+        ] {
+            assert_eq!(
+                value.parse::<PluginNotificationText>(),
+                Err(PluginNotificationParseError::UrlDisallowed)
+            );
+        }
     }
 }

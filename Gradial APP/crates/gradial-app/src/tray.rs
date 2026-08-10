@@ -2,21 +2,23 @@ use std::{
     collections::VecDeque,
     mem::size_of,
     sync::{
-        Mutex, MutexGuard,
+        Arc, LazyLock, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
 use anyhow::{Context, Result, bail};
-use gradial_core::{ActionErrorCode, ActionResult};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
+use gradial_core::{ActionErrorCode, ActionResult, PluginNotificationText};
 use windows::{
     Win32::{
         Foundation::{HWND, POINT},
         UI::{
             Shell::{
-                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_NOSOUND,
-                NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-                NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_INFO,
+                NIIF_NOSOUND, NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+                Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, IDI_ERROR,
@@ -39,11 +41,14 @@ const OPEN_SETTINGS_COMMAND_ID: usize = 5;
 const RESTART_ONBOARDING_COMMAND_ID: usize = 6;
 const ACTIVITY_CAPACITY: usize = 20;
 const NOTIFICATION_CAPACITY: usize = 20;
+const PLUGIN_NOTIFICATION_CAPACITY: usize = 20;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 static PENDING_COMMAND: AtomicU8 = AtomicU8::new(0);
 static CURRENT_HEALTH: AtomicU8 = AtomicU8::new(TrayHealth::Recovering as u8);
 static ACTION_RUNNING: AtomicBool = AtomicBool::new(false);
 static ACTION_ACTIVITY: Mutex<ActivityStore> = Mutex::new(ActivityStore::new());
+static PLUGIN_NOTIFICATIONS: LazyLock<(Sender<PluginNotification>, Receiver<PluginNotification>)> =
+    LazyLock::new(|| bounded(PLUGIN_NOTIFICATION_CAPACITY));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivityRecord {
@@ -69,6 +74,27 @@ pub(crate) struct FailureNotification {
 impl FailureNotification {
     pub(crate) const fn error_code(self) -> ActionErrorCode {
         self.code
+    }
+}
+
+pub(crate) struct PluginNotification {
+    plugin_id: String,
+    text: PluginNotificationText,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl PluginNotification {
+    pub(crate) fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+}
+
+impl std::fmt::Debug for PluginNotification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginNotification")
+            .field("plugin_id", &self.plugin_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -215,6 +241,22 @@ impl TrayIcon {
         Ok(())
     }
 
+    pub(crate) fn show_plugin_notification(&self, notification: &PluginNotification) -> Result<()> {
+        let data = plugin_notification_data(self.window_address, notification)?;
+        // SAFETY: `data` identifies the live notification-area icon and uses
+        // only the non-activating information fields.
+        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) }.as_bool() {
+            bail!("Windows could not show Gradial's plugin notification");
+        }
+        log::info!(
+            target: "plugins",
+            "component=capabilities event_code=plugin_notification_shown result_code=ok \
+             plugin_id={}",
+            notification.plugin_id
+        );
+        Ok(())
+    }
+
     fn add(&mut self) -> Result<()> {
         CURRENT_HEALTH.store(self.health as u8, Ordering::Release);
         let mut data = self.icon_data(self.health)?;
@@ -334,6 +376,28 @@ pub(crate) fn record_action_result(result: &ActionResult, config_revision: u64) 
 
 pub(crate) fn try_failure_notification() -> Option<FailureNotification> {
     activity_state().notifications.pop_front()
+}
+
+pub(crate) fn enqueue_plugin_notification(
+    plugin_id: &str,
+    text: PluginNotificationText,
+    cancellation: Arc<AtomicBool>,
+) -> bool {
+    let notification = PluginNotification { plugin_id: plugin_id.to_owned(), text, cancellation };
+    match PLUGIN_NOTIFICATIONS.0.try_send(notification) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+    }
+}
+
+pub(crate) fn try_plugin_notification() -> Option<PluginNotification> {
+    loop {
+        match PLUGIN_NOTIFICATIONS.1.try_recv() {
+            Ok(notification) if notification.cancellation.load(Ordering::Acquire) => {}
+            Ok(notification) => return Some(notification),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
+        }
+    }
 }
 
 pub(crate) fn clear_activity(config_revision: u64) {
@@ -567,6 +631,27 @@ fn failure_notification_data(
     Ok(data)
 }
 
+fn plugin_notification_data(
+    window_address: usize,
+    notification: &PluginNotification,
+) -> Result<NOTIFYICONDATAW> {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
+            .context("notification icon data size does not fit u32")?,
+        hWnd: hwnd(window_address),
+        uID: ICON_ID,
+        uFlags: NIF_INFO,
+        dwInfoFlags: NIIF_INFO | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME,
+        ..Default::default()
+    };
+    write_wide_buffer(&mut data.szInfoTitle, "Gradial plugin notification");
+    write_wide_buffer(
+        &mut data.szInfo,
+        &format!("{}\n{}", notification.plugin_id, notification.text.as_str()),
+    );
+    Ok(data)
+}
+
 const fn failure_message(code: ActionErrorCode) -> &'static str {
     match code {
         ActionErrorCode::ActionBusy => "Another action is already running.",
@@ -609,8 +694,15 @@ fn hwnd(address: usize) -> HWND {
 
 #[cfg(test)]
 mod tests {
-    use gradial_core::{ActionErrorCode, ActionResult};
-    use windows::Win32::UI::Shell::{NIF_INFO, NIIF_ERROR, NIIF_NOSOUND, NIIF_RESPECT_QUIET_TIME};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use gradial_core::{ActionErrorCode, ActionResult, PluginNotificationText};
+    use windows::Win32::UI::Shell::{
+        NIF_INFO, NIIF_ERROR, NIIF_INFO, NIIF_NOSOUND, NIIF_RESPECT_QUIET_TIME,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuState, GetMenuStringW, GetSubMenu,
         MF_BYCOMMAND, MF_BYPOSITION, MF_GRAYED,
@@ -618,8 +710,9 @@ mod tests {
 
     use super::{
         ACTIVITY_CAPACITY, ActivityRecord, ActivityStore, CLEAR_ACTIVITY_COMMAND_ID,
-        FailureNotification, TrayCommand, TrayHealth, append_activity_submenu, command_from_code,
-        failure_notification_data, health_from_atomic, write_wide_buffer,
+        FailureNotification, PluginNotification, TrayCommand, TrayHealth, append_activity_submenu,
+        command_from_code, enqueue_plugin_notification, failure_notification_data,
+        health_from_atomic, plugin_notification_data, try_plugin_notification, write_wide_buffer,
     };
 
     #[test]
@@ -765,6 +858,39 @@ mod tests {
             from_wide_buffer(&data.szInfo),
             "The configured file or folder could not be found."
         );
+    }
+
+    #[test]
+    fn plugin_notification_is_plain_nonactivating_and_identifies_its_plugin() {
+        let private_text = "Finished private operation";
+        let notification = PluginNotification {
+            plugin_id: "org.gradial.example".to_owned(),
+            text: private_text.parse::<PluginNotificationText>().expect("text"),
+            cancellation: Arc::new(AtomicBool::new(false)),
+        };
+        let data = plugin_notification_data(42, &notification).expect("notification data");
+
+        assert_eq!(data.uFlags, NIF_INFO);
+        assert_eq!(data.dwInfoFlags, NIIF_INFO | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME);
+        assert_eq!(from_wide_buffer(&data.szInfoTitle), "Gradial plugin notification");
+        assert_eq!(
+            from_wide_buffer(&data.szInfo),
+            "org.gradial.example\nFinished private operation"
+        );
+        assert!(!format!("{notification:?}").contains(private_text));
+    }
+
+    #[test]
+    fn cancelled_plugin_notification_is_dropped_before_native_submission() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        assert!(enqueue_plugin_notification(
+            "org.gradial.cancelled",
+            "Must not appear".parse().expect("text"),
+            Arc::clone(&cancellation),
+        ));
+        cancellation.store(true, Ordering::Release);
+
+        assert!(try_plugin_notification().is_none());
     }
 
     fn from_wide_buffer(buffer: &[u16]) -> String {

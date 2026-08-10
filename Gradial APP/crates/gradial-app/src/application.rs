@@ -1385,6 +1385,30 @@ impl GradialApp {
             self.overlay_pool.monitors().len()
         );
     }
+
+    fn poll_notifications(&mut self) {
+        while let Some(notification) = crate::tray::try_failure_notification() {
+            if let Err(error) = self.tray_icon.show_failure_notification(notification) {
+                log::error!(
+                    target: "tray",
+                    "component=tray event_code=action_failure_notification_failed \
+                     result_code=failure error_code={} config_revision={} error={error}",
+                    notification.error_code().as_str(),
+                    self.config_revision
+                );
+            }
+        }
+        while let Some(notification) = crate::tray::try_plugin_notification() {
+            if let Err(error) = self.tray_icon.show_plugin_notification(&notification) {
+                log::error!(
+                    target: "plugins",
+                    "component=capabilities event_code=plugin_notification_failed \
+                     result_code=failure plugin_id={} error={error}",
+                    notification.plugin_id()
+                );
+            }
+        }
+    }
 }
 
 impl eframe::App for GradialApp {
@@ -1446,17 +1470,7 @@ impl eframe::App for GradialApp {
         while let Some(completion) = self.action_executor.try_completion() {
             crate::tray::record_action_result(&completion.result, completion.config_revision);
         }
-        while let Some(notification) = crate::tray::try_failure_notification() {
-            if let Err(error) = self.tray_icon.show_failure_notification(notification) {
-                log::error!(
-                    target: "tray",
-                    "component=tray event_code=action_failure_notification_failed \
-                     result_code=failure error_code={} config_revision={} error={error}",
-                    notification.error_code().as_str(),
-                    self.config_revision
-                );
-            }
-        }
+        self.poll_notifications();
 
         if let Some(event) = self.interaction.as_ref().and_then(InteractionRuntime::try_event) {
             self.handle_runtime_event(context, event);

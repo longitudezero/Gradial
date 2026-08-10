@@ -141,9 +141,10 @@ and Milestone 2 slices, and the completed bounded Milestone 3 slices establish:
   invocation-down, admits only enabled manifest actions, uses the manifest
   update cadence, revalidates the captured target, and dispatches bounded Lua
   Begin/Update/Commit/Cancel callbacks off the interaction thread.
-- Permission-filtered plugin application/title context and a bounded
+- Permission-filtered plugin application/title context, a bounded
   `input.shortcut` broker that reuses full frozen-target validation and
-  synthesized-key cleanup outside Lua and interaction threads.
+  synthesized-key cleanup, and a bounded non-focus-stealing `notification`
+  broker. Native effects stay outside Lua and interaction threads.
 - Manifest-backed continuous action authoring with typed, bounded parameter
   controls and a separate per-wedge continuous checkbox for Global and every
   application profile.
@@ -862,9 +863,9 @@ coroutines, global `require`, `load`, `loadfile`, `dofile`, `collectgarbage`,
 already failed source-image construction, and every executed chunk is
 explicitly text-only. The `gradial` host table is a protected proxy and exposes
 the private module loader. An enabled lifecycle adapter also attaches the
-protected `gradial.input.shortcut` function described below; it has no effect
-outside an active callback and delegates all Windows work to the capability
-broker.
+protected `gradial.input.shortcut` and `gradial.notification` functions
+described below; they have no effect outside an active callback and delegate
+all native work to capability brokers.
 
 Lua authors load another file with:
 
@@ -1077,8 +1078,9 @@ accepts, so it cannot leave an orphan session.
 
 Settings can create actions for enabled manifest controls, edit their generic
 parameters without running plugin code, and assign them independently beyond
-any Global or application-profile wedge. The first operating-system capability
-is the separately permissioned shortcut broker described below.
+any Global or application-profile wedge. The currently implemented
+operating-system capabilities are the separately permissioned shortcut and
+notification brokers described below.
 
 ## `input.shortcut` capability broker
 
@@ -1134,6 +1136,47 @@ and sends at most one whole request per 20 Hz callback. A large jump therefore
 catches up over later updates instead of producing an input burst. Its real
 manifest and Lua source cross the worker and fake bounded broker in the test
 suite.
+
+## `notification` capability broker
+
+An enabled plugin whose reviewed manifest declares `notification` receives a
+protected `gradial.notification(text)` function during its active lifecycle
+callbacks. It returns `true, nil` after the request enters Gradial's bounded
+delivery queue, or `false, reason` when rejected. The relevant stable reasons
+are `inactive_session`, `permission_denied`, `rate_limited`, `busy`,
+`invalid_notification`, and `cancelled`; handling one does not itself fault Lua.
+
+Notification text is one nonempty UTF-8 line of at most 128 bytes. Control
+characters, malformed Lua values, and URL-shaped content—including schemes,
+bare domains, email addresses, IP addresses, localhost endpoints, and Windows
+or UNC paths—are rejected. Accepted text is always written literally to the
+native notification; it has no markup interpretation, URL target, action
+button, sound, or callback destination.
+
+Each continuous session may enqueue one notification, and each plugin may
+enqueue five across all sessions in a rolling minute. The application-wide
+handoff holds at most twenty pending messages and never blocks Lua. Permission
+is checked at the call boundary. A second request, permission revocation, a
+queue failure, cancellation, or shutdown fails the epoch closed. Every queued
+item carries the epoch's cancellation token, allowing the UI to discard work
+before the application begins native submission.
+
+The normal application loop—not the Lua worker, interaction thread, or input
+hook—submits accepted messages through the existing notification-area icon.
+The title is fixed as **Gradial plugin notification** and the first body line is
+the validated plugin ID, so the requester is always identified independently
+of plugin-controlled text. Submission uses only the non-activating information,
+no-sound, and respect-quiet-time flags. Explorer delivery is best effort and is
+logged only with stable metadata; neither message text nor Lua values enter a
+log or diagnostic bundle.
+
+Commit closes the notification epoch after Lua returns and preserves its one
+accepted item for delivery. Every Cancel path closes the epoch before invoking
+Lua and marks pending delivery cancelled, so Cancel cannot create a late
+notification. The checked-in
+`examples/plugins/org.gradial.example.notification` package demonstrates one
+fixed plain-text request from Commit, and its real manifest/source cross the
+plugin worker and fake broker in the automated suite.
 
 ## Configuration and profile resolution
 

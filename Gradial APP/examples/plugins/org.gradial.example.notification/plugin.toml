@@ -1,0 +1,14 @@
+manifest_version = 1
+id = "org.gradial.example.notification"
+name = "Commit notification example"
+version = "0.1.0"
+api_version = 1
+entry = "main.lua"
+permissions = ["notification"]
+
+[[actions]]
+id = "notify-on-commit"
+name = "Notify on commit"
+kind = "continuous"
+description = "Requests one plain Gradial notification after a continuous gesture commits."
+update_hz = 10

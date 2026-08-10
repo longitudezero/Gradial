@@ -83,6 +83,7 @@ Windows to do anything. `input.shortcut`, `notification`, and
 `network.loopback` remain separate permission-checked capability brokers for
 later Milestone 3 slices.
 
-Subsequent status (2026-08-10): `input.shortcut` is now implemented as that
-separate broker. `notification` and `network.loopback` remain deferred. See
-`milestone-3-shortcut-capability-results.md` for the new boundary and evidence.
+Subsequent status (2026-08-10): `input.shortcut` and `notification` are now
+implemented as separate bounded brokers. `network.loopback` remains deferred.
+See `milestone-3-shortcut-capability-results.md` and
+`milestone-3-notification-capability-results.md` for the newer boundaries.

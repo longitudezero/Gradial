@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::{
     capability_broker::{
-        ShortcutCapabilityClient, ShortcutCapabilityFailure, ShortcutCapabilityRuntime,
+        LuaCapabilityBrokerClient, NotificationCapabilityClient, NotificationCapabilityFailure,
+        NotificationCapabilityRuntime, ShortcutCapabilityClient, ShortcutCapabilityFailure,
+        ShortcutCapabilityRuntime,
     },
     plugin_discovery::{
         DiscoveredPlugin, PluginDiscoveryReport, PluginPackageStatus, discover_plugins,
@@ -45,19 +47,26 @@ type SharedPluginActionCatalog = Arc<RwLock<Arc<PluginActionCatalog>>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PluginActionAdmission {
     update_hz: u16,
-    context_application: bool,
-    context_window_title: bool,
-    input_shortcut: bool,
+    permissions: u8,
 }
+
+const CONTEXT_APPLICATION_PERMISSION: u8 = 1 << 0;
+const CONTEXT_WINDOW_TITLE_PERMISSION: u8 = 1 << 1;
+const INPUT_SHORTCUT_PERMISSION: u8 = 1 << 2;
+const NOTIFICATION_PERMISSION: u8 = 1 << 3;
 
 impl PluginActionAdmission {
     fn new(update_hz: u16, permissions: &[PluginPermission]) -> Self {
-        Self {
-            update_hz,
-            context_application: permissions.contains(&PluginPermission::ContextApplication),
-            context_window_title: permissions.contains(&PluginPermission::ContextWindowTitle),
-            input_shortcut: permissions.contains(&PluginPermission::InputShortcut),
-        }
+        let permissions = permissions.iter().fold(0, |mask, permission| {
+            mask | match permission {
+                PluginPermission::ContextApplication => CONTEXT_APPLICATION_PERMISSION,
+                PluginPermission::ContextWindowTitle => CONTEXT_WINDOW_TITLE_PERMISSION,
+                PluginPermission::InputShortcut => INPUT_SHORTCUT_PERMISSION,
+                PluginPermission::Notification => NOTIFICATION_PERMISSION,
+                PluginPermission::NetworkLoopback => 0,
+            }
+        });
+        Self { update_hz, permissions }
     }
 
     pub(crate) const fn update_hz(self) -> u16 {
@@ -65,15 +74,19 @@ impl PluginActionAdmission {
     }
 
     pub(crate) const fn permits_context_application(self) -> bool {
-        self.context_application
+        self.permissions & CONTEXT_APPLICATION_PERMISSION != 0
     }
 
     pub(crate) const fn permits_context_window_title(self) -> bool {
-        self.context_window_title
+        self.permissions & CONTEXT_WINDOW_TITLE_PERMISSION != 0
     }
 
     pub(crate) const fn permits_input_shortcut(self) -> bool {
-        self.input_shortcut
+        self.permissions & INPUT_SHORTCUT_PERMISSION != 0
+    }
+
+    pub(crate) const fn permits_notification(self) -> bool {
+        self.permissions & NOTIFICATION_PERMISSION != 0
     }
 
     #[cfg(test)]
@@ -402,6 +415,7 @@ pub(crate) struct PluginLifecycleClient {
     terminals: Sender<PluginLifecycleCommand>,
     action_catalog: SharedPluginActionCatalog,
     shortcut_capabilities: ShortcutCapabilityClient,
+    notification_capabilities: NotificationCapabilityClient,
     shutdown_requested: Arc<AtomicBool>,
 }
 
@@ -431,6 +445,7 @@ impl PluginLifecycleClient {
             terminals,
             action_catalog: Arc::new(RwLock::new(Arc::new(action_catalog))),
             shortcut_capabilities: ShortcutCapabilityClient::inert_for_test(),
+            notification_capabilities: NotificationCapabilityClient::inert_for_test(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -508,6 +523,33 @@ impl PluginLifecycleClient {
     ) -> Result<(), ShortcutCapabilityFailure> {
         self.shortcut_capabilities.finish_commit(session_id, deadline)
     }
+
+    pub(crate) fn open_notification_session(
+        &self,
+        session_id: Uuid,
+        plugin_id: &PluginId,
+        permitted: bool,
+    ) -> Result<(), NotificationCapabilityFailure> {
+        self.notification_capabilities.open_session(session_id, plugin_id.as_str(), permitted)
+    }
+
+    pub(crate) fn notification_failure(
+        &self,
+        session_id: Uuid,
+    ) -> Option<NotificationCapabilityFailure> {
+        self.notification_capabilities.failure(session_id)
+    }
+
+    pub(crate) fn cancel_notification_session(&self, session_id: Uuid) {
+        self.notification_capabilities.cancel_session(session_id);
+    }
+
+    pub(crate) fn finish_notification_commit(
+        &self,
+        session_id: Uuid,
+    ) -> Result<(), NotificationCapabilityFailure> {
+        self.notification_capabilities.finish_commit(session_id)
+    }
 }
 
 #[derive(Debug)]
@@ -518,20 +560,36 @@ pub(crate) struct PluginWorkerRuntime {
     stopped: Receiver<()>,
     join_handle: Option<JoinHandle<()>>,
     shortcut_capabilities: ShortcutCapabilityRuntime,
+    notification_capabilities: NotificationCapabilityRuntime,
 }
 
 impl PluginWorkerRuntime {
     pub(crate) fn start(paths: AppPaths) -> Result<Self> {
         let shortcut_capabilities = ShortcutCapabilityRuntime::start()
             .context("could not start the shortcut capability broker")?;
-        Self::start_with_shortcut_capabilities(paths, shortcut_capabilities)
+        let notification_capabilities = NotificationCapabilityRuntime::start();
+        Self::start_with_capabilities(paths, shortcut_capabilities, notification_capabilities)
     }
 
+    #[cfg(test)]
     fn start_with_shortcut_capabilities(
         paths: AppPaths,
         shortcut_capabilities: ShortcutCapabilityRuntime,
     ) -> Result<Self> {
+        Self::start_with_capabilities(
+            paths,
+            shortcut_capabilities,
+            NotificationCapabilityRuntime::start(),
+        )
+    }
+
+    fn start_with_capabilities(
+        paths: AppPaths,
+        shortcut_capabilities: ShortcutCapabilityRuntime,
+        notification_capabilities: NotificationCapabilityRuntime,
+    ) -> Result<Self> {
         let shortcut_client = shortcut_capabilities.client();
+        let notification_client = notification_capabilities.client();
         let (command_sender, commands) = bounded(COMMAND_CAPACITY);
         let (begin_sender, begins) = bounded(LIFECYCLE_BEGIN_CAPACITY);
         let (update_sender, updates) = bounded(LIFECYCLE_UPDATE_CAPACITY);
@@ -542,6 +600,7 @@ impl PluginWorkerRuntime {
         let worker_shutdown = Arc::clone(&shutdown_requested);
         let worker_action_catalog = Arc::clone(&action_catalog);
         let worker_shortcut_client = shortcut_client.clone();
+        let worker_notification_client = notification_client.clone();
         let join_handle = thread::Builder::new()
             .name("gradial-plugin-worker".to_owned())
             .spawn(move || {
@@ -550,6 +609,7 @@ impl PluginWorkerRuntime {
                     &worker_shutdown,
                     worker_action_catalog,
                     worker_shortcut_client,
+                    worker_notification_client,
                 );
                 worker.run(&commands, &begins, &updates, &terminals, &worker_shutdown);
                 let _sent = stopped_sender.try_send(());
@@ -569,6 +629,7 @@ impl PluginWorkerRuntime {
             terminals: terminal_sender,
             action_catalog,
             shortcut_capabilities: shortcut_client,
+            notification_capabilities: notification_client,
             shutdown_requested: Arc::clone(&shutdown_requested),
         };
         Ok(Self {
@@ -578,6 +639,7 @@ impl PluginWorkerRuntime {
             stopped,
             join_handle: Some(join_handle),
             shortcut_capabilities,
+            notification_capabilities,
         })
     }
 
@@ -667,6 +729,7 @@ impl PluginWorkerRuntime {
                 SHUTDOWN_WAIT.as_millis()
             ),
         }
+        self.notification_capabilities.shutdown();
         self.shortcut_capabilities.shutdown();
     }
 }
@@ -684,6 +747,7 @@ struct PluginWorker {
     adapters: BTreeMap<String, LoadedPlugin>,
     action_catalog: SharedPluginActionCatalog,
     shortcut_capabilities: ShortcutCapabilityClient,
+    notification_capabilities: NotificationCapabilityClient,
     aborted_begins: BTreeSet<Uuid>,
     active_session: Option<ActivePluginSession>,
     reconciliation_deferred: bool,
@@ -709,6 +773,7 @@ impl PluginWorker {
         shutdown_requested: &AtomicBool,
         action_catalog: SharedPluginActionCatalog,
         shortcut_capabilities: ShortcutCapabilityClient,
+        notification_capabilities: NotificationCapabilityClient,
     ) -> Self {
         let store = PluginStateStore::new(paths.clone());
         let loaded = store.load_or_initialize();
@@ -739,6 +804,7 @@ impl PluginWorker {
             adapters: BTreeMap::new(),
             action_catalog,
             shortcut_capabilities,
+            notification_capabilities,
             aborted_begins: BTreeSet::new(),
             active_session: None,
             reconciliation_deferred: false,
@@ -783,7 +849,11 @@ impl PluginWorker {
                     continue;
                 }
                 let plugin_id = package.directory_name.clone();
-                match load_plugin(package, &self.shortcut_capabilities) {
+                match load_plugin(
+                    package,
+                    &self.shortcut_capabilities,
+                    &self.notification_capabilities,
+                ) {
                     Ok(plugin) => {
                         self.adapters.insert(plugin_id.clone(), plugin);
                         log_operation(
@@ -1172,7 +1242,8 @@ impl PluginWorker {
         }
 
         let candidate =
-            load_plugin(&package, &self.shortcut_capabilities).map_err(PluginWorkerError::Lua)?;
+            load_plugin(&package, &self.shortcut_capabilities, &self.notification_capabilities)
+                .map_err(PluginWorkerError::Lua)?;
         let mut proposed = self.state.clone();
         proposed.record_successful_load(&package).map_err(PluginWorkerError::StateTransition)?;
         self.persist(&proposed)?;
@@ -1209,7 +1280,11 @@ impl PluginWorker {
         }
 
         self.adapters.remove(plugin_id);
-        let candidate = match load_plugin(&package, &self.shortcut_capabilities) {
+        let candidate = match load_plugin(
+            &package,
+            &self.shortcut_capabilities,
+            &self.notification_capabilities,
+        ) {
             Ok(candidate) => candidate,
             Err(error) => {
                 self.persist_adapter_fault(plugin_id);
@@ -1376,6 +1451,14 @@ impl PluginWorker {
             })
             .collect();
         self.shortcut_capabilities.reconcile_permissions(&shortcut_permissions);
+        let notification_permissions = self
+            .adapters
+            .iter()
+            .map(|(plugin_id, plugin)| {
+                (plugin_id.clone(), plugin.permissions.contains(&PluginPermission::Notification))
+            })
+            .collect();
+        self.notification_capabilities.reconcile_permissions(&notification_permissions);
         let mut published =
             self.action_catalog.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         *published = Arc::new(catalog);
@@ -1492,6 +1575,7 @@ fn ensure_compatible(package: &DiscoveredPlugin) -> Result<(), PluginWorkerError
 fn load_plugin(
     package: &DiscoveredPlugin,
     shortcut_capabilities: &ShortcutCapabilityClient,
+    notification_capabilities: &NotificationCapabilityClient,
 ) -> Result<LoadedPlugin, LuaSandboxError> {
     let PluginPackageStatus::Compatible { manifest, sources, .. } = &package.status else {
         return Err(LuaSandboxError::Initialization);
@@ -1499,7 +1583,10 @@ fn load_plugin(
     let adapter = LuaLifecycleAdapter::load_with_capability_host(
         sources.clone(),
         LuaSandboxLimits::default(),
-        Arc::new(shortcut_capabilities.clone()),
+        Arc::new(LuaCapabilityBrokerClient::new(
+            shortcut_capabilities.clone(),
+            notification_capabilities.clone(),
+        )),
     )?;
     let actions =
         manifest.actions.iter().cloned().map(|action| (action.id.clone(), action)).collect();
@@ -1563,6 +1650,11 @@ mod tests {
         include_str!("../../../examples/plugins/org.gradial.example.shortcut-bands/plugin.toml");
     const SHORTCUT_BANDS_SOURCE: &str =
         include_str!("../../../examples/plugins/org.gradial.example.shortcut-bands/main.lua");
+    const NOTIFICATION_PLUGIN: &str = "org.gradial.example.notification";
+    const NOTIFICATION_MANIFEST: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.notification/plugin.toml");
+    const NOTIFICATION_SOURCE: &str =
+        include_str!("../../../examples/plugins/org.gradial.example.notification/main.lua");
     const VALID_SOURCE: &str = r"
         return {
             begin = function(context, parameters, sample) return {} end,
@@ -1611,6 +1703,13 @@ mod tests {
         fs::write(package.join("main.lua"), SHORTCUT_BANDS_SOURCE).expect("example source");
     }
 
+    fn write_notification_example(root: &Path) {
+        let package = root.join(NOTIFICATION_PLUGIN);
+        fs::create_dir_all(&package).expect("example package");
+        fs::write(package.join("plugin.toml"), NOTIFICATION_MANIFEST).expect("example manifest");
+        fs::write(package.join("main.lua"), NOTIFICATION_SOURCE).expect("example source");
+    }
+
     fn write_required_parameter_package(root: &Path, plugin_id: &str) {
         let package = root.join(plugin_id);
         fs::create_dir_all(&package).expect("plugin package");
@@ -1653,6 +1752,18 @@ mod tests {
             PermittedContext::new(None, None),
             parameters,
             20,
+        )
+        .expect("continuous action");
+        ContinuousSession::begin(session_id, action, 0.25).expect("begin session")
+    }
+
+    fn begin_notification_session(session_id: Uuid) -> (ContinuousSession, ContinuousRequest) {
+        let action = ContinuousActionSnapshot::new(
+            PluginId::new(NOTIFICATION_PLUGIN).expect("plugin ID"),
+            PluginActionId::new("notify-on-commit").expect("action ID"),
+            PermittedContext::new(None, None),
+            BTreeMap::new(),
+            10,
         )
         .expect("continuous action");
         ContinuousSession::begin(session_id, action, 0.25).expect("begin session")
@@ -1737,7 +1848,7 @@ mod tests {
         write_package(
             &paths.plugins,
             FIRST_PLUGIN,
-            &["context.application", "context.window_title", "input.shortcut"],
+            &["context.application", "context.window_title", "input.shortcut", "notification"],
             VALID_SOURCE,
         );
         write_package(&paths.plugins, SECOND_PLUGIN, &[], "this is invalid Lua");
@@ -1760,6 +1871,7 @@ mod tests {
         assert!(admission.permits_context_application());
         assert!(admission.permits_context_window_title());
         assert!(admission.permits_input_shortcut());
+        assert!(admission.permits_notification());
         assert_eq!(
             client.action_admission(
                 &PluginId::new(SECOND_PLUGIN).expect("plugin ID"),
@@ -1871,6 +1983,89 @@ mod tests {
             .expect("shortcut completion");
 
         assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn checked_in_notification_example_crosses_worker_and_broker() {
+        let (_temporary, paths) = setup();
+        write_notification_example(&paths.plugins);
+        prepare_state(&paths, &[(NOTIFICATION_PLUGIN, true)]);
+        let (shortcut_capabilities, _shortcut_calls) =
+            ShortcutCapabilityRuntime::successful_for_test();
+        let (notification_capabilities, notifications) =
+            NotificationCapabilityRuntime::successful_for_test();
+        let runtime = PluginWorkerRuntime::start_with_capabilities(
+            paths,
+            shortcut_capabilities,
+            notification_capabilities,
+        )
+        .expect("plugin worker");
+        assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![NOTIFICATION_PLUGIN]);
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(NOTIFICATION_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("notify-on-commit").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        assert!(admission.permits_notification());
+        let session_id = Uuid::from_u128(104);
+        client
+            .open_notification_session(session_id, &plugin_id, admission.permits_notification())
+            .expect("capability session");
+        let (mut session, begin) = begin_notification_session(session_id);
+
+        dispatch(&client, begin).expect("begin");
+        accept_begin(&mut session);
+        dispatch(&client, commit_request(&mut session, 0.75)).expect("commit");
+        client.finish_notification_commit(session_id).expect("notification completion");
+
+        let notifications = notifications.lock().expect("notifications");
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0, NOTIFICATION_PLUGIN);
+        assert_eq!(notifications[0].1, "Continuous gesture committed.");
+        assert!(!notifications[0].2.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn undeclared_notification_permission_fails_without_broker_delivery() {
+        let (_temporary, paths) = setup();
+        let source = VALID_SOURCE.replace(
+            "commit = function(session, sample) end",
+            r#"commit = function(session, sample)
+                local accepted, reason = gradial.notification("Must not appear")
+                assert(not accepted and reason == "permission_denied")
+            end"#,
+        );
+        write_package(&paths.plugins, FIRST_PLUGIN, &[], &source);
+        prepare_state(&paths, &[(FIRST_PLUGIN, true)]);
+        let (shortcut_capabilities, _shortcut_calls) =
+            ShortcutCapabilityRuntime::successful_for_test();
+        let (notification_capabilities, notifications) =
+            NotificationCapabilityRuntime::successful_for_test();
+        let runtime = PluginWorkerRuntime::start_with_capabilities(
+            paths,
+            shortcut_capabilities,
+            notification_capabilities,
+        )
+        .expect("plugin worker");
+        assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![FIRST_PLUGIN]);
+        let client = runtime.lifecycle_client();
+        let plugin_id = PluginId::new(FIRST_PLUGIN).expect("plugin ID");
+        let action_id = PluginActionId::new("measure").expect("action ID");
+        let admission = client.action_admission(&plugin_id, &action_id).expect("admission");
+        assert!(!admission.permits_notification());
+        let session_id = Uuid::from_u128(105);
+        client
+            .open_notification_session(session_id, &plugin_id, admission.permits_notification())
+            .expect("capability session");
+        let (mut session, begin) = begin_session(FIRST_PLUGIN, session_id);
+
+        dispatch(&client, begin).expect("begin");
+        accept_begin(&mut session);
+        dispatch(&client, commit_request(&mut session, 0.75)).expect("handled denial");
+        assert_eq!(
+            client.finish_notification_commit(session_id),
+            Err(NotificationCapabilityFailure::PermissionDenied)
+        );
+        assert!(notifications.lock().expect("notifications").is_empty());
     }
 
     #[test]

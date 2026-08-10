@@ -379,7 +379,8 @@ exposes only reviewed basic functions,
 `math`, `string`, `table`, `utf8`, and the rooted/cached
 `gradial.require("lib.mapping")` source loader. It has no filesystem-backed
 loader; its only current operating-system surface is the explicit protected
-shortcut capability. Memory, instruction, and wall-time limits remain enforced.
+shortcut and notification capability set. Memory, instruction, and wall-time
+limits remain enforced.
 Its strict lifecycle adapter validates and bounds `begin`, `update`, `commit`,
 and `cancel` with private session state and immutable host values. At startup,
 the bounded worker constructs one adapter only for a freshly rediscovered
@@ -408,13 +409,23 @@ Lua's Cancel callback, and Commit waits within its existing deadline for
 accepted work to finish. Shortcut contents, target details, and plugin values
 remain absent from logs.
 
+Plugins approved for `notification` can request one bounded, single-line
+message through `gradial.notification(...)`. Gradial rejects control characters
+and URL-shaped content, never interprets markup, offers no action button, and
+shows the plugin ID in a silent native information notification. Each gesture
+may accept one message; each plugin may accept five in a rolling minute.
+Pending delivery is cancelled with the gesture or permission epoch, and the
+native request remains outside Lua and interaction threads.
+
 A permission-free no-side-effect package is included at
 [`Gradial APP/examples/plugins/org.gradial.example.meter`](Gradial%20APP/examples/plugins/org.gradial.example.meter).
 It records only private session-local scalar state and is used by the worker
 lifecycle tests. The permission-checked
 [`Gradial APP/examples/plugins/org.gradial.example.shortcut-bands`](Gradial%20APP/examples/plugins/org.gradial.example.shortcut-bands)
 example demonstrates bounded radial bands with at most one whole shortcut
-request per callback.
+request per callback. The
+[`Gradial APP/examples/plugins/org.gradial.example.notification`](Gradial%20APP/examples/plugins/org.gradial.example.notification)
+example requests one plain notification only when its gesture commits.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the

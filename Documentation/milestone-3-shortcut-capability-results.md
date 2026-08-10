@@ -74,3 +74,7 @@ pass 266 application, 89 core, and 25 Lua tests.
 `notification` and `network.loopback` remain separate capability slices. This
 broker does not add text entry, mouse input, raw device events, shell commands,
 network access, plugin responses, stored secrets, or background plugin work.
+
+Subsequent status (2026-08-10): `notification` is now implemented as its own
+bounded broker. `network.loopback` remains deferred. See
+`milestone-3-notification-capability-results.md` for the new boundary.
