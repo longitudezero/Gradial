@@ -65,11 +65,13 @@ impl Default for LuaSandboxLimits {
 
 /// A loaded entry module owned by one isolated Lua state.
 ///
-/// This foundation exposes inspection only. Lifecycle callback execution is a
-/// later adapter and must reuse the same budget mechanism.
+/// This foundation exposes inspection only. [`crate::LuaLifecycleAdapter`]
+/// owns callback execution and reuses this state's budget mechanism.
 pub struct LoadedLuaPlugin {
-    lua: Lua,
-    entry: RegistryKey,
+    pub(crate) lua: Lua,
+    pub(crate) entry: RegistryKey,
+    pub(crate) gate: Arc<ExecutionGate>,
+    pub(crate) host_error: Arc<Mutex<Option<LuaSandboxError>>>,
 }
 
 impl LoadedLuaPlugin {
@@ -111,7 +113,7 @@ impl LoadedLuaPlugin {
             return Err(LuaSandboxError::EntryNotTable);
         };
         let entry = lua.create_registry_value(entry_table).map_err(classify_mlua_error)?;
-        Ok(Self { lua, entry })
+        Ok(Self { lua, entry, gate, host_error })
     }
 
     /// Checks a raw entry-table field without invoking Lua metamethods or
@@ -267,7 +269,7 @@ fn install_environment(
     Ok(())
 }
 
-fn execute_with_limits<T>(
+pub(crate) fn execute_with_limits<T>(
     gate: &ExecutionGate,
     host_error: &Mutex<Option<LuaSandboxError>>,
     timeout: Duration,
@@ -300,7 +302,7 @@ fn classify_setup_error(error: MluaError) -> LuaSandboxError {
     }
 }
 
-fn classify_mlua_error(error: MluaError) -> LuaSandboxError {
+pub(crate) fn classify_mlua_error(error: MluaError) -> LuaSandboxError {
     let classified = classify_mlua_error_ref(&error);
     drop(error);
     classified
@@ -342,7 +344,7 @@ struct ActiveBudget {
 }
 
 #[derive(Debug, Default)]
-struct ExecutionGate {
+pub(crate) struct ExecutionGate {
     active: Mutex<Option<ActiveBudget>>,
 }
 
@@ -405,6 +407,22 @@ pub enum LuaSandboxError {
     Runtime,
     #[error("plugin_entry_not_table")]
     EntryNotTable,
+    #[error("plugin_callback_missing:{callback}")]
+    CallbackMissing { callback: &'static str },
+    #[error("plugin_callback_not_function:{callback}")]
+    CallbackNotFunction { callback: &'static str },
+    #[error("plugin_begin_state_not_table")]
+    BeginStateNotTable,
+    #[error("plugin_callback_return_invalid")]
+    CallbackReturnInvalid,
+    #[error("plugin_session_already_active")]
+    SessionAlreadyActive,
+    #[error("plugin_session_not_active")]
+    SessionNotActive,
+    #[error("plugin_faulted")]
+    PluginFaulted,
+    #[error("plugin_host_value_invalid")]
+    HostValueInvalid,
 }
 
 #[cfg(test)]

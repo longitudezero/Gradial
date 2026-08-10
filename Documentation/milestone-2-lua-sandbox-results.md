@@ -105,12 +105,10 @@ suite passed 217 application tests, 81 core tests, and 13 Lua-host tests. The
 separate all-feature release suite passed 213 application tests, 81 core tests,
 and the same 13 Lua-host tests.
 
-## Deferred boundary
+## Superseded deferred boundary
 
-This milestone does not validate the four lifecycle callbacks, execute a
-callback, connect Lua to the continuous coordinator, create a plugin worker,
-persist enablement/approval state, expose Settings controls, grant context, or
-provide shortcut/notification/loopback capabilities. The application has no
-normal call site for Lua loading. Those boundaries remain separate so the next
-slice can validate the callback adapter without quietly introducing external
-effects.
+The callback-validation and isolated execution portion originally deferred by
+this report is now implemented by `LuaLifecycleAdapter`; see
+`milestone-2-lua-lifecycle-results.md`. Coordinator integration, plugin
+workers, enablement/approval state, Settings, and external capabilities remain
+deferred. The application still has no normal Lua-loading call site.

@@ -6,8 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+gradial-core = { path = "../gradial-core" }
 mlua.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

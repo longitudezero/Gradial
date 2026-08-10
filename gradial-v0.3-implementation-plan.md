@@ -617,10 +617,11 @@ end
 return plugin
 ```
 
-- `begin` may return a session-local Lua table.
+- `begin` must return exactly one session-local Lua table.
 - Gradial passes that table back only to the matching session callbacks.
 - Missing required callbacks fail plugin loading.
 - Callback arguments are read-only host values.
+- `update`, `commit`, and `cancel` must return no values.
 - A callback may use only approved functions in the `gradial` host module.
 - `begin` initializes session state and cannot request an external effect.
 - Effect-producing host functions reject calls made during module loading,

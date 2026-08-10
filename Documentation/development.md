@@ -813,11 +813,43 @@ clear the host's terminal budget state. Memory, instruction, deadline, module,
 syntax, runtime, and entry-shape failures are reduced to stable codes that do
 not retain source text, Lua messages, or tracebacks.
 
-The loaded entry must currently be a table, but callback-shape validation and
-callback execution are deliberately deferred. `LoadedLuaPlugin` exposes only
-raw, non-executing function-presence inspection; it cannot yet run `begin`,
-`update`, `commit`, or `cancel`. Enablement, approvals, plugin state, Settings,
-capability functions, and coordinator integration remain absent.
+`LoadedLuaPlugin` remains the non-executing foundation. The separate
+`LuaLifecycleAdapter` validates that the entry table has function-valued
+`begin`, `update`, `commit`, and `cancel` fields before it can be used. This
+keeps lower-level sandbox fixtures independent while making callback-shape
+validation mandatory at the lifecycle boundary.
+
+The lifecycle argument schema is deliberately small:
+
+- `context` contains the continuous API version, opaque session UUID text,
+  action ID, and only the already permission-filtered application/title
+  snapshot. Application context contains executable path and window class;
+  no handle, PID, coordinates, raw key state, or configuration is exposed.
+- `parameters` maps manifest parameter names to Lua booleans, integers,
+  numbers, or strings. Choice values are presented as strings.
+- each sample contains `sequence`, `value`, `delta`, and `elapsed_ms`.
+- cancel reasons use stable snake-case strings such as `escape` and
+  `returned_to_discrete`.
+
+Context, nested application context, parameters, and samples are protected
+read-only proxies. Their `pairs` iterator does not reveal the mutable backing
+table as iterator state. `begin` must return exactly one ordinary Lua table;
+the adapter retains that mutable table privately and passes it only to the
+same session's later callbacks. `update`, `commit`, and `cancel` must return no
+values. A terminal call removes its session before invoking Lua, so it cannot
+be repeated even when Lua fails.
+
+The callback ceilings are 100 ms/1,000,000 instructions for `begin`,
+16 ms/160,000 instructions for `update`, 100 ms/1,000,000 instructions for
+`commit`, and 50 ms/500,000 instructions for `cancel`. The existing global
+hook and memory ceiling enforce them. Runtime, resource, or return-shape
+failure faults the adapter and drops every retained session; duplicate or
+unknown session requests are rejected as host protocol errors without blaming
+the plugin.
+
+This remains an inert testable host API. Application startup has no lifecycle
+adapter call site, and enablement, approvals, Settings, capability functions,
+plugin workers, and continuous-coordinator integration remain absent.
 
 ## Configuration and profile resolution
 

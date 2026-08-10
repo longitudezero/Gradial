@@ -1014,8 +1014,10 @@ dependencies = [
 name = "gradial-lua"
 version = "0.1.0"
 dependencies = [
+ "gradial-core",
  "mlua",
  "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]

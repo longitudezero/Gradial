@@ -3,9 +3,16 @@
 //! Filesystem discovery belongs to the Windows application. This crate accepts
 //! an owned, validated source image and never reads plugin files itself.
 
+mod lifecycle;
 mod sandbox;
 mod source_image;
 
+pub use lifecycle::{
+    DEFAULT_LUA_BEGIN_INSTRUCTION_LIMIT, DEFAULT_LUA_CANCEL_INSTRUCTION_LIMIT,
+    DEFAULT_LUA_COMMIT_INSTRUCTION_LIMIT, DEFAULT_LUA_UPDATE_INSTRUCTION_LIMIT, LUA_BEGIN_TIMEOUT,
+    LUA_CANCEL_TIMEOUT, LUA_COMMIT_TIMEOUT, LUA_UPDATE_TIMEOUT, LuaCallbackBudget,
+    LuaCallbackLimits, LuaLifecycleAdapter,
+};
 pub use sandbox::{
     DEFAULT_LUA_LOAD_INSTRUCTION_LIMIT, DEFAULT_LUA_LOAD_TIMEOUT, LUA_HOOK_INTERVAL,
     LUA_MEMORY_LIMIT_BYTES, LoadedLuaPlugin, LuaSandboxError, LuaSandboxLimits,
