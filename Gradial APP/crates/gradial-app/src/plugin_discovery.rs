@@ -8,33 +8,20 @@ use gradial_core::{
     MAX_PLUGIN_MANIFEST_BYTES, PLUGIN_API_VERSION, PluginManifest, PluginManifestError,
     parse_plugin_manifest,
 };
+use gradial_lua::{
+    MAX_PLUGIN_DIRECTORY_DEPTH, MAX_PLUGIN_PACKAGE_ENTRIES, MAX_PLUGIN_ROOT_ENTRIES,
+    MAX_PLUGIN_SOURCE_FILE_BYTES, MAX_PLUGIN_SOURCE_FILES, MAX_PLUGIN_SOURCE_SET_BYTES,
+    PluginSourceImage, PluginSourceImageError,
+};
 use thiserror::Error;
 
-pub(crate) const MAX_PLUGIN_SOURCE_FILE_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_PLUGIN_SOURCE_SET_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_PLUGIN_SOURCE_FILES: usize = 256;
-pub(crate) const MAX_PLUGIN_ROOT_ENTRIES: usize = 1_024;
-pub(crate) const MAX_PLUGIN_PACKAGE_ENTRIES: usize = 4_096;
-pub(crate) const MAX_PLUGIN_DIRECTORY_DEPTH: usize = 32;
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PluginSourceFile {
-    pub(crate) relative_path: PathBuf,
-    pub(crate) byte_length: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PluginSourceInventory {
-    pub(crate) files: Vec<PluginSourceFile>,
-    pub(crate) total_bytes: usize,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PluginPackageStatus {
-    Compatible { manifest: PluginManifest, sources: PluginSourceInventory },
-    IncompatibleApi { manifest: PluginManifest, sources: PluginSourceInventory, supported: u16 },
+    Compatible { manifest: PluginManifest, sources: PluginSourceImage },
+    IncompatibleApi { manifest: PluginManifest, sources: PluginSourceImage, supported: u16 },
     Invalid(PluginDiscoveryError),
 }
 
@@ -142,8 +129,8 @@ pub(crate) fn log_discovery_report(report: &PluginDiscoveryReport) {
                  plugin_id={} plugin_version={} source_files={} source_bytes={}",
                 manifest.id,
                 manifest.version,
-                sources.files.len(),
-                sources.total_bytes
+                sources.file_count(),
+                sources.total_bytes()
             ),
             PluginPackageStatus::IncompatibleApi { manifest, sources, supported } => log::warn!(
                 target: "plugins",
@@ -153,8 +140,8 @@ pub(crate) fn log_discovery_report(report: &PluginDiscoveryReport) {
                 manifest.id,
                 manifest.api_version,
                 supported,
-                sources.files.len(),
-                sources.total_bytes
+                sources.file_count(),
+                sources.total_bytes()
             ),
             PluginPackageStatus::Invalid(error) => log::warn!(
                 target: "plugins",
@@ -190,7 +177,7 @@ fn inspect_package_inner(
     package_root: &Path,
     directory_name: &str,
     metadata: &Metadata,
-) -> Result<(PluginManifest, PluginSourceInventory), PluginDiscoveryError> {
+) -> Result<(PluginManifest, PluginSourceImage), PluginDiscoveryError> {
     if directory_name.contains(':') {
         return Err(PluginDiscoveryError::UnsafePath);
     }
@@ -218,18 +205,15 @@ fn inspect_package_inner(
         return Err(PluginDiscoveryError::DirectoryIdMismatch);
     }
 
-    let sources = inventory_sources(&canonical_package, package_root)?;
-    let entry = normalized_relative_path(&manifest.entry);
-    if !sources.files.iter().any(|source| source.relative_path == entry) {
-        return Err(PluginDiscoveryError::EntryNotSource);
-    }
+    let sources = inventory_sources(&canonical_package, package_root, &manifest.entry)?;
     Ok((manifest, sources))
 }
 
 fn inventory_sources(
     canonical_package: &Path,
     package_root: &Path,
-) -> Result<PluginSourceInventory, PluginDiscoveryError> {
+    entry_path: &str,
+) -> Result<PluginSourceImage, PluginDiscoveryError> {
     let mut pending = vec![(package_root.to_path_buf(), 0usize)];
     let mut files = Vec::new();
     let mut total_bytes = 0usize;
@@ -291,18 +275,17 @@ fn inventory_sources(
                     PluginDiscoveryError::Io
                 }
             })?;
-            std::str::from_utf8(&bytes).map_err(|_| PluginDiscoveryError::SourceNotUtf8)?;
             total_bytes = total_bytes
                 .checked_add(bytes.len())
                 .ok_or(PluginDiscoveryError::SourceSetTooLarge)?;
             if total_bytes > MAX_PLUGIN_SOURCE_SET_BYTES {
                 return Err(PluginDiscoveryError::SourceSetTooLarge);
             }
-            files.push(PluginSourceFile { relative_path: relative, byte_length: bytes.len() });
+            files.push((relative, bytes));
         }
     }
-    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(PluginSourceInventory { files, total_bytes })
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    PluginSourceImage::from_files(entry_path, files).map_err(map_source_image_error)
 }
 
 fn validate_regular_package_file(
@@ -354,10 +337,6 @@ fn sorted_entries(
     Ok(entries)
 }
 
-fn normalized_relative_path(value: &str) -> PathBuf {
-    value.split(['/', '\\']).collect()
-}
-
 fn validate_relative_components(relative: &Path) -> Result<(), PluginDiscoveryError> {
     if relative.components().any(|component| {
         component.as_os_str().to_str().is_none_or(|value| value.contains(':') || value.is_empty())
@@ -365,6 +344,21 @@ fn validate_relative_components(relative: &Path) -> Result<(), PluginDiscoveryEr
         return Err(PluginDiscoveryError::UnsafePath);
     }
     Ok(())
+}
+
+const fn map_source_image_error(error: PluginSourceImageError) -> PluginDiscoveryError {
+    match error {
+        PluginSourceImageError::UnsafePath
+        | PluginSourceImageError::NotLuaSource
+        | PluginSourceImageError::DuplicatePath
+        | PluginSourceImageError::InvalidModuleName => PluginDiscoveryError::UnsafePath,
+        PluginSourceImageError::EntryNotFound => PluginDiscoveryError::EntryNotSource,
+        PluginSourceImageError::TooManyFiles => PluginDiscoveryError::TooManySourceFiles,
+        PluginSourceImageError::FileTooLarge => PluginDiscoveryError::SourceFileTooLarge,
+        PluginSourceImageError::SourceSetTooLarge => PluginDiscoveryError::SourceSetTooLarge,
+        PluginSourceImageError::SourceNotUtf8 => PluginDiscoveryError::SourceNotUtf8,
+        PluginSourceImageError::BytecodeRejected => PluginDiscoveryError::NativeOrBytecodeModule,
+    }
 }
 
 fn is_native_or_bytecode_extension(extension: &str) -> bool {
@@ -455,6 +449,8 @@ pub(crate) enum PluginDiscoveryError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use gradial_lua::{LoadedLuaPlugin, LuaSandboxLimits};
 
     use super::*;
 
@@ -547,6 +543,39 @@ update_hz = 30
             report.packages[0].status,
             PluginPackageStatus::Invalid(PluginDiscoveryError::SourceNotUtf8)
         ));
+    }
+
+    #[test]
+    fn discovery_freezes_source_and_rejects_bytecode_markers() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path().join("plugins");
+        fs::create_dir(&root).expect("plugin root");
+        let frozen_package = package(&root, "frozen.source", PLUGIN_API_VERSION);
+        let bytecode_package = package(&root, "bytecode.source", PLUGIN_API_VERSION);
+        fs::write(bytecode_package.join("main.lua"), b"\x1bLua").expect("bytecode marker");
+
+        let report = discover_plugins(&root);
+        let frozen_image = report
+            .packages
+            .iter()
+            .find_map(|package| match &package.status {
+                PluginPackageStatus::Compatible { manifest, sources }
+                    if manifest.id == "frozen.source" =>
+                {
+                    Some(sources.clone())
+                }
+                _ => None,
+            })
+            .expect("frozen compatible source");
+        assert!(report.packages.iter().any(|package| matches!(
+            package.status,
+            PluginPackageStatus::Invalid(PluginDiscoveryError::NativeOrBytecodeModule)
+        )));
+
+        fs::write(frozen_package.join("main.lua"), "this is no longer valid Lua")
+            .expect("replace package source after discovery");
+        LoadedLuaPlugin::load(frozen_image, LuaSandboxLimits::default())
+            .expect("frozen source remains independently loadable");
     }
 
     #[test]

@@ -16,6 +16,7 @@ crossbeam-channel.workspace = true
 eframe.workspace = true
 flexi_logger.workspace = true
 gradial-core = { path = "../gradial-core" }
+gradial-lua = { path = "../gradial-lua" }
 image.workspace = true
 log.workspace = true
 raw-window-handle.workspace = true

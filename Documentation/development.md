@@ -149,6 +149,7 @@ Gradial APP\
     Cargo.toml
     crates\
         gradial-core\    Pure geometry, gesture state, and application paths
+        gradial-lua\     Frozen source images and restricted Lua 5.4 hosting
         gradial-app\     Windows input, persistence, executable, and renderer
     scripts\
         check.ps1          Complete local code verification
@@ -179,6 +180,10 @@ Gradial APP\
 gesture geometry, configuration models, profile resolution, and action-plan
 validation belong there as they are introduced.
 
+`gradial-lua` owns no filesystem or Windows APIs. It accepts an immutable
+source image from discovery and provides the explicit, bounded Lua load path.
+The application does not call that path until a later enablement slice.
+
 `gradial-app` owns Windows integration and rendering. Its renderer is behind the
 small `OverlayRenderer` interface so the production interaction code does not
 depend on egui painting details.
@@ -194,6 +199,7 @@ On first run, Gradial creates:
     icons\
         quarantine\
     logs\
+    plugins\
 ```
 
 `config.json` starts at schema 6 and revision 1 with the default unmodified M4
@@ -766,8 +772,52 @@ isolated per directory (`Compatible`, `IncompatibleApi`, or `Invalid`) with a
 stable non-content error code; a bad package cannot abort or hide later
 packages. Routine logs include only sanitized package/plugin identity, version,
 status, source counts, byte counts, and error codes—never TOML or Lua source.
-The later enablement slice must repeat complete validation before creating a
-Lua state, rather than treating this startup report as authorization.
+Compatible discovery captures accepted Lua bytes in an immutable source image.
+Changing a package file afterward cannot change that image or make the future
+module loader reopen it. The later enablement slice must still repeat complete
+validation and create a new image before creating a Lua state, rather than
+treating an earlier startup report as authorization.
+
+## Inert Lua sandbox foundation
+
+`gradial-lua` embeds vendored Lua 5.4 through `mlua`. Loading is an explicit
+host call that creates one fresh, sendable state from one frozen source image.
+Startup discovery never makes that call, so placing a package in the plugin
+directory still executes zero Lua code.
+
+The state loads only Lua's basic value/iteration functions plus `math`,
+`string`, `table`, and `utf8`. It removes `os`, `io`, `package`, `debug`,
+coroutines, global `require`, `load`, `loadfile`, `dofile`, `collectgarbage`,
+`print`, `warn`, `rawset`, and `string.dump`. Native modules and bytecode have
+already failed source-image construction, and every executed chunk is
+explicitly text-only. The `gradial` host table is a protected proxy and exposes
+only the private module loader in this slice—no context or OS capability.
+
+Lua authors load another file with:
+
+```lua
+local mapping = gradial.require("lib.mapping")
+```
+
+The name uses lowercase ASCII letters, digits, `_`, `-`, and `.` separators;
+the example resolves only to the frozen `lib/mapping.lua` entry. Absolute
+paths, separators, empty components, traversal, missing modules, and dependency
+cycles fail with stable errors. Results are cached once per state, recursive
+loads use the same state and environment, and no module request reaches the
+filesystem.
+
+Each state has a 16 MiB allocator ceiling. Initial entry/module loading has a
+100 ms wall deadline and a one-million-instruction budget, checked by a
+host-owned global hook every 1,000 instructions. A caught hook error does not
+clear the host's terminal budget state. Memory, instruction, deadline, module,
+syntax, runtime, and entry-shape failures are reduced to stable codes that do
+not retain source text, Lua messages, or tracebacks.
+
+The loaded entry must currently be a table, but callback-shape validation and
+callback execution are deliberately deferred. `LoadedLuaPlugin` exposes only
+raw, non-executing function-presence inspection; it cannot yet run `begin`,
+`update`, `commit`, or `cancel`. Enablement, approvals, plugin state, Settings,
+capability functions, and coordinator integration remain absent.
 
 ## Configuration and profile resolution
 

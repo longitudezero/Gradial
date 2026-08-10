@@ -2,6 +2,7 @@
 members = [
     "crates/gradial-app",
     "crates/gradial-core",
+    "crates/gradial-lua",
 ]
 resolver = "3"
 
@@ -19,6 +20,7 @@ eframe = { version = "0.35", default-features = false, features = ["default_font
 flexi_logger = { version = "0.31", features = ["async"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 log = "0.4"
+mlua = { version = "0.12", default-features = false, features = ["lua54", "send", "vendored"] }
 raw-window-handle = "0.6"
 regex = "1"
 resvg = { version = "0.47", default-features = false }

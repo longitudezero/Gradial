@@ -356,9 +356,17 @@ parameters. Each immediate package directory is independently classified as
 compatible, API-incompatible, or invalid; one malformed package cannot hide a
 healthy one. Discovery canonicalizes every package/source path, rejects
 reparse points and native or bytecode modules, accepts only bounded UTF-8 Lua
-source, and never executes it. There is intentionally no enable switch, Lua
-runtime, permission approval, Settings plugin page, or continuous-assignment
-editor in this slice.
+source, freezes accepted bytes, and never executes them during discovery.
+
+The separate `gradial-lua` foundation embeds vendored Lua 5.4 for an explicit
+future enablement path. A fresh state exposes only reviewed basic functions,
+`math`, `string`, `table`, `utf8`, and the rooted/cached
+`gradial.require("lib.mapping")` source loader. It has no filesystem-backed
+loader or OS capability and enforces memory, instruction, and wall-time limits.
+Gradial does not currently call this load path during normal operation, so
+discovered packages still execute zero code. There is intentionally no enable
+switch, permission approval, Settings plugin page, callback adapter, or
+continuous-assignment editor yet.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
@@ -456,6 +464,8 @@ and
 [`Documentation/milestone-1-schema-six-results.md`](Documentation/milestone-1-schema-six-results.md).
 Read-only plugin manifest and package-discovery evidence is recorded in
 [`Documentation/milestone-2-plugin-discovery-results.md`](Documentation/milestone-2-plugin-discovery-results.md).
+Frozen-source and restricted Lua-host evidence is recorded in
+[`Documentation/milestone-2-lua-sandbox-results.md`](Documentation/milestone-2-lua-sandbox-results.md).
 Configuration, snapshot, persistence, and resolver results are recorded in
 [`Documentation/milestone-2-configuration-profile-results.md`](Documentation/milestone-2-configuration-profile-results.md).
 Profile-driven gesture and renderer results are recorded in
