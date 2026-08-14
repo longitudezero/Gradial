@@ -1822,6 +1822,10 @@ each, ensuring every measured non-quick invocation has a display opportunity
 while the smoke helper continues to enforce its 100 ms first-frame limit. The
 runner rejects a stale optimized executable before launch and validates the
 schema-six fixture immediately after startup.
+During a long campaign, completed bounded-log parts are archived every 25
+invocations. The validator and report merge the archive with exact-line
+deduplication, retaining both the raw parts and one complete application log
+without disabling Gradial's production log rotation.
 
 Renderer checkpoints are reported only as application diagnostics. The
 displayed usable-frame and displayed-highlight gates remain `unavailable`

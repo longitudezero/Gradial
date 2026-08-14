@@ -526,6 +526,7 @@ $foregroundProcessFile = Join-Path $reportDirectory "foreground.pid"
 $stdoutPath = Join-Path $reportDirectory "interaction.stdout.txt"
 $stderrPath = Join-Path $reportDirectory "interaction.stderr.txt"
 $interactionLogPath = Join-Path $reportDirectory "gradial-interaction.log"
+$logEvidenceDirectory = Join-Path $reportDirectory "interaction-logs"
 $resourcePath = Join-Path $reportDirectory "resources.csv"
 $receiverEventPath = Join-Path $temporaryRoot "shortcut-events.csv"
 $receiverReadyPath = Join-Path $temporaryRoot "shortcut-target-ready.txt"
@@ -805,6 +806,7 @@ try {
         "-MonitorIndex $MonitorIndex -ProcessIdFile `"$processIdFile`" " +
         "-PhaseFile `"$phaseFile`" " +
         "-ForegroundProcessFile `"$foregroundProcessFile`" " +
+        "-LogEvidenceDirectory `"$logEvidenceDirectory`" " +
         "-TimingOutputDirectory `"$captureDirectory`""
     )
     if (-not $usePresentMon) {
@@ -1004,9 +1006,27 @@ try {
     $shortcutReceiverValid = $true
     $foregroundStable = -not $foregroundChanged
     $resourceSamples | Export-Csv -LiteralPath $resourcePath -NoTypeInformation -Encoding utf8
-    Copy-Item `
-        -LiteralPath (Join-Path $gradialDirectory "logs\gradial_rCURRENT.log") `
-        -Destination $interactionLogPath
+    $logEvidenceFiles = @(
+        Get-ChildItem -LiteralPath $logEvidenceDirectory -File -ErrorAction SilentlyContinue |
+            Sort-Object Name
+    )
+    if ($logEvidenceFiles.Count -eq 0) {
+        throw "The interaction campaign retained no bounded-log evidence."
+    }
+    $seenLogLines = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $mergedLog = [Text.StringBuilder]::new()
+    foreach ($logEvidenceFile in $logEvidenceFiles) {
+        foreach ($logLine in [IO.File]::ReadLines($logEvidenceFile.FullName)) {
+            if ($seenLogLines.Add($logLine)) {
+                [void]$mergedLog.AppendLine($logLine)
+            }
+        }
+    }
+    [IO.File]::WriteAllText(
+        $interactionLogPath,
+        $mergedLog.ToString(),
+        [Text.UTF8Encoding]::new($false)
+    )
 
     $coldLaunchValues = Measure-ColdLaunch `
         -Count $preset.cold_launch_samples `

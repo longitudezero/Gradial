@@ -44,6 +44,12 @@ checks the schema-six fixture immediately after startup and preserves the
 application log on failure, so a configuration mismatch cannot consume the
 long idle interval before being diagnosed.
 
+Long interaction campaigns also archive completed bounded-log parts every 25
+invocations and retain a final shutdown snapshot. Validation and reporting
+merge those parts with exact-line deduplication. Consequently, Gradial's normal
+log rotation cannot discard the startup record or early invocation evidence,
+and the raw archived parts remain available beside the merged application log.
+
 Release evaluation additionally requires:
 
 - a detached debugger;

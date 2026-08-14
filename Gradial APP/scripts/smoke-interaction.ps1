@@ -571,6 +571,33 @@ function Save-LogEvidence {
     }
 }
 
+function Read-ValidationLog {
+    $currentLog = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
+    $evidenceFiles = if (
+        $LogEvidenceDirectory -and
+        (Test-Path -LiteralPath $LogEvidenceDirectory)
+    ) {
+        @(Get-ChildItem -LiteralPath $LogEvidenceDirectory -File | Sort-Object Name)
+    }
+    else {
+        @()
+    }
+    if ($evidenceFiles.Count -eq 0) {
+        return Get-Content -LiteralPath $currentLog -Raw
+    }
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $merged = [Text.StringBuilder]::new()
+    foreach ($file in $evidenceFiles) {
+        foreach ($line in [IO.File]::ReadLines($file.FullName)) {
+            if ($seen.Add($line)) {
+                [void]$merged.AppendLine($line)
+            }
+        }
+    }
+    return $merged.ToString()
+}
+
 try {
     $screens = [System.Windows.Forms.Screen]::AllScreens
     if ($MonitorIndex -ge $screens.Count) {
@@ -1063,7 +1090,7 @@ try {
             $m4IsDown = $false
             $completedInvocations++
             Set-InvocationProgress $completedInvocations
-            if ($SummaryValidationOnly -and $completedInvocations % 100 -eq 0) {
+            if ($LogEvidenceDirectory -and $completedInvocations % 25 -eq 0) {
                 Save-LogEvidence "rotation" $false
             }
             if (
@@ -1137,8 +1164,7 @@ finally {
     }
 }
 
-$logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
-$log = Get-Content -LiteralPath $logPath -Raw
+$log = Read-ValidationLog
 if ($SummaryValidationOnly) {
     $expectedInvocations = $directions.Count * $InvocationCount
     $interactionStop = [regex]::Match(
