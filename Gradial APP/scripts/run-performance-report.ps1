@@ -11,6 +11,9 @@ param(
 
     [switch]$MarkersOnly,
 
+    [ValidateRange(0, 1000)]
+    [int]$DevelopmentInvocationCount = 0,
+
     [switch]$SelfTest
 )
 
@@ -208,11 +211,16 @@ function Get-GateResult {
         [bool]$ProtocolEligible,
         [double]$P95Limit,
         [double]$P99Limit,
+        [int]$MinimumSamples = 1,
         [switch]$P95Inclusive,
         [switch]$P99Inclusive
     )
 
-    if (-not $Statistics -or -not $ProtocolEligible) {
+    if (
+        -not $Statistics -or
+        -not $ProtocolEligible -or
+        $Statistics.sample_count -lt $MinimumSamples
+    ) {
         return "not_evaluated"
     }
     $p95Pass = if ($P95Inclusive) {
@@ -410,12 +418,16 @@ if ($SelfTest) {
         $shortcutDurations.Count -ne 1 -or
         $shortcutDurations[0] -ne 14 -or
         (Get-GateResult $shortcutStatistics $true 15 25) -ne "pass" -or
-        (Get-GateResult $shortcutStatistics $false 15 25) -ne "not_evaluated"
+        (Get-GateResult $shortcutStatistics $false 15 25) -ne "not_evaluated" -or
+        (Get-GateResult $shortcutStatistics $true 15 25 -MinimumSamples 2) -ne "not_evaluated"
     ) {
         throw "Performance report shortcut gate self-test failed."
     }
     Write-Host "Performance report analyzer self-test passed."
     return
+}
+if ($Mode -eq "Release" -and $DevelopmentInvocationCount -ne 0) {
+    throw "DevelopmentInvocationCount is diagnostic-only and cannot modify Release mode."
 }
 
 $workspace = Resolve-Path (Join-Path $PSScriptRoot "..")
@@ -481,7 +493,11 @@ $preset = if ($Mode -eq "Release") {
 }
 else {
     [ordered]@{
-        invocation_count = 20
+        invocation_count = if ($DevelopmentInvocationCount -gt 0) {
+            $DevelopmentInvocationCount
+        } else {
+            20
+        }
         warmup_seconds = 2
         idle_seconds = 8
         gesture_delay_ms = 50
@@ -497,9 +513,13 @@ $captureDuration = [Math]::Min(
         [Math]::Ceiling(
             (
                 $preset.invocation_count *
-                ((2 * $preset.gesture_delay_ms) + $preset.inter_invocation_delay_ms)
+                (
+                    (2 * $preset.gesture_delay_ms) +
+                    $preset.inter_invocation_delay_ms +
+                    75
+                )
             ) / 1000.0
-        ) + 4
+        ) + 10
     )
 )
 $gateEligible = (
@@ -533,6 +553,7 @@ $receiverReadyPath = Join-Path $temporaryRoot "shortcut-target-ready.txt"
 $receiverOutputPath = Join-Path $reportDirectory "shortcut-target.stdout.txt"
 $receiverErrorPath = Join-Path $reportDirectory "shortcut-target.stderr.txt"
 $receiverEvidencePath = Join-Path $reportDirectory "shortcut-receiver-events.csv"
+$runnerErrorPath = Join-Path $reportDirectory "performance-runner-error.txt"
 $originalLocalAppData = $env:LOCALAPPDATA
 $child = $null
 $receiverProcess = $null
@@ -683,6 +704,7 @@ $foregroundStable = $false
 $foregroundChanged = $false
 $powerPlanChanged = $false
 $campaignSucceeded = $false
+$campaignFailure = $null
 try {
     New-Item -ItemType Directory -Path $gradialDirectory -Force | Out-Null
     [System.IO.File]::WriteAllText(
@@ -1035,6 +1057,10 @@ try {
         -LogPath (Join-Path $gradialDirectory "logs\gradial_rCURRENT.log")
     $campaignSucceeded = $true
 }
+catch {
+    $campaignFailure = $_
+    throw
+}
 finally {
     $env:LOCALAPPDATA = $originalLocalAppData
     if ($child -and -not $child.HasExited) {
@@ -1045,6 +1071,23 @@ finally {
         if (-not $receiverProcess.WaitForExit(3000)) {
             Stop-Process -Id $receiverProcess.Id -Force
         }
+    }
+    if (Test-Path -LiteralPath $receiverEventPath) {
+        Copy-Item `
+            -LiteralPath $receiverEventPath `
+            -Destination $receiverEvidencePath `
+            -Force
+    }
+    if ($resourceSamples.Count -gt 0) {
+        $resourceSamples |
+            Export-Csv -LiteralPath $resourcePath -NoTypeInformation -Encoding utf8
+    }
+    if ($campaignFailure) {
+        [IO.File]::WriteAllText(
+            $runnerErrorPath,
+            ($campaignFailure | Out-String),
+            [Text.UTF8Encoding]::new($false)
+        )
     }
     if (-not $campaignSucceeded) {
         $failedInteractionLog = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
@@ -1137,7 +1180,8 @@ $displayOpenGate = Get-GateResult `
     -Statistics $displayOpenStats `
     -ProtocolEligible $validProtocol `
     -P95Limit 25 `
-    -P99Limit 40
+    -P99Limit 40 `
+    -MinimumSamples $preset.invocation_count
 [void]$metrics.Add((New-Metric `
     -Name "button_down_to_displayed_usable_frame" `
     -Unit "ms" `
@@ -1147,6 +1191,8 @@ $displayOpenGate = Get-GateResult `
     -Evidence "Gradial ETW correlated with PresentMon displayed events" `
     -Reason $(if (-not $usePresentMon) {
         "PresentMon display capture was unavailable without an elevated session."
+    } elseif ($displayOpenStats -and $displayOpenStats.sample_count -lt $preset.invocation_count) {
+        "Only $($displayOpenStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
     } elseif (-not $gateEligible) {
         "Development protocol is not eligible for a release gate."
     } else { "" })))
@@ -1169,6 +1215,7 @@ $displayHighlightGate = Get-GateResult `
     -ProtocolEligible $validProtocol `
     -P95Limit ($refreshPeriodMs + 4) `
     -P99Limit (2 * $refreshPeriodMs) `
+    -MinimumSamples $preset.invocation_count `
     -P95Inclusive `
     -P99Inclusive
 [void]$metrics.Add((New-Metric `
@@ -1180,6 +1227,8 @@ $displayHighlightGate = Get-GateResult `
     -Evidence "Gradial ETW correlated with PresentMon displayed events" `
     -Reason $(if (-not $usePresentMon) {
         "PresentMon display capture was unavailable without an elevated session."
+    } elseif ($displayHighlightStats -and $displayHighlightStats.sample_count -lt $preset.invocation_count) {
+        "Only $($displayHighlightStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
     } elseif (-not $gateEligible) {
         "Development protocol is not eligible for a release gate."
     } else { "" })))
@@ -1195,7 +1244,8 @@ $dispatchGate = Get-GateResult `
     -Statistics $dispatchStats `
     -ProtocolEligible $validProtocol `
     -P95Limit 10 `
-    -P99Limit 20
+    -P99Limit 20 `
+    -MinimumSamples $preset.invocation_count
 [void]$metrics.Add((New-Metric `
     -Name "release_to_executor_dispatch" `
     -Unit "ms" `
@@ -1203,7 +1253,9 @@ $dispatchGate = Get-GateResult `
     -GateResult $dispatchGate `
     -Statistics $dispatchStats `
     -Evidence "Gradial ETW release_dequeued to action_dispatched" `
-    -Reason $(if (-not $gateEligible) {
+    -Reason $(if ($dispatchStats -and $dispatchStats.sample_count -lt $preset.invocation_count) {
+        "Only $($dispatchStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
+    } elseif (-not $gateEligible) {
         "Development protocol is not eligible for a release gate."
     } else { "" })))
 
@@ -1218,7 +1270,8 @@ $shortcutSubmissionGate = Get-GateResult `
     -Statistics $shortcutSubmissionStats `
     -ProtocolEligible $validProtocol `
     -P95Limit 15 `
-    -P99Limit 25
+    -P99Limit 25 `
+    -MinimumSamples $preset.invocation_count
 [void]$metrics.Add((New-Metric `
     -Name "release_to_completed_sendinput_shortcut" `
     -Unit "ms" `
@@ -1228,6 +1281,8 @@ $shortcutSubmissionGate = Get-GateResult `
     -Evidence "Gradial ETW release_dequeued to successful full shortcut submission; exact Ctrl+F13 receipt archived separately" `
     -Reason $(if (-not $shortcutReceiverValid) {
         "The isolated shortcut receiver did not validate the complete key sequence."
+    } elseif ($shortcutSubmissionStats -and $shortcutSubmissionStats.sample_count -lt $preset.invocation_count) {
+        "Only $($shortcutSubmissionStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
     } elseif (-not $gateEligible) {
         "Development protocol is not eligible for a release gate."
     } else { "" })))
@@ -1272,7 +1327,8 @@ $coldGate = Get-GateResult `
     -Statistics $coldStats `
     -ProtocolEligible $validProtocol `
     -P95Limit 750 `
-    -P99Limit ([double]::MaxValue)
+    -P99Limit ([double]::MaxValue) `
+    -MinimumSamples $preset.cold_launch_samples
 [void]$metrics.Add((New-Metric `
     -Name "cold_launch_to_healthy" `
     -Unit "ms" `
@@ -1280,7 +1336,9 @@ $coldGate = Get-GateResult `
     -GateResult $coldGate `
     -Statistics $coldStats `
     -Evidence "Process start to logged Healthy tray state" `
-    -Reason $(if (-not $gateEligible) {
+    -Reason $(if ($coldStats.sample_count -lt $preset.cold_launch_samples) {
+        "Only $($coldStats.sample_count) of $($preset.cold_launch_samples) required cold launches were captured."
+    } elseif (-not $gateEligible) {
         "Development protocol is not eligible for a release gate."
     } else { "" })))
 

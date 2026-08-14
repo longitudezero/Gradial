@@ -49,6 +49,18 @@ invocations and retain a final shutdown snapshot. Validation and reporting
 merge those parts with exact-line deduplication. Consequently, Gradial's normal
 log rotation cannot discard the startup record or early invocation evidence,
 and the raw archived parts remain available beside the merged application log.
+Development mode can diagnostically override its interaction count up to 1,000
+without becoming gate-eligible; Release rejects that override and stays
+closed. A failed campaign retains its outer-runner error, receiver events,
+resource samples, and bounded-log archive instead of deleting the evidence
+needed to diagnose a late-stage failure.
+
+The timing-capture allowance budgets 200 ms per interaction plus ten seconds
+of fixed startup/shutdown headroom. This covers the measured Windows automation
+cadence rather than only the requested sleep intervals. Displayed-frame,
+displayed-highlight, executor-dispatch, and completed-shortcut Release gates
+each require all 1,000 invocation samples; cold-start qualification requires
+all 100 launches. Incomplete coverage is `not_evaluated`, never a pass.
 
 Release evaluation additionally requires:
 

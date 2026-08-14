@@ -1826,6 +1826,16 @@ During a long campaign, completed bounded-log parts are archived every 25
 invocations. The validator and report merge the archive with exact-line
 deduplication, retaining both the raw parts and one complete application log
 without disabling Gradial's production log rotation.
+For a non-qualifying full interaction-path diagnostic without the long Release
+warmup/idle periods, Development mode accepts
+`-DevelopmentInvocationCount 1000`. The override is rejected in Release mode,
+which remains a closed protocol. Failed runs retain the receiver trace,
+resource samples, application log parts, and outer-runner error beside the
+partial evidence.
+The capture duration budgets 200 ms per interaction plus fixed headroom, and
+every per-invocation Release timing gate requires all 1,000 samples. The cold
+launch gate likewise requires all 100 samples; incomplete coverage remains
+`not_evaluated`.
 
 Renderer checkpoints are reported only as application diagnostics. The
 displayed usable-frame and displayed-highlight gates remain `unavailable`
