@@ -318,9 +318,9 @@ Stable v1 rejection strings are:
 | `invalid_loopback` | The loopback request table or one of its fields is invalid. |
 | `cancelled` | The request epoch is closed, Gradial is stopping, or the call was made during Cancel. |
 
-The following signatures summarize request shapes. Capability policy, rates,
-target checks, and privacy rules will be covered by the separate trust and
-capability guide.
+The following signatures summarize request shapes. The
+[trust, permissions, and capability guide](plugin-trust-and-capabilities-guide.md)
+defines capability policy, rates, target checks, revocation, and privacy rules.
 
 ### `gradial.input.shortcut(chord)`
 

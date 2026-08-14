@@ -449,6 +449,10 @@ transition.
 The [Continuous API v1 reference](Documentation/continuous-api-v1-reference.md)
 defines callback ordering, frozen inputs, samples, cancellation and rejection
 strings, host function signatures, and execution limits.
+See the
+[plugin trust and capability guide](Documentation/plugin-trust-and-capabilities-guide.md)
+for local-script trust, permission review, source changes, exact external effect
+boundaries, revocation, and privacy.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the

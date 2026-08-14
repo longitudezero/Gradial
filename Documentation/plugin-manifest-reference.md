@@ -277,4 +277,6 @@ traversal are not accepted. Modules are cached per loaded adapter.
 For installation, assignment, and a safe testing sequence, continue with the
 [Lua plugin author guide](plugin-author-guide.md). For callback signatures,
 samples, cancellation reasons, host functions, and runtime limits, use the
-[Continuous API v1 reference](continuous-api-v1-reference.md).
+[Continuous API v1 reference](continuous-api-v1-reference.md). For the trust
+model, permission review, capability enforcement, and privacy boundaries, use
+the [plugin trust and capability guide](plugin-trust-and-capabilities-guide.md).

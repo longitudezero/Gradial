@@ -1281,6 +1281,14 @@ all stable cancellation and capability-rejection strings, host function
 signatures, the restricted module environment, and enforced execution limits.
 The Continuous API v1 reference item is complete.
 
+The eighth item is implemented as a checked-in trust, permissions, and
+capability guide. It states the local Lua trust boundary without presenting the
+sandbox as safe for hostile downloaded code; explains first approval, source
+changes, permission/grant review, fingerprinting, and machine-local state; and
+documents the exact context, shortcut, notification, and loopback enforcement,
+revocation, privacy, installation, and author-safety rules. The trust,
+permissions, and capability guide item is complete.
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a
