@@ -47,8 +47,25 @@ impl TimingMarkers {
         source_qpc: i64,
         fields: &str,
     ) {
+        self.emit_observed(marker, invocation_id, source_qpc, Self::now_qpc(), fields);
+    }
+
+    /// Captures a QPC timestamp without writing an event. This lets latency
+    /// markers describe the actual operation boundary instead of the later ETW
+    /// write, which can safely happen after a callback or input submission.
+    pub(crate) fn now_qpc() -> i64 {
+        query_qpc()
+    }
+
+    pub(crate) fn emit_observed(
+        &self,
+        marker: &str,
+        invocation_id: Option<Uuid>,
+        source_qpc: i64,
+        marker_qpc: i64,
+        fields: &str,
+    ) {
         let invocation = invocation_id.map_or_else(|| "none".to_owned(), |id| id.to_string());
-        let marker_qpc = query_qpc();
         let message = format!(
             "marker={marker} invocation_id={invocation} source_qpc={source_qpc} \
              marker_qpc={marker_qpc} qpc_frequency={} {fields}",

@@ -12,11 +12,11 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use gradial_core::{
     ActionErrorCode, ActionResult, DEFAULT_ACTION_STEP_TIMEOUT_MS, ExecutionOperation,
     ExecutionPlan, ExecutionStep, InvocationContext, MAX_ACTION_SEQUENCE_DURATION_MS,
-    MAX_ACTION_SEQUENCE_STEPS,
+    MAX_ACTION_SEQUENCE_STEPS, ShortcutKey, ShortcutModifier,
 };
 use uuid::Uuid;
 
-use crate::{platform, tray};
+use crate::{diagnostics::TimingMarkers, platform, tray};
 
 const COMMAND_CAPACITY: usize = 1;
 const COMPLETION_CAPACITY: usize = 16;
@@ -228,11 +228,27 @@ pub(crate) struct ActionExecutor {
 }
 
 impl ActionExecutor {
+    #[cfg(test)]
     pub(crate) fn start(config_revision: u64) -> Result<Self> {
-        Self::start_with_policy(config_revision, ExecutionPolicy::production())
+        Self::start_with_policy(config_revision, ExecutionPolicy::production(), None)
     }
 
-    fn start_with_policy(config_revision: u64, policy: ExecutionPolicy) -> Result<Self> {
+    pub(crate) fn start_with_timing(
+        config_revision: u64,
+        timing_markers: Arc<TimingMarkers>,
+    ) -> Result<Self> {
+        Self::start_with_policy(
+            config_revision,
+            ExecutionPolicy::production(),
+            Some(timing_markers),
+        )
+    }
+
+    fn start_with_policy(
+        config_revision: u64,
+        policy: ExecutionPolicy,
+        timing_markers: Option<Arc<TimingMarkers>>,
+    ) -> Result<Self> {
         let (command_sender, commands) = bounded(COMMAND_CAPACITY);
         let (completion_sender, completions) = bounded(COMPLETION_CAPACITY);
         let (stopped_sender, stopped) = bounded(1);
@@ -253,6 +269,7 @@ impl ActionExecutor {
                     &worker_cancellation,
                     &worker_shutdown,
                     policy,
+                    timing_markers.as_deref(),
                 );
                 let _sent = stopped_sender.send(());
             })
@@ -416,6 +433,7 @@ fn run_worker(
     cancellation_requested: &AtomicBool,
     shutdown_requested: &AtomicBool,
     policy: ExecutionPolicy,
+    timing_markers: Option<&TimingMarkers>,
 ) {
     while let Ok(command) = commands.recv() {
         match command {
@@ -437,6 +455,7 @@ fn run_worker(
                     cancellation_requested,
                     shutdown_requested,
                     policy,
+                    timing_markers,
                 );
                 let completion = ActionCompletion {
                     invocation_id: request.invocation_id,
@@ -485,6 +504,7 @@ fn execute_plan(
     cancellation_requested: &AtomicBool,
     shutdown_requested: &AtomicBool,
     policy: ExecutionPolicy,
+    timing_markers: Option<&TimingMarkers>,
 ) -> ActionResult {
     if plan.steps().len() > MAX_ACTION_SEQUENCE_STEPS {
         return failure(
@@ -528,6 +548,7 @@ fn execute_plan(
                 step_started,
                 per_step_timeout,
                 cancellation_poll_interval: policy.cancellation_poll_interval,
+                timing_markers,
             },
         );
         if let Some(result) = result
@@ -560,6 +581,7 @@ struct StepRuntime<'a> {
     step_started: Instant,
     per_step_timeout: Duration,
     cancellation_poll_interval: Duration,
+    timing_markers: Option<&'a TimingMarkers>,
 }
 
 fn execute_step(step: &ExecutionStep, runtime: StepRuntime<'_>) -> Option<ActionResult> {
@@ -573,13 +595,9 @@ fn execute_step(step: &ExecutionStep, runtime: StepRuntime<'_>) -> Option<Action
             runtime.shutdown_requested,
             runtime.cancellation_poll_interval,
         ),
-        ExecutionOperation::SendShortcut { modifiers, key } => Some(crate::shortcut::execute(
-            runtime.target,
-            modifiers,
-            *key,
-            runtime.cancellation_requested,
-            runtime.shutdown_requested,
-        )),
+        ExecutionOperation::SendShortcut { modifiers, key } => {
+            Some(execute_shortcut_step(step, runtime, modifiers, *key))
+        }
         ExecutionOperation::TypeText { text } => {
             log::info!(
                 target: "actions",
@@ -659,6 +677,34 @@ fn execute_step(step: &ExecutionStep, runtime: StepRuntime<'_>) -> Option<Action
             ),
         )),
     }
+}
+
+fn execute_shortcut_step(
+    step: &ExecutionStep,
+    runtime: StepRuntime<'_>,
+    modifiers: &[ShortcutModifier],
+    key: ShortcutKey,
+) -> ActionResult {
+    let result = crate::shortcut::execute(
+        runtime.target,
+        modifiers,
+        key,
+        runtime.cancellation_requested,
+        runtime.shutdown_requested,
+    );
+    if result == ActionResult::Success
+        && let Some(markers) = runtime.timing_markers
+    {
+        let submitted_qpc = TimingMarkers::now_qpc();
+        markers.emit_observed(
+            "shortcut_submitted",
+            Some(runtime.invocation_id),
+            submitted_qpc,
+            submitted_qpc,
+            &format!("action_id={}", step.source_action_id()),
+        );
+    }
+    result
 }
 
 fn execute_shell_open_step(
@@ -970,7 +1016,8 @@ mod tests {
             per_step_timeout_override: Some(Duration::from_millis(15)),
             ..ExecutionPolicy::production()
         };
-        let step_executor = ActionExecutor::start_with_policy(1, step_policy).expect("executor");
+        let step_executor =
+            ActionExecutor::start_with_policy(1, step_policy, None).expect("executor");
         assert_eq!(
             dispatch(&step_executor.handle(), Uuid::from_u128(31), delay_plan(100, 1)),
             ActionDispatch::Accepted
@@ -986,7 +1033,7 @@ mod tests {
             ..ExecutionPolicy::production()
         };
         let overall_executor =
-            ActionExecutor::start_with_policy(1, overall_policy).expect("executor");
+            ActionExecutor::start_with_policy(1, overall_policy, None).expect("executor");
         assert_eq!(
             dispatch(&overall_executor.handle(), Uuid::from_u128(32), delay_plan(100, 1)),
             ActionDispatch::Accepted

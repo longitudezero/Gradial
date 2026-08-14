@@ -26,6 +26,7 @@ use crate::{
         NotificationCapabilityRuntime, ShortcutCapabilityClient, ShortcutCapabilityFailure,
         ShortcutCapabilityRuntime,
     },
+    diagnostics::TimingMarkers,
     plugin_discovery::{
         DiscoveredPlugin, PluginDiscoveryReport, PluginPackageStatus, discover_plugins,
         log_discovery_report,
@@ -538,6 +539,8 @@ enum PluginLifecycleCommand {
     Request {
         request: Box<ContinuousRequest>,
         submitted_at: Instant,
+        invocation_id: Uuid,
+        source_qpc: i64,
         reply: Sender<Result<(), PluginLifecycleError>>,
     },
     AbortBegin {
@@ -606,9 +609,19 @@ impl PluginLifecycleClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn request(
         &self,
         request: ContinuousRequest,
+    ) -> Result<PluginLifecycleTicket, PluginLifecycleSubmitError> {
+        self.request_traced(request, Uuid::nil(), 0)
+    }
+
+    pub(crate) fn request_traced(
+        &self,
+        request: ContinuousRequest,
+        invocation_id: Uuid,
+        source_qpc: i64,
     ) -> Result<PluginLifecycleTicket, PluginLifecycleSubmitError> {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(PluginLifecycleSubmitError::ShuttingDown);
@@ -623,6 +636,8 @@ impl PluginLifecycleClient {
         let command = PluginLifecycleCommand::Request {
             request: Box::new(request),
             submitted_at: Instant::now(),
+            invocation_id,
+            source_qpc,
             reply,
         };
         match sender.try_send(command) {
@@ -750,7 +765,19 @@ pub(crate) struct PluginWorkerRuntime {
 }
 
 impl PluginWorkerRuntime {
+    #[cfg(test)]
     pub(crate) fn start(paths: AppPaths) -> Result<Self> {
+        Self::start_internal(paths, None)
+    }
+
+    pub(crate) fn start_with_timing(
+        paths: AppPaths,
+        timing_markers: Arc<TimingMarkers>,
+    ) -> Result<Self> {
+        Self::start_internal(paths, Some(timing_markers))
+    }
+
+    fn start_internal(paths: AppPaths, timing_markers: Option<Arc<TimingMarkers>>) -> Result<Self> {
         let shortcut_capabilities = ShortcutCapabilityRuntime::start()
             .context("could not start the shortcut capability broker")?;
         let notification_capabilities = NotificationCapabilityRuntime::start();
@@ -761,6 +788,7 @@ impl PluginWorkerRuntime {
             shortcut_capabilities,
             notification_capabilities,
             loopback_capabilities,
+            timing_markers,
         )
     }
 
@@ -773,6 +801,7 @@ impl PluginWorkerRuntime {
             paths,
             shortcut_capabilities,
             NotificationCapabilityRuntime::start(),
+            None,
         )
     }
 
@@ -781,6 +810,7 @@ impl PluginWorkerRuntime {
         paths: AppPaths,
         shortcut_capabilities: ShortcutCapabilityRuntime,
         notification_capabilities: NotificationCapabilityRuntime,
+        timing_markers: Option<Arc<TimingMarkers>>,
     ) -> Result<Self> {
         let loopback_capabilities = LoopbackCapabilityRuntime::start()
             .context("could not start the test loopback capability broker")?;
@@ -789,6 +819,7 @@ impl PluginWorkerRuntime {
             shortcut_capabilities,
             notification_capabilities,
             loopback_capabilities,
+            timing_markers,
         )
     }
 
@@ -797,6 +828,7 @@ impl PluginWorkerRuntime {
         shortcut_capabilities: ShortcutCapabilityRuntime,
         notification_capabilities: NotificationCapabilityRuntime,
         loopback_capabilities: LoopbackCapabilityRuntime,
+        timing_markers: Option<Arc<TimingMarkers>>,
     ) -> Result<Self> {
         let shortcut_client = shortcut_capabilities.client();
         let notification_client = notification_capabilities.client();
@@ -823,6 +855,7 @@ impl PluginWorkerRuntime {
                     worker_shortcut_client,
                     worker_notification_client,
                     worker_loopback_client,
+                    timing_markers,
                 );
                 worker.run(&commands, &begins, &updates, &terminals, &worker_shutdown);
                 worker.callback_timing.log(worker.active_session.is_some());
@@ -966,6 +999,7 @@ struct PluginWorker {
     shortcut_capabilities: ShortcutCapabilityClient,
     notification_capabilities: NotificationCapabilityClient,
     loopback_capabilities: LoopbackCapabilityClient,
+    timing_markers: Option<Arc<TimingMarkers>>,
     callback_timing: PluginCallbackTiming,
     aborted_begins: BTreeSet<Uuid>,
     active_session: Option<ActivePluginSession>,
@@ -995,6 +1029,7 @@ impl PluginWorker {
         shortcut_capabilities: ShortcutCapabilityClient,
         notification_capabilities: NotificationCapabilityClient,
         loopback_capabilities: LoopbackCapabilityClient,
+        timing_markers: Option<Arc<TimingMarkers>>,
     ) -> Self {
         let store = PluginStateStore::new(paths.clone());
         let loaded = store.load_or_initialize();
@@ -1027,6 +1062,7 @@ impl PluginWorker {
             shortcut_capabilities,
             notification_capabilities,
             loopback_capabilities,
+            timing_markers,
             callback_timing: PluginCallbackTiming::default(),
             aborted_begins: BTreeSet::new(),
             active_session: None,
@@ -1193,10 +1229,14 @@ impl PluginWorker {
     }
 
     fn handle_lifecycle_command(&mut self, command: PluginLifecycleCommand) {
-        let (request, submitted_at, reply) = match command {
-            PluginLifecycleCommand::Request { request, submitted_at, reply } => {
-                (*request, submitted_at, reply)
-            }
+        let (request, submitted_at, invocation_id, source_qpc, reply) = match command {
+            PluginLifecycleCommand::Request {
+                request,
+                submitted_at,
+                invocation_id,
+                source_qpc,
+                reply,
+            } => (*request, submitted_at, invocation_id, source_qpc, reply),
             PluginLifecycleCommand::AbortBegin { session_id, reason } => {
                 self.abort_begin(session_id, reason);
                 self.publish_action_catalog();
@@ -1215,9 +1255,29 @@ impl PluginWorker {
                 .map_or_else(|| "none".to_owned(), |active| active.plugin_id.clone()),
         };
         let callback_started = Instant::now();
+        let callback_started_qpc = TimingMarkers::now_qpc();
         let queue_duration = callback_started.saturating_duration_since(submitted_at);
         let result = self.dispatch_lifecycle(&request);
         let callback_duration = callback_started.elapsed();
+        if !invocation_id.is_nil()
+            && source_qpc > 0
+            && let Some(markers) = self.timing_markers.as_ref()
+        {
+            let marker = match stage {
+                PluginLifecycleStage::Begin => "plugin_begin_callback_started",
+                PluginLifecycleStage::Update => "plugin_update_callback_started",
+                PluginLifecycleStage::Commit | PluginLifecycleStage::Cancel => {
+                    "plugin_terminal_callback_started"
+                }
+            };
+            markers.emit_observed(
+                marker,
+                Some(invocation_id),
+                source_qpc,
+                callback_started_qpc,
+                &format!("session_id={session_id} stage={}", stage.as_str()),
+            );
+        }
         self.callback_timing.record(stage, queue_duration, callback_duration, result.is_ok());
         log::info!(
             target: "plugins",
@@ -2320,6 +2380,7 @@ mod tests {
             paths,
             shortcut_capabilities,
             notification_capabilities,
+            None,
         )
         .expect("plugin worker");
         assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![NOTIFICATION_PLUGIN]);
@@ -2366,6 +2427,7 @@ mod tests {
             paths,
             shortcut_capabilities,
             notification_capabilities,
+            None,
         )
         .expect("plugin worker");
         assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![FIRST_PLUGIN]);
@@ -2405,6 +2467,7 @@ mod tests {
             shortcut_capabilities,
             notification_capabilities,
             loopback_capabilities,
+            None,
         )
         .expect("plugin worker");
         let snapshot = snapshot(&runtime);
@@ -2468,6 +2531,7 @@ mod tests {
             shortcut_capabilities,
             notification_capabilities,
             loopback_capabilities,
+            None,
         )
         .expect("plugin worker");
         assert_eq!(snapshot(&runtime).loaded_plugin_ids, vec![FIRST_PLUGIN]);

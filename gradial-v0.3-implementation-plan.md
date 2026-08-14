@@ -1224,6 +1224,16 @@ evidence, hook duration, and input/renderer health without reading the user's
 configuration. A short development baseline is recorded; the complete
 release-duration run remains required before qualification.
 
+Implementation note (2026-08-14): the campaign now retains the originating
+outer-edge, latest-publication, and activation-release QPC through the
+continuous coordinator and records the endpoint immediately before Lua Begin,
+Update, and terminal callbacks. Its Release result evaluates the exact section
+11.1 callback gates plus correlated displayed open/continuous-feedback gates
+only when active and slow fixtures each provide at least 1,000 samples. The
+separate base reporter now measures completed shortcut submission against an
+exact isolated Ctrl+F13 receiver. Short optimized validations passed both
+measurement routes; the long elevated Release campaigns remain required.
+
 The second item is implemented as a release-only production-route campaign
 that preserves all rotated lifecycle evidence outside Gradial's bounded log
 retention, validates terminal integrity and coalescing, and compares sessions
@@ -1302,7 +1312,7 @@ reliability, usability, packaging, and signing work remains open. See
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a
-disabled plugin, or unmeasured continuous latency gate.
+disabled plugin, or unevaluated/failed continuous latency gate.
 
 ## 14. Future WASM admission
 

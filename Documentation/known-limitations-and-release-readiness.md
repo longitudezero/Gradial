@@ -21,6 +21,7 @@ interchangeable.
 | Qualifying 10,000-session Lua continuous soak | Passed |
 | Plugin privacy campaign | Passed |
 | Display/DPI/recovery/shutdown automation | Passed on the available single 96-DPI display; unavailable physical rows remain open |
+| Completed shortcut and continuous callback timing instrumentation | Implemented and proven on short optimized production routes; qualifying campaigns remain open |
 | Full latency, resource, reliability, hardware, and participant qualification | Incomplete |
 | Installer and Authenticode signing | Not implemented; no signing certificate is available |
 | Public release readiness | **Not yet release-qualified** |
@@ -191,26 +192,27 @@ simulation.
 | Evidence | Current result | What it does not prove |
 | --- | --- | --- |
 | Complete checked-in Rust/Lua tests and project checks | Passing at this checkpoint | Hardware, displayed pixels, long-duration behavior, and human usability |
-| Five-state plugin performance harness | All ten short debug/release scenario contracts passed | The five-minute warmup, 1,000-session, 30-minute-idle release protocol; displayed-frame timing; full publication-to-callback latency |
+| Five-state plugin performance harness | Short scenario contracts pass; end-to-end callback and displayed-frame gates are implemented | The five-minute warmup, 1,000-session, 30-minute-idle elevated Release protocol |
+| Isolated completed-shortcut timing | 20 optimized development invocations delivered all 80 expected key events and produced 20 timing samples | The 1,000-invocation elevated Release distribution |
 | Continuous plugin soak | 10,000 sessions passed; p95 working-set growth was 3.270 MiB against a 10 MiB limit | The separate v0.2 24-hour soak, full displayed-frame campaign, or participant study |
 | Continuous hardening matrix | 12 of 12 scenarios passed on one 96-DPI display | Unavailable physical DPI/display rows and real OS state transitions |
 | Plugin privacy campaign | All six checks passed | Privacy outside the documented log/default-bundle and explicit process-path opt-in boundaries |
 | Guided continuous study tooling | Protocol, private reports, and evaluator are implemented | The required eight-participant cohort; every usability gate remains unevaluated |
 
-The earlier base performance run is diagnostic only. Displayed usable-frame,
-displayed highlight, shortcut-submission, GPU, long-idle resource, cold-start,
-and cross-display gates are not release-qualified. The short plugin performance
-campaign likewise does not qualify the v0.3 outer-edge-to-Begin,
-latest-publication-to-Update, or release-to-terminal distributions. Optimization
-is required only if a qualifying run fails a gate; short checkpoint timings are
-not a sound target for speculative tuning.
+The base and plugin timing reporters now measure completed shortcut submission
+and the full continuous outer-edge/publication/release-to-callback boundaries.
+Their short validations are diagnostic only. Displayed usable-frame,
+displayed feedback, shortcut-submission, GPU, long-idle resource, cold-start,
+cross-display, and continuous-callback gates are still not release-qualified.
+Optimization is required only if a qualifying run fails a gate; short
+checkpoint timings are not a sound target for speculative tuning.
 
 The following release work remains:
 
 1. Complete the elevated release performance campaigns with PresentMon display
    events, full-duration warmup/idle periods, at least 1,000 sessions per
-   required configuration, GPU counters, shortcut-submission evidence, and
-   end-to-end continuous callback timing.
+   required configuration, GPU counters, isolated shortcut-receiver evidence,
+   and the implemented end-to-end continuous callback timing.
 2. Run the physical display and Windows-state matrix: high refresh, every
    required DPI, mixed scaling, negative coordinates, attach/detach, primary
    change, DPI change, sleep/resume, lock/unlock, Explorer restart, and the
@@ -257,6 +259,7 @@ shortcut around an open v0.2 or v0.3 release gate.
 ## Evidence index
 
 - [Base performance harness](milestone-3-performance-harness-results.md)
+- [Release timing instrumentation](milestone-4-release-timing-instrumentation-results.md)
 - [Interaction matrix](milestone-1-interaction-matrix-results.md)
 - [Continuous participant protocol](milestone-0-continuous-study-results.md)
 - [Plugin performance baseline](milestone-4-plugin-performance-baseline-results.md)

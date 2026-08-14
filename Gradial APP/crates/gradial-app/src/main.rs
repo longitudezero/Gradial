@@ -44,6 +44,13 @@ fn log_startup_begin() {
     );
 }
 
+fn register_timing_markers() -> Result<Arc<diagnostics::TimingMarkers>> {
+    Ok(Arc::new(
+        diagnostics::TimingMarkers::register()
+            .context("could not initialize ETW-compatible timing markers")?,
+    ))
+}
+
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.iter().any(|argument| matches!(argument.as_str(), "--help" | "-h")) {
@@ -59,8 +66,12 @@ fn main() -> Result<()> {
     let logger =
         diagnostics::initialize(&paths.logs).context("could not initialize local logging")?;
     log_startup_begin();
-    let plugin_worker = plugin_worker::PluginWorkerRuntime::start(paths.clone())
-        .context("could not start Gradial's plugin worker")?;
+    let timing_markers = register_timing_markers()?;
+    let plugin_worker = plugin_worker::PluginWorkerRuntime::start_with_timing(
+        paths.clone(),
+        Arc::clone(&timing_markers),
+    )
+    .context("could not start Gradial's plugin worker")?;
     let loaded_configuration = configuration::ConfigStore::new(paths.clone())
         .load_or_initialize()
         .context("could not load Gradial configuration")?;
@@ -87,11 +98,6 @@ fn main() -> Result<()> {
             warning.backup_error.as_deref().unwrap_or("none")
         );
     }
-    let timing_markers = Arc::new(
-        diagnostics::TimingMarkers::register()
-            .context("could not initialize ETW-compatible timing markers")?,
-    );
-
     let options = overlay::native_options();
     let app_timing_markers = Arc::clone(&timing_markers);
     let app_services = application::ApplicationServices::new(

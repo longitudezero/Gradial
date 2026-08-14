@@ -526,7 +526,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-repo
 ```
 
 An elevated `-Mode Release` run enables PresentMon and uses the complete
-five-minute warmup, 1,000-invocation, and 30-minute idle protocol.
+five-minute warmup, 1,000-invocation, and 30-minute idle protocol. The action
+fixture targets an isolated Ctrl+F13 receiver and measures successful complete
+shortcut submission without sending input to a real application.
 
 Compare disabled, idle-enabled, active, deliberately slow, and faulted plugins
 in both development and optimized executables with:
@@ -539,7 +541,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-performan
 
 This short campaign is diagnostic only. The elevated release form is
 `-Mode Release -Build release`; it captures PresentMon evidence and uses the
-full per-scenario warmup, invocation, and idle protocol.
+full per-scenario warmup, invocation, and idle protocol. It measures the full
+outer-edge/publication/release-to-Lua-callback-start boundaries and emits an
+overall pass or fail only when every continuous/display gate and the idle
+plugin memory gate have valid evidence.
 
 Run the qualifying real-plugin continuous soak after building the optimized
 executable:
@@ -681,6 +686,9 @@ development baseline are recorded in
 The five-state plugin performance protocol, bounded callback timing, and
 current non-qualifying two-build baseline are recorded in
 [`Documentation/milestone-4-plugin-performance-baseline-results.md`](Documentation/milestone-4-plugin-performance-baseline-results.md).
+Completed shortcut submission, continuous callback-start correlation, release
+gate semantics, and the short optimized route validation are recorded in
+[`Documentation/milestone-4-release-timing-instrumentation-results.md`](Documentation/milestone-4-release-timing-instrumentation-results.md).
 The qualifying 10,000-session real-plugin soak, renderer font-cache fix, and
 post-warm-up memory evidence are recorded in
 [`Documentation/milestone-4-plugin-continuous-soak-results.md`](Documentation/milestone-4-plugin-continuous-soak-results.md).

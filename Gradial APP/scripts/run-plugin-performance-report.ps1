@@ -124,6 +124,70 @@ function Get-MarkerDurations {
     return [double[]]$durations
 }
 
+function Get-SelfTimedMarkerDurations {
+    param(
+        [object[]]$Markers,
+        [string]$Marker
+    )
+
+    $durations = @()
+    foreach ($entry in ($Markers | Where-Object {
+        $_.marker -eq $Marker -and $_.invocation_id -ne "none"
+    })) {
+        $duration = Get-QpcDurationMilliseconds `
+            -Start $entry.source_qpc `
+            -End $entry.marker_qpc `
+            -Frequency $entry.qpc_frequency
+        if ($null -ne $duration) {
+            $durations += $duration
+        }
+    }
+    return [double[]]$durations
+}
+
+function New-LatencyGate {
+    param(
+        [string]$Name,
+        [Collections.IDictionary]$Statistics,
+        [bool]$Eligible,
+        [int]$MinimumSamples,
+        [double]$P95Limit,
+        [double]$P99Limit = [double]::NaN,
+        [switch]$P95Inclusive,
+        [switch]$P99Inclusive
+    )
+
+    $result = "not_evaluated"
+    if ($Eligible -and $Statistics -and $Statistics.sample_count -ge $MinimumSamples) {
+        $p95Pass = if ($P95Inclusive) {
+            $Statistics.p95 -le $P95Limit
+        }
+        else {
+            $Statistics.p95 -lt $P95Limit
+        }
+        $p99Pass = if ([double]::IsNaN($P99Limit)) {
+            $true
+        }
+        elseif ($P99Inclusive) {
+            $Statistics.p99 -le $P99Limit
+        }
+        else {
+            $Statistics.p99 -lt $P99Limit
+        }
+        $result = if ($p95Pass -and $p99Pass) { "pass" } else { "fail" }
+    }
+    return [ordered]@{
+        name = $Name
+        result = $result
+        minimum_samples = $MinimumSamples
+        p95_limit_ms = $P95Limit
+        p95_inclusive = [bool]$P95Inclusive
+        p99_limit_ms = if ([double]::IsNaN($P99Limit)) { $null } else { $P99Limit }
+        p99_inclusive = [bool]$P99Inclusive
+        statistics = $Statistics
+    }
+}
+
 function Get-PresentEvents {
     param(
         [string]$Path,
@@ -562,6 +626,7 @@ return {
         enabled = $enabled
         faulted = $faulted
         fingerprint = $fingerprint
+        update_hz = 30
     }
 }
 
@@ -909,6 +974,68 @@ function Get-ScenarioResult {
             $markers $presents "overlay_shown" "activation_dequeued"
         $displayedVisual = Get-DisplayedDurations `
             $markers $presents $visualEnd $visualStart
+        $beginCallback = Get-SelfTimedMarkerDurations `
+            $markers "plugin_begin_callback_started"
+        $updateCallback = Get-SelfTimedMarkerDurations `
+            $markers "plugin_update_callback_started"
+        $terminalCallback = Get-SelfTimedMarkerDurations `
+            $markers "plugin_terminal_callback_started"
+        $beginCallbackStats = Get-Statistics $beginCallback
+        $updateCallbackStats = Get-Statistics $updateCallback
+        $terminalCallbackStats = Get-Statistics $terminalCallback
+        $displayedOpenStats = Get-Statistics $displayedOpen
+        $displayedVisualStats = Get-Statistics $displayedVisual
+        $releaseLatencyEligible = (
+            $Mode -eq "Release" -and
+            $Configuration -eq "release" -and
+            $Scenario -in @("active", "slow") -and
+            $Preset.invocation_count -ge 1000
+        )
+        $displayLatencyEligible = $releaseLatencyEligible -and $UsePresentMon
+        $refreshRate = (
+            Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+                Where-Object CurrentRefreshRate |
+                Select-Object -First 1 -ExpandProperty CurrentRefreshRate
+        )
+        if (-not $refreshRate) { $refreshRate = 60 }
+        $refreshPeriodMilliseconds = 1000.0 / [double]$refreshRate
+        $beginLatencyGate = New-LatencyGate `
+            "outer_edge_to_begin_callback_start" `
+            $beginCallbackStats `
+            $releaseLatencyEligible `
+            $Preset.invocation_count `
+            20 `
+            35
+        $updateLatencyGate = New-LatencyGate `
+            "latest_publication_to_update_callback_start" `
+            $updateCallbackStats `
+            $releaseLatencyEligible `
+            $Preset.invocation_count `
+            ((1000.0 / [double]$fixture.update_hz) + 5.0) `
+            -P95Inclusive
+        $terminalLatencyGate = New-LatencyGate `
+            "release_to_terminal_callback_start" `
+            $terminalCallbackStats `
+            $releaseLatencyEligible `
+            $Preset.invocation_count `
+            20 `
+            35
+        $displayedOpenGate = New-LatencyGate `
+            "button_down_to_displayed_usable_frame" `
+            $displayedOpenStats `
+            $displayLatencyEligible `
+            $Preset.invocation_count `
+            25 `
+            40
+        $displayedVisualGate = New-LatencyGate `
+            "pointer_to_displayed_continuous_feedback" `
+            $displayedVisualStats `
+            $displayLatencyEligible `
+            $Preset.invocation_count `
+            ($refreshPeriodMilliseconds + 4.0) `
+            (2.0 * $refreshPeriodMilliseconds) `
+            -P95Inclusive `
+            -P99Inclusive
         $hook = [regex]::Matches(
             $log,
             "event_code=hook_thread_stopped .*callback_count=(?<count>[0-9]+) " +
@@ -1133,8 +1260,11 @@ function Get-ScenarioResult {
                 callback_queue_wait_us = $allTiming.queue
                 application_open_checkpoint_ms = Get-Statistics $open
                 application_visual_checkpoint_ms = Get-Statistics $visual
-                displayed_open_ms = Get-Statistics $displayedOpen
-                displayed_visual_ms = Get-Statistics $displayedVisual
+                outer_edge_to_begin_callback_start_ms = $beginCallbackStats
+                latest_publication_to_update_callback_start_ms = $updateCallbackStats
+                release_to_terminal_callback_start_ms = $terminalCallbackStats
+                displayed_open_ms = $displayedOpenStats
+                displayed_visual_ms = $displayedVisualStats
                 hook_callback_us = if ($hook) {
                     [ordered]@{
                         sample_count = [int64]$hook.Groups["count"].Value
@@ -1147,6 +1277,13 @@ function Get-ScenarioResult {
                 } else {
                     $null
                 }
+            }
+            gates = [ordered]@{
+                continuous_begin_latency = $beginLatencyGate
+                continuous_update_latency = $updateLatencyGate
+                continuous_terminal_latency = $terminalLatencyGate
+                displayed_open_latency = $displayedOpenGate
+                displayed_continuous_feedback_latency = $displayedVisualGate
             }
             frame_evidence = [ordered]@{
                 timing_markers = $markers.Count
@@ -1217,6 +1354,40 @@ if ($SelfTest) {
         $statistics.p99 -ne 99 -or $statistics.max -ne 100
     ) {
         throw "Plugin performance percentile self-test failed."
+    }
+    $sampleMarkers = @(
+        [pscustomobject]@{
+            marker = "plugin_update_callback_started"
+            invocation_id = "00000000-0000-0000-0000-000000000001"
+            source_qpc = 100
+            marker_qpc = 138
+            qpc_frequency = 1000
+        },
+        [pscustomobject]@{
+            marker = "plugin_update_callback_started"
+            invocation_id = "00000000-0000-0000-0000-000000000001"
+            source_qpc = 200
+            marker_qpc = 239
+            qpc_frequency = 1000
+        }
+    )
+    $sampleDurations = Get-SelfTimedMarkerDurations `
+        $sampleMarkers "plugin_update_callback_started"
+    $passingGate = New-LatencyGate `
+        "update" (Get-Statistics $sampleDurations) $true 2 39 -P95Inclusive
+    $failingGate = New-LatencyGate `
+        "update" (Get-Statistics $sampleDurations) $true 2 38 -P95Inclusive
+    $ineligibleGate = New-LatencyGate `
+        "update" (Get-Statistics $sampleDurations) $false 2 39 -P95Inclusive
+    if (
+        $sampleDurations.Count -ne 2 -or
+        $sampleDurations[0] -ne 38 -or
+        $sampleDurations[1] -ne 39 -or
+        $passingGate.result -ne "pass" -or
+        $failingGate.result -ne "fail" -or
+        $ineligibleGate.result -ne "not_evaluated"
+    ) {
+        throw "Plugin end-to-end latency gate self-test failed."
     }
     $sampleLog = (
         "event_code=plugin_lifecycle result_code=ok error_code=none " +
@@ -1431,19 +1602,44 @@ foreach ($configuration in $configurations) {
 $contractFailures = @(
     $results | Where-Object { $_.contracts.Values -contains "fail" }
 )
+$releaseScenarioGates = @(
+    $results |
+        Where-Object {
+            $_.configuration -eq "release" -and $_.scenario -in @("active", "slow")
+        } |
+        ForEach-Object { $_.gates.Values }
+)
+$releaseGateResults = @($releaseScenarioGates | ForEach-Object { $_.result })
+$resourceGateResults = @(
+    $comparisons | ForEach-Object { $_.idle_enabled_working_set_gate }
+)
+$releaseEvidenceComplete = (
+    $Mode -eq "Release" -and
+    $configurations.Count -eq 1 -and
+    $configurations[0] -eq "release" -and
+    $releaseScenarioGates.Count -eq 10 -and
+    $releaseGateResults -notcontains "not_evaluated" -and
+    $resourceGateResults.Count -eq 1 -and
+    $resourceGateResults -notcontains "not_evaluated"
+)
 $overall = if ($contractFailures.Count -gt 0) {
     "fail"
 } elseif ($Mode -eq "Soak" -and $preset.qualifying_soak) {
     "pass"
 } elseif ($Mode -eq "Development") {
     "not_evaluated"
-} elseif ($comparisons.idle_enabled_working_set_gate -contains "fail") {
+} elseif (
+    $releaseGateResults -contains "fail" -or
+    $resourceGateResults -contains "fail"
+) {
     "fail"
-} else {
+} elseif (-not $releaseEvidenceComplete) {
     "not_evaluated"
+} else {
+    "pass"
 }
 $report = [ordered]@{
-    report_schema_version = 2
+    report_schema_version = 3
     captured_at = (Get-Date).ToUniversalTime().ToString("o")
     overall_gate_result = $overall
     protocol = [ordered]@{
@@ -1456,7 +1652,7 @@ $report = [ordered]@{
         release_duration_protocol = $Mode -eq "Release"
         continuous_soak_protocol = $Mode -eq "Soak"
         qualifying_continuous_soak = $preset.qualifying_soak
-        complete_release_qualification = $false
+        complete_release_qualification = $releaseEvidenceComplete
     }
     capabilities = [ordered]@{
         elevated = $isElevated
@@ -1477,24 +1673,33 @@ $report = [ordered]@{
     comparisons = $comparisons
     notes = @(
         "Development mode checks the harness and correctness contracts but does not qualify release resource or latency gates.",
-        "Release mode evaluates the release-duration resource contract, but overall qualification remains not evaluated until displayed-frame and full input-to-callback latency gates are available.",
+        "Release mode produces an overall pass or fail only when active and slow fixtures each provide 1,000 samples for every continuous callback-start and displayed-frame gate, and the idle-plugin memory gate is evaluable.",
         "Soak mode archives completed log rotations, de-duplicates exact lines, and validates every lifecycle session while production log retention remains bounded.",
         "Only a release soak with exactly 10,000 sessions evaluates the post-warmup working-set gate and may pass overall.",
         "Disabled and faulted fixtures contain top-level failing Lua; zero callbacks and zero startup loads prove those sources stayed inert.",
         "Application checkpoints are diagnostic and do not substitute for PresentMon displayed-frame evidence.",
-        "Callback queue wait starts when the continuous coordinator submits to the bounded plugin lane; it does not yet include the configured update-period wait."
+        "End-to-end callback timing begins at the exact outer-edge input, latest scalar publication, or activation release and ends immediately before the Lua callback starts; Update therefore includes its configured cadence wait."
     )
 }
 $jsonPath = Join-Path $reportDirectory "plugin-performance-report.json"
 Write-Utf8File $jsonPath ($report | ConvertTo-Json -Depth 14)
 
 $csvRows = foreach ($result in $results) {
+    $metricGateMap = @{
+        outer_edge_to_begin_callback_start_ms = "continuous_begin_latency"
+        latest_publication_to_update_callback_start_ms = "continuous_update_latency"
+        release_to_terminal_callback_start_ms = "continuous_terminal_latency"
+        displayed_open_ms = "displayed_open_latency"
+        displayed_visual_ms = "displayed_continuous_feedback_latency"
+    }
     foreach ($metricProperty in $result.metrics.GetEnumerator()) {
         $statistics = $metricProperty.Value
+        $gateName = $metricGateMap[$metricProperty.Key]
         [pscustomobject]@{
             configuration = $result.configuration
             scenario = $result.scenario
             metric = $metricProperty.Key
+            gate_result = if ($gateName) { $result.gates[$gateName].result } else { "diagnostic" }
             sample_count = $statistics.sample_count
             mean = $statistics.mean
             p50 = $statistics.p50
@@ -1561,6 +1766,26 @@ if ($Mode -eq "Soak") {
     )
 }
 if ($Mode -ne "Soak") {
+    $lines += @(
+        "",
+        "## Release gates",
+        "",
+        "| Build | Scenario | Begin p95 ms | Begin gate | Update p95 ms | Update gate | Terminal p95 ms | Terminal gate | Display open | Display feedback |",
+        "|---|---|---:|---|---:|---|---:|---|---|---|"
+    )
+    foreach ($result in ($results | Where-Object scenario -in @("active", "slow"))) {
+        $lines += (
+            "| $($result.configuration) | $($result.scenario) | " +
+            "$(Format-Number $result.metrics.outer_edge_to_begin_callback_start_ms.p95) | " +
+            "$($result.gates.continuous_begin_latency.result) | " +
+            "$(Format-Number $result.metrics.latest_publication_to_update_callback_start_ms.p95) | " +
+            "$($result.gates.continuous_update_latency.result) | " +
+            "$(Format-Number $result.metrics.release_to_terminal_callback_start_ms.p95) | " +
+            "$($result.gates.continuous_terminal_latency.result) | " +
+            "$($result.gates.displayed_open_latency.result) | " +
+            "$($result.gates.displayed_continuous_feedback_latency.result) |"
+        )
+    }
     $lines += @("", "## Comparisons", "")
     foreach ($comparison in $comparisons) {
         $lines += (

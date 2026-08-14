@@ -87,11 +87,16 @@ pub(crate) enum ContinuousBackendError {
 pub(crate) struct ContinuousBackendContext<'a> {
     deadline: Instant,
     stop_token: &'a CoordinatorStopToken,
+    source_qpc: i64,
 }
 
 impl ContinuousBackendContext<'_> {
     pub(crate) const fn deadline(self) -> Instant {
         self.deadline
+    }
+
+    pub(crate) const fn source_qpc(self) -> i64 {
+        self.source_qpc
     }
 
     pub(crate) fn cancellation_requested(self) -> bool {
@@ -402,7 +407,11 @@ impl ContinuousBackend for PluginContinuousBackend {
             ContinuousRequest::Cancel(_) => {}
         }
 
-        let ticket = match self.client.request(request.clone()) {
+        let ticket = match self.client.request_traced(
+            request.clone(),
+            self.invocation_id,
+            context.source_qpc(),
+        ) {
             Ok(ticket) => ticket,
             Err(error) => {
                 self.abandon_commit(request, ContinuousCancelReason::PluginFaulted);
@@ -609,6 +618,7 @@ struct LatestObservation {
     value: f64,
     observed_at: Instant,
     count: u64,
+    source_qpc: i64,
 }
 
 #[derive(Debug, Default)]
@@ -617,10 +627,10 @@ struct LatestObservationSlot {
 }
 
 impl LatestObservationSlot {
-    fn publish(&self, value: f64, observed_at: Instant) {
+    fn publish(&self, value: f64, observed_at: Instant, source_qpc: i64) {
         let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = pending.map_or(1, |observation| observation.count.saturating_add(1));
-        *pending = Some(LatestObservation { value, observed_at, count });
+        *pending = Some(LatestObservation { value, observed_at, count, source_qpc });
     }
 
     fn take(&self) -> Option<LatestObservation> {
@@ -630,11 +640,11 @@ impl LatestObservationSlot {
 
 #[derive(Debug)]
 enum ContinuousControl {
-    Resume { session_id: Uuid, snapshot: ContinuousActionSnapshot, value: f64 },
-    Suspend { reason: ContinuousCancelReason },
-    Commit { value: f64 },
-    Cancel { reason: ContinuousCancelReason },
-    FinishDiscrete { plan: Arc<ExecutionPlan>, target: Arc<InvocationContext> },
+    Resume { session_id: Uuid, snapshot: ContinuousActionSnapshot, value: f64, source_qpc: i64 },
+    Suspend { reason: ContinuousCancelReason, source_qpc: i64 },
+    Commit { value: f64, source_qpc: i64 },
+    Cancel { reason: ContinuousCancelReason, source_qpc: i64 },
+    FinishDiscrete { plan: Arc<ExecutionPlan>, target: Arc<InvocationContext>, source_qpc: i64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -658,28 +668,53 @@ pub(crate) struct ContinuousInvocationHandle {
 }
 
 impl ContinuousInvocationHandle {
+    #[cfg(test)]
     pub(crate) fn publish(&self, value: f64) -> Result<(), ContinuousSubmitError> {
-        validate_value(value)?;
-        if self.is_closed_for_input() {
-            return Err(ContinuousSubmitError::Closed);
-        }
-        self.latest.publish(value, Instant::now());
-        self.worker_thread.unpark();
-        Ok(())
+        self.publish_at(value, 0)
     }
 
-    pub(crate) fn handoff(
+    pub(crate) fn publish_at(
         &self,
-        snapshot: ContinuousActionSnapshot,
         value: f64,
+        source_qpc: i64,
     ) -> Result<(), ContinuousSubmitError> {
         validate_value(value)?;
         if self.is_closed_for_input() {
             return Err(ContinuousSubmitError::Closed);
         }
-        self.send_control(ContinuousControl::Resume { session_id: Uuid::new_v4(), snapshot, value })
+        self.latest.publish(value, Instant::now(), source_qpc);
+        self.worker_thread.unpark();
+        Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn handoff(
+        &self,
+        snapshot: ContinuousActionSnapshot,
+        value: f64,
+    ) -> Result<(), ContinuousSubmitError> {
+        self.handoff_at(snapshot, value, 0)
+    }
+
+    pub(crate) fn handoff_at(
+        &self,
+        snapshot: ContinuousActionSnapshot,
+        value: f64,
+        source_qpc: i64,
+    ) -> Result<(), ContinuousSubmitError> {
+        validate_value(value)?;
+        if self.is_closed_for_input() {
+            return Err(ContinuousSubmitError::Closed);
+        }
+        self.send_control(ContinuousControl::Resume {
+            session_id: Uuid::new_v4(),
+            snapshot,
+            value,
+            source_qpc,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn resume(
         &self,
         snapshot: ContinuousActionSnapshot,
@@ -688,34 +723,79 @@ impl ContinuousInvocationHandle {
         self.handoff(snapshot, value)
     }
 
+    pub(crate) fn resume_at(
+        &self,
+        snapshot: ContinuousActionSnapshot,
+        value: f64,
+        source_qpc: i64,
+    ) -> Result<(), ContinuousSubmitError> {
+        self.handoff_at(snapshot, value, source_qpc)
+    }
+
+    #[cfg(test)]
     pub(crate) fn suspend(
         &self,
         reason: ContinuousCancelReason,
     ) -> Result<(), ContinuousSubmitError> {
+        self.suspend_at(reason, 0)
+    }
+
+    pub(crate) fn suspend_at(
+        &self,
+        reason: ContinuousCancelReason,
+        source_qpc: i64,
+    ) -> Result<(), ContinuousSubmitError> {
         if self.is_closed_for_input() {
             return Err(ContinuousSubmitError::Closed);
         }
-        self.send_control(ContinuousControl::Suspend { reason })
+        self.send_control(ContinuousControl::Suspend { reason, source_qpc })
     }
 
+    #[cfg(test)]
     pub(crate) fn commit(&self, value: f64) -> Result<(), ContinuousSubmitError> {
+        self.commit_at(value, 0)
+    }
+
+    pub(crate) fn commit_at(
+        &self,
+        value: f64,
+        source_qpc: i64,
+    ) -> Result<(), ContinuousSubmitError> {
         validate_value(value)?;
-        self.send_terminal(ContinuousControl::Commit { value })
+        self.send_terminal(ContinuousControl::Commit { value, source_qpc })
     }
 
     pub(crate) fn cancel(
         &self,
         reason: ContinuousCancelReason,
     ) -> Result<(), ContinuousSubmitError> {
-        self.send_terminal(ContinuousControl::Cancel { reason })
+        self.cancel_at(reason, 0)
     }
 
+    pub(crate) fn cancel_at(
+        &self,
+        reason: ContinuousCancelReason,
+        source_qpc: i64,
+    ) -> Result<(), ContinuousSubmitError> {
+        self.send_terminal(ContinuousControl::Cancel { reason, source_qpc })
+    }
+
+    #[cfg(test)]
     pub(crate) fn finish_discrete(
         &self,
         plan: Arc<ExecutionPlan>,
         target: Arc<InvocationContext>,
     ) -> Result<(), ContinuousSubmitError> {
-        self.send_terminal(ContinuousControl::FinishDiscrete { plan, target })
+        self.finish_discrete_at(plan, target, 0)
+    }
+
+    pub(crate) fn finish_discrete_at(
+        &self,
+        plan: Arc<ExecutionPlan>,
+        target: Arc<InvocationContext>,
+        source_qpc: i64,
+    ) -> Result<(), ContinuousSubmitError> {
+        self.send_terminal(ContinuousControl::FinishDiscrete { plan, target, source_qpc })
     }
 
     fn send_terminal(&self, control: ContinuousControl) -> Result<(), ContinuousSubmitError> {
@@ -758,6 +838,7 @@ pub(crate) struct ContinuousInvocation {
 }
 
 impl ContinuousInvocation {
+    #[cfg(test)]
     pub(crate) fn start<B: ContinuousBackend>(
         action_executor: &ActionExecutorHandle,
         invocation_id: Uuid,
@@ -765,11 +846,23 @@ impl ContinuousInvocation {
         initial_value: f64,
         backend: B,
     ) -> Result<Self, ActionResult> {
+        Self::start_at(action_executor, invocation_id, snapshot, initial_value, 0, backend)
+    }
+
+    pub(crate) fn start_at<B: ContinuousBackend>(
+        action_executor: &ActionExecutorHandle,
+        invocation_id: Uuid,
+        snapshot: ContinuousActionSnapshot,
+        initial_value: f64,
+        source_qpc: i64,
+        backend: B,
+    ) -> Result<Self, ActionResult> {
         Self::start_with_policy(
             action_executor,
             invocation_id,
             snapshot,
             initial_value,
+            source_qpc,
             backend,
             ContinuousExecutionPolicy::production(),
         )
@@ -780,6 +873,7 @@ impl ContinuousInvocation {
         invocation_id: Uuid,
         snapshot: ContinuousActionSnapshot,
         initial_value: f64,
+        source_qpc: i64,
         backend: B,
         policy: ContinuousExecutionPolicy,
     ) -> Result<Self, ActionResult> {
@@ -795,7 +889,8 @@ impl ContinuousInvocation {
         let terminal_requested = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
         let worker_closed = Arc::clone(&closed);
-        let initial = SegmentStart { session_id: Uuid::new_v4(), snapshot, value: initial_value };
+        let initial =
+            SegmentStart { session_id: Uuid::new_v4(), snapshot, value: initial_value, source_qpc };
         let clock_origin = Instant::now();
         let worker_action_executor = action_executor.clone();
         let worker_stop_token = stop_token.clone();
@@ -888,6 +983,7 @@ struct SegmentStart {
     session_id: Uuid,
     snapshot: ContinuousActionSnapshot,
     value: f64,
+    source_qpc: i64,
 }
 
 #[derive(Debug)]
@@ -1010,18 +1106,18 @@ fn run_inactive(
         }
         if let Ok(control) = controls.try_recv() {
             return match control {
-                ContinuousControl::Resume { session_id, snapshot, value } => {
-                    SegmentResult::Handoff(SegmentStart { session_id, snapshot, value })
+                ContinuousControl::Resume { session_id, snapshot, value, source_qpc } => {
+                    SegmentResult::Handoff(SegmentStart { session_id, snapshot, value, source_qpc })
                 }
                 ContinuousControl::Suspend { .. } => SegmentResult::Inactive,
                 ContinuousControl::Commit { .. } => SegmentResult::Complete(failed_completion(
                     invocation_id,
                     ContinuousBackendFailure::Faulted(ContinuousBackendStage::Commit),
                 )),
-                ContinuousControl::Cancel { reason } => {
+                ContinuousControl::Cancel { reason, .. } => {
                     SegmentResult::Complete(cancelled_completion(invocation_id, reason, None))
                 }
-                ContinuousControl::FinishDiscrete { plan, target } => {
+                ContinuousControl::FinishDiscrete { plan, target, .. } => {
                     SegmentResult::DispatchDiscrete { plan, target }
                 }
             };
@@ -1053,7 +1149,7 @@ fn run_segment<B: ContinuousBackend>(
             ContinuousBackendFailure::Faulted(ContinuousBackendStage::Begin),
         ));
     };
-    if let Err(error) = call_backend(backend, &begin, stop_token, policy) {
+    if let Err(error) = call_backend(backend, &begin, stop_token, segment.source_qpc, policy) {
         let _rejected = session.reject_begin();
         return SegmentResult::Complete(begin_failure(invocation_id, error, stop_token));
     }
@@ -1063,27 +1159,37 @@ fn run_segment<B: ContinuousBackend>(
     }
 
     let mut pending_transition = None;
+    let mut terminal_source_qpc = segment.source_qpc;
     if session.terminal().is_none()
         && let Ok(control) = controls.try_recv()
     {
         match control {
-            ContinuousControl::Resume { session_id, snapshot, value } => {
+            ContinuousControl::Resume { session_id, snapshot, value, source_qpc } => {
                 let _pending = session.cancel(ContinuousCancelReason::DirectionChanged);
-                pending_transition =
-                    Some(SegmentResult::Handoff(SegmentStart { session_id, snapshot, value }));
+                terminal_source_qpc = source_qpc;
+                pending_transition = Some(SegmentResult::Handoff(SegmentStart {
+                    session_id,
+                    snapshot,
+                    value,
+                    source_qpc,
+                }));
             }
-            ContinuousControl::Suspend { reason } => {
+            ContinuousControl::Suspend { reason, source_qpc } => {
                 let _pending = session.cancel(reason);
+                terminal_source_qpc = source_qpc;
                 pending_transition = Some(SegmentResult::Inactive);
             }
-            ContinuousControl::Commit { value } => {
+            ContinuousControl::Commit { value, source_qpc } => {
                 let _pending = session.commit(value, elapsed(clock_origin));
+                terminal_source_qpc = source_qpc;
             }
-            ContinuousControl::Cancel { reason } => {
+            ContinuousControl::Cancel { reason, source_qpc } => {
                 let _pending = session.cancel(reason);
+                terminal_source_qpc = source_qpc;
             }
-            ContinuousControl::FinishDiscrete { plan, target } => {
+            ContinuousControl::FinishDiscrete { plan, target, source_qpc } => {
                 let _pending = session.cancel(ContinuousCancelReason::ReturnedToDiscrete);
+                terminal_source_qpc = source_qpc;
                 pending_transition = Some(SegmentResult::DispatchDiscrete { plan, target });
             }
         }
@@ -1097,7 +1203,8 @@ fn run_segment<B: ContinuousBackend>(
         ));
     };
     if let Some(request) = terminal {
-        let delivery = call_backend(backend, &request, stop_token, policy).err();
+        let delivery =
+            call_backend(backend, &request, stop_token, terminal_source_qpc, policy).err();
         if let Some(transition) = pending_transition {
             if let Some(reason) = stop_reason(stop_token) {
                 return SegmentResult::Complete(cancelled_completion(
@@ -1123,20 +1230,30 @@ fn run_segment<B: ContinuousBackend>(
         ));
     }
 
-    apply_latest(&mut session, latest, clock_origin, accepted_at);
+    let mut update_source_qpc =
+        apply_latest(&mut session, latest, clock_origin, accepted_at).unwrap_or(segment.source_qpc);
 
     loop {
         if let Some(reason) = stop_reason(stop_token) {
-            return finish_cancel(invocation_id, &mut session, reason, backend, stop_token, policy);
+            return finish_cancel(
+                invocation_id,
+                &mut session,
+                reason,
+                0,
+                backend,
+                stop_token,
+                policy,
+            );
         }
 
         if let Ok(control) = controls.try_recv() {
             match control {
-                ContinuousControl::Resume { session_id, snapshot, value } => {
+                ContinuousControl::Resume { session_id, snapshot, value, source_qpc } => {
                     let result = finish_cancel(
                         invocation_id,
                         &mut session,
                         ContinuousCancelReason::DirectionChanged,
+                        source_qpc,
                         backend,
                         stop_token,
                         policy,
@@ -1149,15 +1266,17 @@ fn run_segment<B: ContinuousBackend>(
                             session_id,
                             snapshot,
                             value,
+                            source_qpc,
                         });
                     }
                     return result;
                 }
-                ContinuousControl::Suspend { reason } => {
+                ContinuousControl::Suspend { reason, source_qpc } => {
                     let result = finish_cancel(
                         invocation_id,
                         &mut session,
                         reason,
+                        source_qpc,
                         backend,
                         stop_token,
                         policy,
@@ -1170,14 +1289,15 @@ fn run_segment<B: ContinuousBackend>(
                     }
                     return result;
                 }
-                ContinuousControl::Commit { value } => {
+                ContinuousControl::Commit { value, source_qpc } => {
                     let Ok(Some(request)) = session.commit(value, elapsed(clock_origin)) else {
                         return SegmentResult::Complete(failed_completion(
                             invocation_id,
                             ContinuousBackendFailure::Faulted(ContinuousBackendStage::Commit),
                         ));
                     };
-                    let delivery = call_backend(backend, &request, stop_token, policy).err();
+                    let delivery =
+                        call_backend(backend, &request, stop_token, source_qpc, policy).err();
                     return SegmentResult::Complete(terminal_completion(
                         invocation_id,
                         &request,
@@ -1185,21 +1305,23 @@ fn run_segment<B: ContinuousBackend>(
                         stop_token,
                     ));
                 }
-                ContinuousControl::Cancel { reason } => {
+                ContinuousControl::Cancel { reason, source_qpc } => {
                     return finish_cancel(
                         invocation_id,
                         &mut session,
                         reason,
+                        source_qpc,
                         backend,
                         stop_token,
                         policy,
                     );
                 }
-                ContinuousControl::FinishDiscrete { plan, target } => {
+                ContinuousControl::FinishDiscrete { plan, target, source_qpc } => {
                     let result = finish_cancel(
                         invocation_id,
                         &mut session,
                         ContinuousCancelReason::ReturnedToDiscrete,
+                        source_qpc,
                         backend,
                         stop_token,
                         policy,
@@ -1215,15 +1337,20 @@ fn run_segment<B: ContinuousBackend>(
             }
         }
 
-        apply_latest(&mut session, latest, clock_origin, accepted_at);
+        if let Some(source_qpc) = apply_latest(&mut session, latest, clock_origin, accepted_at) {
+            update_source_qpc = source_qpc;
+        }
         match session.take_due_update(elapsed(clock_origin)) {
             Ok(Some(request)) => {
-                if let Err(error) = call_backend(backend, &request, stop_token, policy) {
+                if let Err(error) =
+                    call_backend(backend, &request, stop_token, update_source_qpc, policy)
+                {
                     if let Some(reason) = stop_reason(stop_token) {
                         return finish_cancel(
                             invocation_id,
                             &mut session,
                             reason,
+                            0,
                             backend,
                             stop_token,
                             policy,
@@ -1239,6 +1366,7 @@ fn run_segment<B: ContinuousBackend>(
                         invocation_id,
                         &mut session,
                         cancel_reason,
+                        update_source_qpc,
                         backend,
                         stop_token,
                         policy,
@@ -1276,19 +1404,22 @@ fn apply_latest(
     latest: &LatestObservationSlot,
     clock_origin: Instant,
     accepted_at: Duration,
-) {
+) -> Option<i64> {
     if let Some(observation) = latest.take() {
         let observed_at =
             observation.observed_at.saturating_duration_since(clock_origin).max(accepted_at);
         let _observed =
             session.observe_coalesced(observation.value, observed_at, observation.count);
+        return Some(observation.source_qpc);
     }
+    None
 }
 
 fn finish_cancel<B: ContinuousBackend>(
     invocation_id: Uuid,
     session: &mut ContinuousSession,
     reason: ContinuousCancelReason,
+    source_qpc: i64,
     backend: &mut B,
     stop_token: &CoordinatorStopToken,
     policy: ContinuousExecutionPolicy,
@@ -1299,7 +1430,7 @@ fn finish_cancel<B: ContinuousBackend>(
             ContinuousBackendFailure::Faulted(ContinuousBackendStage::Cancel),
         ));
     };
-    let delivery = call_backend(backend, &request, stop_token, policy).err();
+    let delivery = call_backend(backend, &request, stop_token, source_qpc, policy).err();
     SegmentResult::Complete(terminal_completion(invocation_id, &request, delivery, stop_token))
 }
 
@@ -1307,12 +1438,14 @@ fn call_backend<B: ContinuousBackend>(
     backend: &mut B,
     request: &ContinuousRequest,
     stop_token: &CoordinatorStopToken,
+    source_qpc: i64,
     policy: ContinuousExecutionPolicy,
 ) -> Result<(), ContinuousBackendError> {
     let stage = stage_for(request);
     let deadline =
         Instant::now().checked_add(policy.timeout_for(stage)).unwrap_or_else(Instant::now);
-    let result = backend.dispatch(request, ContinuousBackendContext { deadline, stop_token });
+    let result =
+        backend.dispatch(request, ContinuousBackendContext { deadline, stop_token, source_qpc });
     if result.is_ok() && Instant::now() > deadline {
         Err(ContinuousBackendError::TimedOut)
     } else {
@@ -1499,6 +1632,24 @@ mod tests {
         calls: Sender<ContinuousRequest>,
     }
 
+    #[derive(Debug)]
+    struct SourceBackend {
+        calls: Sender<(ContinuousRequest, i64)>,
+    }
+
+    impl ContinuousBackend for SourceBackend {
+        fn dispatch(
+            &mut self,
+            request: &ContinuousRequest,
+            context: ContinuousBackendContext<'_>,
+        ) -> Result<(), ContinuousBackendError> {
+            self.calls
+                .send((request.clone(), context.source_qpc()))
+                .expect("source timing receiver");
+            Ok(())
+        }
+    }
+
     impl ContinuousBackend for FakeBackend {
         fn dispatch(
             &mut self,
@@ -1579,6 +1730,7 @@ mod tests {
         let context = ContinuousBackendContext {
             deadline: Instant::now() + Duration::from_secs(1),
             stop_token: &stop_token,
+            source_qpc: 0,
         };
 
         assert_eq!(
@@ -1644,6 +1796,37 @@ mod tests {
 
     fn finish(invocation: &mut ContinuousInvocation) -> ContinuousCompletion {
         invocation.wait_for_completion(Duration::from_secs(1)).expect("continuous completion")
+    }
+
+    #[test]
+    fn input_source_qpc_reaches_each_delivered_callback_stage() {
+        let executor = ActionExecutor::start(1).expect("executor");
+        let (sender, calls) = bounded(8);
+        let backend = SourceBackend { calls: sender };
+        let mut invocation = ContinuousInvocation::start_at(
+            &executor.handle(),
+            Uuid::from_u128(9),
+            snapshot("timed"),
+            0.2,
+            101,
+            backend,
+        )
+        .expect("continuous invocation");
+
+        let (begin, source_qpc) = calls.recv_timeout(Duration::from_secs(1)).expect("begin");
+        assert!(matches!(begin, ContinuousRequest::Begin(_)));
+        assert_eq!(source_qpc, 101);
+
+        invocation.handle().publish_at(0.6, 202).expect("publication");
+        let (update, source_qpc) = calls.recv_timeout(Duration::from_secs(1)).expect("update");
+        assert!(matches!(update, ContinuousRequest::Update(_)));
+        assert_eq!(source_qpc, 202);
+
+        invocation.handle().commit_at(0.7, 303).expect("commit");
+        let (commit, source_qpc) = calls.recv_timeout(Duration::from_secs(1)).expect("commit");
+        assert!(matches!(commit, ContinuousRequest::Commit(_)));
+        assert_eq!(source_qpc, 303);
+        assert_eq!(finish(&mut invocation).outcome, ContinuousCompletionOutcome::Committed);
     }
 
     #[test]

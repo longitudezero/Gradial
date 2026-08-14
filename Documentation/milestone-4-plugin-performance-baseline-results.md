@@ -50,6 +50,11 @@ useful worker-isolation measurement, but it does not include the configured
 update-period wait and therefore does not by itself qualify the full
 latest-publication-to-Update-start release gate.
 
+As of 14 August 2026, separate ETW callback-start markers close that gap. They
+retain the originating outer-edge, latest-publication, or activation-release
+QPC through the coordinator and capture the endpoint immediately before Lua.
+The original queue and callback histograms remain useful diagnostics.
+
 ## Current-machine development baseline
 
 The short campaign completed on the current machine with ten invocations and
@@ -119,7 +124,10 @@ latency distributions, displayed-frame gates, or the later 10,000-session
 soak. It establishes a repeatable measurement boundary before any
 evidence-driven optimization.
 
-Until displayed-frame and full input-to-callback latency gates exist, even a
-successful release-duration campaign reports its overall result as
-`not_evaluated`; its enabled-idle working-set contract is still evaluated and
-reported independently.
+The reporter now evaluates the full callback-start and displayed-frame gates.
+An optimized Release campaign produces overall `pass` or `fail` only when the
+active and slow fixtures each provide at least 1,000 samples for every required
+latency gate and the idle-plugin working-set comparison is evaluable. Missing
+or non-elevated evidence still produces `not_evaluated`. The short optimized
+validation and exact gates are recorded in
+[`milestone-4-release-timing-instrumentation-results.md`](milestone-4-release-timing-instrumentation-results.md).

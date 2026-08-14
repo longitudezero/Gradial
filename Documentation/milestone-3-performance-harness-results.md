@@ -18,9 +18,10 @@ The implementation adds:
   capture, application log, resource samples, and helper output;
 - an analyzer self-test included in the normal local check.
 
-The runner uses an isolated `LOCALAPPDATA`, a completed onboarding marker, and
-a harmless 10 ms Delay action on all eight slices. It never reads or changes
-the user's Gradial configuration.
+The original baseline used a harmless 10 ms Delay action. As of 14 August
+2026, the runner instead uses Ctrl+F13 on all eight slices and requires an
+isolated receiver to prove the exact complete key-down/key-up sequence. It
+never reads or changes the user's Gradial configuration.
 
 ## Evidence contract
 
@@ -90,6 +91,17 @@ The ignored raw report is under:
 Gradial APP\captures\performance\20260730-181638-development
 ```
 
+## Completed-shortcut instrumentation follow-up
+
+The previously missing shortcut boundary is now measured. The action worker
+emits a successful marker only after the complete `SendInput` sequence, and
+the report independently validates exact delivery to its isolated receiver.
+A fresh 20-invocation optimized development run captured all 80 expected key
+events and measured p95 1.894 ms and p99 2.306 ms from activation release to
+completed submission. These numbers are diagnostic; the Release preset still
+has to run before the p95 < 15 ms and p99 < 25 ms gate can pass or fail. See
+[`milestone-4-release-timing-instrumentation-results.md`](milestone-4-release-timing-instrumentation-results.md).
+
 ## Required coverage still open
 
 No required hardware/display configuration has a release-qualified report
@@ -105,10 +117,9 @@ yet:
 - center, every edge midpoint, and every corner;
 - standard, elevated, closing, and borderless-fullscreen targets.
 
-The completed shortcut-submission gate remains `not_run`; it needs the
-isolated shortcut receiver so the report can prove the final `SendInput`
-submission without typing into a real application. Elevated PresentMon capture
-and GPU-counter availability must also be established before a release run.
+Shortcut-submission instrumentation and isolated receiver evidence are now
+available. Elevated PresentMon capture, GPU-counter availability, and the full
+Release preset must still be completed before a release result exists.
 
 ## Automated coverage
 

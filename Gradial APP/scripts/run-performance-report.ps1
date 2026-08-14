@@ -392,6 +392,28 @@ if ($SelfTest) {
     if ($durations.Count -ne 1 -or $durations[0] -ne 25) {
         throw "Performance report QPC self-test failed."
     }
+    $shortcutMarker = [pscustomobject]@{
+        marker = "shortcut_submitted"
+        invocation_id = $sampleMarker.invocation_id
+        source_qpc = 114
+        marker_qpc = 114
+        qpc_frequency = 1000
+    }
+    $shortcutDurations = Get-MarkerDurations `
+        -Markers @($sampleMarker, $shortcutMarker) `
+        -StartMarker "activation_dequeued" `
+        -StartField source_qpc `
+        -EndMarker "shortcut_submitted" `
+        -EndField marker_qpc
+    $shortcutStatistics = Get-Statistics $shortcutDurations
+    if (
+        $shortcutDurations.Count -ne 1 -or
+        $shortcutDurations[0] -ne 14 -or
+        (Get-GateResult $shortcutStatistics $true 15 25) -ne "pass" -or
+        (Get-GateResult $shortcutStatistics $false 15 25) -ne "not_evaluated"
+    ) {
+        throw "Performance report shortcut gate self-test failed."
+    }
     Write-Host "Performance report analyzer self-test passed."
     return
 }
@@ -484,8 +506,15 @@ $foregroundProcessFile = Join-Path $reportDirectory "foreground.pid"
 $stdoutPath = Join-Path $reportDirectory "interaction.stdout.txt"
 $stderrPath = Join-Path $reportDirectory "interaction.stderr.txt"
 $resourcePath = Join-Path $reportDirectory "resources.csv"
+$receiverEventPath = Join-Path $temporaryRoot "shortcut-events.csv"
+$receiverReadyPath = Join-Path $temporaryRoot "shortcut-target-ready.txt"
+$receiverOutputPath = Join-Path $reportDirectory "shortcut-target.stdout.txt"
+$receiverErrorPath = Join-Path $reportDirectory "shortcut-target.stderr.txt"
+$receiverEvidencePath = Join-Path $reportDirectory "shortcut-receiver-events.csv"
 $originalLocalAppData = $env:LOCALAPPDATA
 $child = $null
+$receiverProcess = $null
+$shortcutReceiverValid = $false
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @"
@@ -510,7 +539,10 @@ public static class GradialPerformanceNative
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
     [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr window);
 
     [DllImport("user32.dll")]
     private static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
@@ -672,8 +704,15 @@ try {
         actions = @(
             [ordered]@{
                 id = $actionId
-                name = "10 ms performance delay"
-                kind = [ordered]@{ type = "delay"; milliseconds = 10 }
+                name = "Isolated Ctrl+F13 performance shortcut"
+                kind = [ordered]@{
+                    type = "send_shortcut"
+                    modifiers = @("left_control")
+                    key = [ordered]@{
+                        scan_code = 100
+                        extended = $false
+                    }
+                }
             }
         )
     }
@@ -683,12 +722,60 @@ try {
         [System.Text.UTF8Encoding]::new($false)
     )
 
+    $targetScript = Join-Path $PSScriptRoot "input-smoke-target.ps1"
+    $receiverProcess = Start-Process -FilePath "powershell.exe" `
+        -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            ('"' + $targetScript + '"'),
+            "-EventPath",
+            ('"' + $receiverEventPath + '"'),
+            "-ReadyPath",
+            ('"' + $receiverReadyPath + '"')
+        ) `
+        -RedirectStandardOutput $receiverOutputPath `
+        -RedirectStandardError $receiverErrorPath `
+        -PassThru `
+        -WindowStyle Hidden
+    $receiverDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (
+        -not (Test-Path -LiteralPath $receiverReadyPath) -and
+        -not $receiverProcess.HasExited -and
+        [DateTime]::UtcNow -lt $receiverDeadline
+    ) {
+        Start-Sleep -Milliseconds 50
+    }
+    if ($receiverProcess.HasExited) {
+        $receiverError = if (Test-Path -LiteralPath $receiverErrorPath) {
+            (Get-Content -Raw -LiteralPath $receiverErrorPath).Trim()
+        }
+        else { "no error output" }
+        throw "The isolated shortcut receiver exited early: $receiverError"
+    }
+    if (-not (Test-Path -LiteralPath $receiverReadyPath)) {
+        throw "The isolated shortcut receiver did not become ready."
+    }
+    $receiverIdentity = (Get-Content -Raw -LiteralPath $receiverReadyPath).Trim().Split(",")
+    if ($receiverIdentity.Count -ne 2 -or [int]$receiverIdentity[0] -ne $receiverProcess.Id) {
+        throw "The isolated shortcut receiver reported invalid identity metadata."
+    }
+    $receiverWindow = [IntPtr]::new([long]$receiverIdentity[1])
+    if (-not [GradialPerformanceNative]::SetForegroundWindow($receiverWindow)) {
+        throw "Windows did not foreground the isolated shortcut receiver."
+    }
+    Start-Sleep -Milliseconds 150
+    if ([GradialPerformanceNative]::GetForegroundWindow() -ne $receiverWindow) {
+        throw "The isolated shortcut receiver did not retain foreground focus."
+    }
+
     $env:LOCALAPPDATA = $temporaryRoot
     $smokeScript = Join-Path $PSScriptRoot "smoke-interaction.ps1"
     $childArguments = (
         "-NoProfile -ExecutionPolicy Bypass -File `"$smokeScript`" " +
         "-Configuration release -Geometry fixed-origin -Slices 8 -Direction E " +
-        "-InvocationCount $($preset.invocation_count) -ExpectDelayExecution " +
+        "-InvocationCount $($preset.invocation_count) -ExpectShortcutExecution " +
         "-GestureDelayMilliseconds $($preset.gesture_delay_ms) " +
         "-InterInvocationDelayMilliseconds $($preset.inter_invocation_delay_ms) " +
         "-WarmupSeconds $($preset.warmup_seconds) " +
@@ -818,6 +905,48 @@ try {
         }
         throw "The interaction campaign failed with code $childExitCode. $failure"
     }
+    Start-Sleep -Milliseconds 100
+    if (-not (Test-Path -LiteralPath $receiverEventPath)) {
+        throw "The isolated shortcut receiver captured no keyboard events."
+    }
+    $receiverEvents = @(
+        Get-Content -LiteralPath $receiverEventPath |
+            Where-Object { -not $_.StartsWith("char,") } |
+            ForEach-Object {
+                $fields = $_.Split(",")
+                [pscustomobject]@{
+                    scan_code = [int]$fields[2]
+                    extended = [bool]::Parse($fields[3])
+                    key_up = [bool]::Parse($fields[4])
+                }
+            }
+    )
+    $expectedShortcut = @(
+        [pscustomobject]@{ scan_code = 29; extended = $false; key_up = $false },
+        [pscustomobject]@{ scan_code = 100; extended = $false; key_up = $false },
+        [pscustomobject]@{ scan_code = 100; extended = $false; key_up = $true },
+        [pscustomobject]@{ scan_code = 29; extended = $false; key_up = $true }
+    )
+    $expectedReceiverEventCount = $preset.invocation_count * $expectedShortcut.Count
+    if ($receiverEvents.Count -ne $expectedReceiverEventCount) {
+        throw (
+            "Expected $expectedReceiverEventCount isolated shortcut events; " +
+            "observed $($receiverEvents.Count)."
+        )
+    }
+    for ($eventIndex = 0; $eventIndex -lt $receiverEvents.Count; $eventIndex++) {
+        $expected = $expectedShortcut[$eventIndex % $expectedShortcut.Count]
+        $observed = $receiverEvents[$eventIndex]
+        if (
+            $observed.scan_code -ne $expected.scan_code -or
+            $observed.extended -ne $expected.extended -or
+            $observed.key_up -ne $expected.key_up
+        ) {
+            throw "Isolated shortcut event $eventIndex violated the Ctrl+F13 cleanup contract."
+        }
+    }
+    Copy-Item -LiteralPath $receiverEventPath -Destination $receiverEvidencePath
+    $shortcutReceiverValid = $true
     $foregroundStable = -not $foregroundChanged
     $resourceSamples | Export-Csv -LiteralPath $resourcePath -NoTypeInformation -Encoding utf8
     $interactionLogPath = Join-Path $reportDirectory "gradial-interaction.log"
@@ -837,6 +966,12 @@ finally {
     if ($child -and -not $child.HasExited) {
         Stop-Process -Id $child.Id -Force
     }
+    if ($receiverProcess -and -not $receiverProcess.HasExited) {
+        [void]$receiverProcess.CloseMainWindow()
+        if (-not $receiverProcess.WaitForExit(3000)) {
+            Stop-Process -Id $receiverProcess.Id -Force
+        }
+    }
     if (-not $campaignSucceeded) {
         $failedTemporary = Resolve-Path -LiteralPath $temporaryRoot -ErrorAction SilentlyContinue
         $systemTemporary = Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())
@@ -854,7 +989,12 @@ finally {
 }
 $powerPlanAfter = Get-ActivePowerPlan
 $powerPlanStable = -not $powerPlanChanged -and $powerPlanBefore -eq $powerPlanAfter
-$validProtocol = $gateEligible -and $foregroundStable -and $powerPlanStable
+$validProtocol = (
+    $gateEligible -and
+    $foregroundStable -and
+    $powerPlanStable -and
+    $shortcutReceiverValid
+)
 
 $markerCsv = Get-ChildItem -LiteralPath $captureDirectory -Filter "gradial-markers-*.csv" |
     Sort-Object LastWriteTime |
@@ -986,11 +1126,30 @@ $dispatchGate = Get-GateResult `
         "Development protocol is not eligible for a release gate."
     } else { "" })))
 
+$shortcutSubmission = Get-MarkerDurations `
+    -Markers $markers `
+    -StartMarker "release_dequeued" `
+    -StartField source_qpc `
+    -EndMarker "shortcut_submitted" `
+    -EndField marker_qpc
+$shortcutSubmissionStats = Get-Statistics $shortcutSubmission
+$shortcutSubmissionGate = Get-GateResult `
+    -Statistics $shortcutSubmissionStats `
+    -ProtocolEligible $validProtocol `
+    -P95Limit 15 `
+    -P99Limit 25
 [void]$metrics.Add((New-Metric `
     -Name "release_to_completed_sendinput_shortcut" `
     -Unit "ms" `
-    -MeasurementStatus "not_run" `
-    -Reason "The safe Delay fixture does not synthesize keyboard input; this gate needs an isolated shortcut receiver."))
+    -MeasurementStatus $(if ($shortcutSubmissionStats) { "measured" } else { "unavailable" }) `
+    -GateResult $shortcutSubmissionGate `
+    -Statistics $shortcutSubmissionStats `
+    -Evidence "Gradial ETW release_dequeued to successful full shortcut submission; exact Ctrl+F13 receipt archived separately" `
+    -Reason $(if (-not $shortcutReceiverValid) {
+        "The isolated shortcut receiver did not validate the complete key sequence."
+    } elseif (-not $gateEligible) {
+        "Development protocol is not eligible for a release gate."
+    } else { "" })))
 
 $hookMatch = [regex]::Matches(
     $log,
@@ -1162,6 +1321,9 @@ $gateResults = @($metrics | ForEach-Object { $_.gate_result })
 $overall = if ($Mode -eq "Release" -and -not ($foregroundStable -and $powerPlanStable)) {
     "invalid"
 }
+elseif ($Mode -eq "Release" -and -not $shortcutReceiverValid) {
+    "invalid"
+}
 elseif ($gateResults -contains "fail") {
     "fail"
 }
@@ -1173,8 +1335,8 @@ else {
 }
 $notes = @(
     "Application frame checkpoints are diagnostic and never substitute for displayed-frame evidence.",
-    "The interaction campaign used a harmless 10 ms Delay action on every slice.",
-    "The shortcut-completion gate remains intentionally not run until an isolated receiver is used.",
+    "The interaction campaign used Ctrl+F13 on every slice and delivered it only to Gradial's isolated receiver.",
+    "Shortcut timing ends after successful SendInput submission of all key-down and key-up events; the archived receiver log independently proves exact delivery and cleanup.",
     "Raw ETW, PresentMon, resource, stdout, and stderr evidence remains beside this report."
 )
 if (-not $isElevated) {
@@ -1184,7 +1346,7 @@ if ($Mode -eq "Development") {
     $notes += "Development mode is a harness check and local baseline, not a release qualification."
 }
 $report = [ordered]@{
-    report_schema_version = 1
+    report_schema_version = 2
     captured_at = (Get-Date).ToUniversalTime().ToString("o")
     overall_gate_result = $overall
     protocol = [ordered]@{
@@ -1204,6 +1366,7 @@ $report = [ordered]@{
             "not_installed"
         }
         timing_markers = if ($markers.Count -gt 0) { "captured" } else { "unavailable" }
+        shortcut_receiver = if ($shortcutReceiverValid) { "validated" } else { "invalid" }
         gpu_counters = if ($gpuStats) { "captured" } else { "unavailable" }
         windows_performance_toolkit = if (
             Test-Path -LiteralPath (
@@ -1214,7 +1377,8 @@ $report = [ordered]@{
     validity = [ordered]@{
         foreground_stable = $foregroundStable
         power_plan_stable = $powerPlanStable
-        valid = $foregroundStable -and $powerPlanStable
+        shortcut_receiver_valid = $shortcutReceiverValid
+        valid = $foregroundStable -and $powerPlanStable -and $shortcutReceiverValid
     }
     machine = [ordered]@{
         windows = if ($windows) {

@@ -271,7 +271,8 @@ impl GradialApp {
         platform::set_display_topology_monitoring(false);
         platform::configure_overlay_window(creation_context)?;
         let tray_icon = TrayIcon::install(platform::controller_window_address())?;
-        let action_executor = ActionExecutor::start(config_revision)?;
+        let action_executor =
+            ActionExecutor::start_with_timing(config_revision, Arc::clone(&timing_markers))?;
         let monitors =
             platform::monitor_work_areas().context("could not read the display work areas")?;
         let (debug_menu_override, debug_slice_override) =

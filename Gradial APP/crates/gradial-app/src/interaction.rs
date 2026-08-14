@@ -1114,7 +1114,13 @@ fn dispatch_continuous_effect(
     else {
         return;
     };
-    update_live_continuous(update.invocation_id, update.visual, active, dispatcher);
+    update_live_continuous(
+        update.invocation_id,
+        update.visual,
+        update.source_qpc,
+        active,
+        dispatcher,
+    );
     dispatch_continuous_changed(
         update.invocation_id,
         update.visual,
@@ -1158,7 +1164,12 @@ fn dispatch_effect(
             }
         }
         InteractionEffect::SelectionChanged { invocation_id, selected_slice } => {
-            suspend_live_continuous(active, ContinuousCancelReason::ReturnedToDiscrete, dispatcher);
+            suspend_live_continuous(
+                active,
+                ContinuousCancelReason::ReturnedToDiscrete,
+                source_qpc,
+                dispatcher,
+            );
             dispatch_selection_changed(
                 invocation_id,
                 selected_slice,
@@ -1169,7 +1180,7 @@ fn dispatch_effect(
             );
         }
         InteractionEffect::ContinuousChanged { invocation_id, visual } => {
-            update_live_continuous(invocation_id, visual, active, dispatcher);
+            update_live_continuous(invocation_id, visual, source_qpc, active, dispatcher);
             dispatch_continuous_changed(
                 invocation_id,
                 visual,
@@ -1189,6 +1200,7 @@ fn dispatch_effect(
 fn update_live_continuous(
     invocation_id: uuid::Uuid,
     visual: ContinuousVisualState,
+    source_qpc: i64,
     active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
 ) {
@@ -1201,7 +1213,12 @@ fn update_live_continuous(
     match change {
         LiveContinuousChange::None => return,
         LiveContinuousChange::Suspend => {
-            suspend_live_continuous(active, ContinuousCancelReason::ReturnedToDiscrete, dispatcher);
+            suspend_live_continuous(
+                active,
+                ContinuousCancelReason::ReturnedToDiscrete,
+                source_qpc,
+                dispatcher,
+            );
             return;
         }
         LiveContinuousChange::Start
@@ -1218,7 +1235,8 @@ fn update_live_continuous(
     let config_revision = target.config_revision;
     if change == LiveContinuousChange::Publish {
         if let Some(live) = active.live_continuous.as_ref()
-            && let Err(error) = live.invocation.handle().publish(visual.selection.value)
+            && let Err(error) =
+                live.invocation.handle().publish_at(visual.selection.value, source_qpc)
         {
             log_continuous_submit_failure(invocation_id, config_revision, "value", error);
         }
@@ -1246,24 +1264,24 @@ fn update_live_continuous(
             action_snapshot,
             target,
             config_revision,
+            source_qpc,
             active,
             dispatcher,
         );
         return;
     }
-    let submit_result =
-        match change {
-            LiveContinuousChange::Handoff => active.live_continuous.as_ref().map(|live| {
-                live.invocation.handle().handoff(action_snapshot, visual.selection.value)
-            }),
-            LiveContinuousChange::Resume => active.live_continuous.as_ref().map(|live| {
-                live.invocation.handle().resume(action_snapshot, visual.selection.value)
-            }),
-            LiveContinuousChange::None
-            | LiveContinuousChange::Start
-            | LiveContinuousChange::Publish
-            | LiveContinuousChange::Suspend => None,
-        };
+    let submit_result = match change {
+        LiveContinuousChange::Handoff => active.live_continuous.as_ref().map(|live| {
+            live.invocation.handle().handoff_at(action_snapshot, visual.selection.value, source_qpc)
+        }),
+        LiveContinuousChange::Resume => active.live_continuous.as_ref().map(|live| {
+            live.invocation.handle().resume_at(action_snapshot, visual.selection.value, source_qpc)
+        }),
+        LiveContinuousChange::None
+        | LiveContinuousChange::Start
+        | LiveContinuousChange::Publish
+        | LiveContinuousChange::Suspend => None,
+    };
 
     let Some(submit_result) = submit_result else {
         return;
@@ -1291,23 +1309,26 @@ fn start_live_continuous(
     action_snapshot: ContinuousActionSnapshot,
     target: Arc<gradial_core::InvocationContext>,
     config_revision: u64,
+    source_qpc: i64,
     active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
 ) {
     let start = if active.continuous_meter {
-        ContinuousInvocation::start(
+        ContinuousInvocation::start_at(
             dispatcher.action_executor,
             invocation_id,
             action_snapshot,
             visual.selection.value,
+            source_qpc,
             ValidatingInertBackend::new(invocation_id, target),
         )
     } else {
-        ContinuousInvocation::start(
+        ContinuousInvocation::start_at(
             dispatcher.action_executor,
             invocation_id,
             action_snapshot,
             visual.selection.value,
+            source_qpc,
             PluginContinuousBackend::new(
                 invocation_id,
                 target,
@@ -1363,6 +1384,7 @@ const fn classify_live_continuous_change(
 fn suspend_live_continuous(
     active: &mut ActiveInvocation,
     reason: ContinuousCancelReason,
+    source_qpc: i64,
     dispatcher: &EffectDispatcher<'_>,
 ) {
     reap_live_continuous(active, dispatcher.config_revision);
@@ -1373,7 +1395,7 @@ fn suspend_live_continuous(
         return;
     }
     let handle = live.invocation.handle();
-    match handle.suspend(reason) {
+    match handle.suspend_at(reason, source_qpc) {
         Ok(()) => live.phase = LiveContinuousPhase::Inactive,
         Err(error) => log_continuous_submit_failure(
             active.snapshot.as_ref().map_or(uuid::Uuid::nil(), |snapshot| snapshot.invocation_id),
@@ -1389,6 +1411,7 @@ fn suspend_live_continuous(
 
 fn finalize_live_continuous(
     outcome: InteractionOutcome,
+    source_qpc: i64,
     active: &mut ActiveInvocation,
     dispatcher: &EffectDispatcher<'_>,
 ) -> bool {
@@ -1398,16 +1421,23 @@ fn finalize_live_continuous(
     };
     let handle = live.invocation.handle();
     let result = match outcome {
-        InteractionOutcome::ContinuousCommitted { value, .. } => handle.commit(value),
+        InteractionOutcome::ContinuousCommitted { value, .. } => {
+            handle.commit_at(value, source_qpc)
+        }
         InteractionOutcome::Selected { .. } => {
             match (active.execution_plan.as_ref(), active.snapshot.as_ref()) {
-                (Some(plan), Some(snapshot)) if !active.continuous_meter => {
-                    handle.finish_discrete(Arc::clone(plan), Arc::clone(&snapshot.context))
-                }
-                _ => handle.cancel(ContinuousCancelReason::ReturnedToDiscrete),
+                (Some(plan), Some(snapshot)) if !active.continuous_meter => handle
+                    .finish_discrete_at(
+                        Arc::clone(plan),
+                        Arc::clone(&snapshot.context),
+                        source_qpc,
+                    ),
+                _ => handle.cancel_at(ContinuousCancelReason::ReturnedToDiscrete, source_qpc),
             }
         }
-        InteractionOutcome::Cancelled { reason } => handle.cancel(map_cancel_reason(reason)),
+        InteractionOutcome::Cancelled { reason } => {
+            handle.cancel_at(map_cancel_reason(reason), source_qpc)
+        }
     };
     let transferred = matches!(outcome, InteractionOutcome::Selected { .. })
         && active.execution_plan.is_some()
@@ -1523,7 +1553,7 @@ fn dispatch_close(
     route: &OverlayRoute,
     dispatcher: &EffectDispatcher<'_>,
 ) {
-    let live_discrete_transfer = finalize_live_continuous(outcome, active, dispatcher);
+    let live_discrete_transfer = finalize_live_continuous(outcome, source_qpc, active, dispatcher);
     let active_snapshot = active.snapshot.as_ref();
     let config_revision = active_snapshot
         .map_or(dispatcher.config_revision, |snapshot| snapshot.context.config_revision);

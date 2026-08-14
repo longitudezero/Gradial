@@ -1812,16 +1812,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-repo
 ```
 
 Release mode fixes the warmup at five minutes, performs 1,000 real synthetic
-M4 invocations against an isolated 10 ms Delay fixture, retains a 30-minute
-idle phase, and measures 100 cold launches. It writes Markdown,
+M4 invocations against an isolated Ctrl+F13 receiver, retains a 30-minute idle
+phase, and measures 100 cold launches. The receiver must observe Ctrl down,
+F13 down/up, and Ctrl up for every invocation. It writes Markdown,
 schema-versioned JSON, flat CSV, raw ETW/PresentMon tables, application log,
 resource samples, and helper output below `captures\performance`.
 
 Renderer checkpoints are reported only as application diagnostics. The
 displayed usable-frame and displayed-highlight gates remain `unavailable`
-unless PresentMon produces correlatable displayed events. The shortcut
-completion gate remains `not_run` because the Delay fixture does not synthesize
-keys. Any foreground change or power-plan change invalidates a release run.
+unless PresentMon produces correlatable displayed events. The completed
+shortcut gate correlates activation release with successful submission of the
+entire key sequence and is valid only when the isolated receiver also verifies
+exact delivery. Any foreground change or power-plan change invalidates a
+release run.
 The complete protocol and current-machine development numbers are recorded in
 `Documentation\milestone-3-performance-harness-results.md`.
 
@@ -1836,17 +1839,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-performan
 The runner creates isolated disabled, idle-enabled, active, deliberately slow,
 and faulted packages. It parses process CPU and memory, application and
 displayed-frame timing where available, exact plugin callback/queue timing,
-fixed worker aggregates, hook duration, and input/renderer health. The short
+full input/publication-to-callback-start timing, fixed worker aggregates, hook
+duration, and input/renderer health. The short
 mode uses ten invocations and three seconds idle per scenario and never
 qualifies release gates. From an elevated, otherwise idle PowerShell, use
 `-Mode Release -Build release` for the five-minute warmup, 1,000-invocation,
 30-minute-idle protocol. Raw evidence is ignored below
-`captures\plugin-performance`. The measurement contract and current short
+`captures\plugin-performance`. In Release mode the report produces an overall
+pass or fail only when active and slow each supply 1,000 samples for every
+continuous callback and displayed-frame gate and the idle-plugin memory gate
+is evaluable. The measurement contract and current short
 baseline are recorded in
 `Documentation\milestone-4-plugin-performance-baseline-results.md`.
-The release-duration run evaluates the enabled-idle working-set contract, but
-keeps its overall result `not_evaluated` until displayed-frame and complete
-input-to-callback latency gates are implemented.
+The implementation and short optimized route evidence are recorded in
+`Documentation\milestone-4-release-timing-instrumentation-results.md`.
 
 ## Manual interaction check
 
