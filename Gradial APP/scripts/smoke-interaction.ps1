@@ -35,6 +35,8 @@ param(
 
     [string]$ForegroundProcessFile,
 
+    [long]$ForegroundWindowHandle = 0,
+
     [string]$TimingOutputDirectory,
 
     [string]$PresentMonPath,
@@ -186,6 +188,9 @@ public static class GradialSmokeNative
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr window);
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromPoint(Point point, uint flags);
@@ -944,8 +949,15 @@ try {
     Set-PerformancePhase "invocations"
     if ($CaptureTiming) {
         $captureScript = Join-Path $PSScriptRoot "capture-timing.ps1"
+        $timingReadyPath = if ($TimingOutputDirectory) {
+            Join-Path $TimingOutputDirectory "timing-ready.txt"
+        }
+        else {
+            Join-Path ([IO.Path]::GetTempPath()) "gradial-timing-ready-$PID.txt"
+        }
         $captureArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$captureScript`" " +
-            "-DurationSeconds $CaptureDurationSeconds -ProcessId $($gradial.Id)"
+            "-DurationSeconds $CaptureDurationSeconds -AllProcesses " +
+            "-ReadyFile `"$timingReadyPath`""
         if ($TimingMarkersOnly) {
             $captureArguments += " -MarkersOnly"
         }
@@ -960,15 +972,36 @@ try {
             -WorkingDirectory $workspace `
             -PassThru `
             -WindowStyle Hidden
-        Start-Sleep -Milliseconds 900
-        if ($timingCapture.HasExited) {
-            throw "The timing capture helper exited before the gesture with code $($timingCapture.ExitCode)."
+        $timingReadyDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $timingReadyPath)) {
+            if ($timingCapture.HasExited) {
+                throw "The timing capture helper exited before becoming ready with code $($timingCapture.ExitCode)."
+            }
+            if ([DateTime]::UtcNow -ge $timingReadyDeadline) {
+                throw "The timing capture helper did not become ready within 30 seconds."
+            }
+            Start-Sleep -Milliseconds 100
         }
+        Start-Sleep -Milliseconds 1000
     }
 
     # Recovery pass-through checks may legitimately let the foreground
     # application handle M4. Establish the focus baseline immediately before
     # the measured Gradial invocation set so only Gradial-caused changes fail.
+    if ($ForegroundWindowHandle -ne 0) {
+        $requiredForegroundWindow = [IntPtr]::new($ForegroundWindowHandle)
+        $foregroundDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            [void][GradialSmokeNative]::SetForegroundWindow($requiredForegroundWindow)
+            Start-Sleep -Milliseconds 50
+        } while (
+            [GradialSmokeNative]::GetForegroundWindow() -ne $requiredForegroundWindow -and
+            [DateTime]::UtcNow -lt $foregroundDeadline
+        )
+        if ([GradialSmokeNative]::GetForegroundWindow() -ne $requiredForegroundWindow) {
+            throw "Windows did not restore the required smoke target before measured invocations."
+        }
+    }
     $foregroundWindow = [GradialSmokeNative]::GetForegroundWindow()
     $foregroundProcess = [GradialSmokeNative]::ForegroundProcessId()
     if ($ForegroundProcessFile) {

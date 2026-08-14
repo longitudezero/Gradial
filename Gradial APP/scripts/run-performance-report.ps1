@@ -124,7 +124,8 @@ function Get-MarkerDurations {
 function Get-PresentEvents {
     param(
         [string]$Path,
-        [int64]$QpcFrequency
+        [int64]$QpcFrequency,
+        [int]$TargetProcessId = 0
     )
 
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
@@ -135,7 +136,7 @@ function Get-PresentEvents {
         return @()
     }
     $names = @($rows[0].PSObject.Properties.Name)
-    $qpcColumn = @("CPUStartQPC", "CPUStartQpc") |
+    $qpcColumn = @("QPCTime", "CPUStartQPC", "CPUStartQpc") |
         Where-Object { $names -contains $_ } |
         Select-Object -First 1
     $displayColumn = @("msUntilDisplayed", "MsUntilDisplayed") |
@@ -143,6 +144,18 @@ function Get-PresentEvents {
         Select-Object -First 1
     if (-not $qpcColumn -or -not $displayColumn -or $QpcFrequency -le 0) {
         return @()
+    }
+
+    if ($TargetProcessId -gt 0) {
+        $processIdColumn = @("ProcessID", "ProcessId") |
+            Where-Object { $names -contains $_ } |
+            Select-Object -First 1
+        if (-not $processIdColumn) {
+            return @()
+        }
+        $rows = @($rows | Where-Object {
+            [string]$_.$processIdColumn -eq [string]$TargetProcessId
+        })
     }
 
     $events = @()
@@ -400,6 +413,39 @@ if ($SelfTest) {
     if ($durations.Count -ne 1 -or $durations[0] -ne 25) {
         throw "Performance report QPC self-test failed."
     }
+    $presentFixture = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        "gradial-present-selftest-$PID.csv"
+    try {
+        [IO.File]::WriteAllLines(
+            $presentFixture,
+            @(
+                "Application,ProcessID,msUntilDisplayed,QPCTime",
+                "other.exe,123,2.5,100",
+                "gradial.exe,456,5.0,200"
+            ),
+            [Text.UTF8Encoding]::new($false)
+        )
+        $presentEvents = @(Get-PresentEvents `
+            -Path $presentFixture `
+            -QpcFrequency 1000 `
+            -TargetProcessId 456)
+        if (
+            $presentEvents.Count -ne 1 -or
+            $presentEvents[0].start_qpc -ne 200 -or
+            $presentEvents[0].displayed_qpc -ne 205
+        ) {
+            throw (
+                "Performance report PresentMon self-test failed: " +
+                "count=$($presentEvents.Count) " +
+                "start=$($presentEvents[0].start_qpc) " +
+                "displayed=$($presentEvents[0].displayed_qpc)."
+            )
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $presentFixture -Force -ErrorAction SilentlyContinue
+    }
     $shortcutMarker = [pscustomobject]@{
         marker = "shortcut_submitted"
         invocation_id = $sampleMarker.invocation_id
@@ -478,7 +524,7 @@ if (-not $PresentMonPath) {
 $presentMonAvailable = [bool](
     $PresentMonPath -and (Test-Path -LiteralPath $PresentMonPath)
 )
-$usePresentMon = $presentMonAvailable -and $isElevated -and -not $MarkersOnly
+$usePresentMon = $presentMonAvailable -and -not $MarkersOnly
 
 $preset = if ($Mode -eq "Release") {
     [ordered]@{
@@ -552,6 +598,7 @@ $receiverEventPath = Join-Path $temporaryRoot "shortcut-events.csv"
 $receiverReadyPath = Join-Path $temporaryRoot "shortcut-target-ready.txt"
 $receiverOutputPath = Join-Path $reportDirectory "shortcut-target.stdout.txt"
 $receiverErrorPath = Join-Path $reportDirectory "shortcut-target.stderr.txt"
+$receiverIdentityPath = Join-Path $reportDirectory "shortcut-target-identity.txt"
 $receiverEvidencePath = Join-Path $reportDirectory "shortcut-receiver-events.csv"
 $runnerErrorPath = Join-Path $reportDirectory "performance-runner-error.txt"
 $originalLocalAppData = $env:LOCALAPPDATA
@@ -805,6 +852,7 @@ try {
     if ($receiverIdentity.Count -ne 2 -or [int]$receiverIdentity[0] -ne $receiverProcess.Id) {
         throw "The isolated shortcut receiver reported invalid identity metadata."
     }
+    Copy-Item -LiteralPath $receiverReadyPath -Destination $receiverIdentityPath
     $receiverWindow = [IntPtr]::new([long]$receiverIdentity[1])
     if (-not [GradialPerformanceNative]::SetForegroundWindow($receiverWindow)) {
         throw "Windows did not foreground the isolated shortcut receiver."
@@ -828,6 +876,7 @@ try {
         "-MonitorIndex $MonitorIndex -ProcessIdFile `"$processIdFile`" " +
         "-PhaseFile `"$phaseFile`" " +
         "-ForegroundProcessFile `"$foregroundProcessFile`" " +
+        "-ForegroundWindowHandle $($receiverWindow.ToInt64()) " +
         "-LogEvidenceDirectory `"$logEvidenceDirectory`" " +
         "-TimingOutputDirectory `"$captureDirectory`""
     )
@@ -1130,7 +1179,10 @@ $markers = Read-TimingMarkers $markerCsv.FullName
 $qpcFrequency = (
     $markers | Select-Object -First 1 -ExpandProperty qpc_frequency -ErrorAction SilentlyContinue
 )
-$presents = Get-PresentEvents $presentCsv.FullName $qpcFrequency
+$presents = @(Get-PresentEvents `
+    -Path $presentCsv.FullName `
+    -QpcFrequency $qpcFrequency `
+    -TargetProcessId $gradialProcessId)
 $logPath = Join-Path $reportDirectory "gradial-interaction.log"
 $log = if (Test-Path -LiteralPath $logPath) {
     Get-Content -Raw -LiteralPath $logPath
@@ -1190,7 +1242,7 @@ $displayOpenGate = Get-GateResult `
     -Statistics $displayOpenStats `
     -Evidence "Gradial ETW correlated with PresentMon displayed events" `
     -Reason $(if (-not $usePresentMon) {
-        "PresentMon display capture was unavailable without an elevated session."
+        "PresentMon display capture was unavailable for this run."
     } elseif ($displayOpenStats -and $displayOpenStats.sample_count -lt $preset.invocation_count) {
         "Only $($displayOpenStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
     } elseif (-not $gateEligible) {
@@ -1226,7 +1278,7 @@ $displayHighlightGate = Get-GateResult `
     -Statistics $displayHighlightStats `
     -Evidence "Gradial ETW correlated with PresentMon displayed events" `
     -Reason $(if (-not $usePresentMon) {
-        "PresentMon display capture was unavailable without an elevated session."
+        "PresentMon display capture was unavailable for this run."
     } elseif ($displayHighlightStats -and $displayHighlightStats.sample_count -lt $preset.invocation_count) {
         "Only $($displayHighlightStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
     } elseif (-not $gateEligible) {
@@ -1478,8 +1530,8 @@ $notes = @(
     "Shortcut timing ends after successful SendInput submission of all key-down and key-up events; the archived receiver log independently proves exact delivery and cleanup.",
     "Raw ETW, PresentMon, resource, stdout, and stderr evidence remains beside this report."
 )
-if (-not $isElevated) {
-    $notes += "This PowerShell session was not elevated, so PresentMon display evidence was not captured."
+if (-not $usePresentMon) {
+    $notes += "PresentMon display evidence was not requested or was unavailable for this run."
 }
 if ($Mode -eq "Development") {
     $notes += "Development mode is a harness check and local baseline, not a release qualification."
@@ -1500,7 +1552,7 @@ $report = [ordered]@{
     capabilities = [ordered]@{
         elevated = $isElevated
         presentmon = if ($usePresentMon) { "captured" } elseif ($presentMonAvailable) {
-            "installed_but_elevation_required"
+            "installed_but_not_captured"
         } else {
             "not_installed"
         }

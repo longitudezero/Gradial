@@ -1790,22 +1790,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-timing.ps1
 
 The helper uses the installed PresentMon executable and Windows `logman`. It
 writes ignored `.csv` and `.etl` diagnostics under `Gradial APP\captures`.
-Run the full display-event capture from an elevated PowerShell. Pass
-`-MarkersOnly` when only the Gradial ETW stream is needed.
+Run it from a normal PowerShell; Windows requests elevation for PresentMon
+alone. Pass `-MarkersOnly` when only the Gradial ETW stream is needed.
 
 For a complete machine-readable report, first build the release executable and
 run:
 
 ```powershell
 cargo build --workspace --all-features --release
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Development -MarkersOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Development
 ```
 
 Development mode is deliberately short: a two-second warmup, 20 invocations,
 eight seconds of idle sampling, and three cold launches. It validates the
 harness but marks every release gate `not_evaluated`.
 
-From an elevated, otherwise idle PowerShell, the full protocol is:
+From a normal, otherwise idle PowerShell, the full protocol is:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Release
@@ -1836,6 +1836,22 @@ The capture duration budgets 200 ms per interaction plus fixed headroom, and
 every per-invocation Release timing gate requires all 1,000 samples. The cold
 launch gate likewise requires all 100 samples; incomplete coverage remains
 `not_evaluated`.
+The isolated receiver publishes its process ID and native window handle. The
+interaction helper restores and verifies that exact window immediately after
+warm-up, before freezing the invocation target; the identity is archived with
+the report. PresentMon is the only elevated child, so an administrator console
+cannot accidentally become the shortcut target.
+PresentMon uses a unique capture session, the v1 CSV schema expected by the
+analyzer, an explicit collector-ready handshake, and a one-second settling
+allowance before measured gestures. Its exact arguments and ShellExecute
+launch/exit diagnostics are retained beside the raw CSV. A missing or empty
+CSV fails the helper instead of being reported as a successful capability.
+The automated smoke route captures the shared presentation stream and the
+analyzer filters it to the exact Gradial process ID. This avoids unreliable
+attachment to initially hidden swap chains while keeping the results
+process-specific. The standalone helper still accepts a process name or ID for
+manual diagnostics. PresentMon 2.5's `QPCTime` field and the older
+`CPUStartQPC` spelling are both accepted.
 
 Renderer checkpoints are reported only as application diagnostics. The
 displayed usable-frame and displayed-highlight gates remain `unavailable`
@@ -1949,9 +1965,10 @@ reject that option; isolated release action fixtures create their own valid
 marker inside their disposable `LOCALAPPDATA` trees.
 
 Add `-CaptureTiming` to the second command to run the documented ETW and
-PresentMon capture around the synthetic gesture. In a non-elevated development
-shell, add `-TimingMarkersOnly`. Pass `-Configuration release` after building
-with `cargo build --release` for performance-oriented checks. `-MonitorIndex`
+PresentMon capture around the synthetic gesture. Windows requests elevation
+for PresentMon alone; add `-TimingMarkersOnly` to intentionally capture only
+Gradial's ETW markers. Pass `-Configuration release` after building with
+`cargo build --release` for performance-oriented checks. `-MonitorIndex`
 selects an entry from Windows' current display list. `-Slices 4` or `-Slices 8`
 selects and validates the corresponding startup geometry.
 `-ChangeFromDirection N -Direction W` adds a deliberate post-arm turn to a

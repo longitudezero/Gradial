@@ -62,6 +62,24 @@ displayed-highlight, executor-dispatch, and completed-shortcut Release gates
 each require all 1,000 invocation samples; cold-start qualification requires
 all 100 launches. Incomplete coverage is `not_evaluated`, never a pass.
 
+The runner passes the isolated receiver's exact native window handle into the
+interaction helper. Immediately after warm-up, the helper restores and verifies
+that window before freezing the target and records its process ID separately.
+Only PresentMon is elevated, so an administrator console cannot accidentally
+become the stable shortcut target.
+
+PresentMon capture uses a unique session name and explicitly requests its v1
+metric schema. The interaction helper waits for an explicit collector-ready
+file and then allows one second for settling. The exact arguments and
+ShellExecute launch/exit diagnostics are archived; exit code zero without a
+non-empty CSV is a capture failure rather than a successfully captured
+capability.
+The automated route captures the shared presentation stream and the analyzer
+then selects only the exact Gradial PID. This avoids unreliable attachment to
+initially hidden swap chains while preserving process-specific results.
+Standalone diagnostics may still select a process name or PID. The analyzer
+accepts PresentMon 2.5's `QPCTime` column and the older `CPUStartQPC` spelling.
+
 Release evaluation additionally requires:
 
 - a detached debugger;
@@ -145,15 +163,17 @@ yet:
 - standard, elevated, closing, and borderless-fullscreen targets.
 
 Shortcut-submission instrumentation and isolated receiver evidence are now
-available. Elevated PresentMon capture, GPU-counter availability, and the full
-Release preset must still be completed before a release result exists.
+available. PresentMon elevation is isolated and validated in Development mode;
+GPU-counter availability and the full Release preset must still be completed
+before a release result exists.
 
 ## Automated coverage
 
-The complete suite contains 227 tests:
+The complete suite contains 420 tests:
 
-- 175 `gradial-app` tests;
-- 52 `gradial-core` tests.
+- 296 `gradial-app` tests;
+- 96 `gradial-core` tests;
+- 28 `gradial-lua` tests.
 
 The new hook test proves nearest-rank p99 behavior, including the bounded
 overflow bucket. The performance analyzer self-test proves nearest-rank
@@ -164,10 +184,10 @@ and the release build pass.
 Run the quick local report from `Gradial APP` with:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Development -MarkersOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Development
 ```
 
-Run the release protocol from an elevated, otherwise idle PowerShell with:
+Run the release protocol from a normal, otherwise idle PowerShell with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-report.ps1 -Mode Release
