@@ -5,6 +5,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+#[cfg(debug_assertions)]
+use gradial_core::ActionKind;
 use gradial_core::{
     ActionPlanCompiler, Configuration, DEFAULT_OVERLAY_HALF_EXTENT_DIP, GeometryMode,
     GestureConfig, ProfileResolver, ResolvedMenu, continuous_arm_radius_for_size,
@@ -186,6 +188,14 @@ fn create_settings_editor(
     let settings = SettingsEditor::new(recovery_warning, Arc::clone(icons));
     settings.update_start_at_login_status(start_at_login.inspect());
     settings
+}
+
+#[cfg(debug_assertions)]
+fn debug_plugin_operation_target(configuration: &Configuration) -> Option<String> {
+    configuration.actions.iter().find_map(|action| match &action.kind {
+        ActionKind::PluginContinuous { plugin_id, .. } => Some(plugin_id.clone()),
+        _ => None,
+    })
 }
 
 pub(crate) struct GradialApp {
@@ -1101,6 +1111,27 @@ impl GradialApp {
         self.begin_plugin_operation(context, operation, plugin_id, enable_after_approval);
     }
 
+    #[cfg(debug_assertions)]
+    fn handle_debug_plugin_operation(
+        &mut self,
+        context: &eframe::egui::Context,
+        operation: platform::DebugPluginOperation,
+    ) {
+        let Some(plugin_id) = debug_plugin_operation_target(&self.configuration) else {
+            log::warn!(
+                target: "plugins",
+                "component=plugins event_code=debug_plugin_operation_rejected \
+                 result_code=failure error_code=no_configured_continuous_plugin"
+            );
+            return;
+        };
+        let operation = match operation {
+            platform::DebugPluginOperation::Reload => PluginWorkerOperation::Reload,
+            platform::DebugPluginOperation::Disable => PluginWorkerOperation::Disable,
+        };
+        self.begin_plugin_operation(context, operation, plugin_id, false);
+    }
+
     fn refresh_start_at_login_status(&self, context: &eframe::egui::Context) {
         let status = self.start_at_login.inspect();
         match status {
@@ -1501,6 +1532,11 @@ impl eframe::App for GradialApp {
             }
         }
 
+        #[cfg(debug_assertions)]
+        if let Some(operation) = platform::take_debug_plugin_operation() {
+            self.handle_debug_plugin_operation(context, operation);
+        }
+
         if let Some(event) = self.settings.try_event() {
             self.handle_settings_event(context, event);
         }
@@ -1521,5 +1557,51 @@ impl eframe::App for GradialApp {
         self.settings.show(ui.ctx());
         self.onboarding.show(ui.ctx());
         self.continuous_study.show(ui.ctx());
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::debug_plugin_operation_target;
+    use gradial_core::{ActionDefinition, ActionKind, Configuration};
+    use uuid::Uuid;
+
+    #[test]
+    fn debug_plugin_operation_targets_the_first_configured_continuous_plugin() {
+        let configuration = Configuration {
+            actions: vec![
+                ActionDefinition {
+                    id: Uuid::from_u128(1),
+                    name: "Delay".to_owned(),
+                    kind: ActionKind::Delay { milliseconds: 10 },
+                },
+                ActionDefinition {
+                    id: Uuid::from_u128(2),
+                    name: "First plugin".to_owned(),
+                    kind: ActionKind::PluginContinuous {
+                        plugin_id: "org.gradial.first".to_owned(),
+                        plugin_action_id: "measure".to_owned(),
+                        parameters: BTreeMap::default(),
+                    },
+                },
+                ActionDefinition {
+                    id: Uuid::from_u128(3),
+                    name: "Second plugin".to_owned(),
+                    kind: ActionKind::PluginContinuous {
+                        plugin_id: "org.gradial.second".to_owned(),
+                        plugin_action_id: "measure".to_owned(),
+                        parameters: BTreeMap::default(),
+                    },
+                },
+            ],
+            ..Configuration::default()
+        };
+
+        assert_eq!(
+            debug_plugin_operation_target(&configuration).as_deref(),
+            Some("org.gradial.first")
+        );
     }
 }

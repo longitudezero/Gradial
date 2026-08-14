@@ -1236,6 +1236,21 @@ by applying continuously varying presence-animation scale to font sizes;
 fonts now use stable appearance-preset sizes while geometry and opacity retain
 the animation. The 10,000-session continuous-soak item is complete.
 
+The third item is implemented as a versioned production-route matrix with an
+isolated real Lua fixture. Optimized-build cases cover every available display
+and effective DPI, active-session display cancellation and overlay rewarm,
+resume re-registration, and bounded shutdown before Begin, after Begin, after
+Update, at Commit submission, and after Cancel submission. Debug-only signals
+add active heartbeat recovery, queue-overflow pass-through/manual retry, and
+Plugins-page-equivalent Reload and Disable cancellation paths without adding
+production UI. The qualifying 2026-08-14 run passed 12 of 12 scenarios with 16
+valid sessions, 15 Updates, exactly one terminal per begun session, no
+post-terminal Updates, no callback failures, and no unclean shutdowns. Only
+96-DPI hardware was present; 120/144/168/192 DPI and physical attach, DPI,
+sleep, lock, and Explorer transitions remain explicitly unavailable or
+`not_run`. The automated display/DPI, recovery, and shutdown matrix item is
+complete within that hardware boundary.
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a

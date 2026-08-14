@@ -537,6 +537,21 @@ bounded logs, and enforces at most 10 MiB working-set p95 growth after the
 first 1,000 sessions. Shorter `-InvocationCount` runs are diagnostic and do
 not qualify the gate.
 
+Run the continuous display/recovery/shutdown matrix after building both
+executables:
+
+```powershell
+cargo build --workspace --all-features
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-continuous-hardening-matrix.ps1 -Build Both
+```
+
+It uses disposable configuration and plugin state, drives real production
+continuous sessions on every available display, and covers active topology
+change, resume, heartbeat loss, queue overflow, plugin Reload/Disable, and
+shutdown across the lifecycle. Missing physical DPI and system-transition
+hardware is reported as unavailable or not run rather than inferred.
+
 See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
@@ -636,3 +651,6 @@ current non-qualifying two-build baseline are recorded in
 The qualifying 10,000-session real-plugin soak, renderer font-cache fix, and
 post-warm-up memory evidence are recorded in
 [`Documentation/milestone-4-plugin-continuous-soak-results.md`](Documentation/milestone-4-plugin-continuous-soak-results.md).
+The display/DPI, active recovery, plugin-management cancellation, and bounded
+shutdown matrix is recorded in
+[`Documentation/milestone-4-continuous-hardening-matrix-results.md`](Documentation/milestone-4-continuous-hardening-matrix-results.md).

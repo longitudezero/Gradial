@@ -66,6 +66,10 @@ const WM_GRADIAL_DEBUG_HOOK_UNRESPONSIVE: u32 = WM_APP + 0x247;
 const WM_GRADIAL_DEBUG_QUEUE_OVERFLOW: u32 = WM_APP + 0x248;
 #[cfg(debug_assertions)]
 const WM_GRADIAL_DEBUG_RETRY_INPUT: u32 = WM_APP + 0x249;
+#[cfg(debug_assertions)]
+const WM_GRADIAL_DEBUG_RELOAD_PLUGIN: u32 = WM_APP + 0x24A;
+#[cfg(debug_assertions)]
+const WM_GRADIAL_DEBUG_DISABLE_PLUGIN: u32 = WM_APP + 0x24B;
 static DISPLAY_TOPOLOGY_MONITORING: AtomicBool = AtomicBool::new(false);
 static DISPLAY_TOPOLOGY_CHANGED: AtomicBool = AtomicBool::new(false);
 static CONTROLLER_WINDOW_ADDRESS: AtomicUsize = AtomicUsize::new(0);
@@ -75,12 +79,21 @@ static TRAY_READD_REQUESTED: AtomicBool = AtomicBool::new(false);
 static INPUT_REREGISTRATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
 static DEBUG_INPUT_FAILURE: AtomicU8 = AtomicU8::new(0);
+#[cfg(debug_assertions)]
+static DEBUG_PLUGIN_OPERATION: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DebugInputFailure {
     HookUnresponsive,
     QueueOverflow,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DebugPluginOperation {
+    Reload,
+    Disable,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -344,6 +357,15 @@ pub(crate) fn take_debug_input_failure() -> Option<DebugInputFailure> {
     match DEBUG_INPUT_FAILURE.swap(0, Ordering::AcqRel) {
         1 => Some(DebugInputFailure::HookUnresponsive),
         2 => Some(DebugInputFailure::QueueOverflow),
+        _ => None,
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn take_debug_plugin_operation() -> Option<DebugPluginOperation> {
+    match DEBUG_PLUGIN_OPERATION.swap(0, Ordering::AcqRel) {
+        1 => Some(DebugPluginOperation::Reload),
+        2 => Some(DebugPluginOperation::Disable),
         _ => None,
     }
 }
@@ -764,6 +786,8 @@ fn handle_debug_message(hwnd: HWND, message: u32) -> bool {
         WM_GRADIAL_DEBUG_HOOK_UNRESPONSIVE => DEBUG_INPUT_FAILURE.store(1, Ordering::Release),
         WM_GRADIAL_DEBUG_QUEUE_OVERFLOW => DEBUG_INPUT_FAILURE.store(2, Ordering::Release),
         WM_GRADIAL_DEBUG_RETRY_INPUT => crate::tray::request_debug_retry(),
+        WM_GRADIAL_DEBUG_RELOAD_PLUGIN => DEBUG_PLUGIN_OPERATION.store(1, Ordering::Release),
+        WM_GRADIAL_DEBUG_DISABLE_PLUGIN => DEBUG_PLUGIN_OPERATION.store(2, Ordering::Release),
         _ => return false,
     }
     request_controller_repaint();

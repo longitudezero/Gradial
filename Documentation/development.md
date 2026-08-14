@@ -173,6 +173,7 @@ Gradial APP\
         capture-timing.ps1 Capture ETW markers and presented-frame timings
         run-performance-report.ps1 Run development or release core performance protocol
         run-plugin-performance-report.ps1 Compare five plugin runtime states
+        run-continuous-hardening-matrix.ps1 Exercise continuous recovery and shutdown
         run-continuous-matrix.ps1 Run the continuous direction/distance matrix
         summarize-continuous-study.ps1 Evaluate anonymous participant reports
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
@@ -2124,12 +2125,46 @@ zero lifecycle or health failures, and 3.270 MiB post-warm-up working-set p95
 growth. Exact protocol and evidence are recorded in
 `Documentation/milestone-4-plugin-continuous-soak-results.md`.
 
+## Continuous hardening matrix
+
+The Milestone 4 hardening runner drives an enabled, no-side-effect Lua fixture
+through the normal M4 hook, production overlay, continuous coordinator, plugin
+worker, and bounded shutdown. Each scenario owns a complete disposable
+`LOCALAPPDATA` tree under its ignored evidence directory.
+
+Build both executables, then run from `Gradial APP`:
+
+```powershell
+cargo build --workspace --all-features
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-continuous-hardening-matrix.ps1 -Build Both
+```
+
+The optimized route covers every available display/DPI, active display
+topology cancellation and pool rewarm, resume re-registration, and shutdown
+before Begin, after Begin, after Update, at Commit submission, and after
+Cancel submission. Debug-only native messages add deterministic heartbeat,
+queue-overflow, Reload, and Disable signals. Reload and Disable enter the same
+application cancellation/worker operation path as the Plugins settings page;
+the messages are not compiled into release builds and add no production UI.
+
+The report requires one Begin and one terminal per observed session, zero
+post-terminal Updates or callback failures, a zero process exit code, all four
+component shutdown records, and no active plugin session in the fixed timing
+summary. JSON and CSV evidence is written under
+`captures\continuous-hardening-matrix`. Available DPI values are executed;
+missing 100/125/150/175/200% rows are `unavailable`. Physical attach/detach,
+DPI changes, sleep, lock/unlock, and Explorer restart remain `not_run` unless
+performed externally. The exact current-machine result is in
+`Documentation/milestone-4-continuous-hardening-matrix-results.md`.
+
 ## Checks
 
 `scripts\check.ps1` runs, in order:
 
 1. PowerShell syntax checks for every script in `scripts`.
-2. The deterministic core and plugin performance-report analyzer self-tests.
+2. The deterministic core, plugin-performance, and continuous-hardening
+   analyzer self-tests.
 3. The deterministic continuous-study summarizer self-test.
 4. `cargo fmt --all --check`
 5. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
