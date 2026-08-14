@@ -143,8 +143,8 @@ emits a successful marker only after the complete `SendInput` sequence, and
 the report independently validates exact delivery to its isolated receiver.
 A fresh 20-invocation optimized development run captured all 80 expected key
 events and measured p95 1.894 ms and p99 2.306 ms from activation release to
-completed submission. These numbers are diagnostic; the Release preset still
-has to run before the p95 < 15 ms and p99 < 25 ms gate can pass or fail. See
+completed submission. The later complete Release campaign captured all 4,000
+expected events and passed this gate at p95 2.436 ms and p99 3.131 ms. See
 [`milestone-4-release-timing-instrumentation-results.md`](milestone-4-release-timing-instrumentation-results.md).
 
 ## Required coverage still open
@@ -164,8 +164,9 @@ yet:
 
 Shortcut-submission instrumentation and isolated receiver evidence are now
 available. PresentMon elevation is isolated and validated in Development mode;
-GPU-counter availability and the full Release preset must still be completed
-before a release result exists.
+the full base Release preset subsequently captured GPU counters and completed
+with a working-set failure plus unevaluated displayed-frame gates. See
+[`milestone-4-base-release-performance-results.md`](milestone-4-base-release-performance-results.md).
 
 ## Automated coverage
 

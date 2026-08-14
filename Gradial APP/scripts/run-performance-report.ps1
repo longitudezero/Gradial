@@ -1243,6 +1243,8 @@ $displayOpenGate = Get-GateResult `
     -Evidence "Gradial ETW correlated with PresentMon displayed events" `
     -Reason $(if (-not $usePresentMon) {
         "PresentMon display capture was unavailable for this run."
+    } elseif (-not $displayOpenStats) {
+        "No correlatable Gradial presentation events were captured."
     } elseif ($displayOpenStats -and $displayOpenStats.sample_count -lt $preset.invocation_count) {
         "Only $($displayOpenStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
     } elseif (-not $gateEligible) {
@@ -1279,6 +1281,8 @@ $displayHighlightGate = Get-GateResult `
     -Evidence "Gradial ETW correlated with PresentMon displayed events" `
     -Reason $(if (-not $usePresentMon) {
         "PresentMon display capture was unavailable for this run."
+    } elseif (-not $displayHighlightStats) {
+        "No correlatable Gradial presentation events were captured."
     } elseif ($displayHighlightStats -and $displayHighlightStats.sample_count -lt $preset.invocation_count) {
         "Only $($displayHighlightStats.sample_count) of $($preset.invocation_count) required invocation samples were captured."
     } elseif (-not $gateEligible) {

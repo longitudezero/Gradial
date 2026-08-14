@@ -1861,7 +1861,9 @@ entire key sequence and is valid only when the isolated receiver also verifies
 exact delivery. Any foreground change or power-plan change invalidates a
 release run.
 The complete protocol and current-machine development numbers are recorded in
-`Documentation\milestone-3-performance-harness-results.md`.
+`Documentation\milestone-3-performance-harness-results.md`. The first complete
+base Release result is recorded in
+`Documentation\milestone-4-base-release-performance-results.md`.
 
 For the Milestone 4 plugin comparison, build both configurations and run:
 

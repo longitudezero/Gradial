@@ -1232,7 +1232,19 @@ Update, and terminal callbacks. Its Release result evaluates the exact section
 only when active and slow fixtures each provide at least 1,000 samples. The
 separate base reporter now measures completed shortcut submission against an
 exact isolated Ctrl+F13 receiver. Short optimized validations passed both
-measurement routes; the long elevated Release campaigns remain required.
+measurement routes; the base Release result and remaining plugin Release
+qualification are recorded below.
+
+Qualification note (2026-08-14): the complete base Release campaign has now
+run with the closed five-minute warmup, 1,000-invocation, 30-minute-idle, and
+100-cold-launch preset. The report is valid. Dispatch, completed shortcut,
+hook, cold-start, idle CPU/GPU, and overflow gates passed; all 4,000 isolated
+receiver events arrived. The working-set gate failed at 156.934 MiB maximum
+against `< 80 MiB`, and displayed-frame gates remain unevaluated because the
+valid PresentMon stream contained no Gradial-process presentation rows. Base
+memory optimization and a valid transparent-overlay display measurement are
+therefore required before the separate plugin Release campaign. See
+[`Documentation/milestone-4-base-release-performance-results.md`](Documentation/milestone-4-base-release-performance-results.md).
 
 The second item is implemented as a release-only production-route campaign
 that preserves all rotated lifecycle evidence outside Gradial's bounded log
