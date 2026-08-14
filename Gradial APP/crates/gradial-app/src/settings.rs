@@ -2214,9 +2214,8 @@ impl SettingsState {
                      edits require Reload before they become active.",
                 );
                 ui.weak(
-                    "Enabled plugin controls already assigned by an imported configuration can \
-                     run beyond a wedge. Creating or editing those controls in Settings is not \
-                     available yet.",
+                    "Enable a compatible plugin, create its continuous control on the Actions \
+                     page, then assign it beyond a wedge on the Menu page.",
                 );
 
                 let Some(snapshot) = snapshot.as_ref() else {

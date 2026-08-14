@@ -1264,6 +1264,16 @@ opted-in bundle disclosed exactly its one configured executable path while
 excluding all ten non-path sentinels. The diagnostic-bundle and log privacy
 evidence item is complete.
 
+The fifth and sixth items are implemented as two checked-in user documents.
+The Lua plugin author guide starts from the permission-free meter, follows the
+actual Rescan, review, Actions, Menu, Save, and Reload workflow, explains the
+hybrid continuous gesture, introduces parameters and capabilities through the
+four shipped examples, and provides a bounded troubleshooting and test loop.
+The manifest v1 reference records the complete closed TOML schema, identifier,
+action and parameter rules, exact loopback grants, package/source bounds, and
+trust transitions. The plugin author guide and plugin manifest reference items
+are complete.
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a

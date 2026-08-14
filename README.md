@@ -441,6 +441,12 @@ example requests one plain notification only when its gesture commits. The
 example posts one JSON scalar on Commit to an explicitly reviewed local test
 service.
 
+To build a plugin from the permission-free meter through assignment and safe
+testing, read the [Lua plugin author guide](Documentation/plugin-author-guide.md).
+The [plugin manifest v1 reference](Documentation/plugin-manifest-reference.md)
+defines every supported field, parameter type, bound, package rule, and trust
+transition.
+
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
 current Windows account, so it does not require administrator access. Gradial reports
