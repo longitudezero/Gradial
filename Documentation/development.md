@@ -174,6 +174,8 @@ Gradial APP\
         run-performance-report.ps1 Run development or release core performance protocol
         run-plugin-performance-report.ps1 Compare five plugin runtime states
         run-continuous-hardening-matrix.ps1 Exercise continuous recovery and shutdown
+        run-plugin-privacy-evidence.ps1 Prove plugin log and diagnostic privacy
+        plugin-privacy-loopback-target.ps1 Receive one bounded private loopback request
         run-continuous-matrix.ps1 Run the continuous direction/distance matrix
         summarize-continuous-study.ps1 Evaluate anonymous participant reports
         smoke-interaction.ps1 Exercise a real hidden app with synthetic M4 input
@@ -2158,13 +2160,47 @@ DPI changes, sleep, lock/unlock, and Explorer restart remain `not_run` unless
 performed externally. The exact current-machine result is in
 `Documentation/milestone-4-continuous-hardening-matrix-results.md`.
 
+## Plugin log and diagnostic privacy evidence
+
+The Milestone 4 privacy runner uses an enabled local Lua fixture and real
+optimized M4 gestures. Recognizable values cross a configured parameter,
+permission-filtered application and title context, shortcut, notification, and
+literal loopback capabilities. A second action throws a recognizable Commit
+error. Isolated shortcut and TCP receivers first prove that the private values
+reached their intended host boundaries.
+
+Build both executables, close any existing Gradial process, and run from
+`Gradial APP`:
+
+```powershell
+cargo build --workspace --all-features
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-privacy-evidence.ps1
+```
+
+The runner then opens Settings with the debug build solely to invoke the
+existing diagnostic preview and export automation. It scans all raw Gradial
+logs, every entry in the default ZIP, and every entry in a second ZIP whose
+configured-process-path checkbox is explicitly enabled. The default bundle
+must contain only its manifest and owned logs. The opted-in bundle may add one
+process-path document containing exactly one configured path; source,
+manifest-owned private text, plugin parameters, target context, shortcut
+values, notification text, HTTP data, and Lua messages remain forbidden in
+both bundles.
+
+Evidence is written under `captures\plugin-privacy`. `report.json` contains
+only sentinel hashes, checks, entry names, and route metadata; exact receiver
+payloads and fixture files stay disposable. The current result and explicit
+opt-in boundary are recorded in
+`Documentation/milestone-4-plugin-privacy-results.md`.
+
 ## Checks
 
 `scripts\check.ps1` runs, in order:
 
 1. PowerShell syntax checks for every script in `scripts`.
-2. The deterministic core, plugin-performance, and continuous-hardening
-   analyzer self-tests.
+2. The deterministic core, plugin-performance, continuous-hardening, and
+   plugin-privacy analyzer self-tests.
 3. The deterministic continuous-study summarizer self-test.
 4. `cargo fmt --all --check`
 5. `cargo clippy --workspace --all-targets --all-features -- -D warnings`

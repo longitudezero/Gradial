@@ -552,6 +552,21 @@ change, resume, heartbeat loss, queue overflow, plugin Reload/Disable, and
 shutdown across the lifecycle. Missing physical DPI and system-transition
 hardware is reported as unavailable or not run rather than inferred.
 
+Exercise private plugin parameters, target context, capability payloads, and a
+Lua failure through optimized interactions, then scan raw logs plus default and
+explicit-path diagnostic bundles with:
+
+```powershell
+cargo build --workspace --all-features
+cargo build --workspace --all-features --release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-plugin-privacy-evidence.ps1
+```
+
+The disposable campaign proves its shortcut and loopback payloads reached
+isolated receivers before enforcing their absence from logs and default
+exports. The opt-in ZIP may contain exactly its one configured executable path;
+all other sentinels remain forbidden.
+
 See [`Documentation/development.md`](Documentation/development.md) for the
 threading model, safety boundaries, timing capture, workspace layout, and
 current limitations. The latest bounded interaction evidence is recorded in
@@ -654,3 +669,6 @@ post-warm-up memory evidence are recorded in
 The display/DPI, active recovery, plugin-management cancellation, and bounded
 shutdown matrix is recorded in
 [`Documentation/milestone-4-continuous-hardening-matrix-results.md`](Documentation/milestone-4-continuous-hardening-matrix-results.md).
+Plugin parameter/context/capability and Lua-failure privacy evidence is recorded
+in
+[`Documentation/milestone-4-plugin-privacy-results.md`](Documentation/milestone-4-plugin-privacy-results.md).

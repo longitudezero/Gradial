@@ -1251,6 +1251,19 @@ sleep, lock, and Explorer transitions remain explicitly unavailable or
 `not_run`. The automated display/DPI, recovery, and shutdown matrix item is
 complete within that hardware boundary.
 
+The fourth item is implemented as an isolated optimized-interaction campaign
+with eleven recognizable private values. Positive foreground and loopback
+receivers prove that parameter, application/title context, shortcut, and HTTP
+payloads crossed their real boundaries; native notification queued/shown
+metadata proves that route completed. A separate Commit callback throws a
+private Lua message and persists the plugin fault while logs retain only the
+stable `lua_runtime_error` code. The campaign then exports the real default and
+explicit-process-path diagnostic ZIPs. The qualifying 2026-08-14 run passed
+all six checks: no sentinel appeared in raw logs or the default bundle, and the
+opted-in bundle disclosed exactly its one configured executable path while
+excluding all ten non-path sentinels. The diagnostic-bundle and log privacy
+evidence item is complete.
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a
