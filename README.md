@@ -453,6 +453,11 @@ See the
 [plugin trust and capability guide](Documentation/plugin-trust-and-capabilities-guide.md)
 for local-script trust, permission review, source changes, exact external effect
 boundaries, revocation, and privacy.
+The
+[known-limitations and release-readiness snapshot](Documentation/known-limitations-and-release-readiness.md)
+separates intentional v0.3 boundaries from deferred features, unavailable
+hardware evidence, open qualification gates, installer work, and the postponed
+code-signing step.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the
@@ -685,3 +690,5 @@ shutdown matrix is recorded in
 Plugin parameter/context/capability and Lua-failure privacy evidence is recorded
 in
 [`Documentation/milestone-4-plugin-privacy-results.md`](Documentation/milestone-4-plugin-privacy-results.md).
+The consolidated Milestone 4 limitations and release-status record is
+[`Documentation/known-limitations-and-release-readiness.md`](Documentation/known-limitations-and-release-readiness.md).

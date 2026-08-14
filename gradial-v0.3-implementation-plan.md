@@ -1289,6 +1289,16 @@ documents the exact context, shortcut, notification, and loopback enforcement,
 revocation, privacy, installation, and author-safety rules. The trust,
 permissions, and capability guide item is complete.
 
+The ninth item is implemented as a checked-in known-limitations and
+release-readiness snapshot. It separates intentional v0.3 product boundaries,
+later deferred features, unsupported environments, unavailable physical
+hardware, completed qualification evidence, open release gates, installer
+work, and the postponed certificate/signing step. This completes the Milestone
+4 implementation and documentation checklist; it does not mark the build
+release-qualified while the explicitly listed performance, hardware,
+reliability, usability, packaging, and signing work remains open. See
+[`Documentation/known-limitations-and-release-readiness.md`](Documentation/known-limitations-and-release-readiness.md).
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a
