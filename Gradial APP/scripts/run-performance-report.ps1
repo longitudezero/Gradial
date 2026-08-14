@@ -423,6 +423,26 @@ $executable = Join-Path $workspace "target\release\gradial.exe"
 if (-not (Test-Path -LiteralPath $executable)) {
     throw "Build Gradial's release configuration before running a performance report."
 }
+$releaseBuiltAt = (Get-Item -LiteralPath $executable).LastWriteTimeUtc
+$releaseInputs = @(
+    Get-Item -LiteralPath (Join-Path $workspace "Cargo.toml")
+    Get-Item -LiteralPath (Join-Path $workspace "Cargo.lock")
+    Get-ChildItem -LiteralPath (Join-Path $workspace "crates") -Recurse -File |
+        Where-Object {
+            $_.Extension -eq ".rs" -or $_.Name -eq "Cargo.toml"
+        }
+)
+$newerReleaseInput = $releaseInputs |
+    Where-Object { $_.LastWriteTimeUtc -gt $releaseBuiltAt } |
+    Sort-Object LastWriteTimeUtc -Descending |
+    Select-Object -First 1
+if ($newerReleaseInput) {
+    throw (
+        "The optimized Gradial executable is stale: " +
+        "$($newerReleaseInput.FullName) is newer than target\release\gradial.exe. " +
+        "Run 'cargo build --release' before collecting performance evidence."
+    )
+}
 if (Get-Process gradial -ErrorAction SilentlyContinue) {
     throw "Close the existing Gradial process before running the isolated performance report."
 }
@@ -453,7 +473,7 @@ $preset = if ($Mode -eq "Release") {
         invocation_count = 1000
         warmup_seconds = 300
         idle_seconds = 1800
-        gesture_delay_ms = 10
+        gesture_delay_ms = 50
         inter_invocation_delay_ms = 25
         cold_launch_samples = 100
         sample_interval_ms = 1000
@@ -464,7 +484,7 @@ else {
         invocation_count = 20
         warmup_seconds = 2
         idle_seconds = 8
-        gesture_delay_ms = 10
+        gesture_delay_ms = 50
         inter_invocation_delay_ms = 25
         cold_launch_samples = 3
         sample_interval_ms = 250
@@ -505,6 +525,7 @@ $phaseFile = Join-Path $reportDirectory "phase.txt"
 $foregroundProcessFile = Join-Path $reportDirectory "foreground.pid"
 $stdoutPath = Join-Path $reportDirectory "interaction.stdout.txt"
 $stderrPath = Join-Path $reportDirectory "interaction.stderr.txt"
+$interactionLogPath = Join-Path $reportDirectory "gradial-interaction.log"
 $resourcePath = Join-Path $reportDirectory "resources.csv"
 $receiverEventPath = Join-Path $temporaryRoot "shortcut-events.csv"
 $receiverReadyPath = Join-Path $temporaryRoot "shortcut-target-ready.txt"
@@ -812,6 +833,40 @@ try {
         throw "The performance interaction process did not publish Gradial's process ID."
     }
     $gradialProcessId = [int](Get-Content -Raw -LiteralPath $processIdFile)
+    $startupLogPath = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
+    $startupLogDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (
+        -not (Test-Path -LiteralPath $startupLogPath) -and
+        -not $child.HasExited -and
+        [DateTime]::UtcNow -lt $startupLogDeadline
+    ) {
+        Start-Sleep -Milliseconds 50
+    }
+    $startupLog = if (Test-Path -LiteralPath $startupLogPath) {
+        Get-Content -Raw -LiteralPath $startupLogPath
+    }
+    else {
+        ""
+    }
+    $configurationRecord = [regex]::Match(
+        $startupLog,
+        "event_code=config_loaded .*config_revision=(?<revision>[1-9][0-9]*) " +
+        "schema_version=6 source=(?<source>[a-z_]+) " +
+        "migrated_from_schema=(?<migration>none|1|2|3|4|5) action_count=(?<actions>[0-9]+)"
+    )
+    if (-not $configurationRecord.Success) {
+        $observedConfiguration = [regex]::Match(
+            $startupLog,
+            "(?m)^.*event_code=config_loaded.*$"
+        ).Value.Trim()
+        if (-not $observedConfiguration) {
+            $observedConfiguration = "no config_loaded event"
+        }
+        throw (
+            "The performance fixture failed startup configuration preflight. " +
+            "Observed: $observedConfiguration"
+        )
+    }
     $previousTime = [DateTime]::UtcNow
     $previousCpu = 0.0
     $resourceSampleIndex = 0
@@ -949,7 +1004,6 @@ try {
     $shortcutReceiverValid = $true
     $foregroundStable = -not $foregroundChanged
     $resourceSamples | Export-Csv -LiteralPath $resourcePath -NoTypeInformation -Encoding utf8
-    $interactionLogPath = Join-Path $reportDirectory "gradial-interaction.log"
     Copy-Item `
         -LiteralPath (Join-Path $gradialDirectory "logs\gradial_rCURRENT.log") `
         -Destination $interactionLogPath
@@ -973,6 +1027,13 @@ finally {
         }
     }
     if (-not $campaignSucceeded) {
+        $failedInteractionLog = Join-Path $gradialDirectory "logs\gradial_rCURRENT.log"
+        if (Test-Path -LiteralPath $failedInteractionLog) {
+            Copy-Item `
+                -LiteralPath $failedInteractionLog `
+                -Destination $interactionLogPath `
+                -Force
+        }
         $failedTemporary = Resolve-Path -LiteralPath $temporaryRoot -ErrorAction SilentlyContinue
         $systemTemporary = Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())
         if (

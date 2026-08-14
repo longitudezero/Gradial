@@ -35,6 +35,15 @@ never reads or changes the user's Gradial configuration.
 Development is a quick harness check and local comparison point. Its metrics
 are always `not_evaluated` against release gates.
 
+Both presets hold activation for 50 ms before moving and hold the selected
+wedge for another 50 ms before release. This matches the plugin reporter and
+gives every non-quick invocation a valid display interval while retaining the
+independent 100 ms first-frame limit. Before creating evidence, the runner now
+rejects an optimized executable older than its Rust or Cargo inputs. It also
+checks the schema-six fixture immediately after startup and preserves the
+application log on failure, so a configuration mismatch cannot consume the
+long idle interval before being diagnosed.
+
 Release evaluation additionally requires:
 
 - a detached debugger;

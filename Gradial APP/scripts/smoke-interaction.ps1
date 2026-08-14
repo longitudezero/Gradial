@@ -723,6 +723,25 @@ try {
     Set-PerformancePhase "startup"
     $logPath = Join-Path $env:LOCALAPPDATA "Gradial\logs\gradial_rCURRENT.log"
     $startupLog = Get-Content -Raw -LiteralPath $logPath
+    $startupConfigurationRecord = [regex]::Match(
+        $startupLog,
+        "event_code=config_loaded .*config_revision=(?<revision>[1-9][0-9]*) " +
+        "schema_version=6 source=(?<source>[a-z_]+) " +
+        "migrated_from_schema=(?<migration>none|1|2|3|4|5) action_count=(?<actions>[0-9]+)"
+    )
+    if (-not $startupConfigurationRecord.Success) {
+        $observedConfiguration = [regex]::Match(
+            $startupLog,
+            "(?m)^.*event_code=config_loaded.*$"
+        ).Value.Trim()
+        if (-not $observedConfiguration) {
+            $observedConfiguration = "no config_loaded event"
+        }
+        throw (
+            "The live check failed startup configuration preflight. " +
+            "Observed: $observedConfiguration"
+        )
+    }
     Set-InvocationProgress 0
     Save-LogEvidence "startup" $true
     $responsiveBeforeRecovery = (

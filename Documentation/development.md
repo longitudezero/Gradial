@@ -1817,6 +1817,11 @@ phase, and measures 100 cold launches. The receiver must observe Ctrl down,
 F13 down/up, and Ctrl up for every invocation. It writes Markdown,
 schema-versioned JSON, flat CSV, raw ETW/PresentMon tables, application log,
 resource samples, and helper output below `captures\performance`.
+Both performance presets hold activation and the selected wedge for 50 ms
+each, ensuring every measured non-quick invocation has a display opportunity
+while the smoke helper continues to enforce its 100 ms first-frame limit. The
+runner rejects a stale optimized executable before launch and validates the
+schema-six fixture immediately after startup.
 
 Renderer checkpoints are reported only as application diagnostics. The
 displayed usable-frame and displayed-highlight gates remain `unavailable`
