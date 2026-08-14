@@ -446,6 +446,9 @@ testing, read the [Lua plugin author guide](Documentation/plugin-author-guide.md
 The [plugin manifest v1 reference](Documentation/plugin-manifest-reference.md)
 defines every supported field, parameter type, bound, package rule, and trust
 transition.
+The [Continuous API v1 reference](Documentation/continuous-api-v1-reference.md)
+defines callback ordering, frozen inputs, samples, cancellation and rejection
+strings, host function signatures, and execution limits.
 
 The **General** tab keeps **Start at login** outside portable menu
 configuration. Gradial never enables it automatically, and it uses only the

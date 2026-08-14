@@ -274,5 +274,7 @@ traversal are not accepted. Modules are cached per loaded adapter.
 - Parameter keys are unique and defaults satisfy every bound.
 - The entry module returns `begin`, `update`, `commit`, and `cancel` functions.
 
-For installation, assignment, lifecycle examples, and a safe testing sequence,
-continue with the [Lua plugin author guide](plugin-author-guide.md).
+For installation, assignment, and a safe testing sequence, continue with the
+[Lua plugin author guide](plugin-author-guide.md). For callback signatures,
+samples, cancellation reasons, host functions, and runtime limits, use the
+[Continuous API v1 reference](continuous-api-v1-reference.md).

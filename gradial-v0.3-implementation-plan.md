@@ -1274,6 +1274,13 @@ action and parameter rules, exact loopback grants, package/source bounds, and
 trust transitions. The plugin author guide and plugin manifest reference items
 are complete.
 
+The seventh item is implemented as a checked-in Continuous API v1 reference.
+It records the exact entry and four-callback contract, lifecycle and segment
+handoff ordering, read-only context, parameter and sample shapes, coalescing,
+all stable cancellation and capability-rejection strings, host function
+signatures, the restricted module environment, and enforced execution limits.
+The Continuous API v1 reference item is complete.
+
 Release is blocked by a failed v0.2 MUST requirement, callback on an
 input/render path, unbounded queue, post-terminal update, stuck synthesized key,
 focus theft, configuration corruption, permission bypass, code execution from a

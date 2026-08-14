@@ -229,6 +229,7 @@ to test a different distance scale.
 ## Reference
 
 - [Plugin manifest v1 reference](plugin-manifest-reference.md)
+- [Continuous API v1 reference](continuous-api-v1-reference.md)
 - [No-side-effect meter](../Gradial%20APP/examples/plugins/org.gradial.example.meter)
 - [Banded shortcut example](../Gradial%20APP/examples/plugins/org.gradial.example.shortcut-bands)
 - [Commit notification example](../Gradial%20APP/examples/plugins/org.gradial.example.notification)
