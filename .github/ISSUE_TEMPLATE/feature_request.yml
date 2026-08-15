@@ -1,0 +1,37 @@
+name: Idea or usability feedback
+description: Suggest an improvement or describe an interaction that could feel better
+title: "[Idea]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Concrete workflows and friction are more useful than a feature name alone.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Gradial to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Radial interaction
+        - Actions and profiles
+        - Continuous input
+        - Lua plugins
+        - Settings and onboarding
+        - Packaging or documentation
+        - Other
+    validations:
+      required: true

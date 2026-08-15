@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "gradial-app"
-version = "0.1.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "gradial-core"
-version = "0.1.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "regex",
  "semver",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "gradial-lua"
-version = "0.1.0"
+version = "0.3.0-beta.1"
 dependencies = [
  "gradial-core",
  "mlua",

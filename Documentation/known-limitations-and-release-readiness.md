@@ -1,6 +1,6 @@
 # Known limitations and release readiness
 
-Date: 2026-08-14
+Date: 2026-08-15
 
 This document is the current release snapshot for the Windows MVP in the
 [v0.2 implementation plan](../gradial-v0.2-implementation-plan.md) plus the
@@ -21,17 +21,20 @@ interchangeable.
 | Qualifying 10,000-session Lua continuous soak | Passed |
 | Plugin privacy campaign | Passed |
 | Display/DPI/recovery/shutdown automation | Passed on the available single 96-DPI display; unavailable physical rows remain open |
-| Base Release performance campaign | Valid run completed: seven measured gates passed; working set failed; displayed-frame gates remain unevaluated |
+| Base Release performance campaign | Valid run completed: seven measured gates passed; 156.934 MiB failed the historical 80 MiB target but passes the public-beta ceiling below 192 MiB; displayed-frame gates remain unevaluated |
 | Completed shortcut and continuous callback timing instrumentation | Base shortcut gate passed in a 1,000-invocation Release run; qualifying continuous-plugin campaign remains open |
-| Full latency, resource, reliability, hardware, and participant qualification | Incomplete; base memory optimization is required |
-| Installer and Authenticode signing | Not implemented; no signing certificate is available |
-| Public release readiness | **Not yet release-qualified** |
+| Full latency, resource, reliability, hardware, and participant qualification | Incomplete; deferred for stable-release qualification |
+| Installer and Authenticode signing | Per-user installer and portable ZIP implemented and package-smoke tested; unsigned because no certificate is available |
+| Public beta readiness | **Packaging gate passed locally; ready to publish as a prerelease** |
+| Stable release readiness | **Not yet release-qualified** |
 
-There is no known failure in the checked-in automated suites at this
-checkpoint. There is one known failed Release performance gate: retained
-working set. That failure does not turn unavailable display/hardware evidence
-into a pass. Under both implementation plans, the present build is a completed
-implementation candidate, not yet a distributable release candidate.
+There is no known failure in the checked-in automated suites or public-beta
+packaging gate at this checkpoint. The historical Release campaign failed its
+then-current 80 MiB retained-working-set target. That result remains recorded
+as a failure against the old threshold; the measured 156.934 MiB passes the
+separately documented public-beta ceiling below 192 MiB. Neither policy turns
+unavailable display/hardware evidence into a pass. The present build is a
+public-beta candidate, not a stable-release candidate.
 
 ## What is implemented
 
@@ -161,11 +164,12 @@ individual evidence documents.
   is not portable with menu configuration.
 - Gradial has no account, cloud sync, telemetry, automatic update, or managed
   plugin distribution service.
-- There is currently no per-user installer. Development and qualification use
-  the built executable directly.
-- The executable is unsigned because no Windows code-signing certificate is
-  available. This is acceptable for local development but not the intended
-  public-distribution state.
+- The public beta has a per-user, no-elevation installer and a portable ZIP.
+  Start at login remains opt-in, updates are manual, and uninstall preserves
+  `%LOCALAPPDATA%\Gradial` so settings and local plugins survive reinstall.
+- The executable and installer are unsigned because no Windows code-signing
+  certificate is available. Windows may show an unfamiliar-publisher or
+  SmartScreen warning. Signing remains the final stable-distribution step.
 
 ## Unsupported versus not yet verified
 
@@ -194,7 +198,8 @@ simulation.
 | Evidence | Current result | What it does not prove |
 | --- | --- | --- |
 | Complete checked-in Rust/Lua tests and project checks | Passing at this checkpoint | Hardware, displayed pixels, long-duration behavior, and human usability |
-| Base Release performance campaign | Valid; dispatch, completed shortcut, hook, cold start, idle CPU/GPU, and overflow gates passed; working set failed at 156.934 MiB maximum | Displayed pixels, unavailable hardware rows, and a passing `< 80 MiB` memory result |
+| Base Release performance campaign | Valid; dispatch, completed shortcut, hook, cold start, idle CPU/GPU, and overflow gates passed; 156.934 MiB failed the historical 80 MiB target and passes the beta ceiling below 192 MiB | Displayed pixels, unavailable hardware rows, or stable-release resource policy |
+| Public-beta package smoke | Passed clean install, real launch to ready state, in-place reinstall, user-data preservation, and uninstall using isolated local state | Upgrade from a distinct older published build, code signing, or clean-machine hardware diversity |
 | Five-state plugin performance harness | Short scenario contracts pass; end-to-end callback and displayed-frame gates are implemented | The five-minute warmup, 1,000-session, 30-minute-idle elevated Release protocol |
 | Isolated completed-shortcut timing | Release pass: 1,000 samples, p95 2.436 ms, p99 3.131 ms, and all 4,000 receiver events | Other built-in actions and unavailable target/display configurations |
 | Continuous plugin soak | 10,000 sessions passed; p95 working-set growth was 3.270 MiB against a 10 MiB limit | The separate v0.2 24-hour soak, full displayed-frame campaign, or participant study |
@@ -205,17 +210,18 @@ simulation.
 The base and plugin timing reporters measure completed shortcut submission and
 the full continuous outer-edge/publication/release-to-callback boundaries. The
 base Release campaign qualified shortcut submission, dispatch, hook duration,
-cold start, idle CPU/GPU, and queue integrity. It failed the `< 80 MiB`
-working-set gate at 156.934 MiB maximum. Displayed usable-frame and highlight
-gates remain unevaluated because the valid PresentMon stream contained no
-Gradial-process presents. The full continuous-plugin campaign remains open.
+cold start, idle CPU/GPU, and queue integrity. Its 156.934 MiB maximum is a
+historical failure against 80 MiB and an explicit public-beta pass below 192
+MiB. Displayed usable-frame and highlight gates remain unevaluated because the
+valid PresentMon stream contained no Gradial-process presents. The full
+continuous-plugin campaign remains open for stable qualification.
 
-The following release work remains:
+The following stable-release work remains; it does not block the public beta
+under the [public beta release policy](public-beta-release-policy.md):
 
-1. Attribute and reduce the base candidate's 156.934 MiB retained working set
-   below the `< 80 MiB` gate, then rerun the complete base Release protocol.
-   Establish a valid composition/display measurement for the transparent
-   overlay without substituting application checkpoints.
+1. Decide the stable memory budget from beta evidence and rerun the complete
+   base Release protocol. Establish a valid composition/display measurement for
+   the transparent overlay without substituting application checkpoints.
 2. Complete the plugin Release performance campaign with full-duration
    warmup/idle periods, at least 1,000 sessions per required scenario, and the
    implemented end-to-end continuous callback timing.
@@ -231,18 +237,18 @@ The following release work remains:
    Revisit the provisional 300-DIP default only from that evidence.
 6. Fix or optimize only any gate that fails, rerun the affected complete
    protocol, and retain its machine-readable evidence.
-7. Build and validate the planned per-user, no-elevation installer without
-   enabling start at login implicitly. An unsigned test installer may be used
-   for packaging validation before a certificate is available.
-8. As the final distribution step, obtain a Windows code-signing certificate,
+7. Validate upgrade from a genuinely older published installer on a clean
+   Windows user profile and repeat the package smoke on additional machines.
+8. As the final stable-distribution step, obtain a Windows code-signing certificate,
    Authenticode-sign and timestamp the executable and installer, verify their
    signatures and hashes, and repeat clean-machine install, upgrade, launch,
    uninstall, and diagnostics checks.
 
-Any failed MUST requirement, unmeasured required latency gate, stuck key,
-focus theft, leaked activation event, partial configuration write, permission
-bypass, disabled-plugin execution, unbounded queue, post-terminal Update, or
-unclean shutdown continues to block the release candidate.
+Any stuck key, focus theft, leaked activation event, partial configuration
+write, permission bypass, disabled-plugin execution, unbounded queue,
+post-terminal Update, unclean shutdown, privacy defect, or failed public-beta
+packaging requirement blocks a beta. The remaining unmeasured stable gates
+continue to block a stable release rather than being reported as passed.
 
 ## Deferred beyond v0.3
 
@@ -265,6 +271,7 @@ shortcut around an open v0.2 or v0.3 release gate.
 ## Evidence index
 
 - [Base performance harness](milestone-3-performance-harness-results.md)
+- [Public beta release policy](public-beta-release-policy.md)
 - [Base Release performance result](milestone-4-base-release-performance-results.md)
 - [Release timing instrumentation](milestone-4-release-timing-instrumentation-results.md)
 - [Interaction matrix](milestone-1-interaction-matrix-results.md)

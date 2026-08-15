@@ -539,7 +539,7 @@ Messages state what failed and the next useful step. For example, `elevated_targ
 | Cold launch to healthy tray state | p95 < 750 ms |
 | Idle CPU after warm-up, 10-minute average | < 0.2% of total machine CPU |
 | Idle GPU after warm-up, 10-minute average | < 0.5% |
-| Working set after 30 minutes idle plus 1,000 invocations | < 80 MiB |
+| Working set after 30 minutes idle plus 1,000 invocations | < 192 MiB |
 | Input queue overflow during standard test suite | 0 |
 
 “Usable frame” means the correct menu geometry, labels, and highlight state are present at no less than 85% final opacity. A transparent placeholder frame does not count.

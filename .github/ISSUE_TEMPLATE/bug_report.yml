@@ -1,0 +1,61 @@
+name: Bug report
+description: Report reproducible incorrect behavior in the newest Gradial beta
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Gradial. Do not post sensitive paths, window titles, typed text, credentials, or unreviewed diagnostic bundles.
+  - type: input
+    id: version
+    attributes:
+      label: Gradial version
+      description: Shown in Settings > Diagnostics or the downloaded release name.
+      placeholder: 0.3.0-beta.1
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2, build 26100
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open ...
+        2. Hold ...
+        3. Move ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Relevant environment
+      description: Mouse model, display layout/scaling/refresh rate, foreground application, and whether a plugin was involved.
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Reviewed diagnostic evidence
+      description: Attach a diagnostic bundle only after previewing it. Remove anything you do not want to publish.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched existing issues for this behavior.
+          required: true
+        - label: I reviewed attached logs or diagnostics for sensitive information.
+          required: true

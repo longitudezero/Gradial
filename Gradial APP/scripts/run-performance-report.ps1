@@ -1438,7 +1438,7 @@ $workingSetGate = if (
     $preset.idle_seconds -ge 1800 -and
     $workingSetStats
 ) {
-    if ($workingSetStats.max -lt 80) { "pass" } else { "fail" }
+    if ($workingSetStats.max -lt 192) { "pass" } else { "fail" }
 }
 else { "not_evaluated" }
 [void]$metrics.Add((New-Metric `

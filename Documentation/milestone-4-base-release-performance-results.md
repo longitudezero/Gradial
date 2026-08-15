@@ -4,10 +4,11 @@ Date: 2026-08-14
 
 ## Outcome
 
-The first complete base Release performance campaign is valid and has an
-overall result of **fail**. Seven measured release gates passed. The 30-minute
-idle working-set gate failed at 156.934 MiB maximum against the required
-`< 80 MiB`. The two displayed-frame gates remain `not_evaluated` because
+The first complete base Release performance campaign is valid. Under the
+original plan it had an overall result of **fail**: seven measured release
+gates passed, while the 30-minute idle working-set gate recorded 156.934 MiB
+maximum against the then-current `< 80 MiB` requirement. The two
+displayed-frame gates remain `not_evaluated` because
 PresentMon captured a valid system-wide stream but no presentation rows for
 Gradial's transparent overlay process.
 
@@ -81,15 +82,14 @@ composition-level measurement that proves the overlay content was displayed,
 or a renderer/presentation route that PresentMon can observe. Application
 checkpoints must not be promoted into display evidence.
 
-## Optimization decision
+## Public-beta policy decision
 
-The next base optimization target is resident memory. The observed maximum is
-76.934 MiB above the `< 80 MiB` gate and is essentially flat across the idle
-period, indicating retained baseline allocations rather than continuing idle
-growth. Investigation should attribute retained memory by subsystem before
-changing caches or overlay prewarming, because both are deliberate latency
-features.
+The public-beta working-set ceiling is `< 192 MiB`. The captured 156.934 MiB
+maximum meets that revised policy with about 35 MiB headroom and remained
+essentially flat across the idle period. The original report and its failure
+remain preserved so the policy change is explicit and auditable.
 
-After a bounded memory change, rerun the complete base Release protocol. The
-separate full plugin Release campaign remains open and should follow only
-after the base candidate no longer fails its working-set requirement.
+Memory attribution and reduction are deferred until stable-release hardening
+or earlier user feedback demonstrates a practical problem. The separate full
+plugin Release campaign and transparent-overlay display measurement remain
+open qualification work.

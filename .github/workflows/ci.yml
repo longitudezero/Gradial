@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: Gradial APP
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Gradial APP
+      - name: Run project checks
+        shell: powershell
+        run: .\scripts\check.ps1

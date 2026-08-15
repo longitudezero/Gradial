@@ -1,0 +1,21 @@
+GRADIAL PUBLIC BETA
+
+This is an early public build for Windows 11 x86-64. It has not completed the
+full stable-release hardware and participant qualification.
+
+The executable and installer are not digitally signed. Windows may show an
+Unknown publisher or Microsoft Defender SmartScreen warning. Download Gradial
+only from https://github.com/longitudezero/Gradial/releases.
+
+Gradial has no automatic updater. Installing a newer version over the existing
+one preserves settings and local plugins. Uninstalling also leaves this user
+data in %LOCALAPPDATA%\Gradial unless you remove it yourself.
+
+Local Lua plugins can perform only approved Gradial capabilities, but they are
+still code. Install plugins only from authors you trust and review source when
+practical.
+
+Please report ordinary bugs at:
+https://github.com/longitudezero/Gradial/issues
+
+Read the known limitations before continuing.

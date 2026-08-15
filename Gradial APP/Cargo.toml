@@ -7,10 +7,14 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0-beta.1"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["Gradial contributors"]
+description = "A fast, configurable radial launcher for Windows 11"
+license = "MIT"
+repository = "https://github.com/longitudezero/Gradial"
+homepage = "https://github.com/longitudezero/Gradial"
 publish = false
 
 [workspace.dependencies]
