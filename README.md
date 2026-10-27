@@ -2,6 +2,8 @@
   <img src="assets/gradial-logo.png" width="128" alt="Gradial logo">
 </p>
 
+# Abandoned project. If you want to pick it up and continue it, feel free to do so. 
+
 # Gradial
 
 Gradial is a fast, configurable radial launcher for Windows 11. Hold a mouse
